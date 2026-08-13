@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-14
+
 ### Fixed
 - Test collection died before running anything on every Python that does not
   restore `loader.top_level_dir` after a nested `discover`: loading the asset
