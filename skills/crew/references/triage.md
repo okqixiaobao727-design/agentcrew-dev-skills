@@ -22,7 +22,8 @@ identical bodies are silently dropped as duplicates.
 A Codex child has no message channel: its answer is its next turn, delivered through the bridge.
 
 ```bash
-python3 <bridge> send --state-file <state-dir>/<NN>.json --prompt-file <answer-file>
+python3 <crew-skill-dir>/assets/codex/codex_bridge.py send \
+  --state-file <run-dir>/codex/<NN>.json --prompt-file <answer-file>
 ```
 
 ## Answer a permission prompt
@@ -48,27 +49,25 @@ tmux send-keys -t <window-id> Enter
 
 ## Log
 
-Append every answer to `<feature-dir>/decisions.md`:
+The ruling hook copies every message you send into the machine log verbatim as you send it, so an
+answer is logged by being sent. What the log then holds is exactly what you wrote: name the effect
+and its exact reversal inside the ruling itself whenever you approve something outside the
+worktree, because the report is built from these lines.
 
-```text
-## <NN> <ticket title> — <timestamp>
-Q: <question>
-A: <answer and reason>
-```
-
-For an effect outside the worktree, also append:
-
-```text
-## OUTSIDE WORKTREE — <NN> <effect> — <timestamp>
-Effect: <what changed and where>
-Undo: <exact reversal>
-```
+An answer sent as tmux keys passes no hook and so reaches no log: it is a ruling only the report
+will carry, so carry it there.
 
 ## Park
 
-When no credible undo exists, leave the child where it stands, rename its window `<NN>?`, append
-its exact worktree path to the wave's parked-path file, and log the blocked action. Descendants of
-that ticket are blocked.
+When no credible undo exists, leave the child where it stands, append its exact worktree path to
+`<run-dir>/parked-paths` so the wake monitor reads it as parked, and settle the ticket:
 
-**Done when** the submitted answer matches the log, or the parked ticket, blocked action, parked
-path, and window marker are all recorded.
+```bash
+python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
+  receipt --ticket <NN> --verdict parked --detail '<the blocked action and its worktree path>'
+```
+
+Descendants of that ticket are blocked, which the advance driver marks when the wave settles.
+
+**Done when** the answer is sent and logged, or the parked ticket's verdict, blocked action, and
+parked path are all recorded.
