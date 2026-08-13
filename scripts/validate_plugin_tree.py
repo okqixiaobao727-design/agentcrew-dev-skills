@@ -19,6 +19,8 @@ MANIFEST = ".claude-plugin/plugin.json"
 MARKETPLACE = ".claude-plugin/marketplace.json"
 DEFAULT_CONFIG = "config/agentcrew.default.toml"
 SKILLS_DIR = "skills"
+# Git's own storage, which a release export never carries and no check ever reads.
+GIT_DIR = ".git"
 # Reference material both skills point at, which belongs to neither of them.
 REFERENCES_DIR = "references"
 
@@ -325,12 +327,26 @@ def local_identifier_pattern(identifiers):
     )
 
 
-def shipped_text_files(root):
-    """Every readable shipped text file, excluding only the validator's top-level fixtures."""
+def shipped_paths(root):
+    """Every shipped file under `root`, as a relative path.
+
+    A release is a `git ls-files` export, so `.git/` is never published and never scanned: its
+    reflogs carry the committer's name, which would fail every clone whose maintainer configured
+    their own git identity as a local identifier.
+    """
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         relative = path.relative_to(root)
+        if GIT_DIR in relative.parts:
+            continue
+        yield relative
+
+
+def shipped_text_files(root):
+    """Every readable shipped text file, excluding only the validator's top-level fixtures."""
+    for relative in shipped_paths(root):
+        path = root / relative
         if relative.parts and relative.parts[0].lower() == "tests":
             continue
         # The identifier list names the very tokens it bans, so it is policy, not residue.
@@ -375,9 +391,8 @@ def check_personal_residue(root, problems):
 def shipped_files(root):
     """Every file this plugin ships, keyed by name, as relative paths."""
     shipped = {}
-    for path in root.rglob("*"):
-        if path.is_file():
-            shipped.setdefault(path.name, []).append(path.relative_to(root))
+    for relative in shipped_paths(root):
+        shipped.setdefault(relative.name, []).append(relative)
     return shipped
 
 
