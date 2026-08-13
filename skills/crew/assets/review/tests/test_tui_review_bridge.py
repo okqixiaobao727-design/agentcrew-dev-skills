@@ -2,9 +2,13 @@
 
 import argparse
 import asyncio
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -37,6 +41,9 @@ def base_args(**overrides):
         "network": False,
         "tmux_target": None,
         "resume_session": None,
+        "recover_session": False,
+        "model": None,
+        "effort": None,
         "probe": False,
         "browser_probe": False,
     }
@@ -260,6 +267,271 @@ class BridgeContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "already running"):
                     with self.bridge.owner_lock(store, owner):
                         pass
+
+
+MARKER_PATTERN = re.compile(r"\[claude-tui-review-bridge:[^\]]+\]")
+
+
+class FakeCodexSession:
+    """One Codex TUI pane and its app-server, seen through the bridge's calls.
+
+    It answers the three requests the bridge makes and records what it was asked
+    to create, so a test can assert that a second pane or a second turn was never
+    started.
+    """
+
+    def __init__(self):
+        self.marker = None
+        self.status = "in_progress"
+        self.final_message = ""
+        self.thread_id = "thread-ticket-13"
+        self.turn_id = "turn-round-one"
+        self.panes = []
+        self.started_turns = []
+
+    def launch_pane(self, args, runtime_dir, prompt_file):
+        runtime_dir = pathlib.Path(runtime_dir)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        (runtime_dir / "app-server.sock").touch()
+        self.marker = MARKER_PATTERN.search(
+            pathlib.Path(prompt_file).read_text(encoding="utf-8")
+        ).group(0)
+        self.panes.append("%%%d" % (90 + len(self.panes)))
+        return self.panes[-1]
+
+    def finish(self, message):
+        self.status = "completed"
+        self.final_message = message
+
+    def turn(self):
+        return {
+            "id": self.turn_id,
+            "status": self.status,
+            "items": [
+                {
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": self.marker}],
+                },
+                {
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": self.final_message,
+                },
+            ],
+        }
+
+    async def request(self, method, params):
+        if method == "thread/list":
+            return {"data": [{"id": self.thread_id, "preview": self.marker}]}
+        if method == "thread/read":
+            return {"thread": {"id": self.thread_id, "turns": [self.turn()]}}
+        if method == "turn/start":
+            self.started_turns.append(params)
+            self.marker = MARKER_PATTERN.search(
+                params["input"][0]["text"]
+            ).group(0)
+            return {"turn": {"id": self.turn_id}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    async def __aexit__(self, *_ignored):
+        return None
+
+
+class RecoveryTests(unittest.TestCase):
+    """A driver killed mid-review is recovered, not restarted.
+
+    The whole path runs through `run_bridge` against a stubbed pane: the first
+    call is killed the way the harness kills it — the record is written, the
+    pane lives on, nothing is printed — and the second call has only its own
+    owner identity to work from.
+    """
+
+    TMUX = "/private/tmp/tmux-501/default,11028,2"
+    ORIGIN_PANE = "%235"
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.root = pathlib.Path(self.work.name)
+        self.worktree = self.root / "worktree"
+        self.worktree.mkdir()
+        self.state_dir = self.root / "state"
+        self.codex = FakeCodexSession()
+
+        self.environment = {
+            "TMUX": self.TMUX,
+            "TMUX_PANE": self.ORIGIN_PANE,
+            "CODE_REVIEW_TUI_STATE_DIR": str(self.state_dir),
+        }
+        self.worktree_root = str(self.worktree)
+        self.enter(mock.patch.dict(os.environ, self.environment, clear=False))
+        self.enter(mock.patch.object(
+            self.bridge, "canonical_worktree_root",
+            side_effect=lambda _cwd: self.worktree_root,
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "launch_pane", self.codex.launch_pane
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "pane_exists",
+            side_effect=lambda pane: pane in self.codex.panes,
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "connect_when_ready", self.connect
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "connect_existing_session", self.connect_existing
+        ))
+
+    def enter(self, patcher):
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def connect(self, *_args, **_kwargs):
+        return self.codex
+
+    async def connect_existing(self, state):
+        if state["paneId"] not in self.codex.panes:
+            return None
+        return self.codex
+
+    def args(self, **overrides):
+        values = {"cwd": str(self.worktree), "timeout": 5, "startup_timeout": 5}
+        values.update(overrides)
+        return base_args(**values)
+
+    def run_bridge(self, args):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = asyncio.run(self.bridge.run_bridge(args))
+        printed = stdout.getvalue().strip()
+        return code, json.loads(printed) if printed else None
+
+    def kill_the_driver(self):
+        """The first review, killed the way the harness kills it."""
+        with self.assertRaisesRegex(RuntimeError, "Timed out"):
+            self.run_bridge(self.args(timeout=0.2))
+        return self.stored_session()
+
+    def stored_session(self):
+        records = sorted(self.state_dir.glob("*.json"))
+        self.assertEqual(len(records), 1, records)
+        return json.loads(records[0].read_text(encoding="utf-8"))
+
+    def test_a_killed_driver_leaves_a_recoverable_record_and_a_live_pane(self):
+        state = self.kill_the_driver()
+
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(state["threadId"], self.codex.thread_id)
+        self.assertEqual(state["marker"], self.codex.marker)
+        self.assertEqual(state["owner"]["origin_pane"], self.ORIGIN_PANE)
+
+    def test_recovery_returns_the_same_session_without_a_second_pane(self):
+        killed = self.kill_the_driver()
+        self.codex.finish("two spec findings, one standards finding")
+
+        code, output = self.run_bridge(
+            self.args(target=None, recover_session=True)
+        )
+
+        self.assertEqual(code, 0)
+        self.assertTrue(output["recovered"])
+        self.assertEqual(output["reviewSessionId"], killed["reviewSessionId"])
+        self.assertEqual(output["threadId"], self.codex.thread_id)
+        self.assertEqual(output["paneId"], killed["paneId"])
+        self.assertEqual(
+            output["finalMessage"], "two spec findings, one standards finding"
+        )
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(self.codex.started_turns, [])
+        self.assertEqual(
+            self.stored_session()["target"], killed["target"]
+        )
+
+    def test_recovery_keeps_the_lineage_resumable_for_round_two(self):
+        killed = self.kill_the_driver()
+        self.codex.finish("round one findings")
+        self.run_bridge(self.args(target=None, recover_session=True))
+
+        code, output = self.run_bridge(
+            self.args(resume_session=killed["reviewSessionId"])
+        )
+
+        self.assertEqual(code, 0)
+        self.assertFalse(output["recovered"])
+        self.assertEqual(len(self.codex.started_turns), 1)
+        self.assertEqual(self.codex.panes, ["%90"])
+
+    def test_another_origin_pane_recovers_nothing(self):
+        self.kill_the_driver()
+        os.environ["TMUX_PANE"] = "%777"
+
+        with self.assertRaisesRegex(
+            self.bridge.NoLiveSessionError, "No live review session"
+        ):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+        self.assertEqual(self.codex.panes, ["%90"])
+
+    def test_another_worktree_recovers_nothing(self):
+        self.kill_the_driver()
+        self.worktree_root = str(self.root / "another-worktree")
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+    def test_a_dead_pane_recovers_nothing(self):
+        self.kill_the_driver()
+        self.codex.panes.clear()
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+    def test_a_record_from_before_recovery_names_no_turn_to_wait_on(self):
+        state = self.kill_the_driver()
+        del state["marker"]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+    def test_nothing_to_recover_exits_distinguishably_from_a_failed_review(self):
+        with mock.patch.object(sys, "argv", [
+            "tui_review_bridge.py", "--recover-session", "--cwd", str(self.worktree),
+        ]):
+            code = self.bridge.main()
+
+        self.assertEqual(code, self.bridge.NO_LIVE_SESSION_EXIT)
+        self.assertNotEqual(self.bridge.NO_LIVE_SESSION_EXIT, 1)
+        self.assertEqual(self.codex.panes, [])
+
+
+class RecoveryParserTests(unittest.TestCase):
+    def setUp(self):
+        self.bridge = load_bridge()
+
+    def test_recovery_needs_no_target(self):
+        args = self.bridge.parse_args(["--recover-session"])
+
+        self.assertTrue(args.recover_session)
+        self.assertIsNone(args.target)
+
+    def test_a_review_still_requires_its_target(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.parse_args(["--cwd", "/workspace/ticket-13"])
+
+    def test_recovery_and_resume_are_exclusive(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.parse_args(
+                ["--recover-session", "--resume-session", "session-13"]
+            )
+
+    def test_recovery_takes_no_target(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.parse_args(["--recover-session", "HEAD"])
 
 
 class LaunchHookTests(unittest.TestCase):
