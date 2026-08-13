@@ -3,17 +3,17 @@
 """The machine log: one append-only event log per run, written without model tokens.
 
 Scripts append what they did — a child launched, a receipt verified, a branch merged, a ticket
-settled — and a `PostToolUse` hook on `SendMessage` copies every outgoing message in verbatim, so
-escalations and rulings land in the log as the messages are sent rather than costing a
-coordinator turn to transcribe (ADR-0001).
+settled, a wave advanced or halted — and a `PostToolUse` hook on `SendMessage` copies every
+outgoing message in verbatim, so escalations and rulings land in the log as the messages are sent
+rather than costing a coordinator turn to transcribe (ADR-0001).
 
 The file is JSON Lines: one object per line, appended and never rewritten, every line stamped
 `%Y-%m-%dT%H:%M:%SZ` in UTC — the run's one timestamp format, so any two lines subtract to a
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome ...  # a script's own event
-    machine_log.py --log <path> hook --role coordinator|child     # a hook, reading JSON on stdin
+    machine_log.py --log <path> launch|receipt|merge|outcome|advance ...  # a script's own event
+    machine_log.py --log <path> hook --role coordinator|child            # a hook, on stdin
 
 The hook never speaks on a channel a model reads: it writes nothing to stdout on the happy path,
 writes nothing to stderr ever, and exits 0 even when the log cannot be written, because a send
@@ -52,6 +52,9 @@ ESCALATION_VERB = "CREW ASK"
 VERDICTS = ("landable", "parked", "failed")
 OUTCOMES = ("completed", "failed", "parked", "blocked")
 MERGE_RESULTS = ("clean", "conflict", "repaired", "escalated")
+# What the run decided about carrying on after a wave. One of these per decision, and a decision
+# is about a wave rather than a ticket, so this is the one event that carries no ticket.
+DECISIONS = ("launched", "escalated", "complete", "interrupted")
 
 LOG_FILE_MODE = 0o644
 
@@ -287,6 +290,12 @@ def build_parser():
     outcome = event_command("outcome", "a ticket's one report outcome")
     outcome.add_argument("--outcome", required=True, choices=OUTCOMES)
     outcome.add_argument("--detail")
+
+    advance = subcommands.add_parser("advance", help="what the run decided after a wave settled")
+    advance.set_defaults(handler=run_event)
+    advance.add_argument("--wave", required=True, help="the wave the decision is about")
+    advance.add_argument("--decision", required=True, choices=DECISIONS)
+    advance.add_argument("--detail")
 
     hook = subcommands.add_parser("hook", help="copy an outgoing SendMessage into the log")
     hook.set_defaults(handler=run_hook)
