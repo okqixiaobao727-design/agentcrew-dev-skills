@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A read-only token is all these checks need. Anything more would be handed to
+# workflow runs triggered by pull requests from forks.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      # One version failing should not hide how the others fared.
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor: the config validator reads TOML with `tomllib`.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Both checks are stdlib-only, so there is nothing to install.
+
+      - name: Validate the plugin tree
+        run: python3 scripts/validate_plugin_tree.py
+
+      - name: Run the test suite
+        run: python3 -m unittest discover -s tests -v
