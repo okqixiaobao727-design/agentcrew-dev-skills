@@ -34,7 +34,7 @@ Short of destroying data, it pushes everything forward on its own.
 | Skill | Takes | Gives back |
 | --- | --- | --- |
 | `/route <feature-dir>` | a spec, with or without tickets | every ticket carrying a `## Routing` section — workflow, executor, model, effort, and a review lane on the reviewed workflows |
-| `/crew <feature-dir>` | routed tickets | an integration branch `crew/<slug>`, a `decisions.md` log, and a per-ticket duration table |
+| `/crew <feature-dir>` | routed tickets | an integration branch `crew/<slug>`, a `report.md` with a per-ticket duration table, and a machine log of everything the run did |
 
 `/route` has two modes, decided by what the feature directory holds. A spec with no tickets is cut
 and routed in one pass; a feature that already has tickets is routed and nothing is cut, so you can
@@ -90,7 +90,7 @@ git clone https://github.com/okqixiaobao727-design/agentcrew-dev-skills.git
 3. **`/crew <feature-dir>`.** It rebuilds the wave table from what the tickets now carry, asks once,
    then runs: a worktree and a tmux window per ticket, waves cut from the dependency frontier, each
    landed branch merged into `crew/<slug>` before the next wave is cut.
-4. **Review the integration branch and `decisions.md`,** then merge it yourself.
+4. **Review the integration branch and `report.md`,** then merge it yourself.
 
 To check a config file you have edited by hand:
 

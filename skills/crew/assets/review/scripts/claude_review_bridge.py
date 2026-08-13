@@ -177,8 +177,9 @@ class SessionStore:
 
 # The whole review request, stated here rather than delegated to a skill name:
 # a headless reviewer that names a skill resolves that name a second time, in a
-# session nobody is watching. Same contract as references/rounds.md, which the
-# reviewed child carries; the two copies are the two ends of one review.
+# session nobody is watching. Same contract as the `rounds` block in
+# dispatch/templates/shapes.toml, which the reviewed child carries in its first
+# turn; the two copies are the two ends of one review.
 ROUNDS_CONTRACT = (
     "Rounds contract. Classify each finding on two axes: standards — style, "
     "naming, convention, anything that leaves behaviour intact — and spec — "

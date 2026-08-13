@@ -23,8 +23,10 @@ Escalate — one compact message, then wait; the answer wakes you — the moment
 the spec, the ticket, and the code disagree; the same obstacle has survived two attempts;
 finishing needs a change to the ticket's scope. Format:
 CREW ASK <NN> <doc-conflict|stuck|scope> — question in one paragraph, 2-3 options with
-yours marked, ts=<unix time>
-Distil: the coordinator decides from this message alone and does not read your files.
+yours marked, then the pointers: ticket <absolute path>, branch <name>, and the files or
+diffs at issue, ts=<unix time>
+Distil: the coordinator decides from this message alone and does not read your files, so
+carry every pointer it would otherwise have to hunt for.
 
 <completion paragraph>
 '''
