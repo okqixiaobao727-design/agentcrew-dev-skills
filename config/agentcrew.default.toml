@@ -1,36 +1,43 @@
 # AgentCrew configuration — the defaults this plugin ships.
 #
 # The setup wizard copies this file to `agentcrew.toml` at your project root, where you edit it
-# per repo. Everything here is an outcome: which vendor, model, and effort each classification
-# case gets. The classification logic itself — six workflows, core vs non-core, complex vs
-# routine — is fixed, so you configure the answers, not the questions.
+# per repo. A project file overrides only the cells it names; every case it leaves out keeps the
+# value it has here. Everything here is an outcome: which vendor, model, and effort each
+# classification case gets. The classification logic itself — six workflows, core vs non-core,
+# complex vs routine — is fixed, so you configure the answers, not the questions.
 #
 # Every cell carries three fields:
 #   executor — `claude` or `codex`, the vendor that runs the ticket
-#   model    — passed verbatim to that vendor's launch command, so a Codex model is its full slug
+#   model    — a full model ID for either vendor, never an alias: the value passes verbatim from
+#              this cell to the ticket's `## Routing` line to the launch command, and an alias
+#              mis-resolves under plan mode
 #   effort   — the reasoning effort that vendor is launched at
+#
+# Each cell's name is the case that selects it. The comment above each group says what the
+# classification turns on, so the case a cell answers is readable from this file alone.
 
 # --- Implementer table ------------------------------------------------------
-# One cell per case of `/route`'s implementer table: which agent writes the ticket's code.
+# Which agent writes the ticket's code, one cell per case of `/route`'s classification.
 
-# `tdd` and `refactor` split on two axes. Core: downstream couples to this ticket's design
-# decisions. Complex: it crosses modules, the spec leaves the approach to the executor, or the
-# logic is convoluted. The three cells other than non-core × routine share one default; each is
-# listed separately so any one of them can be retargeted on its own.
+# `tdd` and `refactor` split on two axes, and the cell is the two answers hyphenated. Core:
+# downstream couples to this ticket's design decisions. Complex: it crosses modules, the spec
+# leaves the approach to the executor, or the logic is convoluted. The three cells other than
+# non-core × routine share one default; each is listed separately so any one of them can be
+# retargeted on its own.
 
 [implementer.tdd-refactor.core-complex]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
 [implementer.tdd-refactor.core-routine]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
 [implementer.tdd-refactor.non-core-complex]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
 [implementer.tdd-refactor.non-core-routine]
@@ -42,7 +49,7 @@ effort = "max"
 
 [implementer.direct.any]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
 # `spike` splits on whether the questions are enumerable up front as fill-in blanks, each naming
@@ -56,10 +63,11 @@ effort = "max"
 
 [implementer.spike.open-exploration]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
-# `ops` splits on whether the run is mechanical, or ends in a judgement of the result.
+# `ops` is mechanical iff the steps are known up front and the deliverable is the record that they
+# ran; a run whose result someone has to weigh before calling it done is acceptance-judgement.
 
 [implementer.ops.mechanical]
 executor = "codex"
@@ -68,20 +76,21 @@ effort = "max"
 
 [implementer.ops.acceptance-judgement]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
 # `acceptance` — finishing needs a human, so the agent's job is to prepare and hand over.
 
 [implementer.acceptance.any]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
 # --- Reviewer table ---------------------------------------------------------
 # `tdd` and `refactor` are the only workflows whose diff a review can catch anything in, so they
-# are the only ones that carry a reviewer. The quadrant is the same one the implementer table
-# used; keep the reviewer on the vendor that did not implement, at the strength the stakes justify.
+# are the only ones that carry a reviewer, and the four cells are the same quadrant that chose the
+# implementer — no second classification. Keep the reviewer on the vendor that did not implement,
+# at the strength the stakes justify.
 
 [reviewer.core-complex]
 executor = "codex"
@@ -100,7 +109,7 @@ effort = "max"
 
 [reviewer.non-core-routine]
 executor = "claude"
-model = "opus"
+model = "claude-opus-5"
 effort = "medium"
 
 # --- Hooks ------------------------------------------------------------------

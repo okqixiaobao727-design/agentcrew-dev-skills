@@ -120,16 +120,16 @@ Every cell carries the same three fields:
 
 | Cell | The case it answers | Shipped default |
 | --- | --- | --- |
-| `implementer.tdd-refactor.core-complex` | reviewed code whose design decisions downstream couples to, crossing modules or leaving the approach open | `claude` / `opus` / `medium` |
-| `implementer.tdd-refactor.core-routine` | the same coupling, contained and specified | `claude` / `opus` / `medium` |
-| `implementer.tdd-refactor.non-core-complex` | nothing couples to its design decisions, but the work is intricate | `claude` / `opus` / `medium` |
+| `implementer.tdd-refactor.core-complex` | reviewed code whose design decisions downstream couples to, crossing modules or leaving the approach open | `claude` / `claude-opus-5` / `medium` |
+| `implementer.tdd-refactor.core-routine` | the same coupling, contained and specified | `claude` / `claude-opus-5` / `medium` |
+| `implementer.tdd-refactor.non-core-complex` | nothing couples to its design decisions, but the work is intricate | `claude` / `claude-opus-5` / `medium` |
 | `implementer.tdd-refactor.non-core-routine` | contained, specified, and nothing downstream depends on how it is built | `codex` / `gpt-5.6-luna` / `max` |
-| `implementer.direct.any` | prose, docs, skill copy, config — every difficulty | `claude` / `opus` / `medium` |
+| `implementer.direct.any` | prose, docs, skill copy, config — every difficulty | `claude` / `claude-opus-5` / `medium` |
 | `implementer.spike.directed-collection` | the questions are enumerable up front, each naming its verification method, with no recommendation in the deliverable | `codex` / `gpt-5.6-luna` / `max` |
-| `implementer.spike.open-exploration` | any one of those three missing | `claude` / `opus` / `medium` |
+| `implementer.spike.open-exploration` | any one of those three missing | `claude` / `claude-opus-5` / `medium` |
 | `implementer.ops.mechanical` | an action against an environment, run and recorded | `codex` / `gpt-5.6-luna` / `max` |
-| `implementer.ops.acceptance-judgement` | the same run, ending in a judgement of the result | `claude` / `opus` / `medium` |
-| `implementer.acceptance.any` | finishing needs a human, so the agent prepares and hands over | `claude` / `opus` / `medium` |
+| `implementer.ops.acceptance-judgement` | the same run, ending in a judgement of the result | `claude` / `claude-opus-5` / `medium` |
+| `implementer.acceptance.any` | finishing needs a human, so the agent prepares and hands over | `claude` / `claude-opus-5` / `medium` |
 
 The three `tdd-refactor` cells that share a default are listed separately so any one of them can be
 retargeted on its own.
@@ -145,7 +145,7 @@ and the reviewing vendor is always the one that did not implement.
 | `reviewer.core-complex` | `codex` / `gpt-5.6-sol` / `medium` |
 | `reviewer.core-routine` | `codex` / `gpt-5.6-luna` / `max` |
 | `reviewer.non-core-complex` | `codex` / `gpt-5.6-luna` / `max` |
-| `reviewer.non-core-routine` | `claude` / `opus` / `medium` |
+| `reviewer.non-core-routine` | `claude` / `claude-opus-5` / `medium` |
 
 ### `[hooks.on-child-launch]` — the one extension point
 

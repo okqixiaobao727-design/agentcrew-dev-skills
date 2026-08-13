@@ -111,16 +111,16 @@ core 与 non-core、complex 与 routine——是固定的产品判断：你配�
 
 | 格子 | 对应的 case | 默认值 |
 | --- | --- | --- |
-| `implementer.tdd-refactor.core-complex` | 下游耦合其设计决策，且跨模块或由执行者自行决定实现路线 | `claude` / `opus` / `medium` |
-| `implementer.tdd-refactor.core-routine` | 同样的耦合，但范围收敛、实现路线已定 | `claude` / `opus` / `medium` |
-| `implementer.tdd-refactor.non-core-complex` | 没有下游耦合其设计决策，但活儿本身复杂 | `claude` / `opus` / `medium` |
+| `implementer.tdd-refactor.core-complex` | 下游耦合其设计决策，且跨模块或由执行者自行决定实现路线 | `claude` / `claude-opus-5` / `medium` |
+| `implementer.tdd-refactor.core-routine` | 同样的耦合，但范围收敛、实现路线已定 | `claude` / `claude-opus-5` / `medium` |
+| `implementer.tdd-refactor.non-core-complex` | 没有下游耦合其设计决策，但活儿本身复杂 | `claude` / `claude-opus-5` / `medium` |
 | `implementer.tdd-refactor.non-core-routine` | 范围收敛、路线已定，且下游不依赖它怎么实现 | `codex` / `gpt-5.6-luna` / `max` |
-| `implementer.direct.any` | 文档、技能文案、配置——不分难度 | `claude` / `opus` / `medium` |
+| `implementer.direct.any` | 文档、技能文案、配置——不分难度 | `claude` / `claude-opus-5` / `medium` |
 | `implementer.spike.directed-collection` | 问题能事先枚举成填空、每个空都指明验证方式、交付物不含推荐结论 | `codex` / `gpt-5.6-luna` / `max` |
-| `implementer.spike.open-exploration` | 上述三条缺任意一条 | `claude` / `opus` / `medium` |
+| `implementer.spike.open-exploration` | 上述三条缺任意一条 | `claude` / `claude-opus-5` / `medium` |
 | `implementer.ops.mechanical` | 对环境执行动作并记录结果 | `codex` / `gpt-5.6-luna` / `max` |
-| `implementer.ops.acceptance-judgement` | 同样是执行，但以对结果的判断收尾 | `claude` / `opus` / `medium` |
-| `implementer.acceptance.any` | 收尾需要人，agent 的活儿是准备好并交接 | `claude` / `opus` / `medium` |
+| `implementer.ops.acceptance-judgement` | 同样是执行，但以对结果的判断收尾 | `claude` / `claude-opus-5` / `medium` |
+| `implementer.acceptance.any` | 收尾需要人，agent 的活儿是准备好并交接 | `claude` / `claude-opus-5` / `medium` |
 
 三个默认值相同的 `tdd-refactor` 格子仍然分开列出，这样其中任何一个都能被单独改掉。
 
@@ -134,7 +134,7 @@ core 与 non-core、complex 与 routine——是固定的产品判断：你配�
 | `reviewer.core-complex` | `codex` / `gpt-5.6-sol` / `medium` |
 | `reviewer.core-routine` | `codex` / `gpt-5.6-luna` / `max` |
 | `reviewer.non-core-complex` | `codex` / `gpt-5.6-luna` / `max` |
-| `reviewer.non-core-routine` | `claude` / `opus` / `medium` |
+| `reviewer.non-core-routine` | `claude` / `claude-opus-5` / `medium` |
 
 ### `[hooks.on-child-launch]`——唯一的扩展点
 
