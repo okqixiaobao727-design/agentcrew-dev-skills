@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "code-review-graph": {
+      "command": "uvx",
+      "args": [
+        "code-review-graph",
+        "serve"
+      ],
+      "cwd": "/Users/simon/Documents/coding/skills/agentcrew-dev-skills",
+      "type": "stdio"
+    }
+  }
+}
