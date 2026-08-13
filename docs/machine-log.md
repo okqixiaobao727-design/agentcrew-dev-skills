@@ -18,7 +18,7 @@ Every line carries these two keys first, in this order:
 | Key | Value |
 | --- | --- |
 | `ts` | the moment the event was recorded, `%Y-%m-%dT%H:%M:%SZ` in UTC |
-| `event` | `launch`, `receipt`, `merge`, `outcome`, `escalation`, `ruling`, or `message` |
+| `event` | `launch`, `receipt`, `merge`, `outcome`, `advance`, `escalation`, `ruling`, `message` |
 
 `ts` is the run's one timestamp format — the same one the crew skill reads with
 `date -u +%Y-%m-%dT%H:%M:%SZ` — so any two lines subtract to a duration.
@@ -55,6 +55,19 @@ ladder's four stops ([ADR-0004](adr/0004-escalation-ladder-script-then-sonnet-th
 `ticket`, `outcome` (`completed`, `failed`, `parked`, or `blocked`), `detail`. These are the four
 outcomes the crew contract gives every ticket.
 
+### `advance` — what the run decided after a wave settled
+
+`wave`, `decision`, `detail`. The one event that carries no `ticket`: a decision is about a wave.
+`decision` is one of the four the advance driver reaches
+([`docs/wave-advance.md`](wave-advance.md)):
+
+| `decision` | Meaning |
+| --- | --- |
+| `launched` | the next wave is running; `wave` is the wave that started |
+| `complete` | that was the last wave of the run |
+| `escalated` | a ticket failed, parked or did not land, and the chain stopped |
+| `interrupted` | the operator stopped the run |
+
 ### `escalation`, `ruling`, `message` — an outgoing message, copied verbatim
 
 Written by the SendMessage hook below, never by hand: `role` (`coordinator` or `child`), `to`,
@@ -74,6 +87,9 @@ machine_log.py --log <path> receipt --ticket NN --verdict landable|parked|failed
 machine_log.py --log <path> merge   --ticket NN --result clean|conflict|repaired|escalated \
                                     [--branch B] [--into B] [--sha SHA] [--detail TEXT]
 machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parked|blocked \
+                                    [--detail TEXT]
+machine_log.py --log <path> advance --wave N \
+                                    --decision launched|complete|escalated|interrupted \
                                     [--detail TEXT]
 ```
 

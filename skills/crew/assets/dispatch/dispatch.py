@@ -34,7 +34,9 @@ The wave table is one JSON object:
         "model": full model ID, "effort": str,
         "review": {"vendor", "model", "effort"} — on `tdd` and `refactor` only,
         "slug": optional, defaulting to the ticket file's name after its number,
-        "base_commit": optional, defaulting to the run's integration base commit
+        "base_commit": optional, defaulting to `--base-commit` or the run's base commit,
+        "blocked_by": optional list of ticket ids — the dependency edges the advance driver
+                      follows; routing does not read them
       }]}]
     }
 
@@ -654,6 +656,11 @@ def parse_args(argv):
     parser.add_argument("--wave", required=True, type=int, help="which wave of it to render")
     parser.add_argument("--out-dir", required=True, help="where launch artifacts are written")
     parser.add_argument(
+        "--base-commit",
+        help="the commit this wave's worktrees and reviews are based on, in place of the table's"
+             " integration base commit — what an earlier wave left on the integration branch",
+    )
+    parser.add_argument(
         "--verify-timeout", type=float, default=DEFAULT_VERIFY_TIMEOUT_SECONDS,
         help="how long post-launch verification waits for a child to report its model",
     )
@@ -673,6 +680,11 @@ def main(argv=None):
         # ValueError covers both a table that is not JSON and one that is not even text.
         print(f"run: {args.table} is not a readable wave table: {error}", file=sys.stderr)
         return 1
+
+    if args.base_commit and isinstance(table.get("run"), dict):
+        # One value, read by the worktree and by the first turn's review base alike: a wave cut
+        # from a later commit is also reviewed against it.
+        table["run"]["integration_base_commit"] = args.base_commit
 
     try:
         validate(table, templates)
