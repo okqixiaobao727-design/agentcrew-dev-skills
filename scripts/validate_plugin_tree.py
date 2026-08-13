@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -30,6 +31,12 @@ SKILL_SLOTS = ("route", "crew")
 # The rename cascade: the shipped surface speaks crew, never the skill's former name. The token is
 # assembled from two halves so this checker's own source stays clean of it.
 LEGACY_NAME = re.compile("orchestr" + "ate", re.IGNORECASE)
+# The former name written as its slash-command inside a code span cites the old surface rather than
+# speaking it, and two kinds of file have to: the glossary entry that names the term in order to
+# ban it, and an ADR recording forensics on a run that really did happen under that command.
+# Renaming either would falsify the record. A bare mention is still the surface speaking, and is
+# still rejected — the same reasoning that exempts the identifier list from the identifier rule.
+LEGACY_NAME_CITATION = re.compile("`/" + "orchestr" + "ate`", re.IGNORECASE)
 # These directories contain install-path-bearing plugin surfaces for the self-reference check.
 # Text residue rules use `shipped_text_files`, which also excludes intentional test fixtures.
 SCANNED_DIRS = (".claude-plugin", "config", REFERENCES_DIR, "scripts", SKILLS_DIR)
@@ -362,18 +369,43 @@ def local_identifier_pattern(identifiers):
     )
 
 
+def ignored_paths(root):
+    """Every path under `root` that this repo ignores, as relative paths.
+
+    A release is a `git ls-files` export, so a file the repo ignores is never published and has
+    nothing to leak: a crew run's own working directory, sitting under the repo it is building,
+    must not fail this lint. An untracked file that is *not* ignored still ships, so it is still
+    scanned. Outside a git repo there is nothing to ask, and the tree as it stands is what ships.
+    """
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--others", "--ignored",
+             "--exclude-standard", "-z"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    return frozenset(pathlib.Path(entry) for entry in listed.split("\0") if entry)
+
+
 def shipped_paths(root):
     """Every shipped file under `root`, as a relative path.
 
     A release is a `git ls-files` export, so `.git/` is never published and never scanned: its
     reflogs carry the committer's name, which would fail every clone whose maintainer configured
-    their own git identity as a local identifier.
+    their own git identity as a local identifier. Ignored files are excluded for the same reason:
+    the export never carries them.
     """
+    ignored = ignored_paths(root)
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         relative = path.relative_to(root)
         if GIT_DIR in relative.parts:
+            continue
+        if relative in ignored:
             continue
         yield relative
 
@@ -394,11 +426,13 @@ def shipped_text_files(root):
         yield relative, text
 
 
+# Each rule is (pattern, message, cited), where `cited` matches the spans in which this rule's own
+# token is being quoted rather than used. A match inside such a span is not residue.
 RESIDUE_RULES = (
-    (PRIVATE_BRIDGE_PATH, "{match} — private bridge path is not public"),
-    (PRIVATE_ENV_TOKEN, "{match} — private environment token is not public"),
-    (SPEND_FIGURE, "{match} — spend figure is not public"),
-    (LEGACY_NAME, "{match} — the rename cascade says crew"),
+    (PRIVATE_BRIDGE_PATH, "{match} — private bridge path is not public", None),
+    (PRIVATE_ENV_TOKEN, "{match} — private environment token is not public", None),
+    (SPEND_FIGURE, "{match} — spend figure is not public", None),
+    (LEGACY_NAME, "{match} — the rename cascade says crew", LEGACY_NAME_CITATION),
 )
 
 
@@ -407,7 +441,17 @@ def residue_rules(root):
     pattern = local_identifier_pattern(local_identifiers(root))
     if pattern is None:
         return RESIDUE_RULES
-    return RESIDUE_RULES + ((pattern, "{match} — personal identifier is not public"),)
+    return RESIDUE_RULES + ((pattern, "{match} — personal identifier is not public", None),)
+
+
+def residue_match(pattern, cited, line):
+    """This rule's first match on `line` that is used rather than quoted, or None."""
+    spans = [span.span() for span in cited.finditer(line)] if cited else ()
+    for found in pattern.finditer(line):
+        if any(start <= found.start() and found.end() <= end for start, end in spans):
+            continue
+        return found
+    return None
 
 
 def check_personal_residue(root, problems):
@@ -415,8 +459,8 @@ def check_personal_residue(root, problems):
     rules = residue_rules(root)
     for relative, text in shipped_text_files(root):
         for number, line in enumerate(text.splitlines(), start=1):
-            for pattern, message in rules:
-                found = pattern.search(line)
+            for pattern, message, cited in rules:
+                found = residue_match(pattern, cited, line)
                 if found:
                     problems.append(
                         f"{relative}:{number}: {message.format(match=found.group())}"
