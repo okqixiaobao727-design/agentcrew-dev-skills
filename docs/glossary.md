@@ -52,9 +52,10 @@ landed.
 
 **Routing** — What `/route` concludes for one ticket: workflow, executor, model, effort, plus a
 review line on tdd/refactor tickets naming the reviewing vendor and its model/effort. Written into
-the ticket as a `## Routing` section of `key: value` lines, which `/crew` dispatches from. Routing
-is proposed, not imposed: `/route` presents the full table with per-ticket reasons and writes
-nothing until you approve it.
+the ticket as a `## Routing` section of `key: value` lines, which is advisory input to the wave
+table `/crew` dispatches from, never a second live authority beside it. Routing is proposed, not
+imposed: `/route` presents the full table with per-ticket reasons and writes nothing until you
+approve it.
 
 **Workflow** — How a ticket gets developed. A closed set of six: `tdd`, `refactor`, `direct`,
 `spike`, `ops`, `acceptance`. It shapes the child's first prompt — which stages run and which are

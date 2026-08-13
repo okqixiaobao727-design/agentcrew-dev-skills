@@ -513,6 +513,13 @@ class ProjectConfigTests(unittest.TestCase):
             "alias",
         )
 
+    def test_an_overridden_cell_with_a_versioned_alias_is_rejected(self):
+        """Not every alias is a bare word: a versioned name the vendor routes onward is one too."""
+        self.assert_rejects(
+            '[implementer.direct.any]\nexecutor = "codex"\nmodel = "gpt-5.6"\neffort = "max"\n',
+            "alias",
+        )
+
     def test_an_overridden_cell_with_a_context_suffixed_full_id_is_accepted(self):
         """The suffix on a full ID is part of the ID, and the launch chain carries it."""
         self.assert_accepts(

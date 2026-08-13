@@ -204,9 +204,13 @@ escalate with what the bridge printed and the `logFile` path it names.
 '''
 
 [models]
-# ADR-0003: model names are always full IDs. A bare vendor-less word — `opus`, `haiku` — is an
-# alias, and an alias was measured to resolve to a different model than the table approved.
+# ADR-0003: model names are always full IDs, because an alias was measured to resolve to a
+# different model than the table approved. A bare vendor-less word — `opus`, `haiku` — is one, but
+# so is a versioned name a vendor routes onward, which is why this is a list and not a shape test.
+# A context-window suffix belongs to whatever it is attached to: `sonnet[1m]` is still this alias,
+# `claude-opus-5[1m]` is still that full ID, so strip it before looking a name up here.
 aliases = [
+    # Claude
     "opus",
     "opusplan",
     "sonnet",
@@ -214,6 +218,9 @@ aliases = [
     "fable",
     "default",
     "inherit",
+    # OpenAI: `gpt-5.6` routes to `gpt-5.6-sol`. The `-sol`, `-terra`, and `-luna` names it routes
+    # among are full IDs and belong nowhere near this list.
+    "gpt-5.6",
 ]
 
 [agent]
