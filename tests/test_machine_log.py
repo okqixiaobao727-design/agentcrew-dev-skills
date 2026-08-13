@@ -185,6 +185,34 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["outcome"], "blocked")
         self.assertEqual(entry["detail"], "blocked by 07")
 
+    def test_an_advance_records_what_the_run_decided_about_a_wave(self):
+        result = run_cli(
+            "advance", "--wave", "2", "--decision", "launched",
+            "--detail", "advanced from wave 1: 08, 09", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "advance")
+        self.assertEqual(entry["wave"], "2")
+        self.assertEqual(entry["decision"], "launched")
+        self.assertEqual(entry["detail"], "advanced from wave 1: 08, 09")
+        # A decision is about a wave, so it carries no ticket at all.
+        self.assertNotIn("ticket", entry)
+
+    def test_every_advance_decision_is_accepted_and_an_unknown_one_is_refused(self):
+        for decision in ("launched", "escalated", "complete", "interrupted"):
+            self.assertEqual(
+                run_cli("advance", "--wave", "1", "--decision", decision, log=self.log).returncode,
+                0,
+            )
+
+        refused = run_cli("advance", "--wave", "1", "--decision", "advanced", log=self.log)
+
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(len(self.lines()), 4)
+
     def test_every_verdict_outcome_and_merge_result_is_accepted(self):
         for verdict in ("landable", "parked", "failed"):
             self.assertEqual(

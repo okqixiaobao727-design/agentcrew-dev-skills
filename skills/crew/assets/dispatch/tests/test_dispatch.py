@@ -494,6 +494,24 @@ class DispatchLaunchTests(DispatchTestCase):
         ).stdout.strip()
         self.assertEqual(branch, "worktree-06-dispatch-renderer")
 
+    def test_base_commit_cuts_the_worktree_and_the_review_from_that_commit(self):
+        """A wave launched after an earlier one landed is cut from what that wave left behind."""
+        (self.fixture.repo / "landed.md").write_text("what wave one landed\n")
+        run_git(self.fixture.repo, "add", "landed.md")
+        run_git(self.fixture.repo, "commit", "-m", "wave one")
+        landed = subprocess.run(
+            ["git", "-C", str(self.fixture.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        result = self.fixture.run_dispatch(
+            "dispatch", self.table, extra=("--base-commit", landed),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue((self.worktree / "landed.md").is_file())
+        self.assertIn(f"Base commit for the review: {landed}.", self.fixture.turn("06"))
+
     def test_the_guard_assets_are_installed_with_the_worktree_path_filled_in(self):
         self.fixture.run_dispatch("dispatch", self.table)
 
