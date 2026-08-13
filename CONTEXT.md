@@ -82,6 +82,13 @@ launch command — passed verbatim end to end with no alias-resolution layer. Al
 mis-resolve under plan mode (ADR-0003).
 _Avoid_: alias, short name
 
+**Review recovery**:
+Re-attaching to the review a child already has running, keyed on the owner tuple the review
+bridge stores — tmux server, origin pane, worktree root. The reviewing session outlives the
+driver process that launched it, so a lost handle is recovered rather than replaced; starting
+a second review of one diff is the failure recovery exists to prevent.
+_Avoid_: retry, restart
+
 **Mode-gated reference**:
 A reference file only one mode of a skill loads, via an explicit Read instruction in the
 body — e.g. the cutting overlay that spec-only `/route` runs read and route-only runs

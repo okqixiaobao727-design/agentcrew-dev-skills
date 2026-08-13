@@ -162,7 +162,9 @@ than opening another round.
 [review.codex]
 block = '''
 Review: codex at model <review model>, effort <review effort>. Once the work is in place and
-before you commit it, run:
+before you commit it, run this as a background command — `run_in_background: true` — and wait
+for it. A foreground Bash call is killed at ten minutes, which a review of this diff routinely
+outlasts; in the background it runs to completion and wakes you when it exits.
 
 python3 <crew-skill-dir>/assets/review/scripts/tui_review_bridge.py \
   --cwd <worktree-abs-path> --model <review model> --effort <review effort> \
@@ -175,8 +177,21 @@ The bridge prints one JSON object. A `status` of `completed` with a non-empty `f
 the report; keep `reviewSessionId` and pass it back as `--resume-session '<reviewSessionId>'` on
 the same command for round two, so the follow-up still sees round one's findings and can say which
 of them the fixes closed. A `status` of `interrupted` carrying a `reviewSessionId` is a resumable
-pane: resume it the same way. Any other result is a failed review — retry once, then escalate with
-exactly what the bridge printed.
+pane: resume it the same way.
+
+If that JSON object never reaches you — the command was killed, its output was lost, or you hold
+no `reviewSessionId` for a review you know you started — recover the review you already have
+rather than starting a second one:
+
+python3 <crew-skill-dir>/assets/review/scripts/tui_review_bridge.py \
+  --cwd <worktree-abs-path> --recover-session
+
+It re-attaches to the review pane still running for this worktree, waits out the turn in flight,
+and prints the same JSON object with `recovered` true and the original `reviewSessionId`. Exit
+code 3 means no live session belongs to this worktree, and that is the only result that licenses a
+fresh review: a first review started while the old pane lives bills the same diff twice and
+reviews it twice. Any other result is a failed review — retry once, then escalate with exactly
+what the bridge printed.
 
 <rounds contract>
 '''
