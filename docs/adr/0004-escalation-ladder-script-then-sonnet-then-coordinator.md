@@ -14,9 +14,10 @@ to the coordinator.
 ## Considered Options
 
 - **Resident cheap "executive" session** doing all mechanics: grows its own long-context
-  bill (~$4.65 replayed against the measured run) and adds a relay hop that distorts
+  bill (~13.6% of the measured run's bill, replayed) and adds a relay hop that distorts
   escalations. Rejected.
 - **Coordinator-spawned repair subagents**: every exception costs the coordinator at
-  least two late-context turns (~$0.15–0.20 each in pure prefix re-reading) to buy
-  conversation context that a mechanical fix by definition does not need. Conflicts that
-  do need that context are semantic and go straight to the coordinator anyway. Rejected.
+  least two late-context turns (~0.4–0.6% of the measured run's bill each, in pure
+  prefix re-reading) to buy conversation context that a mechanical fix by definition
+  does not need. Conflicts that do need that context are semantic and go straight to
+  the coordinator anyway. Rejected.
