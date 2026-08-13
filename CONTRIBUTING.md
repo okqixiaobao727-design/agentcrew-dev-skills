@@ -35,6 +35,10 @@ python3 -m unittest discover -s tests -v      # the test suite
 CI runs both on every pull request against 3.11, 3.12, 3.13 and 3.14. Run them locally first — they
 take a few seconds.
 
+A skill asset's tests live next to the asset, in a `tests/` directory beside it, because the stub
+PATH and fixture repository they need belong with the script they stand in for. The second command
+still runs them: `tests/test_asset_suites.py` loads every one of those directories into the suite.
+
 ### One thing that will surprise you
 
 The validator's residue lint rejects **personal identifiers**: machine nicknames and account names
