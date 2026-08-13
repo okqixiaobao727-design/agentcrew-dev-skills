@@ -97,6 +97,38 @@ CELL_FIELDS = ("executor", "model", "effort")
 EXECUTORS = ("claude", "codex")
 HOOK = "hooks.on-child-launch"
 
+PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
+# The alias list the dispatch renderer refuses to launch on, so a cell this accepts is a cell that
+# reaches a launch command intact rather than failing at the wave table.
+SHAPES = "skills/crew/assets/dispatch/templates/shapes.toml"
+# A bare vendor-less word is an alias whatever either vendor's catalogue holds today.
+BARE_WORD = re.compile(r"^[A-Za-z]+$")
+# A context-window suffix rides on both forms — `sonnet[1m]` is still that alias, and
+# `claude-opus-5[1m]` is still that full ID — so it comes off before either test.
+CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]$")
+
+
+def model_aliases(root, problems):
+    """Every alias the dispatch renderer rejects, lowercased, from the templates it renders with.
+
+    The list comes from the tree under validation, so a cell is checked against the very renderer
+    that will launch it. Failing to read it is a problem in its own right: an empty list would pass
+    cells that renderer then refuses.
+    """
+    try:
+        templates = tomllib.loads((root / SHAPES).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        problems.append(f"{SHAPES}: the alias list the renderer enforces is unreadable: {error}")
+        return frozenset()
+    listed = templates.get("models", {}).get("aliases", [])
+    return frozenset(alias.lower() for alias in listed if isinstance(alias, str))
+
+
+def is_alias(model, aliases):
+    """A model value that would reach a launch command as an alias instead of a full ID."""
+    bare = CONTEXT_SUFFIX.sub("", model.strip())
+    return bare.lower() in aliases or bool(BARE_WORD.match(bare))
+
 
 def read_json(path):
     """The parsed document, or a problem string."""
@@ -198,7 +230,7 @@ def check_skills(root, manifest, problems):
             problems.append(f"{SKILLS_DIR}/{path.name}: on disk but absent from {MANIFEST}")
 
 
-def check_cell(config, key, label, complete, problems):
+def check_cell(config, key, label, complete, aliases, problems):
     """One vendor/model/effort cell of a model table."""
     cell = config
     for part in key.split("."):
@@ -215,6 +247,9 @@ def check_cell(config, key, label, complete, problems):
         problems.append(
             f"{label}: [{key}] executor {cell['executor']!r} is not one of {EXECUTORS}"
         )
+    model = cell.get("model")
+    if isinstance(model, str) and model.strip() and is_alias(model, aliases):
+        problems.append(f"{label}: [{key}] model {model!r} is an alias, not a full model ID")
     for field in sorted(set(cell) - set(CELL_FIELDS)):
         problems.append(f"{label}: [{key}] carries an unknown field {field!r}")
 
@@ -229,10 +264,10 @@ def check_config(root, problems):
     except OSError as error:
         problems.append(f"{DEFAULT_CONFIG}: unreadable: {error}")
         return
-    check_config_text(text, DEFAULT_CONFIG, True, problems)
+    check_config_text(text, DEFAULT_CONFIG, True, model_aliases(root, problems), problems)
 
 
-def check_config_text(text, label, complete, problems):
+def check_config_text(text, label, complete, aliases, problems):
     """The config in `text`: every cell answered when `complete`, else only the cells it overrides.
 
     The shipped defaults answer every case, which is what lets a project file inherit the cells it
@@ -255,12 +290,12 @@ def check_config_text(text, label, complete, problems):
         for case in sorted(set(implementer.get(workflow, {})) - set(cases)):
             problems.append(f"{label}: unknown case [implementer.{workflow}.{case}]")
         for case in cases:
-            check_cell(config, f"implementer.{workflow}.{case}", label, complete, problems)
+            check_cell(config, f"implementer.{workflow}.{case}", label, complete, aliases, problems)
 
     for case in sorted(set(config.get("reviewer", {})) - set(REVIEWER_CASES)):
         problems.append(f"{label}: unknown case [reviewer.{case}]")
     for case in REVIEWER_CASES:
-        check_cell(config, f"reviewer.{case}", label, complete, problems)
+        check_cell(config, f"reviewer.{case}", label, complete, aliases, problems)
 
     check_hook(config, label, complete, problems)
 
@@ -299,7 +334,7 @@ def validate_project_config(path):
         return [f"{label}: missing"]
     except OSError as error:
         return [f"{label}: unreadable: {error}"]
-    check_config_text(text, label, False, problems)
+    check_config_text(text, label, False, model_aliases(PLUGIN_ROOT, problems), problems)
     return problems
 
 
@@ -448,7 +483,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--root",
-        default=pathlib.Path(__file__).resolve().parents[1],
+        default=PLUGIN_ROOT,
         type=pathlib.Path,
         help="plugin tree to validate (default: the tree this script ships in)",
     )

@@ -435,13 +435,27 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.write(
             CONFIG,
             self.tree.read(CONFIG)
-            + '\n[implementer.acceptance.any]\nexecutor = "claude"\nmodel = "opus"\n',
+            + '\n[implementer.acceptance.any]\nexecutor = "claude"\nmodel = "claude-opus-5"\n',
         )
         self.assert_rejects("effort")
 
     def test_cell_with_a_blank_model_is_rejected(self):
-        self.tree.edit_config('model = "opus"', 'model = ""')
+        self.tree.edit_config('model = "claude-opus-5"', 'model = ""')
         self.assert_rejects("model")
+
+    def test_cell_with_an_alias_model_is_rejected(self):
+        self.tree.edit_config('model = "claude-opus-5"', 'model = "opus"')
+        self.assert_rejects("alias")
+
+    def test_cell_with_a_context_suffixed_alias_is_rejected(self):
+        """A context-window suffix does not turn an alias into a full ID."""
+        self.tree.edit_config('model = "claude-opus-5"', 'model = "sonnet[1m]"')
+        self.assert_rejects("alias")
+
+    def test_alias_list_the_renderer_enforces_must_be_readable(self):
+        """An unreadable alias list would pass cells the dispatch renderer then refuses."""
+        self.tree.write("skills/crew/assets/dispatch/templates/shapes.toml", "[models\n")
+        self.assert_rejects("alias list")
 
     def test_cell_with_an_unknown_executor_is_rejected(self):
         self.tree.edit_config('executor = "claude"', 'executor = "gemini"')
@@ -490,7 +504,20 @@ class ProjectConfigTests(unittest.TestCase):
 
     def test_an_overridden_cell_missing_a_field_is_rejected(self):
         self.assert_rejects(
-            '[implementer.direct.any]\nexecutor = "claude"\nmodel = "opus"\n', "effort"
+            '[implementer.direct.any]\nexecutor = "claude"\nmodel = "claude-opus-5"\n', "effort"
+        )
+
+    def test_an_overridden_cell_with_an_alias_model_is_rejected(self):
+        self.assert_rejects(
+            '[implementer.direct.any]\nexecutor = "claude"\nmodel = "opus"\neffort = "medium"\n',
+            "alias",
+        )
+
+    def test_an_overridden_cell_with_a_context_suffixed_full_id_is_accepted(self):
+        """The suffix on a full ID is part of the ID, and the launch chain carries it."""
+        self.assert_accepts(
+            '[implementer.direct.any]\nexecutor = "claude"\nmodel = "claude-opus-5[1m]"\n'
+            'effort = "medium"\n'
         )
 
     def test_an_unknown_executor_is_rejected(self):
