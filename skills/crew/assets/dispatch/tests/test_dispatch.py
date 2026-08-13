@@ -320,7 +320,8 @@ class ClaudeRenderTests(DispatchTestCase):
         prompt = self.initial_prompt()
         self.assertIn(
             f"Review: codex at model {CODEX_MODEL}, effort {CODEX_EFFORT}. Once the work is in"
-            " place and\nbefore you commit it, run:",
+            " place and\nbefore you commit it, run this as a background command —"
+            " `run_in_background: true` — and wait\nfor it.",
             prompt,
         )
         self.assertIn(
@@ -331,6 +332,17 @@ class ClaudeRenderTests(DispatchTestCase):
                self.fixture.base_commit),
             prompt,
         )
+
+    def test_the_first_turn_names_the_recovery_call_a_lost_handle_needs(self):
+        """The review outlives its driver, so a killed driver is re-attached, not restarted."""
+        prompt = self.initial_prompt()
+        self.assertIn(
+            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
+            "  --cwd %s --recover-session" % (CREW_SKILL_DIR, self.worktree),
+            prompt,
+        )
+        self.assertIn("`recovered` true", prompt)
+        self.assertIn("Exit\ncode 3 means no live session belongs to this worktree", prompt)
         self.assertIn(
             "Rounds. Classify each finding on two axes: standards — style, naming, convention,"
             " anything that\nleaves behaviour intact — and spec — correctness, security,"

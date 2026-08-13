@@ -36,10 +36,17 @@ DEFAULT_TIMEOUT_SECONDS = 7200
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 60
 SESSION_STATE_VERSION = 1
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# Recovery found nothing to re-attach to, which is a different answer from a
+# failed review: it is the one result that licenses starting a first review.
+NO_LIVE_SESSION_EXIT = 3
 
 
 class AppServerError(RuntimeError):
     pass
+
+
+class NoLiveSessionError(RuntimeError):
+    """No live review session belongs to the caller's owner identity."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,6 +179,34 @@ class SessionStore:
 
     def delete(self, session_id):
         self.state_path(session_id).unlink(missing_ok=True)
+
+    def find_by_owner(self, owner):
+        """Returns every recoverable record this owner wrote, newest turn first.
+
+        The record is written before the turn is awaited, so a session whose
+        driver died mid-review is already on disk under the same owner tuple the
+        resume path validates. A record without a `marker` predates recovery and
+        names no turn to wait on, so it is not recoverable; so is anything
+        unreadable or written by another version, which is skipped rather than
+        raised — one damaged file must not hide a healthy session.
+        """
+        found = []
+        for path in sorted(self.root.glob("*.json")):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, dict):
+                continue
+            if state.get("version") != SESSION_STATE_VERSION:
+                continue
+            if state.get("owner") != owner.to_dict():
+                continue
+            if not state.get("marker") or not state.get("threadId"):
+                continue
+            found.append(state)
+        found.sort(key=lambda state: state.get("updatedAt") or 0, reverse=True)
+        return found
 
 
 @contextmanager
@@ -681,7 +716,8 @@ def make_runtime(prompt):
 
 
 def session_state(
-    session_id, owner, runtime_dir, pane_id, thread_id, target, model, effort
+    session_id, owner, runtime_dir, pane_id, thread_id, target, model, effort,
+    marker,
 ):
     now = time.time()
     return {
@@ -695,6 +731,9 @@ def session_state(
         "target": target,
         "model": model,
         "effort": effort,
+        # The marker of the turn now in flight: the handle a recovering caller
+        # needs to find that turn again in the thread.
+        "marker": marker,
         "createdAt": now,
         "updatedAt": now,
     }
@@ -766,6 +805,7 @@ async def run_new_review(args, owner, store):
                 args.target,
                 args.model,
                 args.effort,
+                marker,
             )
             store.write(session_id, state)
             thread, turn = await wait_for_review(
@@ -843,6 +883,10 @@ async def run_existing_review(args, owner, store):
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
     prompt = build_prompt(args, bridge_id, followup=True)
+    # On disk before the turn is awaited, for the same reason the first review
+    # writes its record early: a driver killed mid-turn must leave a marker the
+    # recovery path can wait on.
+    state["marker"] = marker
 
     client = await connect_existing_session(state)
     if client is None:
@@ -851,6 +895,7 @@ async def run_existing_review(args, owner, store):
         )
     else:
         try:
+            store.write(state["reviewSessionId"], state)
             await start_followup_turn(client, state, prompt)
             thread, turn = await wait_for_review(
                 client,
@@ -864,13 +909,59 @@ async def run_existing_review(args, owner, store):
     return state, thread, turn, True
 
 
+async def run_recovered_review(args, owner, store):
+    """Re-attach to the review this owner already has running.
+
+    Returns the same `(state, thread, turn, reused)` tuple the other two review
+    paths return, for the session this owner already owns.
+
+    The caller reaching here has lost the handle its driver was going to print —
+    the driver was killed, or its output never arrived. Everything needed to pick
+    the review back up survived that death: the record on disk, the pane, and the
+    thread. So this starts no pane and no thread; it finds the owner's live
+    session and waits on the turn already in flight. With no such session it
+    raises `NoLiveSessionError` rather than falling back to a first review.
+    """
+    for state in store.find_by_owner(owner):
+        client = await connect_existing_session(state)
+        if client is None:
+            continue
+        # The record's own target, so the turn that is already in flight is
+        # reported as what it actually reviews.
+        args.target = state["target"]
+        try:
+            thread, turn = await wait_for_review(
+                client,
+                state["threadId"],
+                state["marker"],
+                state["paneId"],
+                args.timeout,
+            )
+        finally:
+            await client.__aexit__(None, None, None)
+        return state, thread, turn, True
+    raise NoLiveSessionError(
+        "No live review session for this tmux pane and worktree. "
+        "Nothing to recover; start a review instead."
+    )
+
+
 async def run_bridge(args):
     if not pathlib.Path(args.cwd).is_dir():
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
     owner = resolve_owner(args)
     store = SessionStore()
+    # The lock stays process-scoped: it serialises concurrent calls from one
+    # pane, and a driver that dies releases it. Duplicate prevention across a
+    # driver's death is the recovery path's job, not a longer-lived lock's — a
+    # lock that outlived its holder would also have to be reaped, and would
+    # block the very recovery call that clears the duplicate.
     with owner_lock(store, owner):
-        if args.resume_session:
+        if args.recover_session:
+            state, thread, turn, reused = await run_recovered_review(
+                args, owner, store
+            )
+        elif args.resume_session:
             state, thread, turn, reused = await run_existing_review(
                 args, owner, store
             )
@@ -888,6 +979,7 @@ async def run_bridge(args):
         "status": turn.get("status"),
         "reviewSessionId": state["reviewSessionId"],
         "reused": reused,
+        "recovered": bool(args.recover_session),
         "threadId": thread.get("id"),
         "turnId": turn.get("id"),
         "paneId": state["paneId"],
@@ -902,7 +994,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Launch or resume an interactive Codex TUI review."
     )
-    parser.add_argument("target")
+    parser.add_argument("target", nargs="?")
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
@@ -919,10 +1011,34 @@ def build_parser():
     )
     parser.add_argument("--network", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-session")
+    parser.add_argument(
+        "--recover-session",
+        action="store_true",
+        help=(
+            "re-attach to the live review this tmux pane and worktree already "
+            f"own, instead of starting one (exit {NO_LIVE_SESSION_EXIT} when "
+            "there is none)"
+        ),
+    )
     parser.add_argument("--tmux-target", help=argparse.SUPPRESS)
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-probe", action="store_true", help=argparse.SUPPRESS)
     return parser
+
+
+def parse_args(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.recover_session:
+        # Recovery names no target and no session: the owner tuple is the
+        # lookup key, and the target comes from the record it finds.
+        if args.target:
+            parser.error("--recover-session takes no target")
+        if args.resume_session:
+            parser.error("--recover-session and --resume-session are exclusive")
+    elif not args.target:
+        parser.error("the target to review is required")
+    return args
 
 
 def build_pane_parser():
@@ -944,9 +1060,12 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "_pane":
         args = build_pane_parser().parse_args(sys.argv[2:])
         return run_pane(args)
-    args = build_parser().parse_args()
+    args = parse_args()
     try:
         return asyncio.run(run_bridge(args))
+    except NoLiveSessionError as error:
+        print(str(error), file=sys.stderr)
+        return NO_LIVE_SESSION_EXIT
     except (AppServerError, OSError, RuntimeError) as error:
         print(str(error), file=sys.stderr)
         return 1
