@@ -32,7 +32,7 @@ AgentCrew 是 [mattpocock-skills](https://github.com/mattpocock/skills) 的聚�
 | 技能 | 输入 | 产出 |
 | --- | --- | --- |
 | `/route <feature-dir>` | 一份 spec，有没有 ticket 都可以 | 每张 ticket 带上 `## Routing` 段落——workflow、executor、model、effort，以及需要 review 的 workflow 上的 review lane |
-| `/crew <feature-dir>` | 已路由的 ticket | 集成分支 `crew/<slug>`、`decisions.md` 决策日志，以及逐 ticket 的耗时表 |
+| `/crew <feature-dir>` | 已路由的 ticket | 集成分支 `crew/<slug>`、带逐 ticket 耗时表的 `report.md`，以及记录整场运行的 machine log |
 
 `/route` 有两种模式，由 feature 目录里已有的东西决定。没有 ticket 的 spec 会在一趟里切分并路由；已经
 有 ticket 的 feature 只做路由、不切分，所以进行中的工作也能接入 AgentCrew。路由是**建议**：一张表、
@@ -82,7 +82,7 @@ git clone https://github.com/okqixiaobao727-design/agentcrew-dev-skills.git
 3. **跑 `/crew <feature-dir>`。** 它按 ticket 当前携带的路由重建波次表，确认一次，然后开跑：每张
    ticket 一个 worktree 和一个 tmux window，波次从依赖 frontier 切出，本波落地的分支全部合入
    `crew/<slug>` 之后才切下一波。
-4. **review 集成分支与 `decisions.md`**，然后由你自己合并。
+4. **review 集成分支与 `report.md`**，然后由你自己合并。
 
 手工改过配置文件后可以这样校验：
 
