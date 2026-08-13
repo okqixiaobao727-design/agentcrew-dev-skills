@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-14
+
 Crew v2: the coordinator is reduced to judgment, and everything mechanical
 moves into scripts, hooks and a machine-readable log (#4).
 
