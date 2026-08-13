@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Behaviour of the plugin-tree validation script, asserted at its CLI seam."""
 
+import importlib.util
 import json
 import os
 import pathlib
@@ -14,6 +15,7 @@ import unittest
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "scripts" / "validate_plugin_tree.py"
 CONFIG = "config/agentcrew.default.toml"
+DISPATCH = "skills/crew/assets/dispatch/dispatch.py"
 
 
 IDENTIFIERS_FILE = ".agentcrew-local-identifiers"
@@ -594,6 +596,54 @@ class ProjectConfigTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("missing", result.stdout + result.stderr)
+
+
+class AliasVerdictParityTests(unittest.TestCase):
+    """The config-time check and the launch-time check must call the same names aliases.
+
+    They are two implementations of one rule over one list. Whenever they disagree the weaker one
+    decides, and dispatch is the last gate before a wave spends real money on the wrong model.
+    """
+
+    @staticmethod
+    def load(path, name):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @classmethod
+    def setUpClass(cls):
+        cls.validator = cls.load(SCRIPT, "validate_plugin_tree")
+        cls.dispatch = cls.load(PLUGIN_ROOT / DISPATCH, "dispatch")
+        cls.aliases = cls.validator.model_aliases(PLUGIN_ROOT, [])
+        if not cls.aliases:
+            raise AssertionError("the shipped alias list is empty, so parity would be vacuous")
+
+    def names(self):
+        """Every listed alias and a full ID, in each form a wave table can carry them."""
+        for stem in [*sorted(self.aliases), "claude-opus-5", "gpt-5.6-sol"]:
+            for form in (stem, f"{stem}[1m]", f"  {stem}  ", f" {stem}[1m] "):
+                yield stem, form
+
+    def test_both_checkers_agree_on_every_alias_in_every_form(self):
+        for _, form in self.names():
+            with self.subTest(name=form):
+                self.assertEqual(
+                    self.validator.is_alias(form, self.aliases),
+                    self.dispatch.alias_problem("Model", form, self.aliases) is not None,
+                    f"{form!r} splits the two checkers",
+                )
+
+    def test_a_listed_alias_is_an_alias_in_every_form_and_a_full_id_never_is(self):
+        """Pins the shared verdict itself, so agreeing on a wrong answer still fails."""
+        for stem, form in self.names():
+            with self.subTest(name=form):
+                self.assertEqual(
+                    self.validator.is_alias(form, self.aliases),
+                    stem in self.aliases,
+                    f"{form!r} is judged against {stem!r}",
+                )
 
 
 if __name__ == "__main__":

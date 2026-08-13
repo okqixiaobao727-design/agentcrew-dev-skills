@@ -69,6 +69,9 @@ EXECUTABLE_ASSETS = ("red-line.sh", "worktree-guard.sh")
 WORKTREE_PLACEHOLDER = "<WORKTREE_ABSOLUTE_PATH>"
 # A bare vendor-less word is an alias whatever the vendor's catalogue holds today.
 BARE_WORD = re.compile(r"^[A-Za-z]+$")
+# A context-window suffix rides on both forms — `sonnet[1m]` is still that alias, and
+# `claude-opus-5[1m]` is still that full ID — so it comes off before either test.
+CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]$")
 
 RUN_KEYS = (
     "repo_root",
@@ -129,7 +132,8 @@ def block(text):
 def alias_problem(label, value, aliases):
     if not isinstance(value, str):
         return f"{label} `{value}` is not a model name"
-    if value.lower() in aliases or BARE_WORD.match(value):
+    bare = CONTEXT_SUFFIX.sub("", value.strip())
+    if bare.lower() in aliases or BARE_WORD.match(bare):
         return f"{label} `{value}` is an alias, not a full model ID"
     return None
 
