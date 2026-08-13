@@ -224,6 +224,42 @@ class TableValidationTests(DispatchTestCase):
         self.assertIn("haiku", result.stderr)
         self.assertEqual(self.fixture.tmux_calls(), [])
 
+    def test_a_context_suffixed_alias_is_rejected_before_any_launch(self):
+        """The suffix rides on whatever it is attached to; it does not make `sonnet` a full ID."""
+        table = self.fixture.table([self.fixture.ticket("06", "suffixed", model="sonnet[1m]")])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("06", result.stderr)
+        self.assertIn("sonnet[1m]", result.stderr)
+        self.assertIn("full model ID", result.stderr)
+        self.assertEqual(self.fixture.launches(), [])
+        self.assertEqual(self.fixture.tmux_calls(), [])
+
+    def test_a_context_suffixed_review_lane_alias_is_rejected_too(self):
+        table = self.fixture.table([self.fixture.ticket("06", "suffixed-lane", review={
+            "vendor": "codex", "model": "opus[1m]", "effort": CODEX_EFFORT,
+        })])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("opus[1m]", result.stderr)
+        self.assertEqual(self.fixture.launches(), [])
+        self.assertEqual(self.fixture.tmux_calls(), [])
+
+    def test_a_context_suffixed_full_id_still_launches(self):
+        """Stripping the suffix must not cost a full ID its launch: the rule cuts one way only."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "suffixed-id", model=f"{CLAUDE_MODEL}[1m]")],
+        )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue(self.fixture.launches(), result.stderr)
+
     def test_a_codex_ticket_without_bridge_configuration_names_every_affected_ticket(self):
         codex = dict(executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
                      review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT})
