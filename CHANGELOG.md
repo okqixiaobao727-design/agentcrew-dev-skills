@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Test collection died before running anything on every Python that does not
+  restore `loader.top_level_dir` after a nested `discover`: loading the asset
+  suites repointed the walk that loaded them. Each asset suite now loads on its
+  own loader.
+- CI installs `aiohttp`, without which the review bridge's 44 tests error on
+  import rather than run.
+
 ## [0.2.0] - 2026-08-14
 
 Crew v2: the coordinator is reduced to judgment, and everything mechanical
