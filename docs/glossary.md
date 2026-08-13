@@ -141,10 +141,12 @@ finished ticket merges into it; the base branch is untouched for the whole unatt
 final merge is a human's. The integration branch is disposable — if a run goes wrong, delete it and
 run again.
 
-**Decision log** — The feature's `decisions.md`. Every judgement the coordinator makes on your
-behalf is recorded here, and any action reaching outside a worktree (production database, remote,
-deployment, external service) gets its own entry stating how to undo it. With permissions fully
-open, this log is the only trail of what happened overnight.
+**Machine log** — The run's `.crew/log.jsonl`, written entirely by scripts and hooks. Every
+launch, receipt, merge, escalation, ruling and wave decision lands there as one JSON line, and any
+action reaching outside a worktree (production database, remote, deployment, external service) is
+ruled on in a message that says how to undo it, copied in verbatim. With permissions fully open,
+this log is the only trail of what happened overnight; the run's `report.md` is the read of it a
+human gets at the end.
 
 **Red line** — The one class of action blocked mechanically: irreversible destruction of data. A
 ticket that hits it is parked for a human.

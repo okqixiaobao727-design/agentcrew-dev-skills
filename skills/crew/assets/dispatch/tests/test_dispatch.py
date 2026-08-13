@@ -350,7 +350,8 @@ class ClaudeRenderTests(DispatchTestCase):
         prompt = self.initial_prompt()
         self.assertIn(
             "CREW ASK 06 <doc-conflict|stuck|scope> — question in one paragraph, 2-3 options with\n"
-            "yours marked, ts=<unix time>",
+            "yours marked, then the pointers: ticket <absolute path>, branch <name>, and the files"
+            " or\ndiffs at issue, ts=<unix time>",
             prompt,
         )
         self.assertIn(
