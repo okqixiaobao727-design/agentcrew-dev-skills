@@ -5,3 +5,6 @@ __pycache__/
 .agentcrew-local-identifiers
 # Added by code-review-graph
 .code-review-graph/
+# A crew run's own working directory — spec, tickets, decisions and rendered first turns for the
+# feature being built. Scaffolding for building this plugin, never part of it.
+features/

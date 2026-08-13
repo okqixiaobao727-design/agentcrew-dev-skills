@@ -319,6 +319,31 @@ class ValidatePluginTreeTests(unittest.TestCase):
         result = run_validator(self.tree.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_ignored_file_is_accepted(self):
+        # A release is a `git ls-files` export, so an ignored file is never published. A crew run's
+        # own working directory sits under the repo it is building and is full of local paths.
+        self.tree.set_local_identifiers("example-host")
+        self.tree.write(".gitignore", self.tree.read(".gitignore") + "run-dir/\n")
+        self.tree.path("run-dir").mkdir()
+        self.tree.write("run-dir/decisions.md", "Landed from example-host for $46.\n")
+        result = run_validator(self.tree.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_untracked_file_that_is_not_ignored_is_still_scanned(self):
+        # Only *ignored* files leave the shipped set. An untracked file the repo would carry is
+        # still a shipped file, so the release export reasoning must not become a blanket pass.
+        self.tree.set_local_identifiers("example-host")
+        self.tree.write("docs/scratch.md", "Landed from example-host.\n")
+        self.assert_rejects("docs/scratch.md")
+
+    def test_residue_outside_a_git_repo_is_rejected(self):
+        # An unpacked release has no `.git/` to ask what is ignored. Nothing is ignored there —
+        # the tree as it stands is exactly what shipped — so every file is scanned.
+        shutil.rmtree(self.tree.path(".git"))
+        self.tree.set_local_identifiers("example-host")
+        self.tree.write("docs/scratch.md", "Landed from example-host.\n")
+        self.assert_rejects("docs/scratch.md")
+
     def test_spend_figure_with_currency_in_a_shipped_file_is_rejected(self):
         self.tree.write(
             "skills/route/SKILL.md",
@@ -367,6 +392,28 @@ class ValidatePluginTreeTests(unittest.TestCase):
             self.tree.read("docs/design.md") + "\nLegacy ORCHESTRATE wording.\n",
         )
         self.assert_rejects("docs/design.md")
+
+    def test_legacy_command_cited_in_a_code_span_is_accepted(self):
+        # The glossary entry banning the term and the ADR recording a run that happened under it
+        # both have to name it. Quoting the old command is not the surface speaking it.
+        cited = "`/" + "orchestr" + "ate`"
+        self.tree.write(
+            "docs/design.md",
+            self.tree.read("docs/design.md") + f"\nForensics on a real {cited} run.\n",
+        )
+        result = run_validator(self.tree.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_legacy_name_used_beside_a_citation_on_one_line_is_rejected(self):
+        # The exemption is per occurrence, not per line: quoting the old command once does not
+        # license the surface to go on speaking it in the same breath.
+        cited = "`/" + "orchestr" + "ate`"
+        bare = "ORCHESTR" + "ATE"
+        self.tree.write(
+            "docs/design.md",
+            self.tree.read("docs/design.md") + f"\nThe old {cited} is why we say {bare}.\n",
+        )
+        self.assert_rejects(bare)
 
     def test_residue_fixture_under_a_nested_tests_directory_is_rejected(self):
         private_app = "ChatGPT " + "Hands" + "-Free"
