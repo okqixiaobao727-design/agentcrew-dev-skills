@@ -75,6 +75,12 @@ class TreeFixture:
         """Configure the identifiers this tree's residue lint rejects."""
         self.write(IDENTIFIERS_FILE, comment + "\n" + "\n".join(tokens) + "\n")
 
+    def write_git_internal(self, relative, text):
+        """Seed a file under this tree's `.git/`, which no release ever ships."""
+        path = self.path(pathlib.Path(".git") / relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
     def edit_config(self, old, new):
         text = self.read(CONFIG)
         assert old in text, f"config fixture has no {old!r} to edit"
@@ -300,6 +306,18 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("example-host", result.stdout + result.stderr)
         self.assertNotIn("note — personal", result.stdout + result.stderr)
+
+    def test_identifier_in_git_internals_is_accepted(self):
+        # A reflog carries the committer's name, and `.git/` is never published: releases are
+        # `git ls-files` exports. Walking it would fail every clone whose maintainer configured
+        # their own git identity as an identifier.
+        self.tree.set_local_identifiers("example-host")
+        self.tree.write_git_internal(
+            "logs/HEAD",
+            "0000000 1111111 example-host <dev@example.com> 0 +0000\tcommit (initial)\n",
+        )
+        result = run_validator(self.tree.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_spend_figure_with_currency_in_a_shipped_file_is_rejected(self):
         self.tree.write(
