@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# The maintainer's own machine nicknames and account names: local policy, never shipped.
+.agentcrew-local-identifiers

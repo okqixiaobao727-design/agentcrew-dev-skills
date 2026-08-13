@@ -1,0 +1,30 @@
+{
+  "env": {
+    "REVIEW_COORDINATOR": "crew"
+  },
+  "permissions": {
+    "allow": ["SendMessage", "ListAgents"]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<WORKTREE_ABSOLUTE_PATH>/.claude/red-line.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<WORKTREE_ABSOLUTE_PATH>/.claude/worktree-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

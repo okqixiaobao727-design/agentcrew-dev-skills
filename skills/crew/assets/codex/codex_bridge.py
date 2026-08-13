@@ -1,0 +1,745 @@
+#!/usr/bin/env python3
+"""Bridge between a Claude orchestrator and Codex sessions in tmux.
+
+Every Codex session (child or integrator) is launched as a tmux window running
+the Codex TUI attached to a private `codex app-server` unix socket. The
+orchestrator talks to the session through this CLI:
+
+    launch  start app-server + TUI window, submit the first turn, write a state file
+    send    submit a follow-up turn (answer, fix-up request) to a session
+    watch   block while every watched session is busy; exit with a JSON snapshot
+            as soon as any session is idle (turn finished) or vanished
+    stop    kill a session's window and runtime
+
+Each command prints one JSON object on stdout. Exit 0 on success, 1 on error.
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import pathlib
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+try:
+    import aiohttp
+except ImportError as error:
+    raise SystemExit(
+        "codex_bridge requires Python package 'aiohttp'. "
+        "Install it for the Python interpreter used by Claude Code."
+    ) from error
+
+
+STATE_VERSION = 1
+TERMINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 60
+DEFAULT_WATCH_TIMEOUT_SECONDS = 7200
+DEFAULT_WATCH_INTERVAL_SECONDS = 2.0
+CONSECUTIVE_FAILURE_LIMIT = 3
+MARKER_PREFIX = "agentcrew"
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+class AppServerError(BridgeError):
+    pass
+
+
+def new_marker():
+    return f"[{MARKER_PREFIX}:{uuid.uuid4()}]"
+
+
+def write_json_atomic(path, payload):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        with temporary:
+            json.dump(payload, temporary, ensure_ascii=False, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary.name, path)
+    except Exception:
+        pathlib.Path(temporary.name).unlink(missing_ok=True)
+        raise
+
+
+def read_state(path):
+    try:
+        state = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise BridgeError(f"Unknown session state file: {path}") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise BridgeError(f"Unreadable session state file: {path}") from error
+    if state.get("version") != STATE_VERSION:
+        raise BridgeError(
+            f"Unsupported session state version in {path}: {state.get('version')}"
+        )
+    return state
+
+
+def pane_exists(pane_id):
+    # display-message -t on a dead pane exits 0 on tmux >= 3.6, so test
+    # membership in the full pane list instead.
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0 and pane_id in result.stdout.split()
+
+
+def kill_window(window_id):
+    subprocess.run(
+        ["tmux", "kill-window", "-t", window_id],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def read_log_tail(path, limit=4000):
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-limit:].strip()
+
+
+def wait_for_path(path, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def terminate_process(process):
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+
+
+class AppServerClient:
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+        self.next_id = 1
+
+    async def __aenter__(self):
+        connector = aiohttp.UnixConnector(path=self.socket_path)
+        self.session = aiohttp.ClientSession(connector=connector)
+        try:
+            self.websocket = await self.session.ws_connect("http://localhost/")
+            await self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "agentcrew_codex_bridge",
+                        "title": "AgentCrew Codex Bridge",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {"experimentalApi": False},
+                },
+            )
+            await self.websocket.send_json({"method": "initialized", "params": {}})
+        except Exception:
+            await self.session.close()
+            raise
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        await self.websocket.close()
+        await self.session.close()
+
+    async def request(self, method, params):
+        request_id = self.next_id
+        self.next_id += 1
+        await self.websocket.send_json(
+            {"id": request_id, "method": method, "params": params}
+        )
+
+        while True:
+            message = await self.websocket.receive()
+            if message.type != aiohttp.WSMsgType.TEXT:
+                raise AppServerError(
+                    f"Unexpected app-server WebSocket message type: {message.type}"
+                )
+
+            payload = json.loads(message.data)
+            if payload.get("id") == request_id:
+                if payload.get("error"):
+                    error = payload["error"]
+                    raise AppServerError(
+                        f"{method} failed: {error.get('message', error)}"
+                    )
+                return payload.get("result", {})
+
+            if payload.get("id") is not None and payload.get("method"):
+                await self.websocket.send_json(
+                    {
+                        "id": payload["id"],
+                        "error": {
+                            "code": -32601,
+                            "message": (
+                                "The AgentCrew Codex bridge does not answer "
+                                f"server request {payload['method']}."
+                            ),
+                        },
+                    }
+                )
+
+
+async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    while time.monotonic() < deadline:
+        if not pane_exists(pane_id):
+            detail = read_log_tail(log_path)
+            raise BridgeError(
+                "Codex TUI window exited during startup"
+                + (f": {detail}" if detail else "")
+            )
+        if os.path.exists(socket_path):
+            try:
+                client = AppServerClient(socket_path)
+                return await client.__aenter__()
+            except (OSError, aiohttp.ClientError, AppServerError) as error:
+                last_error = error
+        await asyncio.sleep(0.1)
+    detail = read_log_tail(log_path)
+    suffix = detail or str(last_error or "socket unavailable")
+    raise BridgeError(f"Timed out connecting to Codex app-server: {suffix}")
+
+
+def user_message_text(item):
+    if item.get("type") != "userMessage":
+        return ""
+    parts = []
+    for content in item.get("content") or []:
+        if content.get("type") == "text":
+            parts.append(content.get("text", ""))
+    return "\n".join(parts)
+
+
+def find_marker_turn(thread, marker):
+    for turn in thread.get("turns") or []:
+        for item in turn.get("items") or []:
+            if marker in user_message_text(item):
+                return turn
+    return None
+
+
+def final_agent_message(turn):
+    messages = [
+        item.get("text", "")
+        for item in turn.get("items") or []
+        if item.get("type") == "agentMessage"
+        and item.get("phase") == "final_answer"
+    ]
+    if messages:
+        return messages[-1]
+    fallback = [
+        item.get("text", "")
+        for item in turn.get("items") or []
+        if item.get("type") == "agentMessage"
+    ]
+    return fallback[-1] if fallback else ""
+
+
+async def find_thread(client, cwd, marker, pane_id, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not pane_exists(pane_id):
+            raise BridgeError("Codex TUI window exited before creating its thread")
+        result = await client.request(
+            "thread/list",
+            {
+                "cwd": cwd,
+                "limit": 50,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            },
+        )
+        for thread in result.get("data") or []:
+            if marker in (thread.get("preview") or ""):
+                return thread
+        await asyncio.sleep(0.25)
+    raise BridgeError("Timed out waiting for the Codex TUI thread")
+
+
+def read_prompt(args):
+    if args.prompt is not None:
+        return args.prompt
+    if args.prompt_file:
+        return pathlib.Path(args.prompt_file).read_text(encoding="utf-8")
+    raise BridgeError("Provide --prompt or --prompt-file")
+
+
+def model_config_overrides(args):
+    overrides = []
+    if args.model:
+        overrides.extend(["-c", f"model={json.dumps(args.model)}"])
+    if args.effort:
+        overrides.extend(
+            ["-c", f"model_reasoning_effort={json.dumps(args.effort)}"]
+        )
+    return overrides
+
+
+def launch_window(args, runtime_dir, prompt_file):
+    pane_command = [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        "_pane",
+        "--runtime-dir",
+        str(runtime_dir),
+        "--prompt-file",
+        str(prompt_file),
+        "--cwd",
+        args.cwd,
+        "--sandbox",
+        args.sandbox,
+        "--approval",
+        args.approval,
+        "--startup-timeout",
+        str(args.startup_timeout),
+    ]
+    if args.thread_id:
+        pane_command.extend(["--thread-id", args.thread_id])
+    if args.model:
+        pane_command.extend(["--model", args.model])
+    if args.effort:
+        pane_command.extend(["--effort", args.effort])
+
+    tmux_command = [
+        "tmux",
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{window_id}\t#{pane_id}",
+        "-t",
+        args.tmux_session,
+        "-n",
+        args.window_name,
+        "-c",
+        args.cwd,
+        shlex.join(pane_command),
+    ]
+    result = subprocess.run(
+        tmux_command,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BridgeError(result.stderr.strip() or "tmux new-window failed")
+    try:
+        window_id, pane_id = result.stdout.strip().split("\t")
+    except ValueError as error:
+        raise BridgeError(
+            f"Unexpected tmux new-window output: {result.stdout!r}"
+        ) from error
+    return window_id, pane_id
+
+
+def run_pane(args):
+    runtime_dir = pathlib.Path(args.runtime_dir)
+    socket_path = runtime_dir / "app-server.sock"
+    log_path = runtime_dir / "app-server.log"
+    prompt = pathlib.Path(args.prompt_file).read_text(encoding="utf-8")
+    log_file = log_path.open("a", encoding="utf-8")
+    app_server_command = [
+        "codex",
+        "app-server",
+        "--listen",
+        f"unix://{socket_path}",
+    ]
+    app_server_command.extend(model_config_overrides(args))
+    app_server = subprocess.Popen(
+        app_server_command,
+        cwd=args.cwd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+    )
+
+    def cleanup(*_ignored):
+        terminate_process(app_server)
+        log_file.close()
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+    def stop_and_exit(signum, _frame):
+        cleanup()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGHUP, stop_and_exit)
+    signal.signal(signal.SIGTERM, stop_and_exit)
+    signal.signal(signal.SIGINT, stop_and_exit)
+
+    try:
+        if not wait_for_path(socket_path, args.startup_timeout):
+            detail = read_log_tail(log_path) or "app-server socket did not appear"
+            print(f"Codex app-server failed to start: {detail}", file=sys.stderr)
+            return 1
+
+        command = [
+            "codex",
+            "--remote",
+            f"unix://{socket_path}",
+            "--sandbox",
+            args.sandbox,
+            "--ask-for-approval",
+            args.approval,
+        ]
+        command.extend(model_config_overrides(args))
+        if args.thread_id:
+            command.extend(["resume", args.thread_id, prompt])
+        else:
+            command.append(prompt)
+        return subprocess.run(command, cwd=args.cwd, check=False).returncode
+    finally:
+        cleanup()
+
+
+def build_state(args, runtime_dir, window_id, pane_id, thread_id, marker):
+    now = time.time()
+    return {
+        "version": STATE_VERSION,
+        "name": args.window_name,
+        "cwd": str(pathlib.Path(args.cwd).resolve()),
+        "runtimeDir": str(runtime_dir),
+        "socketPath": str(runtime_dir / "app-server.sock"),
+        "windowId": window_id,
+        "paneId": pane_id,
+        "threadId": thread_id,
+        "model": args.model,
+        "effort": args.effort,
+        "marker": marker,
+        "status": "busy",
+        "turnStatus": None,
+        "finalMessage": None,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+def inherit_resume_pins(args):
+    if not args.thread_id or not pathlib.Path(args.state_file).is_file():
+        return
+    try:
+        previous_state = read_state(args.state_file)
+    except BridgeError:
+        return
+    if not args.model:
+        args.model = previous_state.get("model")
+    if not args.effort:
+        args.effort = previous_state.get("effort")
+
+
+async def cmd_launch(args):
+    if not pathlib.Path(args.cwd).is_dir():
+        raise BridgeError(f"Working directory does not exist: {args.cwd}")
+    inherit_resume_pins(args)
+    marker = new_marker()
+    prompt = f"{marker}\n{read_prompt(args)}"
+
+    runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="agentcrew-codex-"))
+    prompt_file = runtime_dir / "prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+
+    try:
+        window_id, pane_id = launch_window(args, runtime_dir, prompt_file)
+    except Exception:
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+        raise
+
+    try:
+        client = await connect_when_ready(
+            runtime_dir / "app-server.sock",
+            pane_id,
+            args.startup_timeout,
+            runtime_dir / "app-server.log",
+        )
+        try:
+            if args.thread_id:
+                thread_id = args.thread_id
+            else:
+                thread = await find_thread(
+                    client, args.cwd, marker, pane_id, args.startup_timeout
+                )
+                thread_id = thread["id"]
+        finally:
+            await client.__aexit__(None, None, None)
+    except Exception:
+        kill_window(window_id)
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+        raise
+
+    state = build_state(args, runtime_dir, window_id, pane_id, thread_id, marker)
+    write_json_atomic(args.state_file, state)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "stateFile": str(args.state_file),
+                "windowId": window_id,
+                "paneId": pane_id,
+                "threadId": thread_id,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+async def connect_existing(state, timeout_seconds=3):
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    while time.monotonic() < deadline:
+        if not pane_exists(state["paneId"]):
+            raise BridgeError(
+                f"Session {state['name']} vanished: its tmux window is gone"
+            )
+        try:
+            client = AppServerClient(state["socketPath"])
+            return await client.__aenter__()
+        except (OSError, aiohttp.ClientError, AppServerError) as error:
+            last_error = error
+        await asyncio.sleep(0.1)
+    raise BridgeError(
+        f"Cannot reach app-server for session {state['name']}: {last_error}"
+    )
+
+
+async def cmd_send(args):
+    state = read_state(args.state_file)
+    marker = new_marker()
+    prompt = f"{marker}\n{read_prompt(args)}"
+
+    client = await connect_existing(state)
+    try:
+        await client.request(
+            "turn/start",
+            {
+                "threadId": state["threadId"],
+                "input": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                        "text_elements": [],
+                    }
+                ],
+            },
+        )
+    finally:
+        await client.__aexit__(None, None, None)
+
+    state["marker"] = marker
+    state["status"] = "busy"
+    state["turnStatus"] = None
+    state["finalMessage"] = None
+    state["updatedAt"] = time.time()
+    write_json_atomic(args.state_file, state)
+    print(
+        json.dumps(
+            {"ok": True, "stateFile": str(args.state_file), "threadId": state["threadId"]},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+async def evaluate_session(state):
+    """Return (status, turn_status, final_message) for one session."""
+    if not pane_exists(state["paneId"]):
+        return "vanished", None, None
+    client = AppServerClient(state["socketPath"])
+    await client.__aenter__()
+    try:
+        result = await client.request(
+            "thread/read", {"threadId": state["threadId"], "includeTurns": True}
+        )
+    finally:
+        await client.__aexit__(None, None, None)
+    thread = result.get("thread") or {}
+    turn = find_marker_turn(thread, state["marker"])
+    if turn is None:
+        return "busy", None, None
+    if turn.get("status") in TERMINAL_TURN_STATUSES:
+        return "idle", turn.get("status"), final_agent_message(turn)
+    return "busy", None, None
+
+
+async def cmd_watch(args):
+    state_files = [str(pathlib.Path(path).resolve()) for path in args.state_files]
+    if len(set(state_files)) != len(state_files):
+        raise BridgeError("Duplicate state files supplied to watch")
+    for path in state_files:
+        read_state(path)
+
+    failures = {path: 0 for path in state_files}
+    deadline = time.monotonic() + args.timeout
+    while True:
+        snapshot = []
+        actionable = False
+        for path in state_files:
+            state = read_state(path)
+            try:
+                status, turn_status, message = await evaluate_session(state)
+                failures[path] = 0
+            except (OSError, aiohttp.ClientError, AppServerError) as error:
+                failures[path] += 1
+                if failures[path] >= CONSECUTIVE_FAILURE_LIMIT:
+                    raise BridgeError(
+                        f"Session {state['name']} is unreachable but its window "
+                        f"is alive: {error}"
+                    ) from error
+                status, turn_status, message = "busy", None, None
+            if status != state.get("status") or turn_status != state.get("turnStatus"):
+                state["status"] = status
+                state["turnStatus"] = turn_status
+                state["finalMessage"] = message
+                state["updatedAt"] = time.time()
+                write_json_atomic(path, state)
+            row = {
+                "stateFile": path,
+                "name": state["name"],
+                "status": status,
+            }
+            if status == "idle":
+                row["turnStatus"] = turn_status
+                row["finalMessage"] = message
+            snapshot.append(row)
+            if status != "busy":
+                actionable = True
+        if actionable:
+            print(json.dumps({"sessions": snapshot}, ensure_ascii=False))
+            return 0
+        if time.monotonic() >= deadline:
+            raise BridgeError(
+                f"watch timed out after {args.timeout} seconds with every session busy"
+            )
+        await asyncio.sleep(args.interval)
+
+
+async def cmd_stop(args):
+    state = read_state(args.state_file)
+    kill_window(state["windowId"])
+    deadline = time.monotonic() + 2
+    while pane_exists(state["paneId"]) and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    shutil.rmtree(state["runtimeDir"], ignore_errors=True)
+    state["status"] = "stopped"
+    state["updatedAt"] = time.time()
+    write_json_atomic(args.state_file, state)
+    print(json.dumps({"ok": True, "stateFile": str(args.state_file)}, ensure_ascii=False))
+    return 0
+
+
+def add_prompt_arguments(parser):
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--prompt")
+    group.add_argument("--prompt-file")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    launch = commands.add_parser("launch", help="Start a Codex session in a tmux window")
+    launch.add_argument("--cwd", required=True)
+    launch.add_argument("--tmux-session", required=True,
+                        help="tmux target for the new window, e.g. '$3:'")
+    launch.add_argument("--window-name", required=True)
+    launch.add_argument("--state-file", required=True)
+    launch.add_argument("--thread-id",
+                        help="Resume this Codex thread instead of starting fresh")
+    launch.add_argument("--sandbox", default="danger-full-access")
+    launch.add_argument("--approval", default="never")
+    launch.add_argument("--model")
+    launch.add_argument("--effort")
+    launch.add_argument("--startup-timeout", type=float,
+                        default=DEFAULT_STARTUP_TIMEOUT_SECONDS)
+    add_prompt_arguments(launch)
+
+    send = commands.add_parser("send", help="Send a follow-up turn to a session")
+    send.add_argument("--state-file", required=True)
+    add_prompt_arguments(send)
+
+    watch = commands.add_parser(
+        "watch", help="Block until any watched session is idle or vanished"
+    )
+    watch.add_argument("state_files", nargs="+")
+    watch.add_argument("--interval", type=float,
+                       default=DEFAULT_WATCH_INTERVAL_SECONDS)
+    watch.add_argument("--timeout", type=float,
+                       default=DEFAULT_WATCH_TIMEOUT_SECONDS)
+
+    stop = commands.add_parser("stop", help="Kill a session's window and runtime")
+    stop.add_argument("--state-file", required=True)
+
+    return parser
+
+
+def build_pane_parser():
+    pane_parser = argparse.ArgumentParser(add_help=False)
+    pane_parser.add_argument("--runtime-dir", required=True)
+    pane_parser.add_argument("--prompt-file", required=True)
+    pane_parser.add_argument("--cwd", required=True)
+    pane_parser.add_argument("--sandbox", required=True)
+    pane_parser.add_argument("--approval", required=True)
+    pane_parser.add_argument("--startup-timeout", type=float, required=True)
+    pane_parser.add_argument("--thread-id")
+    pane_parser.add_argument("--model")
+    pane_parser.add_argument("--effort")
+    return pane_parser
+
+
+COMMANDS = {
+    "launch": cmd_launch,
+    "send": cmd_send,
+    "watch": cmd_watch,
+    "stop": cmd_stop,
+}
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "_pane":
+        args = build_pane_parser().parse_args(sys.argv[2:])
+        return run_pane(args)
+    args = build_parser().parse_args()
+    try:
+        return asyncio.run(COMMANDS[args.command](args))
+    except (BridgeError, OSError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
