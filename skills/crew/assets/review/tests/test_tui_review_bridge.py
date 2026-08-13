@@ -11,6 +11,7 @@ import pathlib
 import re
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -76,6 +77,302 @@ class FakeClient:
         if method == "turn/start":
             return {"turn": {"id": "turn-followup"}}
         raise AssertionError(f"unexpected request: {method}")
+
+
+class GateClient:
+    """An app-server whose MCP servers announce themselves over successive pumps.
+
+    `script` is one dict of name -> status per pump, merged in order, so a test
+    can spell out the startup sequence the gate has to sit through.
+    """
+
+    def __init__(self, script, inventory=("alpha", "beta")):
+        self.inventory = list(inventory)
+        self.script = [dict(step) for step in script]
+        self.mcp_startup = {}
+        self.requests = []
+        self.startup_when_turn_started = None
+
+    async def request(self, method, params):
+        self.requests.append(method)
+        if method == "mcpServerStatus/list":
+            return {"data": [{"name": name} for name in self.inventory]}
+        if method == "thread/start":
+            return {"thread": {"id": "thread-new"}}
+        if method == "thread/resume":
+            return {}
+        if method == "turn/start":
+            # The whole point of the gate: what MCP looked like at this moment.
+            self.startup_when_turn_started = dict(self.mcp_startup)
+            return {"turn": {"id": "turn-1"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    async def pump(self, _seconds):
+        if self.script:
+            self.mcp_startup.update(self.script.pop(0))
+
+    async def __aexit__(self, *_ignored):
+        return None
+
+
+class FakeStore:
+    def __init__(self):
+        self.written = {}
+        # Whether the pane had already been handed its thread when the record
+        # was written — the ordering a killed driver depends on.
+        self.handoff_done_at_write = None
+
+    def write(self, session_id, state):
+        handoff = pathlib.Path(state["runtimeDir"]) / "thread-id"
+        self.handoff_done_at_write = handoff.exists()
+        self.written[session_id] = state
+
+
+class McpReadinessGateTests(unittest.TestCase):
+    """The first turn must not go in while a server is still coming up (#14)."""
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.owner = self.bridge.InvocationOwner(
+            tmux_server="/tmp/tmux-501/default,1",
+            origin_pane="%1",
+            worktree_root="/workspace/ticket-50",
+        )
+        self.runtime_dirs = []
+        self.cleaned = []
+
+    def run_new_review(self, client, startup_timeout=5):
+        """Drive run_new_review with everything but the gate faked out."""
+
+        def fake_launch_pane(args, runtime_dir):
+            self.runtime_dirs.append(pathlib.Path(runtime_dir))
+            return "%9"
+
+        async def fake_connect(*_args, **_kwargs):
+            return client
+
+        async def fake_wait_for_review(*_args, **_kwargs):
+            return {"id": "thread-new"}, {"id": "turn-1", "status": "completed"}
+
+        args = base_args(cwd=os.getcwd(), tmux_target="%1",
+                         startup_timeout=startup_timeout)
+        self.store = FakeStore()
+        with mock.patch.multiple(
+            self.bridge,
+            launch_pane=fake_launch_pane,
+            connect_when_ready=fake_connect,
+            wait_for_review=fake_wait_for_review,
+            pane_exists=lambda pane_id: True,
+            cleanup_failed_pane=lambda pane, runtime: self.cleaned.append(pane),
+        ):
+            return asyncio.run(
+                self.bridge.run_new_review(args, self.owner, self.store)
+            )
+
+    def test_the_turn_waits_until_every_announced_server_has_settled(self):
+        client = GateClient([
+            {"alpha": "starting", "beta": "starting"},
+            {"alpha": "ready"},
+            {"beta": "ready"},
+        ])
+
+        self.run_new_review(client)
+
+        self.assertEqual(
+            client.startup_when_turn_started,
+            {"alpha": "ready", "beta": "ready"},
+            "the first turn was submitted while a server was still starting",
+        )
+
+    def test_the_thread_is_handed_over_only_after_the_turn_has_started(self):
+        """`resume` refuses a thread with no rollout, so this order matters."""
+        client = GateClient([{"alpha": "ready"}])
+
+        self.run_new_review(client)
+
+        handoff = self.runtime_dirs[0] / self.bridge.THREAD_HANDOFF_FILENAME
+        self.assertEqual(handoff.read_text(encoding="utf-8"), "thread-new")
+        self.assertIn("thread/start", client.requests)
+        self.assertIn("turn/start", client.requests)
+
+    def test_the_record_is_on_disk_before_the_pane_is_handed_the_thread(self):
+        """Otherwise a driver killed in between orphans a live, running review.
+
+        The pane attaches as soon as it sees the thread id, so a record written
+        after that leaves a window where a review is running that
+        `--recover-session` cannot find.
+        """
+        client = GateClient([{"alpha": "ready"}])
+
+        self.run_new_review(client)
+
+        self.assertFalse(
+            self.store.handoff_done_at_write,
+            "the pane was handed its thread before the record was written",
+        )
+
+    def test_a_late_announcement_is_still_waited_for(self):
+        """One server was measured announcing 169 ms after another went ready.
+
+        `ghost` is configured but never announces, so the gate cannot simply
+        wait for the whole inventory — and it must still not open in the window
+        where alpha is ready and beta has not spoken yet.
+        """
+        client = GateClient(
+            [
+                {"alpha": "starting"},
+                {"alpha": "ready"},
+                {"beta": "starting"},
+                {"beta": "ready"},
+            ],
+            inventory=("alpha", "beta", "ghost"),
+        )
+
+        settled = asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 10))
+
+        self.assertEqual(settled, {"alpha": "ready", "beta": "ready"})
+
+    def test_an_inventory_call_that_hangs_does_not_hang_the_gate(self):
+        """Nothing under `request` times out, so this RPC needs its own bound.
+
+        Without one a stuck app-server holds the gate open past every budget the
+        caller set, and only the pane's reaper eventually notices.
+        """
+
+        class HangingInventory:
+            mcp_startup = {}
+
+            async def request(self, method, _params):
+                assert method == "mcpServerStatus/list"
+                await asyncio.sleep(3600)
+
+            async def pump(self, _seconds):
+                raise AssertionError("the gate should never reach its poll loop")
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "which MCP servers are configured"):
+            asyncio.run(
+                self.bridge.wait_for_mcp_startup(HangingInventory(), None, 0.3)
+            )
+
+        self.assertLess(time.monotonic() - started, 30)
+
+    def test_a_server_that_never_settles_is_named_in_the_failure(self):
+        client = GateClient([{"alpha": "starting", "beta": "ready"}])
+
+        with self.assertRaisesRegex(RuntimeError, "still starting: alpha"):
+            asyncio.run(
+                self.bridge.wait_for_mcp_startup(client, None, 0.2)
+            )
+
+        self.assertIsNone(
+            client.startup_when_turn_started,
+            "a turn was submitted even though the gate never opened",
+        )
+
+    def test_a_gate_that_times_out_tears_the_pane_down(self):
+        client = GateClient([{"alpha": "starting"}])
+
+        with self.assertRaisesRegex(RuntimeError, "Timed out waiting for Codex MCP"):
+            self.run_new_review(client, startup_timeout=0.2)
+
+        self.assertEqual(self.cleaned, ["%9"])
+        self.assertIsNone(client.startup_when_turn_started)
+
+    def test_silence_from_every_server_names_the_configured_ones(self):
+        client = GateClient([])
+
+        with self.assertRaisesRegex(RuntimeError, "none of alpha, beta announced"):
+            asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 0.2))
+
+    def test_a_codex_without_mcp_servers_is_ready_at_once(self):
+        client = GateClient([], inventory=())
+
+        settled = asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 0.2))
+
+        self.assertEqual(settled, {})
+
+    def test_a_pane_that_dies_during_startup_is_reported(self):
+        client = GateClient([{"alpha": "starting"}])
+
+        with mock.patch.object(self.bridge, "pane_exists", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "pane exited before its MCP"):
+                asyncio.run(self.bridge.wait_for_mcp_startup(client, "%9", 5))
+
+
+class WaitForReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.marker = "[claude-tui-review-bridge:abc]"
+
+    def thread_payload(self):
+        return {
+            "thread": {
+                "id": "thread-1",
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": self.marker}],
+                            },
+                            {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "findings",
+                            },
+                        ],
+                    }
+                ],
+            }
+        }
+
+    def test_a_thread_that_is_not_readable_yet_is_polled_again(self):
+        """The rollout is not flushed the instant turn/start returns.
+
+        Reading the thread fails until it is, which is this poll's normal first
+        answer — treating it as fatal aborts a review that is running fine.
+        """
+        outer = self
+
+        class FlakyClient:
+            def __init__(self):
+                self.reads = 0
+
+            async def request(self, method, _params):
+                assert method == "thread/read"
+                self.reads += 1
+                if self.reads == 1:
+                    raise outer.bridge.AppServerError(
+                        "thread/read failed: rollout at ... is empty"
+                    )
+                return outer.thread_payload()
+
+        client = FlakyClient()
+        with mock.patch.object(self.bridge, "pane_exists", return_value=True):
+            thread, turn = asyncio.run(
+                self.bridge.wait_for_review(client, "thread-1", self.marker, "%9", 10)
+            )
+
+        self.assertEqual(client.reads, 2)
+        self.assertEqual(turn["status"], "completed")
+        self.assertEqual(thread["id"], "thread-1")
+
+    def test_a_thread_that_never_becomes_readable_says_so(self):
+        class DeadClient:
+            async def request(self, _method, _params):
+                raise outer_bridge.AppServerError("rollout is empty")
+
+        outer_bridge = self.bridge
+        with mock.patch.object(self.bridge, "pane_exists", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "never became readable"):
+                asyncio.run(
+                    self.bridge.wait_for_review(
+                        DeadClient(), "thread-1", self.marker, "%9", 1
+                    )
+                )
 
 
 class BridgeContractTests(unittest.TestCase):
@@ -145,7 +442,6 @@ class BridgeContractTests(unittest.TestCase):
             self.bridge.launch_pane(
                 base_args(tmux_target=None),
                 pathlib.Path("/tmp/runtime"),
-                pathlib.Path("/tmp/prompt"),
             )
 
     def test_followup_starts_a_turn_on_the_saved_thread(self):
@@ -190,16 +486,28 @@ class BridgeContractTests(unittest.TestCase):
             )
         )
 
-    def test_reopened_tui_resumes_the_saved_thread(self):
+    def test_the_tui_attaches_to_the_bridges_thread(self):
         command = self.bridge.build_tui_command(
-            base_args(thread_id="thread-ticket-50"),
+            base_args(),
             pathlib.Path("/tmp/app-server.sock"),
-            "review again",
+            "thread-ticket-50",
         )
-        self.assertEqual(
-            command[-3:],
-            ["resume", "thread-ticket-50", "review again"],
+        self.assertEqual(command[-2:], ["resume", "thread-ticket-50"])
+
+    def test_no_prompt_ever_reaches_the_tui_command_line(self):
+        """A positional prompt is submitted at TUI startup, racing MCP (#14).
+
+        The turn goes over the app-server once the readiness gate opens, so the
+        launch command must carry nothing but the thread to attach to.
+        """
+        command = self.bridge.build_tui_command(
+            base_args(),
+            pathlib.Path("/tmp/app-server.sock"),
+            "thread-ticket-50",
         )
+        for argument in command:
+            self.assertNotIn("Review HEAD", argument)
+            self.assertNotIn("Rounds contract", argument)
 
     def test_parser_exposes_explicit_resume_handle(self):
         args = self.bridge.build_parser().parse_args(
@@ -288,16 +596,19 @@ class FakeCodexSession:
         self.turn_id = "turn-round-one"
         self.panes = []
         self.started_turns = []
+        # The bridge gates the first turn on these; one server that goes ready
+        # on the first pump is enough to let every recovery test through.
+        self.mcp_startup = {}
 
-    def launch_pane(self, args, runtime_dir, prompt_file):
+    def launch_pane(self, args, runtime_dir):
         runtime_dir = pathlib.Path(runtime_dir)
         runtime_dir.mkdir(parents=True, exist_ok=True)
         (runtime_dir / "app-server.sock").touch()
-        self.marker = MARKER_PATTERN.search(
-            pathlib.Path(prompt_file).read_text(encoding="utf-8")
-        ).group(0)
         self.panes.append("%%%d" % (90 + len(self.panes)))
         return self.panes[-1]
+
+    async def pump(self, _seconds):
+        self.mcp_startup["graph"] = "ready"
 
     def finish(self, message):
         self.status = "completed"
@@ -321,8 +632,12 @@ class FakeCodexSession:
         }
 
     async def request(self, method, params):
-        if method == "thread/list":
-            return {"data": [{"id": self.thread_id, "preview": self.marker}]}
+        if method == "mcpServerStatus/list":
+            return {"data": [{"name": "graph"}]}
+        if method == "thread/start":
+            return {"thread": {"id": self.thread_id}}
+        if method == "thread/resume":
+            return {}
         if method == "thread/read":
             return {"thread": {"id": self.thread_id, "turns": [self.turn()]}}
         if method == "turn/start":
@@ -430,6 +745,8 @@ class RecoveryTests(unittest.TestCase):
     def test_recovery_returns_the_same_session_without_a_second_pane(self):
         killed = self.kill_the_driver()
         self.codex.finish("two spec findings, one standards finding")
+        # The first review's own turn; recovery must not add to it.
+        turns_before = len(self.codex.started_turns)
 
         code, output = self.run_bridge(
             self.args(target=None, recover_session=True)
@@ -444,7 +761,11 @@ class RecoveryTests(unittest.TestCase):
             output["finalMessage"], "two spec findings, one standards finding"
         )
         self.assertEqual(self.codex.panes, ["%90"])
-        self.assertEqual(self.codex.started_turns, [])
+        self.assertEqual(
+            len(self.codex.started_turns),
+            turns_before,
+            "recovery started a second turn instead of waiting on the first",
+        )
         self.assertEqual(
             self.stored_session()["target"], killed["target"]
         )
@@ -453,6 +774,7 @@ class RecoveryTests(unittest.TestCase):
         killed = self.kill_the_driver()
         self.codex.finish("round one findings")
         self.run_bridge(self.args(target=None, recover_session=True))
+        turns_before = len(self.codex.started_turns)
 
         code, output = self.run_bridge(
             self.args(resume_session=killed["reviewSessionId"])
@@ -460,7 +782,11 @@ class RecoveryTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertFalse(output["recovered"])
-        self.assertEqual(len(self.codex.started_turns), 1)
+        self.assertEqual(
+            len(self.codex.started_turns) - turns_before,
+            1,
+            "round two should start exactly one follow-up turn",
+        )
         self.assertEqual(self.codex.panes, ["%90"])
 
     def test_another_origin_pane_recovers_nothing(self):
@@ -559,7 +885,6 @@ class LaunchHookTests(unittest.TestCase):
             returned = self.bridge.launch_pane(
                 base_args(cwd=str(self.root), tmux_target="%1"),
                 self.root / "runtime",
-                self.root / "prompt.txt",
             )
         self.assertEqual(returned, pane_id)
 

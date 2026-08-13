@@ -32,6 +32,24 @@ import launch_hook  # noqa: E402  — a sibling asset, reached from this file's 
 
 
 TERMINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
+# A thread's MCP servers announce themselves on the connection that started the
+# thread; the first turn must wait until none of them is still coming up.
+MCP_STARTUP_NOTIFICATION = "mcpServer/startupStatus/updated"
+MCP_STARTUP_SETTLED_STATES = {"ready", "failed", "cancelled"}
+# Servers do not all announce at once — one was measured announcing `starting`
+# 169 ms after another had already reported `ready`. When some configured server
+# has yet to say anything, the gate waits out this much quiet before believing
+# the ones it has heard from are the whole set.
+MCP_STARTUP_QUIET_SECONDS = 0.5
+# What the pane allows the parent, on top of the two timeouts the parent's own
+# steps are bounded by (connecting, then the readiness gate), for the turn it
+# submits in between. This is a reaper for a parent that died without cleaning
+# up — a parent that fails in the ordinary way kills the pane itself — so it errs
+# long: expiring early would tear down an app-server still being set up.
+HANDOFF_GRACE_SECONDS = 60
+# The parent writes the thread id here once the first turn has given the thread
+# a rollout; the pane process waits for it before attaching its TUI.
+THREAD_HANDOFF_FILENAME = "thread-id"
 DEFAULT_TIMEOUT_SECONDS = 7200
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 60
 SESSION_STATE_VERSION = 1
@@ -230,6 +248,11 @@ class AppServerClient:
     def __init__(self, socket_path):
         self.socket_path = socket_path
         self.next_id = 1
+        # Startup state of every MCP server that has announced itself on this
+        # connection, keyed by name. Only the connection that started a thread
+        # hears these, which is why the bridge starts the thread itself
+        # (docs/codex-mcp-readiness.md).
+        self.mcp_startup = {}
 
     async def __aenter__(self):
         connector = aiohttp.UnixConnector(path=self.socket_path)
@@ -280,19 +303,54 @@ class AppServerClient:
                     )
                 return payload.get("result", {})
 
-            if payload.get("id") is not None and payload.get("method"):
-                await self.websocket.send_json(
-                    {
-                        "id": payload["id"],
-                        "error": {
-                            "code": -32601,
-                            "message": (
-                                "The read-only Claude bridge does not answer "
-                                f"server request {payload['method']}."
-                            ),
-                        },
-                    }
+            await self._handle_unsolicited(payload)
+
+    async def pump(self, seconds):
+        """Reads whatever the server volunteers for a while; returns nothing.
+
+        Notifications only arrive while someone is reading the socket, and the
+        MCP readiness gate has no request of its own to wait on — so it needs a
+        way to listen without asking anything.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                message = await asyncio.wait_for(
+                    self.websocket.receive(), timeout=remaining
                 )
+            except asyncio.TimeoutError:
+                return
+            if message.type != aiohttp.WSMsgType.TEXT:
+                raise AppServerError(
+                    f"Unexpected app-server WebSocket message type: {message.type}"
+                )
+            await self._handle_unsolicited(json.loads(message.data))
+
+    async def _handle_unsolicited(self, payload):
+        """Records a notification, or declines a server request; returns nothing."""
+        if payload.get("method") == MCP_STARTUP_NOTIFICATION:
+            params = payload.get("params") or {}
+            name = params.get("name")
+            if name:
+                self.mcp_startup[name] = params.get("status")
+            return
+
+        if payload.get("id") is not None and payload.get("method"):
+            await self.websocket.send_json(
+                {
+                    "id": payload["id"],
+                    "error": {
+                        "code": -32601,
+                        "message": (
+                            "The read-only Claude bridge does not answer "
+                            f"server request {payload['method']}."
+                        ),
+                    },
+                }
+            )
 
 
 # The whole review request, stated here rather than delegated to a skill name:
@@ -426,7 +484,6 @@ def run_pane(args):
     runtime_dir = pathlib.Path(args.runtime_dir)
     socket_path = runtime_dir / "app-server.sock"
     log_path = runtime_dir / "app-server.log"
-    prompt = pathlib.Path(args.prompt_file).read_text(encoding="utf-8")
     log_file = log_path.open("a", encoding="utf-8")
     child_env = child_session_env(launch_hook.load_hook(args.cwd))
     app_server_command = [
@@ -474,7 +531,18 @@ def run_pane(args):
             print(f"Codex app-server failed to start: {detail}", file=sys.stderr)
             return 1
 
-        command = build_tui_command(args, socket_path, prompt)
+        # The parent starts the thread, waits for MCP, and submits the first
+        # turn before naming the thread here. A parent that dies instead kills
+        # this pane, so this bound is only a backstop.
+        thread_id = wait_for_thread_handoff(runtime_dir, args.handoff_timeout)
+        if not thread_id:
+            print(
+                "Timed out waiting for the bridge to hand over its Codex thread",
+                file=sys.stderr,
+            )
+            return 1
+
+        command = build_tui_command(args, socket_path, thread_id)
         return subprocess.run(
             command, cwd=args.cwd, env=child_env, check=False
         ).returncode
@@ -482,7 +550,13 @@ def run_pane(args):
         cleanup()
 
 
-def build_tui_command(args, socket_path, prompt):
+def build_tui_command(args, socket_path, thread_id):
+    """Returns the TUI launch command, which attaches to a thread and carries no prompt.
+
+    A positional prompt is submitted the moment the TUI starts, which is what
+    used to race the session's MCP servers (issue #14). The turn is submitted
+    over the app-server instead, once the readiness gate has opened.
+    """
     command = [
         "codex",
         "--remote",
@@ -497,10 +571,7 @@ def build_tui_command(args, socket_path, prompt):
             ["-c", "sandbox_workspace_write.network_access=true", "--search"]
         )
     command.extend(model_config_overrides(args))
-    if args.thread_id:
-        command.extend(["resume", args.thread_id, prompt])
-    else:
-        command.append(prompt)
+    command.extend(["resume", thread_id])
     return command
 
 
@@ -533,7 +604,17 @@ def cleanup_failed_pane(pane_id, runtime_dir):
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
-def launch_pane(args, runtime_dir, prompt_file):
+def handoff_timeout(startup_timeout):
+    """Returns how long the pane waits to be told which thread to attach to.
+
+    Covers every step the parent takes before it hands over: connecting to the
+    app-server and the readiness gate, each bounded by `startup_timeout`, plus
+    the first turn in between.
+    """
+    return startup_timeout * 2 + HANDOFF_GRACE_SECONDS
+
+
+def launch_pane(args, runtime_dir):
     if not args.tmux_target:
         raise RuntimeError("Missing originating tmux pane")
     pane_command = [
@@ -542,8 +623,6 @@ def launch_pane(args, runtime_dir, prompt_file):
         "_pane",
         "--runtime-dir",
         str(runtime_dir),
-        "--prompt-file",
-        str(prompt_file),
         "--cwd",
         args.cwd,
         "--sandbox",
@@ -552,11 +631,11 @@ def launch_pane(args, runtime_dir, prompt_file):
         args.approval,
         "--startup-timeout",
         str(args.startup_timeout),
+        "--handoff-timeout",
+        str(handoff_timeout(args.startup_timeout)),
     ]
     if args.network:
         pane_command.append("--network")
-    if getattr(args, "thread_id", None):
-        pane_command.extend(["--thread-id", args.thread_id])
     if getattr(args, "model", None):
         pane_command.extend(["--model", args.model])
     if getattr(args, "effort", None):
@@ -645,49 +724,166 @@ async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
     raise RuntimeError(f"Timed out connecting to Codex app-server: {suffix}")
 
 
-async def find_thread(client, cwd, marker, pane_id, timeout_seconds):
+async def start_thread(client, cwd):
+    """Returns the id of a new thread the bridge owns, booting its MCP servers."""
+    result = await client.request("thread/start", {"cwd": cwd})
+    thread_id = (result.get("thread") or {}).get("id")
+    if not thread_id:
+        raise RuntimeError("Codex app-server started a thread without an id")
+    return thread_id
+
+
+async def configured_mcp_server_names(client):
+    """Returns the names of every MCP server Codex is configured with."""
+    result = await client.request(
+        "mcpServerStatus/list", {"detail": "toolsAndAuthOnly"}
+    )
+    return {
+        entry.get("name") for entry in result.get("data") or [] if entry.get("name")
+    }
+
+
+def unsettled_mcp_report(announced, configured):
+    still_starting = sorted(
+        name
+        for name, status in announced.items()
+        if status not in MCP_STARTUP_SETTLED_STATES
+    )
+    if still_starting:
+        return "still starting: " + ", ".join(still_starting)
+    return "none of " + ", ".join(sorted(configured)) + " announced itself"
+
+
+async def wait_for_mcp_startup(client, pane_id, timeout_seconds):
+    """Returns the settled startup state of this thread's MCP servers.
+
+    Blocks until they have finished coming up, and raises if they do not.
+
+    Waits on the announcements rather than on a clock: the gate opens once every
+    server that has announced itself has left `starting`. Servers that never
+    announce are not waited for — the configured inventory routinely lists one
+    that never starts, so requiring the whole inventory would hang forever
+    (docs/codex-mcp-readiness.md).
+
+    Because a late announcement would otherwise slip through that rule, the gate
+    only trusts a settled set once either every configured server has been heard
+    from, or nothing new has arrived for `MCP_STARTUP_QUIET_SECONDS`.
+    """
+    # The inventory is an RPC of its own, measured at ~1.5 s, and nothing under
+    # it ever times out: awaited plainly, a stuck app-server would hang here
+    # past every budget the caller set. It gets the deadline's remaining time.
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        configured = await asyncio.wait_for(
+            configured_mcp_server_names(client),
+            timeout=max(0.0, deadline - time.monotonic()),
+        )
+    except asyncio.TimeoutError as error:
+        raise RuntimeError(
+            "Timed out asking Codex which MCP servers are configured"
+        ) from error
+    if not configured:
+        return {}
+
+    seen = None
+    settled_since = None
+    while time.monotonic() < deadline:
+        if pane_id is not None and not pane_exists(pane_id):
+            raise RuntimeError(
+                "Codex TUI pane exited before its MCP servers finished starting"
+            )
+
+        announced = dict(client.mcp_startup)
+        if announced != seen:
+            # Something changed, so any quiet already counted no longer counts.
+            seen = announced
+            settled_since = None
+
+        if announced and all(
+            status in MCP_STARTUP_SETTLED_STATES for status in announced.values()
+        ):
+            if configured <= announced.keys():
+                return announced
+            now = time.monotonic()
+            if settled_since is None:
+                settled_since = now
+            elif now - settled_since >= MCP_STARTUP_QUIET_SECONDS:
+                return announced
+
+        await client.pump(0.1)
+
+    raise RuntimeError(
+        "Timed out waiting for Codex MCP servers to start ("
+        + unsettled_mcp_report(dict(client.mcp_startup), configured)
+        + ")"
+    )
+
+
+def hand_off_thread(runtime_dir, thread_id):
+    """Tells the waiting pane which thread to attach its TUI to; returns nothing.
+
+    Written only after the first turn has started, because `resume` refuses a
+    thread that has no rollout yet.
+    """
+    path = pathlib.Path(runtime_dir) / THREAD_HANDOFF_FILENAME
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(thread_id, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def wait_for_thread_handoff(runtime_dir, timeout_seconds):
+    """Returns the thread id the parent hands over, or None if it never arrives."""
+    path = pathlib.Path(runtime_dir) / THREAD_HANDOFF_FILENAME
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if not pane_exists(pane_id):
-            raise RuntimeError("Codex TUI pane exited before creating its thread")
-        result = await client.request(
-            "thread/list",
-            {
-                "cwd": cwd,
-                "limit": 50,
-                "sortKey": "updated_at",
-                "sortDirection": "desc",
-            },
-        )
-        for thread in result.get("data") or []:
-            if marker in (thread.get("preview") or ""):
-                return thread
-        await asyncio.sleep(0.25)
-    raise RuntimeError("Timed out waiting for the Codex TUI thread")
+        try:
+            thread_id = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            thread_id = ""
+        if thread_id:
+            return thread_id
+        time.sleep(0.05)
+    return None
 
 
 async def wait_for_review(client, thread_id, marker, pane_id, timeout_seconds):
+    """Returns the (thread, turn) pair once the review turn reaches a terminal status."""
     deadline = time.monotonic() + timeout_seconds
+    unreadable = None
     while time.monotonic() < deadline:
-        result = await client.request(
-            "thread/read", {"threadId": thread_id, "includeTurns": True}
-        )
-        thread = result.get("thread") or {}
-        turn = find_bridge_turn(thread, marker)
-        if turn and turn.get("status") in TERMINAL_TURN_STATUSES:
-            return thread, turn
+        try:
+            result = await client.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": True}
+            )
+        except AppServerError as error:
+            # A turn that has only just been submitted has not necessarily
+            # flushed its rollout yet, and the thread cannot be read until it
+            # has. That is this poll's normal first answer, not a failure.
+            unreadable = error
+            result = None
+
+        if result is not None:
+            thread = result.get("thread") or {}
+            turn = find_bridge_turn(thread, marker)
+            if turn and turn.get("status") in TERMINAL_TURN_STATUSES:
+                return thread, turn
+
         if not pane_exists(pane_id):
             raise RuntimeError("Codex TUI pane exited before the review turn completed")
         await asyncio.sleep(0.5)
-    raise RuntimeError("Timed out waiting for the Codex review turn")
+
+    raise RuntimeError(
+        "Timed out waiting for the Codex review turn"
+        + (f"; the thread never became readable: {unreadable}" if unreadable else "")
+    )
 
 
-async def start_followup_turn(client, state, prompt):
+async def start_turn(client, thread_id, prompt, model=None, effort=None):
     # `turn/start` accepts optional `model`/`effort` overrides that apply to
     # this turn and the ones after it. Both are omitted unless the lineage was
     # pinned, so an unpinned session keeps running on the thread's own model.
     params = {
-        "threadId": state["threadId"],
+        "threadId": thread_id,
         "input": [
             {
                 "type": "text",
@@ -696,11 +892,17 @@ async def start_followup_turn(client, state, prompt):
             }
         ],
     }
-    if state.get("model"):
-        params["model"] = state["model"]
-    if state.get("effort"):
-        params["effort"] = state["effort"]
+    if model:
+        params["model"] = model
+    if effort:
+        params["effort"] = effort
     return await client.request("turn/start", params)
+
+
+async def start_followup_turn(client, state, prompt):
+    return await start_turn(
+        client, state["threadId"], prompt, state.get("model"), state.get("effort")
+    )
 
 
 def should_cleanup_session(turn, final_message):
@@ -709,10 +911,15 @@ def should_cleanup_session(turn, final_message):
 
 
 def make_runtime(prompt):
+    """Returns the session's runtime directory, the request recorded beside its log.
+
+    Nothing reads prompt.txt back — the turn is submitted over the app-server —
+    but it keeps what was asked next to app-server.log when a run needs
+    explaining afterwards.
+    """
     runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="claude-codex-tui-"))
-    prompt_file = runtime_dir / "prompt.txt"
-    prompt_file.write_text(prompt, encoding="utf-8")
-    return runtime_dir, prompt_file
+    (runtime_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    return runtime_dir
 
 
 def session_state(
@@ -774,11 +981,10 @@ async def run_new_review(args, owner, store):
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
     prompt = build_prompt(args, bridge_id)
 
-    runtime_dir, prompt_file = make_runtime(prompt)
+    runtime_dir = make_runtime(prompt)
     args.tmux_target = owner.origin_pane
-    args.thread_id = None
     try:
-        pane_id = launch_pane(args, runtime_dir, prompt_file)
+        pane_id = launch_pane(args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
@@ -792,24 +998,29 @@ async def run_new_review(args, owner, store):
             runtime_dir / "app-server.log",
         )
         try:
-            thread = await find_thread(
-                client, args.cwd, marker, pane_id, args.startup_timeout
-            )
+            thread_id = await start_thread(client, args.cwd)
+            await wait_for_mcp_startup(client, pane_id, args.startup_timeout)
+            await start_turn(client, thread_id, prompt, args.model, args.effort)
             session_id = str(uuid.uuid4())
             state = session_state(
                 session_id,
                 owner,
                 runtime_dir,
                 pane_id,
-                thread["id"],
+                thread_id,
                 args.target,
                 args.model,
                 args.effort,
                 marker,
             )
+            # The record goes down before the pane is told to attach. Handing
+            # over first would let a driver killed in between leave a live pane
+            # running a review that `--recover-session` can no longer find.
             store.write(session_id, state)
+            # Only now does the thread have a rollout for the TUI to resume.
+            hand_off_thread(runtime_dir, thread_id)
             thread, turn = await wait_for_review(
-                client, thread["id"], marker, pane_id, args.timeout
+                client, thread_id, marker, pane_id, args.timeout
             )
         finally:
             await client.__aexit__(None, None, None)
@@ -839,11 +1050,10 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
     close_pane(state["paneId"])
     shutil.rmtree(state["runtimeDir"], ignore_errors=True)
 
-    runtime_dir, prompt_file = make_runtime(prompt)
+    runtime_dir = make_runtime(prompt)
     args.tmux_target = owner.origin_pane
-    args.thread_id = state["threadId"]
     try:
-        pane_id = launch_pane(args, runtime_dir, prompt_file)
+        pane_id = launch_pane(args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
@@ -855,15 +1065,24 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
             args.startup_timeout,
             runtime_dir / "app-server.log",
         )
+        # This app-server is as cold as a new review's, so the thread has to be
+        # reopened here — both to boot its MCP servers and to hear them announce
+        # — before the follow-up turn may go in.
+        await client.request("thread/resume", {"threadId": state["threadId"]})
+        await wait_for_mcp_startup(client, pane_id, args.startup_timeout)
+        await start_followup_turn(client, state, prompt)
+        # The record names the new pane before that pane is told to attach, so a
+        # driver killed in between still leaves a recoverable review.
+        state["runtimeDir"] = str(runtime_dir)
+        state["socketPath"] = str(runtime_dir / "app-server.sock")
+        state["paneId"] = pane_id
+        state["updatedAt"] = time.time()
+        store.write(state["reviewSessionId"], state)
+        hand_off_thread(runtime_dir, state["threadId"])
     except Exception:
         cleanup_failed_pane(pane_id, runtime_dir)
         raise
 
-    state["runtimeDir"] = str(runtime_dir)
-    state["socketPath"] = str(runtime_dir / "app-server.sock")
-    state["paneId"] = pane_id
-    state["updatedAt"] = time.time()
-    store.write(state["reviewSessionId"], state)
     try:
         return await wait_for_review(
             client,
@@ -1044,13 +1263,12 @@ def parse_args(argv=None):
 def build_pane_parser():
     pane_parser = argparse.ArgumentParser(add_help=False)
     pane_parser.add_argument("--runtime-dir", required=True)
-    pane_parser.add_argument("--prompt-file", required=True)
     pane_parser.add_argument("--cwd", required=True)
     pane_parser.add_argument("--sandbox", required=True)
     pane_parser.add_argument("--approval", required=True)
     pane_parser.add_argument("--startup-timeout", type=float, required=True)
+    pane_parser.add_argument("--handoff-timeout", type=float, required=True)
     pane_parser.add_argument("--network", action="store_true")
-    pane_parser.add_argument("--thread-id")
     pane_parser.add_argument("--model")
     pane_parser.add_argument("--effort")
     return pane_parser
