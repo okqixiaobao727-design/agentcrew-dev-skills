@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 
+# macOS Finder metadata, written into any directory the maintainer opens.
+.DS_Store
+
 # The maintainer's own machine nicknames and account names: local policy, never shipped.
 .agentcrew-local-identifiers
 # Added by code-review-graph
