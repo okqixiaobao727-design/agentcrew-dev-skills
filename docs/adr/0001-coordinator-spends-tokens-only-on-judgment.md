@@ -4,7 +4,7 @@ status: accepted
 
 # The coordinator spends model tokens only on judgment
 
-Forensics on a real `/orchestrate` run (Fable 5 coordinator, $34.27 measured from the
+Forensics on a real `/orchestrate` run (Fable 5 coordinator, bill measured from the
 transcript) showed 69% of coordinator turns and 70.4% of its bill were dispatch, polling,
 bookkeeping, status narration, and git plumbing; rulings — the only work that needs the
 expensive model — were 7.6%. Cost behaves as turns × context-size-at-that-turn, so every
@@ -29,7 +29,7 @@ scripts. Replayed against the measured run, this removes 127 of 184 coordinator 
   (contract, ruling loop, escalation grammar, reference index); first-turn templates and
   workflow shapes move into the dispatch renderer, watch/merge rules into the monitor —
   the coordinator never reads them again. (The measured 36.5K-token startup preamble was
-  re-read 183 times for $6.69.)
+  re-read 183 times, 19.5% of the coordinator's bill.)
 - **Nothing is inserted into the live coordinator context mid-run** except what the
   coordinator itself chooses to Read. Claude Code writes 1-hour cache entries at 2× base
   price, so a mid-run insertion forces a 2× rewrite of everything after it. The
