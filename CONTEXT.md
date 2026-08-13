@@ -64,3 +64,25 @@ demand and never inserted into the live context by anything but the coordinator 
 **Judgment turn**:
 Any coordinator turn that produces a ruling or an approval. The design goal is that a
 run contains no other kind of coordinator turn.
+
+**Judgment core**:
+The part of a skill body that must stay resident because every run consults it — the
+classification tests, checkpoint rules, and completion criteria. Putting it behind a
+pointer makes applying it a coin-flip.
+_Avoid_: essential prose, main content
+
+**Frontmatter pin**:
+A `model`/`effort` value fixed in a skill's frontmatter, model always as a full ID, so
+the session that makes routing decisions never depends on what the environment happens
+to resolve (ADR-0005).
+
+**Full model ID**:
+The only form a model name takes anywhere in the chain — config cell, `## Routing` line,
+launch command — passed verbatim end to end with no alias-resolution layer. Aliases
+mis-resolve under plan mode (ADR-0003).
+_Avoid_: alias, short name
+
+**Mode-gated reference**:
+A reference file only one mode of a skill loads, via an explicit Read instruction in the
+body — e.g. the cutting overlay that spec-only `/route` runs read and route-only runs
+never see. Disclosure earns its cost only when some branch skips the material.
