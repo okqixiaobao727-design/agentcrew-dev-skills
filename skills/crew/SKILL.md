@@ -260,15 +260,6 @@ The monitor is a one-shot wake-up: it stays armed while every supplied child is 
 as soon as any child is `waiting`, `idle`, `parked`, or `vanished`. A CLI, JSON, duplicate-session,
 or unknown-status error exits nonzero.
 
-The human watches the wave in a pane of its own, which the monitor draws from receipts and the
-machine log at zero tokens. Split it once per wave and then leave it alone — it is the operator's
-window, not a channel to you, and you narrate nothing it already shows:
-
-```bash
-python3 <crew-skill-dir>/assets/monitor/monitor.py pane --session <tmux session> \
-  --log <machine log> --wave <N> <worktree-path>...
-```
-
 A Codex child speaks only at the end of a turn, so its watch carries the messages rather than
 backstopping them. Run it in the background over every busy Codex child's state file:
 
@@ -281,6 +272,14 @@ snapshot as soon as one is `idle` or `vanished`, nonzero for a monitor error. A 
 monitors at once; either one exiting wakes the coordinator, which rules on what woke it and re-arms
 each monitor over only the children still busy under it.
 
+The human watches the wave in a pane of its own. Split it once per wave, then go back to waiting
+for messages — the pane reports to the operator:
+
+```bash
+python3 <crew-skill-dir>/assets/monitor/monitor.py pane --session <tmux session> \
+  --log <machine log> --wave <N> <worktree-path>...
+```
+
 A Codex child's row carries its message in `finalMessage`: read it there and rule on it with the
 grammar below, exactly as on a message from a Claude child — same receipt checks, same outcomes.
 
@@ -290,19 +289,16 @@ unanswered.
 
 - **CREW ASK** — read and follow [`references/triage.md`](references/triage.md). The ticket stays
   live; an answered ASK is not an outcome.
-- **CREW COMPLETE <sha>** — verify it by script, never by eye:
+- **CREW COMPLETE <sha>** — verify it by script:
 
   ```bash
   python3 <crew-skill-dir>/assets/monitor/monitor.py verify --ticket <NN> \
     --worktree <worktree> --sha <sha> --base <recorded base> --log <machine log>
   ```
 
-  It checks all 40 characters of `<sha>` against that worktree's head — children compose a receipt
-  whose short prefix matches and whose tail is invented — that the branch grew from its recorded
-  base and is ahead of it, and that nothing is left uncommitted but the hook assets step 4
-  installed. Exit 0 makes the
-  ticket **landable** and appends its receipt to the log. Exit 1 prints what did not hold: ask that
-  child once on its own channel to finish or send `CREW FAILED`; a second invalid receipt is failed.
+  Exit 0 makes the ticket **landable** and appends its receipt to the log. Exit 1 prints what did
+  not hold: ask that child once on its own channel to finish or send `CREW FAILED`; a second
+  invalid receipt is failed.
 - **CREW PARKED <checklist path>** — the ticket is parked. Record the checklist path and its
   ticket branch in `decisions.md`; the branch stays unmerged so the human resumes from it. Only
   an `acceptance` ticket parks by receipt.
