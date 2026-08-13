@@ -6,7 +6,6 @@
         "code-review-graph",
         "serve"
       ],
-      "cwd": "/Users/simon/Documents/coding/skills/agentcrew-dev-skills",
       "type": "stdio"
     }
   }
