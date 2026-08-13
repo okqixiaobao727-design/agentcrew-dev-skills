@@ -84,15 +84,12 @@ value` lines in any order, plus a reasons line you record and do not act on:
 | `Effort` | the reasoning effort it runs at |
 | `Review` | `<claude\|codex> <model> <effort>` — the **review lane**: the reviewing vendor and the model and effort its review runs at. Carried by `tdd` and `refactor` tickets only |
 
-The first four keys are required on every ticket. `Review` is required on a `tdd` or `refactor`
-ticket and absent on the other four workflows, which get no review at all. Its vendor is always the
-one the `Executor` is not; a `Review` naming the executing vendor is a routing error, not a lane.
-
-A ticket is **unrouted** when it has no `## Routing` section, is missing any required key, carries a
-`Workflow` or `Executor` value outside those enums, or carries a `Review` whose vendor is outside
-`claude`/`codex` or equal to its `Executor`. Routing has no default and no fallback: on the first
-unrouted ticket, stop the run, list every unrouted ticket with what it lacks, and tell the user to
-run `/route` over the feature and re-run `/crew`.
+The first four keys are required on every ticket; `Review` is carried exactly where the table says,
+and its vendor is always the one the `Executor` is not. A ticket with no `## Routing` section, or
+one that breaks any rule of this table, is **unrouted** — the renderer's table validation is the
+authority on the full case list. Routing has no default and no fallback: on the first unrouted
+ticket, stop the run, list every unrouted ticket with what it lacks, and tell the user to run
+`/route` over the feature and re-run `/crew`.
 
 **Every model value is a full model ID, never an alias** — each ticket's `Model`, each review
 lane's model, and the repair model the merge ladder runs on. An alias was measured to resolve to a
@@ -149,12 +146,10 @@ python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
 ```
 
 Write the approved table to `<run-dir>/wave-table.json` in the schema the renderer's docstring
-publishes: a `run` block naming the repo root, the absolute spec path, the integration branch and
-its base commit, your own session name and pid, `<crew-skill-dir>`, the tmux session from
-`tmux display-message -p '#{session_id}'`, your permission mode, the launch hook, and — when any
-ticket is routed to Codex — the bridge at `<crew-skill-dir>/assets/codex/codex_bridge.py` with
-`<run-dir>/codex/` as its state directory; then one entry per ticket carrying its routing, its
-absolute path, its wave, and the tickets that block it.
+publishes — read the docstring, not a memory of it. Two values the docstring cannot name for you:
+the tmux session comes from `tmux display-message -p '#{session_id}'`, and a table with any
+Codex-routed ticket carries the bridge at `<crew-skill-dir>/assets/codex/codex_bridge.py` with
+`<run-dir>/codex/` as its state directory.
 
 Children launch in your own permission mode: cross-session messages deliver automatically only
 between sessions of the same permission-mode class, and a held ASK expires unanswered in minutes.
@@ -251,15 +246,9 @@ conclusion.
 
 ### Escalation grammar
 
-Every escalation carries its own pointers, so a ruling never starts with a hunt. The renderer puts
-this in every child's first turn:
-
-```text
-CREW ASK <NN> <doc-conflict|stuck|scope> — question in one paragraph, 2-3 options with
-yours marked, then the pointers: ticket <absolute path>, branch <name>, and the files or
-diffs at issue, ts=<unix time>
-```
-
+The ASK grammar lives in the renderer's `templates/shapes.toml`, which puts it into every child's
+first turn: an escalation carries its question, 2-3 options with the child's marked, and pointers
+to the ticket, the branch, and the files or diffs at issue — so a ruling never starts with a hunt.
 The pointers are mandatory. An ASK that arrives without them is answered by asking for exactly the
 ones it lacks; the child's files stay unopened either way.
 
