@@ -315,18 +315,19 @@ calibrated from — which quadrants a cheaper lane can take — so a launched ti
 a hole in that dataset.
 
 Then run the cost pass once, here at the end of the run. It writes one `session-cost` line per
-child into the log and prints the run's rollup in tokens:
+child into the log and prints the run's rollup in tokens, with your own session read from its
+transcript as a `coordinator` row beneath the total:
 
 ```bash
-python3 <crew-skill-dir>/assets/monitor/monitor.py cost --log <run-dir>/log.jsonl
+python3 <crew-skill-dir>/assets/monitor/monitor.py cost --log <run-dir>/log.jsonl \
+  --coordinator-session "$CLAUDE_CODE_SESSION_ID"
 ```
 
-Put that rollup into the report as it printed, and add one row beneath it labelled `coordinator`:
-the tokens this session spent on the run, in the rollup's own counters and total. Read them from
-your session's usage readout; where this harness shows that only to the human, ask the operator for
-it once, in the same message that hands over the report. A figure no one can read is the pass's own
-`--` plus one line saying why, so an unmeasured session is visible rather than absent. Tokens
-throughout, never money: what a token costs changes, and the run's own numbers do not.
+Put that rollup into the report as it printed — the coordinator row is a figure you take, never
+one you ask the operator for. It is the whole session's total, so where this session did anything
+but the run, label it in the report as a session-wide upper bound. A row the pass could not read
+is its own `--` plus the line saying why, so an unmeasured session is visible rather than absent.
+Tokens throughout, never money: what a token costs changes, and the run's own numbers do not.
 
 That row is what makes the judgment-only design checkable per run — your tokens against the
 children's total, out of this run's artifacts alone

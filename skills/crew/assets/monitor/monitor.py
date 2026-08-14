@@ -171,6 +171,8 @@ COST_COLUMNS = (
     "TICKET", "EXECUTOR", "MODEL", "INPUT", "OUTPUT", "CACHE-READ", "CACHE-CREATION", "TOTAL",
 )
 TOTAL_ROW = "TOTAL"
+# The row beneath the total: what the session driving the run spent, against the children's total.
+COORDINATOR_ROW = "coordinator"
 # What a cell shows when there is no figure behind it: a diagnosed row's counters, and the two
 # columns the total row has no single answer for.
 NO_FIGURE = "--"
@@ -829,11 +831,33 @@ def unusable(problem):
     return {"session": None, "counters": None, "problem": problem}
 
 
-def claude_usage(records, worktree):
-    """One Claude transcript read against `worktree`: `read`, `unusable`, `UNDETERMINED`, or None.
+def request_counters(record, already):
+    """One Claude record's four counters, or None where it has no usage or repeats a counted one.
 
     Usage is counted once per request: a transcript forked from another repeats the records it
-    was forked from, and a record repeated is the same tokens spent once.
+    was forked from, and a record repeated is the same tokens spent once. `already` is the set of
+    requests counted so far, which this adds to.
+    """
+    message = record.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    request = record.get("requestId") or record.get("uuid")
+    if request is not None:
+        if request in already:
+            return None
+        already.add(request)
+    return {
+        "input": integer(usage.get("input_tokens")),
+        "output": integer(usage.get("output_tokens")),
+        "cache_read": integer(usage.get("cache_read_input_tokens")),
+        "cache_creation": integer(usage.get("cache_creation_input_tokens")),
+    }
+
+
+def claude_usage(records, worktree):
+    """One Claude transcript read against `worktree`: `billed`, `unusable`, `UNDETERMINED`, or
+    None where nothing in it says it ran there.
     """
     counters = zero_counters()
     session = None
@@ -853,21 +877,9 @@ def claude_usage(records, worktree):
             elif not within_path(cwd, worktree):
                 return unusable(f"it names both {first_cwd} and {cwd}")
         session = record.get("sessionId") or session
-        message = record.get("message")
-        usage = message.get("usage") if isinstance(message, dict) else None
-        if not isinstance(usage, dict):
-            continue
-        request = record.get("requestId") or record.get("uuid")
-        if request is not None:
-            if request in already:
-                continue
-            already.add(request)
-        add_counters(counters, {
-            "input": integer(usage.get("input_tokens")),
-            "output": integer(usage.get("output_tokens")),
-            "cache_read": integer(usage.get("cache_read_input_tokens")),
-            "cache_creation": integer(usage.get("cache_creation_input_tokens")),
-        })
+        found = request_counters(record, already)
+        if found is not None:
+            add_counters(counters, found)
     if first_cwd is None:
         # Nothing in it said where it ran, so whose tokens these are was never established.
         return UNDETERMINED if damaged else None
@@ -986,6 +998,61 @@ def child_usage(executor, worktree):
     return {"sessions": sorted(sessions), "counters": counters, "detail": None}
 
 
+def coordinator_transcript(session):
+    """The one file that session's transcript is, or the reason there is no one file to read."""
+    root = transcript_root(CLAUDE_TRANSCRIPTS)
+    found = sorted(path for path in root.glob(TRANSCRIPT_GLOB) if path.stem == session)
+    if not found:
+        return None, f"no transcript named {session}.jsonl under {root}"
+    if len(found) > 1:
+        return None, f"{root} holds more than one {session}.jsonl: {', '.join(map(str, found))}"
+    return found[0], None
+
+
+def coordinator_usage(session):
+    """What the session driving the run spent, as a row of the same shape as a child's.
+
+    Named by its session id rather than found by worktree: the coordinator works in the repository
+    the children's worktrees were cut from, so a cwd match would claim their transcripts too.
+
+    This is the one transcript read while it is still being written, because the session runs the
+    pass on itself. Only its last line is forgiven for not parsing: that one is the request in
+    flight, half-written and unbilled either way. A line that does not parse with more of the
+    session written after it is a hole in the history like any other, and is diagnosed rather
+    than quietly left out of the figure.
+    """
+    row = {"ticket": COORDINATOR_ROW, "sessions": [], "counters": None, "detail": None}
+    if not session:
+        return {**row, "detail": "no session id was given to read a transcript for"}
+    path, problem = coordinator_transcript(session)
+    if problem:
+        return {**row, "detail": problem}
+    counters = zero_counters()
+    already = set()
+    damaged = False
+    unparsed_last = False
+    try:
+        for record in transcript_records(path):
+            if unparsed_last:
+                # The line before this one did not parse and was not the file's last after all.
+                damaged = True
+                unparsed_last = False
+            if record is MALFORMED:
+                unparsed_last = True
+                continue
+            found = request_counters(record, already)
+            if found is not None:
+                add_counters(counters, found)
+    except OSError as error:
+        return {**row, "detail": f"{path} could not be read: {error.strerror}"}
+    if damaged:
+        return {**row, "detail": f"{path} carries a line that does not parse"}
+    if not counted(counters):
+        # A session that ran this pass spent tokens, so nothing counted means the file is not it.
+        return {**row, "detail": f"{path} reports no usage"}
+    return {**row, "sessions": [session], "counters": counters}
+
+
 def cost_rows(records):
     """One row per launched ticket, in ticket order: what it was routed to, and what it spent.
 
@@ -1037,8 +1104,12 @@ def run_total(rows):
     return counters
 
 
-def render_cost(rows):
-    """The rollup the report carries: a row per child, the run's total, then any diagnosis."""
+def render_cost(rows, coordinator=None):
+    """The rollup the report carries: a row per child, the run's total, then any diagnosis.
+
+    The coordinator's row sits beneath the total rather than inside it: it is what the run's
+    judgment cost, read against the children's work, not another share of that work.
+    """
     cells = [list(COST_COLUMNS)]
     cells += [
         [row["ticket"], row["executor"] or NO_FIGURE, row["model"] or NO_FIGURE]
@@ -1046,6 +1117,9 @@ def render_cost(rows):
         for row in rows
     ]
     cells.append([TOTAL_ROW, NO_FIGURE, NO_FIGURE] + figures(run_total(rows)))
+    if coordinator is not None:
+        cells.append([COORDINATOR_ROW, CLAUDE, NO_FIGURE] + figures(coordinator["counters"]))
+        rows = rows + [coordinator]
     widths = [max(len(row[column]) for row in cells) for column in range(len(COST_COLUMNS))]
     lines = [
         COLUMN_GAP.join(value.ljust(width) for value, width in zip(row, widths)).rstrip()
@@ -1077,11 +1151,18 @@ def log_session_cost(log, row):
 
 
 def run_cost(args):
-    """Append one `session-cost` per launched child and print the run's rollup; returns 0."""
+    """Append one `session-cost` per launched child and print the run's rollup; returns 0.
+
+    The coordinator's row is printed and not logged: the log's `session-cost` is a launched
+    ticket's line, and the session that drives the run is not one.
+    """
     rows = cost_rows(read_log(args.log))
     for row in rows:
         log_session_cost(args.log, row)
-    print(render_cost(rows), flush=True)
+    coordinator = None
+    if args.coordinator_session is not None:
+        coordinator = coordinator_usage(args.coordinator_session)
+    print(render_cost(rows, coordinator), flush=True)
     return 0
 
 
@@ -1196,6 +1277,10 @@ def build_parser():
     cost = commands.add_parser("cost", help="record what each child spent and roll the run up")
     cost.set_defaults(handler=run_cost)
     cost.add_argument("--log", required=True, help="the run's machine log")
+    cost.add_argument(
+        "--coordinator-session",
+        help="the id of the session driving the run, whose transcript becomes the coordinator row",
+    )
 
     verify = commands.add_parser("verify", help="check a child's completion receipt")
     verify.set_defaults(handler=run_verify)
