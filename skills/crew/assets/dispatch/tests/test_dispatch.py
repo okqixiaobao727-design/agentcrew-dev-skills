@@ -424,6 +424,92 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertEqual(self.fixture.tmux_calls(), [])
 
 
+class ReviewEventRenderTests(DispatchTestCase):
+    """The rendered review command carries what the bridge needs to log the review it runs.
+
+    The bridge writes the run's `review` event pair, and it can only do that for a run whose
+    machine log and ticket id reached it — so the renderer is what supplies them.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = self.fixture.root / "run" / "log.jsonl"
+        self.worktree = str(self.fixture.repo / ".claude" / "worktrees" / "06-reviewed")
+
+    def prompt_for(self, *extra, **overrides):
+        table = self.fixture.table([self.fixture.ticket("06", "reviewed", **overrides)])
+        result = self.fixture.run_dispatch("render", table, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.fixture.turn("06")
+
+    def test_the_codex_review_command_carries_the_ticket_and_the_runs_machine_log(self):
+        prompt = self.prompt_for("--log", str(self.machine_log))
+
+        self.assertIn(
+            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
+            "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
+            "  -- 'the changes in this worktree since %s'"
+            % (CREW_SKILL_DIR, self.worktree, CODEX_MODEL, CODEX_EFFORT,
+               self.machine_log, self.fixture.base_commit),
+            prompt,
+        )
+
+    def test_the_recovery_command_carries_them_too(self):
+        """A recovered review is a review in progress, so it logs its own pair."""
+        prompt = self.prompt_for("--log", str(self.machine_log))
+
+        self.assertIn(
+            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
+            "  --cwd %s --machine-log %s --ticket 06 --recover-session"
+            % (CREW_SKILL_DIR, self.worktree, self.machine_log),
+            prompt,
+        )
+
+    def test_the_claude_review_command_carries_the_ticket_and_the_runs_machine_log(self):
+        prompt = self.prompt_for(
+            "--log", str(self.machine_log),
+            workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
+
+        self.assertIn(
+            "python3 %s/assets/review/scripts/claude_review_bridge.py \\\n"
+            "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
+            "  'the changes in this worktree since %s'"
+            % (CREW_SKILL_DIR, self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT,
+               self.machine_log, self.fixture.base_commit),
+            prompt,
+        )
+
+    def test_a_relative_log_reaches_the_child_as_an_absolute_path(self):
+        """The review runs in the child's worktree, where a relative path names nothing."""
+        table = self.fixture.table([self.fixture.ticket("06", "reviewed")])
+        here = os.path.realpath(self.fixture.root)
+
+        result = self.fixture.run_dispatch(
+            "render", table, extra=("--log", "run/log.jsonl"), cwd=here
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"--machine-log {here}/run/log.jsonl --ticket 06", self.fixture.turn("06")
+        )
+
+    def test_a_run_with_no_machine_log_still_renders_a_valid_review_command(self):
+        prompt = self.prompt_for()
+
+        self.assertNotIn("--machine-log", prompt)
+        self.assertNotIn("--ticket", prompt)
+        self.assertIn(
+            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
+            "  --cwd %s --model %s --effort %s \\\n"
+            "  -- 'the changes in this worktree since %s'"
+            % (CREW_SKILL_DIR, self.worktree, CODEX_MODEL, CODEX_EFFORT,
+               self.fixture.base_commit),
+            prompt,
+        )
+
+
 class WorkflowShapeTests(DispatchTestCase):
     def prompt_for(self, **overrides):
         table = self.fixture.table([self.fixture.ticket("06", "shaped", **overrides)])

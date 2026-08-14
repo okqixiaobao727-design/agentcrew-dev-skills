@@ -393,5 +393,105 @@ class FailureSurfaceTests(BridgeTestCase):
         self.assertIn("no session_id", run.stderr)
 
 
+class MachineLogTests(BridgeTestCase):
+    """The pair of `review` lines every review leaves in the run's machine log.
+
+    The bridge is the writer because it is the only party that deterministically knows both that a
+    review started and that it ended: the reviewed child may skip a line it was asked for in prose,
+    and a child whose session dies mid-review can never write the `returned` line at all.
+    """
+
+    TICKET = "26"
+    MODEL = "claude-opus-4-6-20260401"
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = pathlib.Path(self.work.name) / "run" / "log.jsonl"
+
+    def run_logged(self, *arguments, machine_log=None, **kwargs):
+        return self.run_bridge(
+            "HEAD",
+            "--model", self.MODEL,
+            "--machine-log", str(self.machine_log if machine_log is None else machine_log),
+            "--ticket", self.TICKET,
+            *arguments,
+            **kwargs,
+        )
+
+    def reviews(self):
+        if not self.machine_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.machine_log.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line).get("event") == "review"
+        ]
+
+    def assertPair(self, records):
+        """Exactly one `running` line and its `returned` pair, for this ticket, in that order."""
+        self.assertEqual([record["state"] for record in records], ["running", "returned"])
+        for record in records:
+            self.assertEqual(record["ticket"], self.TICKET)
+            # Vendor then model, the spelling the dashboard's annotation row prints verbatim.
+            self.assertEqual(record["lane"], f"claude {self.MODEL}")
+
+    def test_a_review_leaves_its_running_line_and_its_returned_pair(self):
+        run = self.run_logged()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertPair(self.reviews())
+
+    def test_a_review_with_no_log_configured_writes_nothing_and_reports_the_same(self):
+        logged = self.run_logged()
+        self.machine_log.unlink()
+
+        unlogged = self.run_bridge("HEAD", "--model", self.MODEL)
+
+        self.assertEqual(unlogged.returncode, logged.returncode, unlogged.stderr)
+        for key in ("status", "lineageId", "sessionId", "round", "findings"):
+            self.assertEqual(unlogged.output[key], logged.output[key], key)
+        self.assertFalse(self.machine_log.exists())
+
+    def test_a_review_told_a_ticket_but_no_log_writes_nothing(self):
+        run = self.run_bridge("HEAD", "--model", self.MODEL, "--ticket", self.TICKET)
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(self.machine_log.exists())
+
+    def test_a_log_that_cannot_be_written_leaves_the_report_and_the_exit_alone(self):
+        blocked = pathlib.Path(self.work.name) / "not-a-directory"
+        blocked.write_text("this is a file, so nothing can be created beneath it\n")
+
+        run = self.run_logged(machine_log=blocked / "log.jsonl")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("Standards:", run.output["findings"])
+
+    def test_a_review_that_came_back_an_error_still_writes_its_returned_line(self):
+        run = self.run_logged(scenario="error")
+
+        self.assertEqual(run.returncode, 1)
+        self.assertPair(self.reviews())
+
+    def test_a_review_the_bridge_could_not_parse_still_writes_its_returned_line(self):
+        run = self.run_logged(scenario="bad-json")
+
+        self.assertEqual(run.returncode, 1)
+        self.assertPair(self.reviews())
+
+    def test_round_two_writes_its_own_pair_for_the_same_ticket(self):
+        first = self.run_logged()
+
+        second = self.run_logged("--resume-session", first.output["lineageId"])
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        records = self.reviews()
+        self.assertEqual(
+            [record["state"] for record in records],
+            ["running", "returned", "running", "returned"],
+        )
+        self.assertEqual({record["ticket"] for record in records}, {self.TICKET})
+
+
 if __name__ == "__main__":
     unittest.main()
