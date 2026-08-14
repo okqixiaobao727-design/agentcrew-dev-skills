@@ -10,6 +10,11 @@ stdout/stderr in a log file and the lineage in a state file.
 Round one starts a review lineage; round two passes the stored lineage id back
 and the bridge resumes the same Claude session with `-r`, so the follow-up
 still sees round one's findings.
+
+Given `--machine-log` and `--ticket`, every call also leaves the run's machine
+log the pair of `review` lines the contract describes — `running` on entry and
+`returned` on exit — so the dashboard's review annotation appears and disappears
+with no operator action and no model token spent (ADR-0001).
 """
 
 import argparse
@@ -29,6 +34,12 @@ import launch_hook  # noqa: E402  — a sibling asset, reached from this file's 
 
 SESSION_STATE_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
+# The log's own writer, so the `review` event's shape and its closed set of states stay the
+# log's alone: this bridge names the event, never spells it.
+MACHINE_LOG = pathlib.Path(__file__).resolve().parents[2] / "machine_log.py"
+# The vendor half of the lane this bridge reviews in. The model half is whatever the lineage was
+# pinned to, so the lane needs no argument of its own.
+REVIEW_VENDOR = "claude"
 # Fixed by spec-113: a headless reviewer has nobody to answer a permission
 # prompt, so the mode is not a caller-tunable option.
 PERMISSION_MODE = "bypassPermissions"
@@ -43,6 +54,45 @@ STATE_DIR_ENV_VAR = "CODE_REVIEW_CLAUDE_STATE_DIR"
 
 class BridgeError(RuntimeError):
     pass
+
+
+class ReviewEvent:
+    """The pair of `review` lines one bridge call leaves in the run's machine log.
+
+    Both the log path and the ticket are optional everywhere they appear, and a call given
+    neither writes nothing: `--log` is optional on dispatch, and a run without one still reviews
+    normally.
+    """
+
+    def __init__(self, log, ticket, model, vendor=REVIEW_VENDOR):
+        # Absolute where the path enters, before it is forwarded to the writer (ADR-0007), so
+        # what this bridge records cannot be moved by anyone's working directory. Symlinks are
+        # left alone: the operator's own name for the run directory is the one to log under.
+        self.log = os.path.abspath(log) if log else None
+        self.ticket = ticket
+        # Vendor then model, separated by a space: the annotation row prints the field verbatim
+        # after collapsing whitespace, so this is the spelling the dashboard shows.
+        self.lane = " ".join(part for part in (vendor, model) if part)
+
+    def write(self, state):
+        """Append one end of this review; returns nothing, and fails at nothing.
+
+        A review that succeeded must not be reported as a failure because its bookkeeping could
+        not be written, so every way the append can go wrong is swallowed here: the caller's exit
+        status and the JSON object the reviewed child reads are the same either way.
+        """
+        if not self.log or not self.ticket:
+            return
+        try:
+            subprocess.run(
+                [
+                    sys.executable, str(MACHINE_LOG), "--log", str(self.log), "review",
+                    "--ticket", str(self.ticket), "--lane", self.lane, "--state", state,
+                ],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError:
+            pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -448,6 +498,16 @@ def build_parser():
         "--resume-session",
         help="Lineage id from a previous round; resumes that Claude session",
     )
+    parser.add_argument(
+        "--machine-log",
+        help="the run's machine log, where this review's `review` event pair is appended;"
+             " the pair is written only when this and --ticket are both given",
+    )
+    parser.add_argument(
+        "--ticket",
+        help="the ticket this review is for, as the machine log spells it; the review's event"
+             " pair is written only when this and --machine-log are both given",
+    )
     parser.add_argument("--state-dir", help=argparse.SUPPRESS)
     parser.add_argument("--claude-binary", help=argparse.SUPPRESS)
     return parser
@@ -456,11 +516,18 @@ def build_parser():
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     args = build_parser().parse_args(argv)
+    # The pair straddles the whole call, so the `returned` line is written on every exit path
+    # this bridge controls — a review that failed, timed out, or raised included. A row claiming
+    # a review that is no longer running is worse than no row at all.
+    review = ReviewEvent(args.machine_log, args.ticket, args.model)
+    review.write("running")
     try:
         return run_bridge(args)
     except (BridgeError, OSError) as error:
         print(str(error), file=sys.stderr)
         return 1
+    finally:
+        review.write("returned")
 
 
 if __name__ == "__main__":

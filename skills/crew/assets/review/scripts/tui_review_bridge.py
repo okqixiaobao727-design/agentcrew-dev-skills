@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 
+"""Interactive Codex TUI code-review channel for a Claude session.
+
+Round one starts a review lineage in its own tmux pane; round two resumes that
+thread, and `--recover-session` re-attaches to the turn a killed driver left in
+flight.
+
+Given `--machine-log` and `--ticket`, every call also leaves the run's machine
+log the pair of `review` lines the contract describes — `running` on entry and
+`returned` on exit — so the dashboard's review annotation appears and disappears
+with no operator action and no model token spent (ADR-0001).
+"""
+
 import argparse
 import asyncio
 import dataclasses
@@ -57,6 +69,12 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Recovery found nothing to re-attach to, which is a different answer from a
 # failed review: it is the one result that licenses starting a first review.
 NO_LIVE_SESSION_EXIT = 3
+# The log's own writer, so the `review` event's shape and its closed set of
+# states stay the log's alone: this bridge names the event, never spells it.
+MACHINE_LOG = pathlib.Path(__file__).resolve().parents[2] / "machine_log.py"
+# The vendor half of the lane this bridge reviews in. The model half is whatever
+# the lineage was pinned to, so the lane needs no argument of its own.
+REVIEW_VENDOR = "codex"
 
 
 class AppServerError(RuntimeError):
@@ -65,6 +83,49 @@ class AppServerError(RuntimeError):
 
 class NoLiveSessionError(RuntimeError):
     """No live review session belongs to the caller's owner identity."""
+
+
+class ReviewEvent:
+    """The pair of `review` lines one bridge call leaves in the run's machine log.
+
+    Both the log path and the ticket are optional everywhere they appear, and a
+    call given neither writes nothing: `--log` is optional on dispatch, and a run
+    without one still reviews normally.
+    """
+
+    def __init__(self, log, ticket, model, vendor=REVIEW_VENDOR):
+        # Absolute where the path enters, before it is forwarded to the writer
+        # (ADR-0007), so what this bridge records cannot be moved by anyone's
+        # working directory. Symlinks are left alone: the operator's own name for
+        # the run directory is the one to log under.
+        self.log = os.path.abspath(log) if log else None
+        self.ticket = ticket
+        # Vendor then model, separated by a space: the annotation row prints the
+        # field verbatim after collapsing whitespace, so this is the spelling the
+        # dashboard shows.
+        self.lane = " ".join(part for part in (vendor, model) if part)
+
+    def write(self, state):
+        """Append one end of this review; returns nothing, and fails at nothing.
+
+        A review that succeeded must not be reported as a failure because its
+        bookkeeping could not be written, so every way the append can go wrong is
+        swallowed here: the caller's exit status and the JSON object the reviewed
+        child reads are the same either way.
+        """
+        if not self.log or not self.ticket:
+            return
+        try:
+            subprocess.run(
+                [
+                    sys.executable, str(MACHINE_LOG), "--log", str(self.log),
+                    "review", "--ticket", str(self.ticket), "--lane", self.lane,
+                    "--state", state,
+                ],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError:
+            pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1253,6 +1314,18 @@ def build_parser():
             "there is none)"
         ),
     )
+    parser.add_argument(
+        "--machine-log",
+        help="the run's machine log, where this review's `review` event pair is "
+             "appended; the pair is written only when this and --ticket are "
+             "both given",
+    )
+    parser.add_argument(
+        "--ticket",
+        help="the ticket this review is for, as the machine log spells it; the "
+             "review's event pair is written only when this and --machine-log "
+             "are both given",
+    )
     parser.add_argument("--tmux-target", help=argparse.SUPPRESS)
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-probe", action="store_true", help=argparse.SUPPRESS)
@@ -1293,6 +1366,12 @@ def main():
         args = build_pane_parser().parse_args(sys.argv[2:])
         return run_pane(args)
     args = parse_args()
+    # The pair straddles the whole call, so the `returned` line is written on
+    # every exit path this bridge controls — a review that failed, timed out, or
+    # raised included. A row claiming a review that is no longer running is worse
+    # than no row at all.
+    review = ReviewEvent(args.machine_log, args.ticket, args.model)
+    review.write("running")
     try:
         return asyncio.run(run_bridge(args))
     except NoLiveSessionError as error:
@@ -1301,6 +1380,8 @@ def main():
     except (AppServerError, OSError, RuntimeError) as error:
         print(str(error), file=sys.stderr)
         return 1
+    finally:
+        review.write("returned")
 
 
 if __name__ == "__main__":
