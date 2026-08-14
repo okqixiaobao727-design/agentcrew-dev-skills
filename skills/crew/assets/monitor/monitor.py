@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-"""The monitor's operator surface: the dashboard pane, its toasts, the receipt check, the cost pass.
+"""The monitor's operator surface: the run dashboard, its toasts, the receipt check, the cost pass.
 
-    dashboard  draw one wave as a table — one row per launched ticket — and toast what just
-               became true, refreshing in place when asked to
-    pane       split a dedicated tmux pane running that refresh loop
+    dashboard  draw the whole run as a table — one row per ticket of every wave — and toast what
+               just became true, refreshing in place when asked to
+    window     create, reuse or recreate the run's one dedicated tmux window running that loop
     verify     decide whether a child's `CREW COMPLETE <sha>` holds, and log the receipt it earns
     cost       at run completion, log what each child's sessions spent and roll the run up
 
 None of this costs a model token and none of it reaches the coordinator (ADR-0001): the table is
-drawn in the operator's own pane, toasts go to `tmux display-message`, and the only things written
-anywhere are the run's own machine-log lines — one `receipt` per verified completion, and one
-`session-cost` per child when the run is over. The wake-up itself stays where it is, in
+drawn in the operator's own window, toasts go to `tmux display-message`, and the only things
+written anywhere are the run's own machine-log lines — one `receipt` per verified completion, and
+one `session-cost` per child when the run is over. The wake-up itself stays where it is, in
 `monitor-wave.sh`, with the contract it already has — armed while every child is busy, exit
 as soon as one needs attention, nonzero on a monitor error. This script is the display beside
 it, so a failure it meets is drawn rather than raised; `docs/monitor-dashboard.md` publishes both
 surfaces.
 
-The dashboard reads the machine log (`docs/machine-log.md`) joined with the live agents list. The
-worktree paths it is given are the wave's membership — the same arguments the wake-up is given.
+The dashboard takes the run directory, never a wave number or a worktree list: the wave table
+there is the whole run's membership, the machine log (`docs/machine-log.md`) is what has happened
+to it, and the live agents list is what its children are doing now. A ticket no launch event names
+is drawn `pending`, so "not started yet" is never mistaken for "lost".
 """
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -50,24 +55,104 @@ GUARD_ASSET_PATHS = (
 # state an installed guard asset is ever in.
 UNTRACKED_CODE = "??"
 
-# The two events that settle a ticket: after either, its state is that line's word and its clock
-# has stopped, whatever the agents list still says about its worktree.
-SETTLING_EVENTS = ("receipt", "outcome")
-SETTLED_STATE_KEYS = ("verdict", "outcome")
-ESCALATION_EVENT = "escalation"
+CLAUDE = "claude"
+CODEX = "codex"
 
-COLUMNS = ("WAVE", "TICKET", "CHILD", "STATE", "LAST EVENT", "ELAPSED")
+# The run directory's fixed layout: the whole run's membership, what has happened to it, where a
+# Codex child says how it is doing, what has already been toasted, and the window it is drawn in.
+WAVE_TABLE_NAME = "wave-table.json"
+MACHINE_LOG_NAME = "log.jsonl"
+CODEX_STATE_DIR = "codex"
+CODEX_STATE_GLOB = "*.json"
+TOAST_STATE_NAME = "toasts.json"
+WINDOW_RECORD_NAME = "dashboard-window"
+# Held across the check-create-record that makes a window, so two callers cannot make two.
+WINDOW_LOCK_NAME = "dashboard-window.lock"
+# One run, one dashboard, one window with this name — so the operator always knows where to look.
+DASHBOARD_WINDOW_NAME = "crew-dashboard"
+
+# The Ticket state vocabulary (`docs/glossary.md`): the words the operator reads, and the only
+# words this script draws. Every source state — a tmux process status, a settlement verdict, a
+# monitor internal — is mapped into one of them before it reaches a frame.
+PENDING = "pending"
+RUNNING = "running"
+WAITING = "waiting"
+PARKED = "parked"
+LANDABLE = "landable"
+MERGED = "merged"
+FAILED = "failed"
+VANISHED = "vanished"
+# The order the summary line counts them in: the way a ticket travels, start to finish.
+STATE_ORDER = (PENDING, RUNNING, WAITING, PARKED, LANDABLE, MERGED, FAILED, VANISHED)
+# The states that owe the operator an explanation; every other row stays quiet.
+ABNORMAL_STATES = (WAITING, FAILED, VANISHED)
+
+# The two anomalies, which are annotations rather than states: no row is ever `duplicate` or
+# `unknown`, because both describe what the agents list did, not where the ticket is.
+DUPLICATE = "duplicate"
+UNKNOWN = "unknown"
+
+# Every settling event and the word it settles a ticket into. A ticket keeps travelling after a
+# receipt — a landable branch is merged next — so the last settling line the log carries wins.
+SETTLED_STATES = {
+    "receipt": ("verdict", {"landable": LANDABLE, "parked": PARKED, "failed": FAILED}),
+    "outcome": ("outcome", {
+        "completed": MERGED, "failed": FAILED, "parked": PARKED, "blocked": PENDING,
+    }),
+    "merge": ("result", {"clean": MERGED, "repaired": MERGED}),
+}
+# Where a live child of each lane says how it is doing, and what its words mean to the operator.
+# The two sources are disjoint: a Codex child has no entry in the agents list at all — the bridge
+# is the only thing that knows about it — so a run's Codex tickets are read from its state files
+# or drawn `vanished` on every frame. `idle` in either lane is a child that has stopped without
+# settling anything, which needs the operator as much as a permission prompt does.
+LIVE_SOURCES = {
+    CLAUDE: "the agents list",
+    CODEX: "the codex bridge state",
+}
+LIVE_STATES = {
+    CLAUDE: {"busy": RUNNING, "waiting": WAITING, "idle": WAITING, "parked": PARKED},
+    CODEX: {"busy": RUNNING, "idle": WAITING, "stopped": VANISHED},
+}
+# What a child that has stopped is toasted as. The two situations send the operator to different
+# places, so neither is announced in the other's words.
+ATTENTION_TOASTS = {
+    "waiting": "stuck at a permission prompt",
+    "idle": "stopped without finishing",
+}
+# The qualifier each event carries, in the order an annotation looks for one.
+EVENT_QUALIFIERS = ("verdict", "outcome", "result", "decision", "state")
+ESCALATION_EVENT = "escalation"
+REVIEW_EVENT = "review"
+REVIEW_RUNNING = "running"
+# The advance decisions after which nothing more happens in this run.
+ADVANCE_EVENT = "advance"
+FINAL_DECISIONS = ("complete", "escalated", "interrupted")
+
+COLUMNS = ("WAVE", "TICKET", "TITLE", "EXECUTOR", "STATE", "ELAPSED")
+# The one column that has no natural width — it is given whatever the window has left over — and
+# the one that is drawn in colour.
+TITLE_COLUMN = COLUMNS.index("TITLE")
+STATE_COLUMN = COLUMNS.index("STATE")
 COLUMN_GAP = "  "
-# What an unsettled row shows when the agents list cannot be read, and when it holds more than one
-# session for the same worktree — the wake monitor's own word for that.
-UNKNOWN_STATE = "unknown"
-VANISHED_STATE = "vanished"
-DUPLICATE_STATE = "duplicate"
-STUCK_STATE = "waiting"
+ANNOTATION_PREFIX = "  ↳ "
+NO_ELAPSED = "--"
+ELLIPSIS = "…"
+FALLBACK_WIDTH = 80
 CLEAR_SCREEN = "\x1b[H\x1b[2J"
 
+# One SGR colour per state, and the reset that ends it. Applied to the state cell alone, and only
+# when a terminal is watching: `plain` is what a pipe, a redirect and every test sees.
+STATE_COLOURS = {
+    PENDING: "90", RUNNING: "36", WAITING: "33", PARKED: "35",
+    LANDABLE: "32", MERGED: "32", FAILED: "31", VANISHED: "31",
+}
+COLOUR_RESET = "\x1b[0m"
+
 DEFAULT_REFRESH_SECONDS = 5.0
-TOAST_STATE_NAME = "toasts.json"
+# How long the renderer sleeps between checks once the run is over: it has stopped drawing, and it
+# stays alive only so the window keeps the last frame until the human closes it.
+HOLD_SECONDS = 3600.0
 
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -78,8 +163,6 @@ CLAUDE_TRANSCRIPTS = ("CLAUDE_CONFIG_DIR", ".claude", "projects")
 CODEX_TRANSCRIPTS = ("CODEX_HOME", ".codex", "sessions")
 TRANSCRIPT_GLOB = "**/*.jsonl"
 
-CLAUDE = "claude"
-CODEX = "codex"
 # The four disjoint counters every child's usage is normalised to, in the order the rollup shows
 # them. Disjoint is what makes them addable: Codex reports its cached tokens inside its input
 # count and Claude reports them beside it, so one of the two is converted rather than compared.
@@ -97,7 +180,6 @@ SESSION_SEPARATOR = ","
 MALFORMED = object()
 UNDETERMINED = object()
 
-LANDABLE = "landable"
 MONITOR_ERROR_EXIT = 3
 
 
@@ -122,7 +204,7 @@ def now():
 def elapsed(start, end):
     """`HH:MM:SS` between two moments, or `--` when either of them was never stamped."""
     if start is None or end is None:
-        return "--"
+        return NO_ELAPSED
     seconds = max(int((end - start).total_seconds()), 0)
     return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
@@ -209,99 +291,297 @@ def agent_states(claude_bin):
         if not isinstance(agent, dict) or "cwd" not in agent:
             continue
         cwd = worktree_key(agent["cwd"])
-        states[cwd] = DUPLICATE_STATE if cwd in states else str(agent.get("status", UNKNOWN_STATE))
+        states[cwd] = DUPLICATE if cwd in states else str(agent.get("status", UNKNOWN))
     return states
 
 
+def codex_states(run_dir):
+    """Each live Codex child's status by the worktree its bridge recorded, never by spelling.
+
+    A Codex child is invisible to `claude agents --json`, so its bridge state file is the only
+    thing that knows it is alive: read nothing here and every Codex ticket of a run is drawn
+    `vanished` from the first frame. A file that cannot be read is not a child that stopped, so it
+    is passed over rather than counted as one.
+    """
+    states = {}
+    for path in sorted((pathlib.Path(run_dir) / CODEX_STATE_DIR).glob(CODEX_STATE_GLOB)):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        cwd = state.get("cwd") if isinstance(state, dict) else None
+        if not cwd:
+            continue
+        key = worktree_key(cwd)
+        states[key] = DUPLICATE if key in states else str(state.get("status", UNKNOWN))
+    return states
+
+
+def live_sources(claude_bin, run_dir):
+    """What each lane says about its own children: the agents list, and the bridge state files."""
+    return {CLAUDE: agent_states(claude_bin), CODEX: codex_states(run_dir)}
+
+
+def read_table(run_dir):
+    """The run's approved wave table: every wave, with every ticket of it, in the table's order.
+
+    A dashboard drawn from a table nobody could read would be an empty frame, which is exactly the
+    failure this window exists to make impossible — so an unreadable table stops the command
+    instead.
+    """
+    path = pathlib.Path(run_dir) / WAVE_TABLE_NAME
+    try:
+        table = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise MonitorError(f"the run's wave table could not be read at {path}: {error}")
+    except ValueError as error:
+        raise MonitorError(f"{path} is not the wave table's JSON: {error}")
+    waves = table.get("waves") if isinstance(table, dict) else None
+    if not isinstance(waves, list):
+        raise MonitorError(f"{path} carries no waves list")
+    return waves
+
+
+def settling_state(record):
+    """The word this record settles a ticket into, or None when it settles nothing."""
+    key, words = SETTLED_STATES.get(str(record.get("event")), (None, {}))
+    if key is None:
+        return None
+    return words.get(str(record.get(key)))
+
+
 def settled(events):
-    """The record that settled this ticket, or None while it is still live."""
+    """The last record that settled this ticket and the word it settled it into, or two Nones.
+
+    The last one wins rather than the first: a ticket keeps travelling after its receipt — a
+    landable branch is merged next — and where it is now is what the operator is looking for.
+    """
     for record in reversed(events):
-        if record.get("event") in SETTLING_EVENTS:
-            return record
+        state = settling_state(record)
+        if state is not None:
+            return record, state
+    return None, None
+
+
+def live_state(launch, sources):
+    """What a launched, unsettled ticket is doing now: its state, its anomaly, and its raw status.
+
+    Each lane is read from its own source, chosen by the executor its launch names, because the
+    two do not overlap: a Claude child is in the agents list and a Codex child is in its bridge
+    state file, and asking either about the other's children answers `vanished`.
+
+    An anomaly is not a state: `duplicate` and `unknown` say what a reading did, not where the
+    ticket got to, so the row keeps the state its own log line justifies and carries the anomaly
+    as an annotation underneath. The raw status rides along because two of them mean the same
+    state and different things to the operator — a permission prompt is not a finished turn.
+    """
+    executor = str(launch.get("executor", ""))
+    if executor not in LIVE_STATES:
+        return RUNNING, (UNKNOWN, f"the launch names executor {executor or '(none)'}"), None
+    states = sources.get(executor)
+    if states is None:
+        return RUNNING, (UNKNOWN, f"{LIVE_SOURCES[executor]} could not be read"), None
+    status = states.get(worktree_key(launch.get("worktree")))
+    if status is None:
+        return VANISHED, None, None
+    if status == DUPLICATE:
+        return RUNNING, (DUPLICATE, f"more than one session in {launch.get('worktree')}"), status
+    if status not in LIVE_STATES[executor]:
+        return RUNNING, (UNKNOWN, f"{LIVE_SOURCES[executor]} calls it {status}"), status
+    return LIVE_STATES[executor][status], None, status
+
+
+def event_note(record):
+    """One line of what an event was: its name, the word it carried, and its detail."""
+    parts = [str(record.get("event", ""))]
+    for key in EVENT_QUALIFIERS:
+        value = record.get(key)
+        if value:
+            parts.append(str(value))
+            break
+    note = " ".join(parts)
+    detail = record.get("detail")
+    if detail:
+        note += " — " + " ".join(str(detail).split())
+    return note
+
+
+def review_note(events, moment):
+    """The review this ticket is under, or None when it is under none.
+
+    The log's last `review` line for the ticket is the one that holds: a review that has returned
+    says so, and its row goes quiet again.
+    """
+    for record in reversed(events):
+        if record.get("event") != REVIEW_EVENT:
+            continue
+        if str(record.get("state")) != REVIEW_RUNNING:
+            return None
+        lane = " ".join(str(record.get("lane", "")).split())
+        clock = elapsed(parse_timestamp(record.get("ts")), moment)
+        return f"review: {lane} {REVIEW_RUNNING} · {clock}"
     return None
 
 
-def settled_state(record):
-    """The word a settling record settles a ticket into: its verdict, or its outcome."""
-    for key in SETTLED_STATE_KEYS:
-        value = record.get(key)
-        if value:
-            return str(value)
-    return str(record.get("event"))
+def annotations(events, state, anomaly, moment):
+    """The lines drawn under one row: its review, its anomaly, and what last happened to it."""
+    lines = []
+    review = review_note(events, moment)
+    if review:
+        lines.append(review)
+    if anomaly is not None:
+        lines.append(f"anomaly: {anomaly[0]} · {anomaly[1]}")
+    if state in ABNORMAL_STATES and events:
+        lines.append(f"last event: {event_note(events[-1])} · {events[-1].get('ts')}")
+    return lines
 
 
-def build_rows(records, worktrees, wave, moment, states):
-    """One row per launched ticket of this wave, in ticket order.
+def build_rows(waves, records, moment, sources):
+    """One row per ticket of every wave, in the order the approved table lists them.
 
-    A worktree the log carries no `launch` for was never launched into and is not a row; a ticket
-    launched twice into the same worktree — a replacement child — is the one row its last launch
-    describes.
+    A ticket no `launch` event names has not started, which is what `pending` says: the frame
+    shows the whole run from its first draw, so "not started yet" is never read as "lost". A
+    ticket launched twice — a replacement child — is the one row its last launch describes.
     """
-    wanted = {worktree_key(path) for path in worktrees}
     launches = {}
     for record in records:
-        if record.get("event") == "launch" and worktree_key(record.get("worktree")) in wanted:
+        if record.get("event") == "launch":
             launches[str(record.get("ticket"))] = record
 
     rows = []
-    for ticket, launch in sorted(launches.items()):
-        events = [record for record in records if str(record.get("ticket")) == ticket]
-        settling = settled(events)
-        if settling is not None:
-            state = settled_state(settling)
-            end = parse_timestamp(settling.get("ts"))
-        elif states is None:
-            state = UNKNOWN_STATE
-            end = moment
-        else:
-            state = states.get(worktree_key(launch.get("worktree")), VANISHED_STATE)
-            end = moment
-        rows.append({
-            "wave": str(wave),
-            "ticket": ticket,
-            "child": str(launch.get("child", "")),
-            "state": state,
-            "last_event": str(events[-1].get("event", "")) if events else "",
-            "elapsed": elapsed(parse_timestamp(launch.get("ts")), end),
-            "settled": settling is not None,
-            "escalated": any(record.get("event") == ESCALATION_EVENT for record in events),
-        })
+    for wave in waves:
+        number = str(wave.get("wave", ""))
+        for entry in wave.get("tickets") or []:
+            ticket = str(entry.get("id", ""))
+            events = [record for record in records if str(record.get("ticket")) == ticket]
+            launch = launches.get(ticket)
+            settling, settled_into = settled(events)
+            anomaly = None
+            status = None
+            if launch is None:
+                state, started, end = PENDING, None, None
+            else:
+                started = parse_timestamp(launch.get("ts"))
+                if settling is not None:
+                    state, end = settled_into, parse_timestamp(settling.get("ts"))
+                else:
+                    state, anomaly, status = live_state(launch, sources)
+                    end = moment
+            rows.append({
+                "wave": number,
+                "ticket": ticket,
+                "title": str(entry.get("title", "")),
+                "executor": "/".join(
+                    part for part in (str(entry.get("executor", "")), str(entry.get("model", "")))
+                    if part
+                ),
+                "state": state,
+                "status": status,
+                "elapsed": elapsed(started, end),
+                "started": started,
+                "launched": launch is not None,
+                "settled": settling is not None,
+                "escalated": any(record.get("event") == ESCALATION_EVENT for record in events),
+                "annotations": annotations(events, state, anomaly, moment),
+            })
     return rows
 
 
-def render(rows, wave, moment):
-    """The dashboard as the pane shows it: a title, a header, and one line per launched ticket."""
+def over(records):
+    """Whether nothing more will happen in this run, which is when the frame stops moving."""
+    return any(
+        record.get("event") == ADVANCE_EVENT and str(record.get("decision")) in FINAL_DECISIONS
+        for record in records
+    )
+
+
+def terminal_width():
+    """How wide the window is, as the terminal or `COLUMNS` has it."""
+    return shutil.get_terminal_size(fallback=(FALLBACK_WIDTH, 24)).columns
+
+
+def cut(text, width):
+    """`text` in at most `width` columns, the last one spent saying it was cut."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    return text[: width - 1].rstrip() + ELLIPSIS
+
+
+def summary(rows, run_id, waves, moment):
+    """The one line above the table: which run, how far through its waves, and how it stands."""
+    counts = {state: 0 for state in STATE_ORDER}
+    for row in rows:
+        counts[row["state"]] += 1
+    started = [row["started"] for row in rows if row["started"] is not None]
+    parts = [
+        f"wave {len({row['wave'] for row in rows if row['launched']})}/{waves}",
+        " ".join(f"{state}={counts[state]}" for state in STATE_ORDER if counts[state]),
+        f"elapsed {elapsed(min(started) if started else None, moment)}",
+    ]
+    return f"crew {run_id} — " + " · ".join(part for part in parts if part)
+
+
+def paint(text, state, colour):
+    """The state cell in its own colour, or exactly as it was when nothing can show one."""
+    code = STATE_COLOURS.get(state) if colour else None
+    return f"\x1b[{code}m{text}{COLOUR_RESET}" if code else text
+
+
+def render(rows, run_id, waves, moment, width=None, colour=False):
+    """The whole frame: the summary line, the header, and each row with its annotations."""
+    width = width or terminal_width()
     cells = [list(COLUMNS)] + [
-        [row["wave"], row["ticket"], row["child"], row["state"], row["last_event"], row["elapsed"]]
+        [row["wave"], row["ticket"], row["title"], row["executor"], row["state"], row["elapsed"]]
         for row in rows
     ]
-    widths = [max(len(row[column]) for row in cells) for column in range(len(COLUMNS))]
-    lines = [f"crew wave {wave} — {moment.strftime(TIMESTAMP_FORMAT)}"]
-    lines += [
-        COLUMN_GAP.join(value.ljust(width) for value, width in zip(row, widths)).rstrip()
-        for row in cells
-    ]
+    widths = [max(len(row[index]) for row in cells) for index in range(len(COLUMNS))]
+    # Every other column is as wide as its content; the title takes what the window has left.
+    fixed = sum(widths) - widths[TITLE_COLUMN] + len(COLUMN_GAP) * (len(COLUMNS) - 1)
+    widths[TITLE_COLUMN] = max(min(widths[TITLE_COLUMN], width - fixed), 0)
+
+    lines = [cut(summary(rows, run_id, waves, moment), width)]
+    for index, values in enumerate(cells):
+        values = list(values)
+        values[TITLE_COLUMN] = cut(values[TITLE_COLUMN], widths[TITLE_COLUMN])
+        padded = [value.ljust(size) for value, size in zip(values, widths)]
+        if index:
+            padded[STATE_COLUMN] = paint(padded[STATE_COLUMN], rows[index - 1]["state"], colour)
+        lines.append(COLUMN_GAP.join(padded).rstrip())
+        if index:
+            lines += [
+                cut(ANNOTATION_PREFIX + note, width) for note in rows[index - 1]["annotations"]
+            ]
     return "\n".join(lines)
 
 
-def toasts(rows, wave):
+def toasts(rows):
     """Every toast this pass has grounds for, each with the key that says it has been said.
 
     The key is per run, not per pass: an exception is announced when it becomes true and is not
-    repeated while it stays true, which is what makes a refreshing pane bearable to sit beside.
+    repeated while it stays true, which is what makes a refreshing window bearable to sit beside.
     """
     said = []
+    waves = {}
     for row in rows:
         ticket = row["ticket"]
-        if not row["settled"]:
-            if row["state"] == STUCK_STATE:
-                said.append((f"stuck:{ticket}", f"crew {ticket} stuck at a permission prompt"))
-            elif row["state"] == VANISHED_STATE:
+        if row["launched"] and not row["settled"]:
+            if row["state"] == WAITING and row["status"] in ATTENTION_TOASTS:
+                # Keyed on the raw status, so a child that waits and later goes idle says both.
+                said.append((
+                    f"{row['status']}:{ticket}",
+                    f"crew {ticket} {ATTENTION_TOASTS[row['status']]}",
+                ))
+            elif row["state"] == VANISHED:
                 said.append((f"vanished:{ticket}", f"crew {ticket} vanished"))
         if row["escalated"]:
             said.append((f"escalated:{ticket}", f"crew {ticket} escalated"))
-    if rows and all(row["settled"] for row in rows):
-        said.append((f"wave-complete:{wave}", f"crew wave {wave} complete"))
+        waves.setdefault(row["wave"], []).append(row)
+    for wave, members in waves.items():
+        # A wave nobody has launched into is not a wave that finished.
+        if any(row["launched"] for row in members) and all(row["settled"] for row in members):
+            said.append((f"wave-complete:{wave}", f"crew wave {wave} complete"))
     return said
 
 
@@ -331,11 +611,11 @@ def display(tmux_bin, text):
         pass
 
 
-def emit_toasts(rows, wave, state_path, tmux_bin):
+def emit_toasts(rows, state_path, tmux_bin):
     """Display the toasts this pass has grounds for and has not shown; returns their texts."""
     said = read_said(state_path)
     shown = []
-    for key, text in toasts(rows, wave):
+    for key, text in toasts(rows):
         if key in said:
             continue
         display(tmux_bin, text)
@@ -346,54 +626,134 @@ def emit_toasts(rows, wave, state_path, tmux_bin):
     return shown
 
 
-def toast_state_path(args):
-    """Where this run remembers what it has already toasted: beside its machine log by default."""
+def run_directory(args):
+    """The run directory, absolute: every path this command reads or writes hangs off it."""
+    return pathlib.Path(args.run_dir).resolve()
+
+
+def toast_state_path(args, run_dir):
+    """Where this run remembers what it has already toasted: in the run directory by default."""
     if args.toast_state:
         return pathlib.Path(args.toast_state)
-    return pathlib.Path(args.log).resolve().parent / TOAST_STATE_NAME
+    return run_dir / TOAST_STATE_NAME
 
 
-def draw(args, moment):
-    records = read_log(args.log)
-    rows = build_rows(records, args.worktrees, args.wave, moment, agent_states(args.claude_bin))
-    print(render(rows, args.wave, moment), flush=True)
-    emit_toasts(rows, args.wave, toast_state_path(args), args.tmux_bin)
+def colour_wanted(args):
+    """Whether a terminal is watching that can show colour, which is the only time it is drawn."""
+    return bool(sys.stdout.isatty()) and not args.no_color and not os.environ.get("NO_COLOR")
+
+
+def draw(args, run_dir, moment):
+    """Draw one frame of the whole run; returns whether the run it drew is over."""
+    waves = read_table(run_dir)
+    records = read_log(run_dir / MACHINE_LOG_NAME)
+    rows = build_rows(waves, records, moment, live_sources(args.claude_bin, run_dir))
+    print(
+        render(rows, run_dir.name, len(waves), moment, colour=colour_wanted(args)),
+        flush=True,
+    )
+    emit_toasts(rows, toast_state_path(args, run_dir), args.tmux_bin)
+    return over(records)
+
+
+def hold():
+    """Keep the finished frame on screen: no more drawing, and nothing closes the window."""
+    while True:
+        time.sleep(HOLD_SECONDS)
 
 
 def run_dashboard(args):
-    """Draw the wave once, or keep drawing it over itself; returns 0."""
+    """Draw the run once, or keep drawing it over itself until the run is over; returns 0."""
+    run_dir = run_directory(args)
     if args.refresh is None:
-        draw(args, args.now or now())
+        draw(args, run_dir, args.now or now())
         return 0
     while True:
         print(CLEAR_SCREEN, end="")
-        draw(args, args.now or now())
+        if draw(args, run_dir, args.now or now()):
+            return hold()
         time.sleep(args.refresh)
 
 
-def dashboard_command(args):
-    """The command line the pane runs: this script's own dashboard, in its refresh loop."""
+def dashboard_command(args, run_dir):
+    """The command line the window runs: this script's own dashboard, in its refresh loop."""
     command = [
         sys.executable, str(pathlib.Path(__file__).resolve()), "dashboard",
-        "--log", str(args.log), "--wave", str(args.wave),
+        "--run-dir", str(run_dir),
         "--refresh", str(args.refresh if args.refresh is not None else DEFAULT_REFRESH_SECONDS),
     ]
     if args.toast_state:
         command += ["--toast-state", str(args.toast_state)]
-    command += [str(worktree) for worktree in args.worktrees]
     return shlex.join(command)
 
 
-def run_pane(args):
-    """Split the run's dashboard pane and print its id; returns 0, or 3 if tmux refused."""
+def recorded_window(run_dir):
+    """The dashboard window this run recorded, or None if it has never had one."""
+    try:
+        return (run_dir / WINDOW_RECORD_NAME).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def live_windows(tmux_bin):
+    """Every window id tmux currently has, across every session."""
     result = subprocess.run(
-        [args.tmux_bin, "split-window", "-d", "-P", "-t", args.session, dashboard_command(args)],
+        [tmux_bin, "list-windows", "-a", "-F", "#{window_id}"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise MonitorError(f"tmux list-windows failed: {(result.stderr or '').strip()}")
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+@contextlib.contextmanager
+def window_lock(run_dir):
+    """Hold the run's dashboard window for the whole check-create-record.
+
+    Reading the record, asking tmux, creating a window and writing the id back is one decision:
+    two callers interleaving inside it both find nothing recorded and both create a window, which
+    is the one thing this command exists to prevent.
+    """
+    with (run_dir / WINDOW_LOCK_NAME).open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def run_window(args):
+    """Give the run its one dashboard window and print its id; returns 0.
+
+    The whole lifecycle is here and idempotent: the recorded window is reused while it is alive,
+    a window the operator closed is recreated on the next call — which is what makes this safe for
+    a resuming coordinator to re-run — and nothing here ever closes one.
+    """
+    run_dir = run_directory(args)
+    with window_lock(run_dir):
+        return make_window(args, run_dir)
+
+
+def make_window(args, run_dir):
+    """Reuse the run's live dashboard window, or create and record one; returns 0."""
+    recorded = recorded_window(run_dir)
+    if recorded and recorded in live_windows(args.tmux_bin):
+        print(recorded)
+        return 0
+    result = subprocess.run(
+        [
+            args.tmux_bin, "new-window", "-d", "-P", "-F", "#{window_id}",
+            "-n", DASHBOARD_WINDOW_NAME, "-t", args.session,
+            dashboard_command(args, run_dir),
+        ],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        print(f"MONITOR ERROR tmux split-window failed: {result.stderr.strip()}", file=sys.stderr)
-        return MONITOR_ERROR_EXIT
-    print(result.stdout.strip())
+        raise MonitorError(f"tmux new-window failed: {(result.stderr or '').strip()}")
+    window_id = result.stdout.strip()
+    if not window_id:
+        raise MonitorError("tmux new-window printed no window id")
+    (run_dir / WINDOW_RECORD_NAME).write_text(window_id + "\n", encoding="utf-8")
+    print(window_id)
     return 0
 
 
@@ -801,15 +1161,13 @@ def build_parser():
     parser.add_argument("--tmux-bin", default=TMUX_BIN, help="the tmux to toast and split through")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    def wave_command(name, help_text):
+    def run_command(name, help_text):
         command = commands.add_parser(name, help=help_text)
-        command.add_argument("--log", required=True, help="the run's machine log")
-        command.add_argument("--wave", required=True, help="the wave these worktrees belong to")
+        command.add_argument("--run-dir", required=True, help="the run's directory")
         command.add_argument("--toast-state", help="where this run remembers what it has toasted")
-        command.add_argument("worktrees", nargs="+", help="the wave's worktrees")
         return command
 
-    dashboard = wave_command("dashboard", "draw one wave as a table and toast what changed")
+    dashboard = run_command("dashboard", "draw the whole run as a table and toast what changed")
     dashboard.set_defaults(handler=run_dashboard)
     dashboard.add_argument(
         "--refresh", type=float, help="redraw every this many seconds instead of drawing once"
@@ -818,13 +1176,16 @@ def build_parser():
         "--now", type=timestamp_argument,
         help="the moment elapsed times are measured to, stamped as the log stamps (default: now)",
     )
+    dashboard.add_argument(
+        "--no-color", action="store_true", help="draw plain text even where colour would show"
+    )
 
-    pane = wave_command("pane", "split a dedicated tmux pane running the dashboard")
-    pane.set_defaults(handler=run_pane)
-    pane.add_argument("--session", required=True, help="the tmux target the pane is split in")
-    pane.add_argument(
+    window = run_command("window", "create, reuse or recreate the run's one dashboard window")
+    window.set_defaults(handler=run_window)
+    window.add_argument("--session", required=True, help="the tmux target the window is created in")
+    window.add_argument(
         "--refresh", type=float,
-        help=f"the pane's redraw interval in seconds (default: {DEFAULT_REFRESH_SECONDS})",
+        help=f"the window's redraw interval in seconds (default: {DEFAULT_REFRESH_SECONDS})",
     )
 
     cost = commands.add_parser("cost", help="record what each child spent and roll the run up")

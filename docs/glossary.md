@@ -48,6 +48,26 @@ form a directed acyclic graph.
 depend on each other, so they run in parallel; the next wave is cut only after the whole wave has
 landed.
 
+**Ticket state** — Where one ticket has got to, in the one vocabulary every part of the run speaks
+to a human: the dashboard, the toasts and the final report. Internal words — a tmux process
+status, a monitor's own bookkeeping, a settlement verdict — are mapped into it before they reach
+anyone, so nobody has to translate.
+
+| State | The ticket |
+| --- | --- |
+| `pending` | is in the table and has not been launched yet |
+| `running` | has a live child working on it |
+| `waiting` | has a child that stopped without settling anything: a prompt, or an idle turn |
+| `parked` | needs an irreversible action, so it is waiting for a human |
+| `landable` | has a verified completion receipt and has not been merged yet |
+| `merged` | is in the integration branch |
+| `failed` | did not produce work that could land |
+| `vanished` | was launched and its child is no longer there |
+
+Two more words describe what a *reading* did rather than where a ticket got to, so they are drawn
+as annotations beneath a row and are never a state of their own: `duplicate`, where two sessions
+are running in one worktree, and `unknown`, where the agents list could not be read at all.
+
 ## Routing
 
 **Routing** — What `/route` concludes for one ticket: workflow, executor, model, effort, plus a
