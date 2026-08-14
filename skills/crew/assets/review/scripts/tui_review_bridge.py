@@ -724,9 +724,21 @@ async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
     raise RuntimeError(f"Timed out connecting to Codex app-server: {suffix}")
 
 
-async def start_thread(client, cwd):
-    """Returns the id of a new thread the bridge owns, booting its MCP servers."""
-    result = await client.request("thread/start", {"cwd": cwd})
+async def start_thread(client, cwd, sandbox, approval):
+    """Returns a new thread id with its unattended approval and sandbox policy.
+
+    Thread start takes the sandbox as a bare enum string, unlike the tagged
+    sandbox object used by turn start; the session approval policy suppresses
+    per-tool prompts in this unattended review.
+    """
+    result = await client.request(
+        "thread/start",
+        {
+            "cwd": cwd,
+            "approvalPolicy": approval,
+            "sandbox": sandbox,
+        },
+    )
     thread_id = (result.get("thread") or {}).get("id")
     if not thread_id:
         raise RuntimeError("Codex app-server started a thread without an id")
@@ -998,7 +1010,9 @@ async def run_new_review(args, owner, store):
             runtime_dir / "app-server.log",
         )
         try:
-            thread_id = await start_thread(client, args.cwd)
+            thread_id = await start_thread(
+                client, cwd=args.cwd, sandbox=args.sandbox, approval=args.approval
+            )
             await wait_for_mcp_startup(client, pane_id, args.startup_timeout)
             await start_turn(client, thread_id, prompt, args.model, args.effort)
             session_id = str(uuid.uuid4())
