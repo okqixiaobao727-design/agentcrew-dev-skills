@@ -4,6 +4,8 @@
     dashboard  draw the whole run as a table — one row per ticket of every wave — and toast what
                just became true, refreshing in place when asked to
     window     create, reuse or recreate the run's one dedicated tmux window running that loop
+    pin        draw one frame of the live run into the coordinator's Claude Code statusline, or
+               draw nothing at all
     verify     decide whether a child's `CREW COMPLETE <sha>` holds, and log the receipt it earns
     cost       at run completion, log what each child's sessions spent and roll the run up
 
@@ -149,7 +151,26 @@ STATE_COLOURS = {
 }
 COLOUR_RESET = "\x1b[0m"
 
+# The pin registry (`docs/monitor-dashboard.md`): the directory a live run leaves the file naming
+# itself in, under the operator's Claude config, and the three things that file carries.
+PIN_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "agentcrew/pins")
+PIN_GLOB = "*.json"
+PIN_RUN_DIR = "run_dir"
+PIN_PID = "coordinator_pid"
+PIN_SESSION = "tmux_session"
+# What tmux exports into every session it runs — socket path, client pid, session id — which is
+# where the caller's own session is read from before tmux itself is asked.
+TMUX_ENVIRONMENT = "TMUX"
+TMUX_ENVIRONMENT_FIELDS = 3
+# tmux's own spelling of a session id, and the suffix a session is addressed as a target by.
+SESSION_PREFIX = "$"
+SESSION_TARGET_SUFFIX = ":"
+
 DEFAULT_REFRESH_SECONDS = 5.0
+# How long one statusline tick gives a live source before drawing its row `unknown` instead. The
+# tick draws the status line the operator's whole session depends on, so nothing in it may wait
+# indefinitely.
+DEFAULT_TIMEOUT_SECONDS = 2.0
 # How long the renderer sleeps between checks once the run is over: it has stopped drawing, and it
 # stays alive only so the window keeps the last frame until the human closes it.
 HOLD_SECONDS = 3600.0
@@ -271,15 +292,22 @@ def read_log(path):
     return records
 
 
-def agent_states(claude_bin):
+def agent_states(claude_bin, timeout=None):
     """Each live session's status by its `cwd`, or None when the agents list cannot be read.
 
     A worktree the list carries twice has no single status, so it is reported as the duplicate the
     wake monitor calls an error — the dashboard draws it and leaves the stopping to the wake-up.
+
+    A list that does not answer within `timeout` is one that could not be read: a caller drawing
+    into a statusline cannot wait on it, and a row drawn `unknown` says more than no frame at all.
     """
-    result = subprocess.run(
-        [claude_bin, "agents", "--json"], capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            [claude_bin, "agents", "--json"],
+            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
     try:
@@ -297,18 +325,35 @@ def agent_states(claude_bin):
     return states
 
 
-def codex_states(run_dir):
+def read_without_blocking(path):
+    """One file's whole text, without ever waiting on what kind of file it turned out to be.
+
+    A path that is not a regular file — a fifo left in the run directory — makes an ordinary
+    read wait for a writer that may never come, and no part of a statusline tick may wait.
+    """
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def codex_states(run_dir, timeout=None):
     """Each live Codex child's status by the worktree its bridge recorded, never by spelling.
 
     A Codex child is invisible to `claude agents --json`, so its bridge state file is the only
     thing that knows it is alive: read nothing here and every Codex ticket of a run is drawn
     `vanished` from the first frame. A file that cannot be read is not a child that stopped, so it
     is passed over rather than counted as one.
+
+    The whole read is bounded by `timeout`, as the other lane's is: a source that has spent its
+    budget answers None — the lane a caller draws `unknown` — rather than holding up the frame.
     """
+    deadline = None if timeout is None else time.monotonic() + timeout
     states = {}
     for path in sorted((pathlib.Path(run_dir) / CODEX_STATE_DIR).glob(CODEX_STATE_GLOB)):
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(read_without_blocking(path))
         except (OSError, ValueError):
             continue
         cwd = state.get("cwd") if isinstance(state, dict) else None
@@ -319,9 +364,9 @@ def codex_states(run_dir):
     return states
 
 
-def live_sources(claude_bin, run_dir):
+def live_sources(claude_bin, run_dir, timeout=None):
     """What each lane says about its own children: the agents list, and the bridge state files."""
-    return {CLAUDE: agent_states(claude_bin), CODEX: codex_states(run_dir)}
+    return {CLAUDE: agent_states(claude_bin, timeout), CODEX: codex_states(run_dir, timeout)}
 
 
 def read_table(run_dir):
@@ -759,8 +804,161 @@ def make_window(args, run_dir):
     return 0
 
 
+def session_key(session):
+    """One tmux session's identity, however the caller or the pin spelled it.
+
+    tmux writes a session id as `$7`, addresses that session as the target `$7:` and exports the
+    bare `7` into the environment, and all three name one session — so the spelling is taken off
+    before two of them are ever compared. A session nobody named is None, which matches no pin.
+    """
+    text = str(session or "").strip().removesuffix(SESSION_TARGET_SUFFIX)
+    return text.removeprefix(SESSION_PREFIX) or None
+
+
+def caller_session(tmux_bin, timeout):
+    """The tmux session this tick was called from, or None when nothing can say.
+
+    The environment is asked first because it costs nothing and cannot hang: tmux exports the
+    session id into every session it runs. tmux itself is only consulted when that variable is
+    absent or is not the three fields it publishes.
+    """
+    fields = os.environ.get(TMUX_ENVIRONMENT, "").split(",")
+    if len(fields) == TMUX_ENVIRONMENT_FIELDS and session_key(fields[-1]):
+        return session_key(fields[-1])
+    try:
+        result = subprocess.run(
+            [tmux_bin, "display-message", "-p", "#{session_id}"],
+            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return session_key(result.stdout) if result.returncode == 0 else None
+
+
+def read_pin(path):
+    """One pin as the run wrote it, or None when that file is not a pin at all.
+
+    A pin names its run directory as an absolute realpath (ADR-0007), so it is resolved here and
+    an aliased spelling never becomes a second run.
+    """
+    try:
+        pin = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(pin, dict):
+        return None
+    run_dir = pin.get(PIN_RUN_DIR)
+    pid = pin.get(PIN_PID)
+    if not run_dir or not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    return {
+        "run_dir": pathlib.Path(worktree_key(run_dir)),
+        "pid": pid,
+        "session": session_key(pin.get(PIN_SESSION)),
+    }
+
+
+def read_pins(pin_dir):
+    """Every pin the registry carries, in a fixed order; a file that is not one is passed over."""
+    try:
+        paths = sorted(pathlib.Path(pin_dir).glob(PIN_GLOB))
+    except OSError:
+        return []
+    return [pin for pin in (read_pin(path) for path in paths) if pin is not None]
+
+
+def select_pin(pins, session):
+    """The one run this tick draws, or None when the registry cannot name a single one.
+
+    The caller's own session decides, so two crews at once never cross frames. A registry holding
+    one pin is drawn whatever session that pin records — the single-run case must work from a
+    session the run was never told about. Two pins recording one session name a single run no
+    better than two unmatched pins do, so both draw nothing.
+    """
+    matching = [pin for pin in pins if session is not None and pin["session"] == session]
+    if matching:
+        return matching[0] if len(matching) == 1 else None
+    return pins[0] if len(pins) == 1 else None
+
+
+def alive(pid):
+    """Whether the coordinator that wrote this pin is still running.
+
+    The whole crash story: a run whose coordinator is gone has no frame to draw, and there is no
+    watchdog, no heartbeat and no liveness file behind that.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A process this user may not signal is still a process, so the pid is not free.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def pin_directory(args):
+    """The pin registry this tick reads: the one it was given, or the operator's own."""
+    return pathlib.Path(args.pin_dir) if args.pin_dir else transcript_root(PIN_REGISTRY)
+
+
+def pin_colour(args):
+    """Whether the frame is painted: unlike the dashboard's, this stdout is always a pipe.
+
+    Claude Code passes raw ANSI through to the statusline it draws, so colour is on by default
+    here and only the operator's own two ways of refusing it turn it off.
+    """
+    return not args.no_color and not os.environ.get("NO_COLOR")
+
+
+def pin_frame(args, run_dir, moment):
+    """The frame that run has to draw right now, or None when it has none.
+
+    A run the log says is over is a run whose final frame lives in the report and the machine log
+    rather than on the operator's screen.
+    """
+    records = read_log(run_dir / MACHINE_LOG_NAME)
+    if over(records):
+        return None
+    waves = read_table(run_dir)
+    sources = live_sources(args.claude_bin, run_dir, args.timeout)
+    rows = build_rows(waves, records, moment, sources)
+    return render(rows, run_dir.name, len(waves), moment, colour=pin_colour(args))
+
+
+def run_pin(args):
+    """Draw the live run's one frame for a statusline tick, or draw nothing; returns 0.
+
+    Every failure here is silence. A statusline that spews diagnostics across the operator's
+    prompt is worse than one that goes quiet, so this is the one command that neither writes to
+    stderr nor returns a `MONITOR ERROR` line — the frame is built whole before a byte of it is
+    printed, and anything that goes wrong on the way leaves the statusline as it was.
+
+    Claude Code writes its own JSON to this command's stdin. Nothing here reads it, and no source
+    this spawns inherits it, so a tick can neither block on that stream nor eat what is on it.
+    """
+    try:
+        pin = select_pin(
+            read_pins(pin_directory(args)), caller_session(args.tmux_bin, args.timeout)
+        )
+        if pin is None or not alive(pin["pid"]):
+            return 0
+        frame = pin_frame(args, pin["run_dir"], args.now or now())
+    except Exception:  # noqa: BLE001 — the silence contract: a tick never reports its own failure
+        return 0
+    if frame is not None:
+        print(frame, flush=True)
+    return 0
+
+
 def transcript_root(spec):
-    """The directory one executor keeps its transcripts in, as this machine has it configured."""
+    """A directory under an executor's configured home: a transcript root, or the pin registry.
+
+    The same three parts every time — the variable that moves the home, the home's own name under
+    `~`, and the fixed subdirectory inside it.
+    """
     variable, home, subdirectory = spec
     configured = os.environ.get(variable)
     return pathlib.Path(configured or pathlib.Path.home() / home) / subdirectory
@@ -1272,6 +1470,24 @@ def build_parser():
     window.add_argument(
         "--refresh", type=float,
         help=f"the window's redraw interval in seconds (default: {DEFAULT_REFRESH_SECONDS})",
+    )
+
+    pin = commands.add_parser(
+        "pin", help="draw the live run's one frame into the coordinator's Claude Code statusline"
+    )
+    pin.set_defaults(handler=run_pin)
+    pin.add_argument("--pin-dir", help="the pin registry the live run is discovered through")
+    pin.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
+        help="how long a live source is given to answer before its row is drawn"
+             f" {UNKNOWN} (default: {DEFAULT_TIMEOUT_SECONDS})",
+    )
+    pin.add_argument(
+        "--no-color", action="store_true", help="draw plain text rather than the state's colour"
+    )
+    pin.add_argument(
+        "--now", type=timestamp_argument,
+        help="the moment elapsed times are measured to, stamped as the log stamps (default: now)",
     )
 
     cost = commands.add_parser("cost", help="record what each child spent and roll the run up")
