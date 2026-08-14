@@ -1,0 +1,131 @@
+# AgentCrew configuration — the defaults this plugin ships.
+#
+# The setup wizard copies this file to `agentcrew.toml` at your project root, where you edit it
+# per repo. A project file overrides only the cells it names; every case it leaves out keeps the
+# value it has here. Everything here is an outcome: which vendor, model, and effort each
+# classification case gets. The classification logic itself — six workflows, core vs non-core,
+# complex vs routine — is fixed, so you configure the answers, not the questions.
+#
+# Every cell carries three fields:
+#   executor — `claude` or `codex`, the vendor that runs the ticket
+#   model    — a full model ID for either vendor, never an alias: the value passes verbatim from
+#              this cell to the ticket's `## Routing` line to the launch command, and an alias
+#              mis-resolves under plan mode
+#   effort   — the reasoning effort that vendor is launched at
+#
+# Each cell's name is the case that selects it. The comment above each group says what the
+# classification turns on, so the case a cell answers is readable from this file alone.
+
+# --- Implementer table ------------------------------------------------------
+# Which agent writes the ticket's code, one cell per case of `/route`'s classification.
+
+# `tdd` and `refactor` split on two axes, and the cell is the two answers hyphenated. Core:
+# downstream couples to this ticket's design decisions. Complex: it crosses modules, the spec
+# leaves the approach to the executor, or the logic is convoluted. The three cells other than
+# non-core × routine share one default; each is listed separately so any one of them can be
+# retargeted on its own.
+
+[implementer.tdd-refactor.core-complex]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+[implementer.tdd-refactor.core-routine]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+[implementer.tdd-refactor.non-core-complex]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+[implementer.tdd-refactor.non-core-routine]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+# `direct` — prose, docs, skill copy, config: one cell for every difficulty.
+
+[implementer.direct.any]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# `spike` splits on whether the questions are enumerable up front as fill-in blanks, each naming
+# its verification method, with no recommendation in the deliverable (directed collection) — or
+# not (open exploration).
+
+[implementer.spike.directed-collection]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[implementer.spike.open-exploration]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# `ops` is mechanical iff the steps are known up front and the deliverable is the record that they
+# ran; a run whose result someone has to weigh before calling it done is acceptance-judgement.
+
+[implementer.ops.mechanical]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[implementer.ops.acceptance-judgement]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# `acceptance` — finishing needs a human, so the agent's job is to prepare and hand over.
+
+[implementer.acceptance.any]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# --- Reviewer table ---------------------------------------------------------
+# `tdd` and `refactor` are the only workflows whose diff a review can catch anything in, so they
+# are the only ones that carry a reviewer, and the four cells are the same quadrant that chose the
+# implementer — no second classification. Keep the reviewer on the vendor that did not implement,
+# at the strength the stakes justify.
+
+[reviewer.core-complex]
+executor = "codex"
+model = "gpt-5.6-sol"
+effort = "medium"
+
+[reviewer.core-routine]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[reviewer.non-core-complex]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[reviewer.non-core-routine]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# --- Hooks ------------------------------------------------------------------
+# `command` runs once per child agent at launch, and is empty by default — set it to wire your own
+# notification or session-tracking system to crew launches. `env` adds variables to the child's
+# environment. Both empty means a child launches exactly as it would with no hook at all.
+#
+# The command runs in the child's working directory, with the `env` variables below plus two
+# naming the child that launched:
+#   AGENTCREW_CHILD_CWD          the child's working directory
+#   AGENTCREW_CHILD_TMUX_TARGET  the tmux window or pane the child runs in, empty for a child
+#                                that has none
+# The command is a courtesy to what you already run: one that fails or hangs leaves the launch
+# itself standing.
+
+[hooks.on-child-launch]
+command = ""
+
+[hooks.on-child-launch.env]
