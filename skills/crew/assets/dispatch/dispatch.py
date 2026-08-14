@@ -11,8 +11,9 @@ Every artifact path is recorded absolute, whatever spelling `--out-dir` was give
 runs in the child's own worktree, so a relative path recorded here would resolve to nothing there.
 Given `--log`, every launched child earns one `launch` event in the run's machine log, written by
 dispatch itself — wave advancement and the dashboard read the launched set with no coordinator
-turn spent on bookkeeping (ADR-0001). Child windows are created detached: a launching wave never
-takes the operator's focus.
+turn spent on bookkeeping (ADR-0001) — and every rendered review command carries that log and its
+ticket, so the review bridge writes the ticket's `review` event pair the same way. Child windows
+are created detached: a launching wave never takes the operator's focus.
 
 The approved wave table is the only routing source this script reads (ADR-0003): a ticket's
 `## Routing` section is advisory input used to build that table, never a second authority. The
@@ -274,7 +275,19 @@ def base_commit(run, ticket):
 # --- the first turn -----------------------------------------------------------------------
 
 
-def render_turn(run, ticket, templates):
+def review_log_flags(ticket, log):
+    """The flags that let the review bridge write this ticket's `review` event, or nothing.
+
+    The bridge is what knows a review started and ended, so the bridge writes the event — but only
+    for a run that has a machine log to write it to. `--log` is optional on dispatch, and a run
+    without one must still render a review command a child can run as it stands.
+    """
+    if not log:
+        return ""
+    return f" --machine-log {log} --ticket {ticket['id']}"
+
+
+def render_turn(run, ticket, templates, log=None):
     shape = templates["workflows"][ticket["workflow"]]
     turn = templates["turn"]
     values = {
@@ -296,6 +309,7 @@ def render_turn(run, ticket, templates):
             {
                 "<review model>": review["model"],
                 "<review effort>": review["effort"],
+                "<review log>": review_log_flags(ticket, log),
                 "<rounds contract>": block(templates["review"]["rounds"]),
             },
         )
@@ -330,11 +344,11 @@ def agent_name(ticket):
     return f"crew-{ticket['id']}"
 
 
-def render_wave(run, tickets, templates, out_dir):
+def render_wave(run, tickets, templates, out_dir, log=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     rendered = []
     for ticket in tickets:
-        turn = render_turn(run, ticket, templates)
+        turn = render_turn(run, ticket, templates, log)
         turn_file = out_dir / f"{ticket['id']}.turn.txt"
         turn_file.write_text(turn)
         launch_json = None
@@ -728,7 +742,8 @@ def parse_args(argv):
     parser.add_argument("--out-dir", required=True, help="where launch artifacts are written")
     parser.add_argument(
         "--log", help="the run's machine log, where each launched child's `launch` event is"
-                      " appended; without it a dispatch launches and records nothing",
+                      " appended and which every rendered review command is pointed at; without"
+                      " it a dispatch launches and records nothing",
     )
     parser.add_argument(
         "--base-commit",
@@ -773,14 +788,17 @@ def main(argv=None):
     # Absolute before anything is recorded: the launch line runs in the child's own worktree, not
     # in this process's working directory, so a relative artifact path there resolves to nothing.
     out_dir = pathlib.Path(os.path.abspath(args.out_dir))
-    rendered = render_wave(run, tickets, templates, out_dir)
+    # Absolute for the same reason every artifact path is: the review this path is rendered into
+    # runs in the child's own worktree, where a relative spelling names another file or none.
+    log = os.path.abspath(args.log) if args.log else None
+    rendered = render_wave(run, tickets, templates, out_dir, log)
     if args.command == "render":
         print(json.dumps({"ok": True, "wave": args.wave, "children": rendered}, indent=2))
         return 0
 
     lines, failed = dispatch_wave(run, tickets, rendered, {
         "verify": args.verify_timeout, "hook": args.hook_timeout,
-    }, log=os.path.abspath(args.log) if args.log else None)
+    }, log=log)
     for line in lines:
         print(line)
     return 1 if failed else 0

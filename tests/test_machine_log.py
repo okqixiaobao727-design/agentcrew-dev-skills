@@ -25,6 +25,9 @@ SCRIPT = PLUGIN_ROOT / "skills" / "crew" / "assets" / "machine_log.py"
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+# A review lane as the wave table approves it: the reviewing vendor, then its full model ID.
+REVIEW_LANE = "codex gpt-5.6-luna"
+
 # A ruling and an escalation as they travel the message channel, in the run's own grammar.
 RULING = (
     "Take option B: keep the existing column and add the new one beside it.\n"
@@ -184,6 +187,45 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["ticket"], "11")
         self.assertEqual(entry["outcome"], "blocked")
         self.assertEqual(entry["detail"], "blocked by 07")
+
+    def test_a_review_records_the_lane_it_ran_in_and_which_end_of_it_this_is(self):
+        result = run_cli(
+            "review", "--ticket", "26", "--lane", REVIEW_LANE, "--state", "running",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "review")
+        self.assertEqual(entry["ticket"], "26")
+        self.assertEqual(entry["lane"], REVIEW_LANE)
+        self.assertEqual(entry["state"], "running")
+
+    def test_a_review_that_came_back_is_the_pair_of_the_one_that_started(self):
+        run_cli("review", "--ticket", "26", "--lane", REVIEW_LANE, "--state", "running",
+                log=self.log)
+
+        result = run_cli(
+            "review", "--ticket", "26", "--lane", REVIEW_LANE, "--state", "returned",
+            "--detail", "round one", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recorded = self.lines()
+        self.assertEqual([entry["state"] for entry in recorded], ["running", "returned"])
+        self.assertEqual(recorded[1]["ticket"], "26")
+        self.assertEqual(recorded[1]["lane"], REVIEW_LANE)
+        self.assertEqual(recorded[1]["detail"], "round one")
+
+    def test_a_review_state_outside_the_two_is_refused_and_appends_nothing(self):
+        result = run_cli(
+            "review", "--ticket", "26", "--lane", REVIEW_LANE, "--state", "finished",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
 
     def test_an_advance_records_what_the_run_decided_about_a_wave(self):
         result = run_cli(
