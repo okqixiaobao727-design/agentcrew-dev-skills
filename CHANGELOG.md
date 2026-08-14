@@ -7,6 +7,40 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+The two defects the first `/crew` run of the fixed code exposed in its own
+records (#26, #27): a run now shows a review while it is running, and bills a
+child that worked in a subdirectory of its own worktree.
+
+### Added
+- A `review` subcommand on the machine-log CLI — `--ticket`, `--lane` and
+  `--state` required, `--detail` optional — validating `--state` against the
+  closed set `running`/`returned` the way the other event subcommands validate
+  theirs (#26).
+- Both review bridges write the run's `review` event themselves, one `running`
+  line on entry and one `returned` on every exit path they control, including
+  an interrupted or errored review and a resumed round two. The bridge writes
+  it because it is the only party that deterministically knows a review both
+  started and ended, which keeps the dashboard's inputs script-written and
+  zero-token (ADR-0001). A run with no log configured writes nothing and
+  reviews normally, and a logging failure never changes a review's exit status
+  or the JSON its child reads (#26).
+
+### Fixed
+- The cost pass compared a transcript's working directory to the ticket's
+  worktree by equality, so a child that changed directory inside its own
+  worktree failed an identity check against itself and lost its whole cost row
+  — three tickets of the #18 run were reported `not measured` for this reason.
+  A cwd at or below the worktree is now the same identity, compared by path
+  component after resolving both sides, so a sibling sharing a prefix and a
+  parent directory both stay outside and stay diagnosed. Both lanes take the
+  new rule: the Claude reader's per-record check and the Codex reader's
+  `session_meta` check (#27).
+- The `review` event was documented and rendered but nothing emitted it, so a
+  ticket sitting in a multi-minute review was drawn as a plain `running` row,
+  indistinguishable from one still writing code. The "nothing writes it yet"
+  notes in `docs/machine-log.md` and `docs/monitor-dashboard.md` are retired
+  (#26).
+
 ## [0.3.5] - 2026-08-14
 
 The defects the first real `/crew` run exposed, fixed together (#18): a run now
