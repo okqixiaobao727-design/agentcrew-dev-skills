@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Vendored from https://github.com/okqixiaobao727-design/review-switch
+# Pinned upstream commit: 03f89b2400580c8998b2404bed12187effb94abe
+# Changes belong upstream; update scripts/sync-bridge.sh when upgrading.
 
 """Interactive Codex TUI code-review channel for a Claude session.
 
