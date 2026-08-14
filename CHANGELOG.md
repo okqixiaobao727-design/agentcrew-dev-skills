@@ -7,6 +7,24 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `monitor.py cost --coordinator-session ID` reads the session driving the run
+  out of its own transcript and prints it as a `coordinator` row beneath the
+  rollup's total, in the same four counters. Step 6 of the crew skill passes
+  `$CLAUDE_CODE_SESSION_ID` and copies the printed rollup whole, so the report's
+  coordinator row is a figure the coordinator takes rather than one it asks the
+  operator for (#28). The row stays out of the run total — it is the judgment
+  the run cost, measured against the children's work (ADR-0001) — and is
+  printed only, never logged, because a `session-cost` line belongs to a
+  launched ticket. Two consequences of a session measuring itself are carried
+  in the skill and the doc: the figure is the whole session's, honest as it
+  stands only where the session did nothing but the run and otherwise labelled
+  a session-wide upper bound, and the transcript is still open as it is read,
+  so its last line alone is forgiven for not parsing — the request in flight,
+  unbilled either way — while an unparsed line with more of the session after
+  it is a hole in the history and takes the row to `--`. A session id with no
+  transcript behind it is the same `--` row plus the line saying why.
+
 ## [0.3.6] - 2026-08-14
 
 The two defects the first `/crew` run of the fixed code exposed in its own
