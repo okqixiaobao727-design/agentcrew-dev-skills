@@ -193,7 +193,7 @@ def read_frontmatter(path):
 
 
 def check_links(root, path, problems):
-    """Every relative link in a SKILL.md resolves from where the skill is installed."""
+    """Every relative link in a skill's markdown resolves from where the skill is installed."""
     relative = path.relative_to(root)
     for bracketed, bare in MARKDOWN_LINK.findall(path.read_text()):
         target = bracketed or bare
@@ -226,6 +226,8 @@ def check_skills(root, manifest, problems):
         if name not in SKILL_SLOTS:
             problems.append(f"{entry}: not one of this plugin's skill slots {SKILL_SLOTS}")
         check_links(root, path / "SKILL.md", problems)
+        for reference in sorted((path / "references").glob("*.md")):
+            check_links(root, reference, problems)
 
     for slot in SKILL_SLOTS:
         if (root / SKILLS_DIR / slot).resolve() not in listed:

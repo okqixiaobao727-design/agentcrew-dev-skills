@@ -14,11 +14,11 @@ derivative and an *aggregating enhancement* of mattpocock-skills: when AgentCrew
 Matt's skills' behaviour are in tension, Matt's experience wins. The overlay adds rules; it
 never overrides or degrades what his skills do on their own.
 
-**/route** — The routing skill. From a spec it both cuts the tickets (invoking
-`/mattpocock-skills:to-tickets` with a routing-aware overlay) and assigns each one a workflow,
-executor, model, effort, and — for tdd/refactor tickets — a review line. Ticket granularity and
-routing granularity are the same sizing decision, so one skill makes both. Where tickets already
-exist, `/route` routes them and cuts nothing.
+**/route** — The routing skill. It assigns every ticket of a feature a workflow, executor, model,
+effort, and — for tdd/refactor tickets — a review line. Where tickets already exist it routes them
+directly; from a bare spec it prompts the user to type `/mattpocock-skills:to-tickets`, whose run
+cuts, confirms, and publishes with `/route`'s rules riding along as additions (ADR-0006). Ticket
+granularity and routing granularity are the same sizing decision, so one approval covers both.
 
 **/crew** — The runner skill. Takes a feature directory of routed tickets and runs them as waves
 of child agents in tmux worktrees, unattended, producing an integration branch and a decision log.

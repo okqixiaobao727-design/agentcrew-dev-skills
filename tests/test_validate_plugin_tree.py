@@ -170,8 +170,8 @@ class ValidatePluginTreeTests(unittest.TestCase):
 
     def test_skill_link_to_a_missing_file_is_rejected(self):
         self.tree.write(
-            "skills/route/SKILL.md",
-            self.tree.read("skills/route/SKILL.md").replace(
+            "skills/route/references/classify.md",
+            self.tree.read("skills/route/references/classify.md").replace(
                 "agentcrew.default.toml", "agentcrew.missing.toml"
             ),
         )
