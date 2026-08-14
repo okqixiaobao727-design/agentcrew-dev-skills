@@ -62,6 +62,14 @@ def main():
         print(window_id)
         return 0
 
+    if command == "display-message" and "-p" in argv:
+        # What tmux answers a caller asking which session it is in; a fixture that wrote no
+        # session leaves the question unanswered, as tmux does outside a session.
+        path = state_dir() / "tmux-session"
+        if path.exists():
+            print(path.read_text().strip())
+        return 0
+
     if command == "list-windows":
         for window_id in windows():
             print(window_id)

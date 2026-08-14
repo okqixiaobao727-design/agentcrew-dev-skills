@@ -7,9 +7,11 @@ Assertions are on external behaviour only — the frame the dashboard window dra
 was asked to display, the verdict line, the log lines that follow it, and the exit code.
 """
 
+import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -97,6 +99,24 @@ CODEX_SESSION = "019ffe0e-e154-7a93-88c2-3be07fd543cd"
 # starts; the child never commits them, so they are not what makes a tree dirty.
 GUARD_ASSETS = ("red-line.sh", "worktree-guard.sh", "settings.local.json")
 
+# The pin registry the statusline discovers the live run through: a directory of pin files under
+# the operator's Claude config, which this fixture points at its own root.
+PIN_REGISTRY = ("agentcrew", "pins")
+# The tmux session the caller of `pin` is sitting in, and one that belongs to another crew.
+CALLER_SESSION = "$7"
+OTHER_SESSION = "$9"
+# A second run of the same shape, so a registry can hold two pins at once.
+SECOND_RUN_ID = "crew-run-2"
+
+# What each lane's row says when its own source did not answer in the time it was given.
+AGENTS_UNREADABLE = "  ↳ anomaly: unknown · the agents list could not be read"
+CODEX_UNREADABLE = "  ↳ anomaly: unknown · the codex bridge state could not be read"
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# The colour the state column is painted in for a running row, and the reset that ends it.
+RUNNING_COLOUR = "\x1b[36m"
+COLOUR_RESET = "\x1b[0m"
+
 
 def run_git(repo, *args):
     return subprocess.run(
@@ -141,6 +161,11 @@ class Fixture:
 
         self.worktrees = {}
         self.columns = 100
+        # The tmux session the monitor is called from, as tmux itself exports it; None is a
+        # caller whose environment cannot answer the question.
+        self.tmux_session = CALLER_SESSION
+        # Anything else this fixture's environment carries, for the variables one test moves.
+        self.extra_environment = {}
 
     def _link_stub(self, name, script):
         target = self.bin_dir / name
@@ -377,6 +402,53 @@ class Fixture:
             link.symlink_to(self.root / "worktrees", target_is_directory=True)
         return link / f"worktree-{ticket}"
 
+    def aliased_run_dir(self):
+        """The run directory addressed through a symlink — the `/tmp` vs `/private/tmp` shape."""
+        link = self.root / "run-alias"
+        if not link.exists():
+            link.symlink_to(self.run_dir, target_is_directory=True)
+        return link
+
+    def second_run(self):
+        """A second run directory of the same shape, so a registry can carry two live pins."""
+        path = self.root / SECOND_RUN_ID
+        if not path.exists():
+            shutil.copytree(self.run_dir, path)
+        return path
+
+    def pin_dir(self):
+        """The pin registry's default location, under the Claude config this fixture points at."""
+        return self.claude_home.joinpath(*PIN_REGISTRY)
+
+    def pin(self, run_dir=None, pid=None, session=CALLER_SESSION, directory=None):
+        """A pin naming a live run: its run directory, the coordinator's pid, its tmux session."""
+        run_dir = self.run_dir if run_dir is None else run_dir
+        directory = self.pin_dir() if directory is None else pathlib.Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        # The run names its pin file after the run directory it points at, as dispatch does.
+        name = hashlib.sha256(os.path.realpath(str(run_dir)).encode()).hexdigest()[:16]
+        path = directory / f"{name}.json"
+        path.write_text(json.dumps({
+            "run_dir": str(run_dir),
+            "coordinator_pid": os.getpid() if pid is None else pid,
+            "tmux_session": session,
+        }))
+        return path
+
+    def dead_pid(self):
+        """A pid that has certainly gone: a process this fixture started and then reaped."""
+        process = subprocess.Popen([sys.executable, "-c", ""])
+        process.wait()
+        return process.pid
+
+    def tmux_says_session(self, session):
+        """The session the stub tmux answers with when it is asked which one this is."""
+        (self.stub_dir / "tmux-session").write_text(session)
+
+    def slow_agents(self, seconds):
+        """Make the stub Claude CLI take `seconds` to answer, so a read can be timed out."""
+        (self.stub_dir / "agents-delay").write_text(str(seconds))
+
     def environment(self):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
@@ -384,8 +456,19 @@ class Fixture:
         # whatever terminal the suite runs in.
         environment["COLUMNS"] = str(self.columns)
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
+        # An operator who turned colour off everywhere is not what these frames are drawn under:
+        # the one case that asks for it puts it back.
+        environment.pop("NO_COLOR", None)
         environment["CLAUDE_CONFIG_DIR"] = str(self.claude_home)
         environment["CODEX_HOME"] = str(self.codex_home)
+        # tmux exports its socket, its client pid and the session id into every session it runs,
+        # which is where the pin reads the caller's own session from. Set here rather than
+        # inherited, so a suite run inside tmux draws the fixture's run and not the machine's.
+        if self.tmux_session:
+            environment["TMUX"] = f"/tmp/tmux-1000/default,1234,{self.tmux_session.lstrip('$')}"
+        else:
+            environment.pop("TMUX", None)
+        environment.update(self.extra_environment)
         return environment
 
     def run_monitor(self, *args):
@@ -406,6 +489,24 @@ class Fixture:
         return self.run_monitor(
             "dashboard", "--run-dir", self.run_dir, "--now", NOW_TS, *extra
         )
+
+    def pin_frame(self, *extra):
+        """One statusline tick, at the fixed moment the elapsed times are measured to."""
+        return self.run_monitor("pin", "--now", NOW_TS, *extra)
+
+    def pin_frame_over(self, stdin, *extra):
+        """One tick with Claude Code's own JSON on its stdin, as the statusline runs it."""
+        with pathlib.Path(stdin).open() as handle:
+            return subprocess.run(
+                [sys.executable, str(MONITOR), "pin", "--now", NOW_TS,
+                 *[str(argument) for argument in extra]],
+                capture_output=True, text=True, env=self.environment(), stdin=handle,
+            )
+
+    def claude_stdin(self):
+        """What the stub Claude CLI was able to read off stdin when the monitor called it."""
+        path = self.stub_dir / "claude-stdin"
+        return path.read_text() if path.exists() else ""
 
     def window(self, *extra):
         """Ask for the run's dashboard window, as a script re-running the command would."""
@@ -1018,6 +1119,286 @@ class AliasedPathTests(MonitorTestCase):
         result = self.fixture.dashboard()
 
         self.assertIn("↳ anomaly: duplicate", result.stdout)
+
+
+class PinTests(MonitorTestCase):
+    """One statusline tick: find the live run through the pin registry, and draw it or nothing.
+
+    Every dead case is silence — no stdout, no stderr, exit 0 — because a statusline that spews
+    diagnostics across the operator's prompt is worse than one that goes quiet.
+    """
+
+    def launch_wave_one(self):
+        self.fixture.table()
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+
+    def live_run(self):
+        """A run of two launched, busy children and one wave nobody has reached yet."""
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+    def assertNothingDrawn(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_no_pin_at_all_draws_nothing(self):
+        self.live_run()
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_pin_naming_a_run_directory_that_is_gone_draws_nothing(self):
+        self.live_run()
+        self.fixture.pin(run_dir=self.fixture.root / "crew-run-gone")
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_pin_whose_coordinator_is_gone_draws_nothing(self):
+        self.live_run()
+        self.fixture.pin(pid=self.fixture.dead_pid())
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_run_a_final_advance_decision_ended_draws_nothing(self):
+        self.live_run()
+        self.fixture.append(SETTLED_TS, "advance", wave=2, decision="complete")
+        self.fixture.pin()
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_malformed_wave_table_draws_nothing(self):
+        self.live_run()
+        self.fixture.table_path.write_text("{ this is not the wave table")
+        self.fixture.pin()
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_pin_that_is_not_a_pin_file_draws_nothing(self):
+        self.live_run()
+        self.fixture.pin_dir().mkdir(parents=True, exist_ok=True)
+        (self.fixture.pin_dir() / "broken.json").write_text("{ half a pin")
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_the_pin_matching_the_callers_session_is_the_run_drawn(self):
+        self.live_run()
+        self.fixture.pin(session=CALLER_SESSION)
+        self.fixture.pin(run_dir=self.fixture.second_run(), session=OTHER_SESSION)
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+        self.assertNotIn(SECOND_RUN_ID, result.stdout)
+
+    def test_the_other_pin_is_drawn_from_the_other_session(self):
+        """The same two pins, read from the other crew's session, draw the other crew's run."""
+        self.live_run()
+        self.fixture.pin(session=CALLER_SESSION)
+        self.fixture.pin(run_dir=self.fixture.second_run(), session=OTHER_SESSION)
+        self.fixture.tmux_session = OTHER_SESSION
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {SECOND_RUN_ID} —", result.stdout)
+        self.assertNotIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_a_caller_whose_environment_cannot_answer_asks_tmux_itself(self):
+        self.live_run()
+        self.fixture.pin(session=CALLER_SESSION)
+        self.fixture.pin(run_dir=self.fixture.second_run(), session=OTHER_SESSION)
+        self.fixture.tmux_session = None
+        self.fixture.tmux_says_session(OTHER_SESSION)
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {SECOND_RUN_ID} —", result.stdout)
+        self.assertNotIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_the_environment_answers_without_tmux_being_asked(self):
+        self.live_run()
+        self.fixture.pin()
+
+        self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.fixture.calls("tmux"), [])
+
+    def test_two_pins_and_neither_matching_the_caller_draws_nothing(self):
+        self.live_run()
+        self.fixture.pin(session=OTHER_SESSION)
+        self.fixture.pin(run_dir=self.fixture.second_run(), session=OTHER_SESSION)
+        self.fixture.tmux_session = CALLER_SESSION
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_the_sole_pin_is_drawn_even_though_it_names_another_session(self):
+        self.live_run()
+        self.fixture.pin(session=OTHER_SESSION)
+        self.fixture.tmux_session = CALLER_SESSION
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_a_pin_recording_an_aliased_run_directory_is_resolved_and_drawn(self):
+        self.live_run()
+        self.fixture.pin(run_dir=self.fixture.aliased_run_dir())
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_a_registry_given_with_pin_dir_is_the_one_read(self):
+        self.live_run()
+        elsewhere = self.fixture.root / "elsewhere"
+        self.fixture.pin(directory=elsewhere)
+
+        result = self.fixture.pin_frame("--no-color", "--pin-dir", elsewhere)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_the_frame_is_the_dashboards_frame_for_the_same_run_at_the_same_moment(self):
+        self.live_run()
+        self.fixture.pin()
+
+        drawn = self.fixture.pin_frame()
+        dashboard = self.fixture.dashboard("--no-color")
+
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(ANSI.sub("", drawn.stdout), dashboard.stdout)
+        self.assertEqual(
+            frame(dashboard.stdout).splitlines()[0],
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=2 · elapsed {LIVE_ELAPSED}",
+        )
+
+    def test_the_state_column_is_coloured_even_though_stdout_is_a_pipe(self):
+        self.live_run()
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame()
+
+        self.assertIn(f"{RUNNING_COLOUR}running{COLOUR_RESET}", result.stdout)
+
+    def test_no_color_draws_plain_text(self):
+        self.live_run()
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertIn("running", result.stdout)
+        self.assertNotIn("\x1b[", result.stdout)
+
+    def test_the_NO_COLOR_environment_draws_plain_text(self):
+        self.live_run()
+        self.fixture.pin()
+        self.fixture.extra_environment["NO_COLOR"] = "1"
+
+        result = self.fixture.pin_frame()
+
+        self.assertIn("running", result.stdout)
+        self.assertNotIn("\x1b[", result.stdout)
+
+    def test_the_title_column_is_cut_to_the_width_columns_gives_it(self):
+        # Ten columns is what this run's other five leave of a 76-column statusline, so the two
+        # long titles are cut to it and the short one is not.
+        self.fixture.columns = 76
+        self.live_run()
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        for line in frame(result.stdout).splitlines():
+            self.assertLessEqual(len(line), 76, line)
+        self.assertIn(
+            row("1", "06", "Dispatch…", CLAUDE_LANE, "running", LIVE_ELAPSED, title=10),
+            result.stdout,
+        )
+
+    def test_a_live_source_that_times_out_is_an_unknown_row_and_the_frame_still_draws(self):
+        self.live_run()
+        self.fixture.pin()
+        self.fixture.slow_agents(30)
+
+        result = self.fixture.pin_frame("--no-color", "--timeout", "0.2")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
+        self.assertIn(f"{AGENTS_UNREADABLE}\n", result.stdout)
+        # The lane read from its own files is unaffected by the one that did not answer.
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
+
+    def test_a_tick_with_no_time_left_draws_each_lane_unknown_and_still_prints_the_frame(self):
+        """Both lanes are bounded by the one budget, and a spent budget still draws a frame."""
+        self.live_run()
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color", "--timeout", "0")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+        self.assertIn(f"{AGENTS_UNREADABLE}\n", result.stdout)
+        self.assertIn(f"{CODEX_UNREADABLE}\n", result.stdout)
+
+    def test_a_bridge_state_file_nothing_will_ever_write_does_not_hold_up_the_tick(self):
+        """A fifo where a state file should be blocks an ordinary read for ever; a tick cannot."""
+        self.live_run()
+        self.fixture.pin()
+        state = self.fixture.codex_state("07")
+        state.unlink()
+        os.mkfifo(state)
+
+        tick = self.fixture.start_monitor(
+            "pin", "--now", NOW_TS, "--no-color", "--timeout", "0.2"
+        )
+        self.addCleanup(tick.kill)
+        output = tick.communicate(timeout=10)[0]
+
+        self.assertEqual(tick.returncode, 0)
+        self.assertIn(f"crew {RUN_ID} —", output)
+
+    def test_the_json_claude_code_writes_to_the_tick_is_never_read_by_a_live_source(self):
+        self.live_run()
+        self.fixture.pin()
+        written = self.fixture.root / "statusline-stdin.json"
+        written.write_text(json.dumps({"workspace": {"current_dir": str(self.fixture.repo)}}))
+
+        result = self.fixture.pin_frame_over(written, "--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+        self.assertEqual(self.fixture.claude_stdin(), "")
+
+    def test_no_failure_ever_reaches_stderr_as_a_monitor_error(self):
+        self.live_run()
+        gone = self.fixture.root / "crew-run-gone"
+
+        for pin in (None, {"run_dir": gone}, {"pid": self.fixture.dead_pid()}):
+            with self.subTest(pin=pin):
+                shutil.rmtree(self.fixture.pin_dir(), ignore_errors=True)
+                if pin is not None:
+                    self.fixture.pin(**pin)
+
+                result = self.fixture.pin_frame()
+
+                self.assertNotIn("MONITOR ERROR", result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.returncode, 0)
 
 
 class WindowTests(MonitorTestCase):
