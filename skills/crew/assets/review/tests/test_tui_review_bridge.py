@@ -91,6 +91,7 @@ class GateClient:
         self.script = [dict(step) for step in script]
         self.mcp_startup = {}
         self.requests = []
+        self.thread_start_params = None
         self.startup_when_turn_started = None
 
     async def request(self, method, params):
@@ -98,6 +99,7 @@ class GateClient:
         if method == "mcpServerStatus/list":
             return {"data": [{"name": name} for name in self.inventory]}
         if method == "thread/start":
+            self.thread_start_params = dict(params)
             return {"thread": {"id": "thread-new"}}
         if method == "thread/resume":
             return {}
@@ -194,6 +196,16 @@ class McpReadinessGateTests(unittest.TestCase):
         self.assertEqual(handoff.read_text(encoding="utf-8"), "thread-new")
         self.assertIn("thread/start", client.requests)
         self.assertIn("turn/start", client.requests)
+
+    def test_the_review_thread_carries_unattended_session_policy(self):
+        client = GateClient([{"alpha": "ready"}])
+
+        self.run_new_review(client)
+
+        self.assertEqual(client.thread_start_params["approvalPolicy"], "never")
+        self.assertEqual(
+            client.thread_start_params["sandbox"], "danger-full-access"
+        )
 
     def test_the_record_is_on_disk_before_the_pane_is_handed_the_thread(self):
         """Otherwise a driver killed in between orphans a live, running review.
