@@ -189,6 +189,7 @@ class Fixture:
 
         self.worktrees = {}
         self.columns = 100
+        self.lines = 24
         # The tmux session the monitor is called from, as tmux itself exports it; None is a
         # caller whose environment cannot answer the question.
         self.tmux_session = CALLER_SESSION
@@ -477,12 +478,17 @@ class Fixture:
         """Make the stub Claude CLI take `seconds` to answer, so a read can be timed out."""
         (self.stub_dir / "agents-delay").write_text(str(seconds))
 
+    def slow_toasts(self, seconds):
+        """Make the stub tmux take `seconds` to display a toast, so the tick can time it out."""
+        (self.stub_dir / "display-delay").write_text(str(seconds))
+
     def environment(self):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         # The window width the title column absorbs, fixed here so a frame is the same frame
         # whatever terminal the suite runs in.
         environment["COLUMNS"] = str(self.columns)
+        environment["LINES"] = str(self.lines)
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
         # An operator who turned colour off everywhere is not what these frames are drawn under:
         # the one case that asks for it puts it back.
@@ -1134,6 +1140,57 @@ class ToastTests(MonitorTestCase):
 
         self.assertEqual(self.fixture.toasts(), ["crew 06 stuck at a permission prompt"])
 
+    def test_pin_toasts_on_the_first_tick_and_not_on_the_second(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "waiting", "07": "busy"})
+        self.fixture.pin()
+
+        first = self.fixture.pin_frame("--no-color")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.fixture.toasts(), ["crew 06 stuck at a permission prompt"])
+
+        second = self.fixture.pin_frame("--no-color")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.fixture.toasts(), ["crew 06 stuck at a permission prompt"])
+
+    def test_pin_no_toast_never_records_a_display_message(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "waiting", "07": "busy"})
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color", "--no-toast")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.toasts(), [])
+
+    def test_pin_toast_display_is_bounded_by_the_tick_timeout(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "waiting", "07": "busy"})
+        self.fixture.pin()
+        delay = 2
+        self.fixture.slow_toasts(delay)
+
+        started = time.monotonic()
+        result = self.fixture.pin_frame("--no-color", "--timeout", "0.2")
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+        self.assertLess(elapsed, delay)
+
+    def test_pin_and_dashboard_deduplicate_through_the_same_toast_state(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "waiting", "07": "busy"})
+        self.fixture.pin()
+        shared_state = self.fixture.root / "shared-toasts.json"
+
+        dashboard = self.fixture.dashboard("--toast-state", shared_state)
+        pin = self.fixture.pin_frame("--no-color", "--toast-state", shared_state)
+
+        self.assertEqual(dashboard.returncode, 0, dashboard.stderr)
+        self.assertEqual(pin.returncode, 0, pin.stderr)
+        self.assertEqual(self.fixture.toasts(), ["crew 06 stuck at a permission prompt"])
+
     def test_nothing_the_monitor_emits_reaches_the_coordinator(self):
         self.launch_wave_one()
         self.fixture.live({"06": "waiting", "07": "busy"})
@@ -1403,6 +1460,88 @@ class PinTests(MonitorTestCase):
             row("1", "06", "Dispatch…", CLAUDE_LANE, "running", LIVE_ELAPSED, title=10),
             result.stdout,
         )
+
+    def test_taller_than_budget_drops_settled_rows_before_live_rows(self):
+        self.live_run()
+        self.fixture.append(
+            REVIEW_TS, "review", ticket="06", state="running", lane=REVIEW_LANE
+        )
+        self.fixture.append(
+            SETTLED_TS, "receipt", ticket="06", verdict="landable", sha=self.fixture.head("06")
+        )
+        self.fixture.append(SETTLED_TS, "merge", ticket="06", result="clean")
+        self.fixture.pin()
+        self.fixture.lines = 7
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "merged", SETTLED_ELAPSED),
+            result.stdout,
+        )
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
+        self.assertIn(
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
+            result.stdout,
+        )
+        self.assertIn("… +1 more", result.stdout)
+        self.assertLessEqual(len(frame(result.stdout).splitlines()), 5)
+
+    def test_still_taller_drops_annotations_then_reports_omitted_rows(self):
+        self.live_run()
+        self.fixture.live({"06": "waiting", "07": "idle"})
+        self.fixture.pin()
+        self.fixture.lines = 6
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("↳", result.stdout)
+        self.assertIn("… +2 more", result.stdout)
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+            result.stdout,
+        )
+        self.assertLessEqual(len(frame(result.stdout).splitlines()), 4)
+
+    def test_budget_below_header_leaves_summary_alone_without_blank_lines(self):
+        self.live_run()
+        self.fixture.pin()
+        self.fixture.lines = 3
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            frame(result.stdout).splitlines(),
+            [f"crew {RUN_ID} — wave 1/2 · pending=1 running=2 · elapsed {LIVE_ELAPSED}"],
+        )
+        self.assertNotIn("\n\n", result.stdout)
+
+    def test_a_full_frame_never_emits_a_blank_line(self):
+        self.live_run()
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(line for line in frame(result.stdout).splitlines()))
+
+    def test_max_lines_overrides_lines(self):
+        self.live_run()
+        self.fixture.pin()
+        self.fixture.lines = 3
+
+        result = self.fixture.pin_frame("--no-color", "--max-lines", "4")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(header(), result.stdout)
+        self.assertIn("… +2 more", result.stdout)
+        self.assertLessEqual(len(frame(result.stdout).splitlines()), 4)
 
     def test_a_live_source_that_times_out_is_an_unknown_row_and_the_frame_still_draws(self):
         self.live_run()

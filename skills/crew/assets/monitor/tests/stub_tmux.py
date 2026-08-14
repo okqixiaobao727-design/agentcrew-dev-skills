@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 
 def state_dir():
@@ -68,6 +69,12 @@ def main():
         path = state_dir() / "tmux-session"
         if path.exists():
             print(path.read_text().strip())
+        return 0
+
+    if command == "display-message":
+        delay_path = state_dir() / "display-delay"
+        if delay_path.exists():
+            time.sleep(float(delay_path.read_text().strip()))
         return 0
 
     if command == "list-windows":
