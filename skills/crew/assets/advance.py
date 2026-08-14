@@ -249,6 +249,7 @@ def launch(table_path, wave, base_commit, options):
         sys.executable, str(DISPATCH), "dispatch",
         "--table", str(table_path), "--wave", str(wave),
         "--out-dir", str(options["out_dir"]),
+        "--log", str(options["log"]),
         "--base-commit", base_commit,
     ])
     return result.returncode == 0, (result.stdout + result.stderr).splitlines()

@@ -33,6 +33,11 @@ reader can tell "not recorded" from "recorded as nothing".
 `ticket`, `child`, `workflow`, `executor`, `model`, `effort`, `branch`, `worktree`, `window`.
 `model` is a full model ID, never an alias.
 
+The dispatch renderer writes this one itself, as each child comes up, given `--log`: the launched
+set is what wave advancement and the dashboard read, and it costs the coordinator no turn. `child`
+is the agent name a Claude child took in the live agents list, and the thread the bridge pinned for
+a Codex child.
+
 ### `receipt` — a child's final word, as verified by script
 
 `ticket`, `verdict` (`landable`, `parked`, or `failed`), `sha`, `detail`. The three verdicts are
