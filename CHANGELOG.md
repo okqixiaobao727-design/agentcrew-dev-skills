@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-14
+
 ### Changed
 - Spec-only `/route` no longer drives `/mattpocock-skills:to-tickets` itself: it
   prints the command for the user to type, and that user-typed run cuts,
