@@ -118,7 +118,8 @@ class Fixture:
         }))
         return path
 
-    def run_dispatch(self, command, table, wave=1, env_overrides=None, extra=()):
+    def run_dispatch(self, command, table, wave=1, env_overrides=None, extra=(),
+                     out_dir=None, cwd=None):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
@@ -132,11 +133,18 @@ class Fixture:
                 sys.executable, str(DISPATCH), command,
                 "--table", str(table),
                 "--wave", str(wave),
-                "--out-dir", str(self.out_dir),
+                "--out-dir", str(self.out_dir if out_dir is None else out_dir),
                 *extra,
             ],
             capture_output=True, text=True, env=environment,
+            cwd=str(cwd) if cwd else None,
         )
+
+    def log_records(self, path):
+        path = pathlib.Path(path)
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
     def launches(self):
         path = self.stub_dir / "launches.jsonl"
@@ -690,6 +698,172 @@ class DispatchLaunchTests(DispatchTestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertTrue(result.stdout.strip().startswith("06 FAILED"), result.stdout)
+
+
+class RelativeOutDirTests(DispatchTestCase):
+    """The artifact list is absolute whatever the caller spelled, because the child never shares
+    this process's working directory: the launch line runs in the child's own worktree."""
+
+    def test_render_records_every_artifact_path_absolute(self):
+        table = self.fixture.table([self.fixture.ticket("06", "relative-render")])
+
+        result = self.fixture.run_dispatch(
+            "render", table, out_dir="render", cwd=self.fixture.root,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        child = json.loads(result.stdout)["children"][0]
+        self.assertTrue(os.path.isabs(child["turnFile"]), child)
+        self.assertTrue(os.path.isabs(child["launchJson"]), child)
+        self.assertEqual(
+            os.path.realpath(child["turnFile"]),
+            os.path.realpath(self.fixture.out_dir / "06.turn.txt"),
+        )
+        self.assertEqual(
+            os.path.realpath(child["launchJson"]),
+            os.path.realpath(self.fixture.out_dir / "06.agents.json"),
+        )
+
+    def test_a_relative_out_dir_still_launches_the_child_with_its_first_turn(self):
+        table = self.fixture.table([self.fixture.ticket("06", "relative-launch")])
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, out_dir="render", cwd=self.fixture.root,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        launches = self.fixture.launches()
+        self.assertEqual(len(launches), 1, launches)
+        argv = launches[0]["argv"]
+        agents = json.loads(argv[argv.index("--agents") + 1])
+        self.assertEqual(
+            next(iter(agents.values()))["initialPrompt"], self.fixture.turn("06")
+        )
+
+    def test_a_relative_out_dir_hands_the_codex_bridge_an_absolute_turn_file(self):
+        ticket = self.fixture.ticket(
+            "07", "relative-codex", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
+        table = self.fixture.table([ticket])
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, out_dir="render", cwd=self.fixture.root,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        argv = self.fixture.codex_launches()[0]["argv"]
+        prompt_file = argv[argv.index("--prompt-file") + 1]
+        self.assertTrue(os.path.isabs(prompt_file), prompt_file)
+        self.assertEqual(
+            os.path.realpath(prompt_file),
+            os.path.realpath(self.fixture.out_dir / "07.turn.txt"),
+        )
+
+
+class DetachedWindowTests(DispatchTestCase):
+    def test_a_child_window_is_created_without_taking_the_focus(self):
+        table = self.fixture.table([self.fixture.ticket("06", "detached")])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        new_windows = [call["argv"] for call in self.fixture.tmux_calls()
+                       if call["argv"][0] == "new-window"]
+        self.assertEqual(len(new_windows), 1, new_windows)
+        self.assertIn("-d", new_windows[0])
+
+
+class LaunchEventTests(DispatchTestCase):
+    def setUp(self):
+        super().setUp()
+        self.log = self.fixture.root / "log.jsonl"
+
+    def launch_events(self):
+        return [record for record in self.fixture.log_records(self.log)
+                if record["event"] == "launch"]
+
+    def test_each_launched_child_earns_one_launch_event(self):
+        tickets = [
+            self.fixture.ticket("06", "claude-child"),
+            self.fixture.ticket(
+                "07", "codex-child", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+                review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+            ),
+        ]
+        table = self.fixture.table(tickets)
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, extra=("--log", str(self.log)),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        events = self.launch_events()
+        self.assertEqual([event["ticket"] for event in events], ["06", "07"], events)
+        claude, codex = events
+        self.assertEqual(claude["executor"], "claude")
+        self.assertEqual(claude["model"], CLAUDE_MODEL)
+        self.assertEqual(claude["effort"], CLAUDE_EFFORT)
+        self.assertEqual(claude["workflow"], "tdd")
+        self.assertEqual(claude["child"], "stub-child-1")
+        self.assertEqual(claude["branch"], "worktree-06-claude-child")
+        self.assertEqual(
+            claude["worktree"],
+            str(self.fixture.repo / ".claude" / "worktrees" / "06-claude-child"),
+        )
+        self.assertTrue(claude["window"].startswith("@"), claude)
+        self.assertEqual(codex["executor"], "codex")
+        self.assertEqual(codex["model"], CODEX_MODEL)
+        self.assertEqual(codex["effort"], CODEX_EFFORT)
+        self.assertEqual(codex["branch"], "worktree-07-codex-child")
+
+    def test_a_child_that_never_started_earns_no_launch_event(self):
+        worktree = self.fixture.repo / ".claude" / "worktrees" / "06-dispatch-renderer"
+        worktree.parent.mkdir(parents=True)
+        run_git(self.fixture.repo, "worktree", "add", "-b", "someone-elses-branch",
+                str(worktree), self.fixture.base_commit)
+        table = self.fixture.table([self.fixture.ticket("06", "dispatch-renderer")])
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, extra=("--log", str(self.log)),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(self.launch_events(), [])
+
+    def test_a_launch_the_log_could_not_record_fails_the_dispatch(self):
+        """A child the log never heard of is a child wave advancement cannot see, so a wave that
+        lost one is not a wave that advanced: the line says the child is up, the exit code does
+        not say the run may carry on."""
+        unwritable = self.fixture.root / "unwritable-log"
+        unwritable.mkdir()
+        table = self.fixture.table([self.fixture.ticket("06", "dispatch-renderer")])
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, extra=("--log", str(unwritable)),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        line = result.stdout.strip()
+        self.assertTrue(line.startswith("06 launched"), line)
+        self.assertIn("log-failed=", line)
+        self.assertEqual(len(self.fixture.launches()), 1)
+
+    def test_rendering_writes_no_launch_event(self):
+        table = self.fixture.table([self.fixture.ticket("06", "dispatch-renderer")])
+
+        result = self.fixture.run_dispatch("render", table, extra=("--log", str(self.log)))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.log_records(self.log), [])
+
+    def test_a_wave_dispatched_without_a_log_still_launches(self):
+        table = self.fixture.table([self.fixture.ticket("06", "dispatch-renderer")])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(len(self.fixture.launches()), 1)
 
 
 class MixedWaveTests(DispatchTestCase):
