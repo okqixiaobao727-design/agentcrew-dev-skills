@@ -3,7 +3,9 @@
 
     dashboard  draw the whole run as a table — one row per ticket of every wave — and toast what
                just became true, refreshing in place when asked to
-    window     create, reuse or recreate the run's one dedicated tmux window running that loop
+    window     draw the run on the surfaces its repo chose: create, reuse or recreate the run's one
+               dedicated tmux window running that loop, and write the pin that names the live run
+    unpin      at the end of the run, take that pin back out of the registry
     pin        draw one frame of the live run into the coordinator's Claude Code statusline, or
                draw nothing at all
     pin-install  wire that same frame into the operator's Claude Code statusline, reversibly
@@ -29,6 +31,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -38,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # The writer that owns the log's schema: a receipt this script verifies is appended through it
@@ -73,6 +77,19 @@ WINDOW_RECORD_NAME = "dashboard-window"
 WINDOW_LOCK_NAME = "dashboard-window.lock"
 # One run, one dashboard, one window with this name — so the operator always knows where to look.
 DASHBOARD_WINDOW_NAME = "crew-dashboard"
+
+# A pin is named for the run it names, so a run re-pinning itself every wave still has one pin.
+PIN_NAME_LENGTH = 16
+
+# Which surface a run draws itself on, from `[dashboard] surface` in the project's config. The
+# window is the default, so upgrading agentcrew changes nobody's run.
+DASHBOARD_SECTION = "dashboard"
+SURFACE_KEY = "surface"
+SURFACE_WINDOW = "window"
+SURFACE_PIN = "pin"
+SURFACE_BOTH = "both"
+SURFACES = (SURFACE_WINDOW, SURFACE_PIN, SURFACE_BOTH)
+DEFAULT_SURFACE = SURFACE_WINDOW
 
 # The Ticket state vocabulary (`docs/glossary.md`): the words the operator reads, and the only
 # words this script draws. Every source state — a tmux process status, a settlement verdict, a
@@ -155,7 +172,8 @@ COLOUR_RESET = "\x1b[0m"
 # The pin registry (`docs/monitor-dashboard.md`): the directory a live run leaves the file naming
 # itself in, under the operator's Claude config, and the three things that file carries.
 PIN_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "agentcrew/pins")
-PIN_GLOB = "*.json"
+PIN_SUFFIX = ".json"
+PIN_GLOB = f"*{PIN_SUFFIX}"
 PIN_RUN_DIR = "run_dir"
 PIN_PID = "coordinator_pid"
 PIN_SESSION = "tmux_session"
@@ -752,9 +770,10 @@ def dashboard_command(args, run_dir):
         sys.executable, str(pathlib.Path(__file__).resolve()), "dashboard",
         "--run-dir", str(run_dir),
         "--refresh", str(args.refresh if args.refresh is not None else DEFAULT_REFRESH_SECONDS),
+        # Named rather than left to the default, so the file this loop dedups its toasts through
+        # is legible in the command itself — it is the file a pinned surface shares with it.
+        "--toast-state", str(toast_state_path(args, run_dir)),
     ]
-    if args.toast_state:
-        command += ["--toast-state", str(args.toast_state)]
     return shlex.join(command)
 
 
@@ -792,14 +811,91 @@ def window_lock(run_dir):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def run_window(args):
-    """Give the run its one dashboard window and print its id; returns 0.
+def configured_surface(args):
+    """Which surface this run draws itself on, read from the project's config file.
 
-    The whole lifecycle is here and idempotent: the recorded window is reused while it is alive,
-    a window the operator closed is recreated on the next call — which is what makes this safe for
-    a resuming coordinator to re-run — and nothing here ever closes one.
+    A run that names no config, or whose config has no `[dashboard]` section, gets the window it
+    has always got: the surface is a choice a repo makes, never one an upgrade makes for it.
+    """
+    if not args.config:
+        return DEFAULT_SURFACE
+    try:
+        text = pathlib.Path(args.config).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return DEFAULT_SURFACE
+    except OSError as error:
+        raise MonitorError(f"config {args.config} is unreadable: {error}")
+    try:
+        config = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise MonitorError(f"config {args.config} is unparsable: {error}")
+    section = config.get(DASHBOARD_SECTION, {})
+    if not isinstance(section, dict):
+        raise MonitorError(f"config {args.config}: [{DASHBOARD_SECTION}] must be a table")
+    surface = section.get(SURFACE_KEY, DEFAULT_SURFACE)
+    if surface not in SURFACES:
+        raise MonitorError(
+            f"config {args.config}: unknown {DASHBOARD_SECTION} {SURFACE_KEY} {surface!r}, "
+            f"one of {', '.join(SURFACES)}"
+        )
+    return surface
+
+
+def pin_path(args, run_dir):
+    """This run's one pin, named for the run directory it names.
+
+    The name is a digest of the resolved run directory, so every wave of one run writes the same
+    pin and the end of the run removes exactly what dispatch wrote — while two runs at once, whose
+    directories differ, never collide. The registry is the one `pin` itself reads.
+    """
+    digest = hashlib.sha256(str(run_dir).encode("utf-8")).hexdigest()[:PIN_NAME_LENGTH]
+    return pin_directory(args) / f"{digest}{PIN_SUFFIX}"
+
+
+def write_pin(args, run_dir):
+    """Name this live run in the pin registry: where it is, whose process it is, and where that
+    process runs.
+
+    The pid is the whole crash story — a statusline tick draws nothing once it is gone — so a pin
+    is never written without one. The file is put in place by rename, because a tick reading it
+    half-written would draw nothing for a run that is very much alive.
+    """
+    if args.coordinator_pid is None:
+        raise MonitorError(
+            "a pinned surface needs --coordinator-pid, the pid of the session driving the run"
+        )
+    path = pin_path(args, run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pin = {
+        PIN_RUN_DIR: str(run_dir),
+        PIN_PID: args.coordinator_pid,
+        PIN_SESSION: args.session,
+    }
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(pin) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise MonitorError(f"the run's pin could not be written: {error}")
+    return path
+
+
+def run_window(args):
+    """Draw the run on the surfaces its repo chose, printing the window's id where it has one;
+    returns 0.
+
+    The window's whole lifecycle is here and idempotent: the recorded window is reused while it is
+    alive, a window the operator closed is recreated on the next call — which is what makes this
+    safe for a resuming coordinator to re-run — and nothing here ever closes one. The pin is
+    idempotent for the same reason: every wave re-writes the one file that names this run.
     """
     run_dir = run_directory(args)
+    surface = configured_surface(args)
+    if surface in (SURFACE_PIN, SURFACE_BOTH):
+        write_pin(args, run_dir)
+    if surface == SURFACE_PIN:
+        return 0
     with window_lock(run_dir):
         return make_window(args, run_dir)
 
@@ -825,6 +921,20 @@ def make_window(args, run_dir):
         raise MonitorError("tmux new-window printed no window id")
     (run_dir / WINDOW_RECORD_NAME).write_text(window_id + "\n", encoding="utf-8")
     print(window_id)
+    return 0
+
+
+def run_unpin(args):
+    """Take this run's pin out of the registry; returns 0.
+
+    The end of the run, after the report is written: the final frame lives in the report and the
+    machine log, not on the operator's screen. A run that never wrote a pin ends through this same
+    step and has nothing to remove, so a missing pin is success.
+    """
+    try:
+        pin_path(args, run_directory(args)).unlink(missing_ok=True)
+    except OSError as error:
+        raise MonitorError(f"the run's pin could not be removed: {error}")
     return 0
 
 
@@ -924,8 +1034,14 @@ def alive(pid):
 
 
 def pin_directory(args):
-    """The pin registry this tick reads: the one it was given, or the operator's own."""
-    return pathlib.Path(args.pin_dir) if args.pin_dir else transcript_root(PIN_REGISTRY)
+    """The pin registry this tick reads, and the one the run writes its pin into.
+
+    Resolved at this boundary (ADR-0007), so a run that writes its pin at dispatch and removes it
+    at the end of the run addresses one registry however the two calls spelled the path or
+    whatever directory each ran from.
+    """
+    given = pathlib.Path(args.pin_dir) if args.pin_dir else transcript_root(PIN_REGISTRY)
+    return given.expanduser().resolve()
 
 
 def pin_colour(args):
@@ -1749,13 +1865,28 @@ def build_parser():
         "--no-color", action="store_true", help="draw plain text even where colour would show"
     )
 
-    window = run_command("window", "create, reuse or recreate the run's one dashboard window")
+    window = run_command("window", "draw the run on the surfaces its repo chose")
     window.set_defaults(handler=run_window)
     window.add_argument("--session", required=True, help="the tmux target the window is created in")
     window.add_argument(
         "--refresh", type=float,
         help=f"the window's redraw interval in seconds (default: {DEFAULT_REFRESH_SECONDS})",
     )
+    window.add_argument(
+        "--config",
+        help=f"the project's config, whose [{DASHBOARD_SECTION}] {SURFACE_KEY} chooses between "
+             f"{', '.join(SURFACES)} (default: {DEFAULT_SURFACE})",
+    )
+    window.add_argument(
+        "--coordinator-pid", type=int,
+        help="the pid of the session driving the run, which a pinned surface is checked against",
+    )
+    window.add_argument("--pin-dir", help="the pin registry to write this run's pin into")
+
+    unpin = commands.add_parser("unpin", help="take the run's pin out of the registry")
+    unpin.set_defaults(handler=run_unpin)
+    unpin.add_argument("--run-dir", required=True, help="the run's directory")
+    unpin.add_argument("--pin-dir", help="the pin registry this run's pin was written into")
 
     pin = commands.add_parser(
         "pin", help="draw the live run's one frame into the coordinator's Claude Code statusline"

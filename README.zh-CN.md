@@ -95,7 +95,7 @@ case，所以项目配置只需要携带它要覆盖的那些格子。
 
 ## 配置参考
 
-可配置面就是两张模型表和一个 hook，位于仓库根目录的 `agentcrew.toml`。分类逻辑——六种 workflow、
+可配置面就是两张模型表、一个 hook，以及 dashboard 画在哪个面上，位于仓库根目录的 `agentcrew.toml`。分类逻辑——六种 workflow、
 core 与 non-core、complex 与 routine——是固定的产品判断：你配置的是结论，不是决策过程。随插件发布的
 带注释默认值在 [`config/agentcrew.default.toml`](config/agentcrew.default.toml)。
 
@@ -161,6 +161,22 @@ command = "notify-send 'AgentCrew child launched' \"$AGENTCREW_CHILD_CWD\""
 [hooks.on-child-launch.env]
 MY_PROJECT_MODE = "unattended"
 ```
+
+### `[dashboard]`——一次 run 把自己画在哪个面上
+
+| `surface` | 这次 run 的行为 |
+| --- | --- |
+| `window` | 和一直以来一样，给这次 run 开它自己的 tmux window——默认值 |
+| `pin` | 不开那个 window，把同一帧画进 coordinator 的 Claude Code statusline，run 结束后没有任何东西要关 |
+| `both` | 两个都跑，通过这次 run 唯一的 toast state 去重 |
+
+```toml
+[dashboard]
+surface = "window"
+```
+
+pin 是什么、怎么接进 Claude Code，见
+[`docs/monitor-dashboard.md`](docs/monitor-dashboard.md)。
 
 ## Tracker 支持
 

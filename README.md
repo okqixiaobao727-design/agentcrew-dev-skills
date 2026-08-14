@@ -103,10 +103,11 @@ shipped defaults answer every case, so a project file carries only the cells it 
 
 ## Configuration reference
 
-The configurable surface is the two model tables and one hook, in `agentcrew.toml` at your repo
-root. The classification logic — six workflows, core vs non-core, complex vs routine — is fixed
-product opinion: you configure the outcomes, not the decision procedure. The shipped, commented
-defaults are [`config/agentcrew.default.toml`](config/agentcrew.default.toml).
+The configurable surface is the two model tables, one hook, and the dashboard's surface, in
+`agentcrew.toml` at your repo root. The classification logic — six workflows, core vs non-core,
+complex vs routine — is fixed product opinion: you configure the outcomes, not the decision
+procedure. The shipped, commented defaults are
+[`config/agentcrew.default.toml`](config/agentcrew.default.toml).
 
 Every cell carries the same three fields:
 
@@ -174,6 +175,22 @@ command = "notify-send 'AgentCrew child launched' \"$AGENTCREW_CHILD_CWD\""
 [hooks.on-child-launch.env]
 MY_PROJECT_MODE = "unattended"
 ```
+
+### `[dashboard]` — which surface a run draws itself on
+
+| `surface` | What the run does |
+| --- | --- |
+| `window` | gives the run its own tmux window, as it always has — the default |
+| `pin` | skips that window and draws the same frame into the coordinator's Claude Code statusline, so there is nothing to close when the run ends |
+| `both` | runs each, deduping toasts through the run's one toast state |
+
+```toml
+[dashboard]
+surface = "window"
+```
+
+What the pinned dashboard is and how it is wired into Claude Code is in
+[`docs/monitor-dashboard.md`](docs/monitor-dashboard.md).
 
 ## Tracker support
 

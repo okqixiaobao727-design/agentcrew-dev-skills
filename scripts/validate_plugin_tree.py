@@ -103,6 +103,10 @@ REVIEWER_CASES = ("core-complex", "core-routine", "non-core-complex", "non-core-
 CELL_FIELDS = ("executor", "model", "effort")
 EXECUTORS = ("claude", "codex")
 HOOK = "hooks.on-child-launch"
+# The surface a run draws itself on: its own tmux window, the coordinator's statusline, or each.
+DASHBOARD = "dashboard"
+SURFACE = "surface"
+SURFACES = ("window", "pin", "both")
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 # The alias list the dispatch renderer refuses to launch on, so a cell this accepts is a cell that
@@ -288,7 +292,7 @@ def check_config_text(text, label, complete, aliases, problems):
         problems.append(f"{label}: unparsable: {error}")
         return
 
-    expected = {"implementer", "reviewer", "hooks"}
+    expected = {"implementer", "reviewer", "hooks", DASHBOARD}
     for section in sorted(set(config) - expected):
         problems.append(f"{label}: unknown section [{section}]")
 
@@ -307,6 +311,29 @@ def check_config_text(text, label, complete, aliases, problems):
         check_cell(config, f"reviewer.{case}", label, complete, aliases, problems)
 
     check_hook(config, label, complete, problems)
+    check_dashboard(config, label, complete, problems)
+
+
+def check_dashboard(config, label, complete, problems):
+    """The surface the run draws itself on, which the shipped defaults must answer for everyone."""
+    dashboard = config.get(DASHBOARD)
+    if dashboard is None:
+        if complete:
+            problems.append(f"{label}: missing [{DASHBOARD}]")
+        return
+    if not isinstance(dashboard, dict):
+        problems.append(f"{label}: [{DASHBOARD}] must be a table with a {SURFACE}")
+        return
+    surface = dashboard.get(SURFACE)
+    if surface is None:
+        if complete:
+            problems.append(f"{label}: [{DASHBOARD}] needs a {SURFACE}, one of {SURFACES}")
+    elif surface not in SURFACES:
+        problems.append(
+            f"{label}: [{DASHBOARD}] {SURFACE} {surface!r} is not one of {SURFACES}"
+        )
+    for field in sorted(set(dashboard) - {SURFACE}):
+        problems.append(f"{label}: [{DASHBOARD}] carries an unknown field {field!r}")
 
 
 def check_hook(config, label, complete, problems):

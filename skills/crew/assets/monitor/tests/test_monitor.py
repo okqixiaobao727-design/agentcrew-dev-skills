@@ -51,6 +51,10 @@ REVIEW_LANE = "codex gpt-5.6-sol"
 # The dashboard window's fixed name, and the file in the run dir that remembers its id.
 WINDOW_NAME = "crew-dashboard"
 WINDOW_RECORD = "dashboard-window"
+# The coordinator's own pid, passed in by the coordinator: nothing here ever looks one up.
+COORDINATOR_PID = 4242
+# The file the dashboard and the pin both dedup toasts through, in the run directory.
+TOAST_STATE = "toasts.json"
 
 # What the executor column shows for each lane of this run, and what a row with no clock shows.
 CLAUDE_LANE = f"claude/{MODEL}"
@@ -105,6 +109,9 @@ PIN_REGISTRY = ("agentcrew", "pins")
 # The tmux session the caller of `pin` is sitting in, and one that belongs to another crew.
 CALLER_SESSION = "$7"
 OTHER_SESSION = "$9"
+# That same session as tmux addresses it as a target, which is the spelling dispatch passes to
+# `window` and the pin therefore records.
+SESSION_TARGET = f"{CALLER_SESSION}:"
 # A second run of the same shape, so a registry can hold two pins at once.
 SECOND_RUN_ID = "crew-run-2"
 
@@ -531,7 +538,26 @@ class Fixture:
 
     def window(self, *extra):
         """Ask for the run's dashboard window, as a script re-running the command would."""
-        return self.run_monitor("window", "--run-dir", self.run_dir, "--session", "$7:", *extra)
+        return self.run_monitor(
+            "window", "--run-dir", self.run_dir, "--session", SESSION_TARGET, *extra
+        )
+
+    def unpin(self, *extra):
+        """Take the run's pin out of the registry, as the end of the run does."""
+        return self.run_monitor("unpin", "--run-dir", self.run_dir, *extra)
+
+    def config(self, surface):
+        """A project config choosing this run's surface, as the setup wizard writes one."""
+        path = self.root / "agentcrew.toml"
+        path.write_text(f'[dashboard]\nsurface = "{surface}"\n')
+        return path
+
+    def pins(self, directory=None):
+        """Every pin in the registry, parsed — what a statusline tick has to find the run by."""
+        directory = pathlib.Path(directory) if directory else self.pin_dir()
+        if not directory.is_dir():
+            return []
+        return [json.loads(path.read_text()) for path in sorted(directory.glob("*.json"))]
 
     def statusline(self, output=PREVIOUS_STATUSLINE):
         """The statusline command the operator already runs, printing one recognisable line."""
@@ -1523,6 +1549,188 @@ class WindowTests(MonitorTestCase):
             [argv[0] for argv in self.fixture.calls("tmux") if argv[0].startswith("kill")], []
         )
         self.assertEqual(list(self.fixture.live_windows()), [window_id])
+
+
+class SurfaceTests(MonitorTestCase):
+    """Which surface a run draws itself on, and the pin's lifecycle: written at dispatch, removed
+    when the run ends. The window stays the default, so a run that says nothing runs as it does
+    today.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.fixture.table()
+
+    def surfaced(self, surface, *extra):
+        """Dispatch's call, on a repo whose config chose that surface."""
+        return self.fixture.window(
+            "--config", self.fixture.config(surface),
+            "--coordinator-pid", COORDINATOR_PID, *extra,
+        )
+
+    def test_dispatch_writes_a_pin_naming_the_run_the_coordinator_pid_and_its_session(self):
+        result = self.surfaced("pin")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.pins(), [{
+            "run_dir": str(self.fixture.run_dir.resolve()),
+            "coordinator_pid": COORDINATOR_PID,
+            "tmux_session": SESSION_TARGET,
+        }])
+
+    def test_the_pin_names_the_runs_realpath_however_the_run_dir_is_spelled(self):
+        """The `/tmp` against `/private/tmp` case: one run, one pin, under its resolved path."""
+        link = self.fixture.root / "alias-run"
+        link.symlink_to(self.fixture.run_dir, target_is_directory=True)
+
+        result = self.fixture.run_monitor(
+            "window", "--run-dir", link, "--session", SESSION_TARGET,
+            "--config", self.fixture.config("pin"), "--coordinator-pid", COORDINATOR_PID,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [pin["run_dir"] for pin in self.fixture.pins()],
+            [str(self.fixture.run_dir.resolve())],
+        )
+
+    def test_dispatching_every_wave_leaves_the_run_one_pin(self):
+        """The command is re-run each wave, as the window's is; a run pins itself once."""
+        self.surfaced("pin")
+
+        self.surfaced("pin")
+
+        self.assertEqual(len(self.fixture.pins()), 1, self.fixture.pins())
+
+    def test_the_end_of_the_run_removes_the_pin(self):
+        self.surfaced("pin")
+
+        result = self.fixture.unpin()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_removing_a_pin_a_run_never_wrote_is_quiet(self):
+        """A `surface = "window"` run ends through the same step, and has nothing to remove."""
+        result = self.fixture.unpin()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_a_pin_surface_never_launches_the_dashboard_window(self):
+        result = self.surfaced("pin")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.window_calls(), [])
+        self.assertEqual(self.fixture.live_windows(), {})
+        self.assertIsNone(self.fixture.recorded_window())
+        self.assertEqual(len(self.fixture.pins()), 1)
+
+    def test_a_window_surface_writes_no_pin(self):
+        result = self.surfaced("window")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_a_run_whose_repo_configures_nothing_keeps_todays_behaviour(self):
+        """No config file at all: the window is created and no pin is written, as before."""
+        result = self.fixture.window("--coordinator-pid", COORDINATOR_PID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_a_config_file_that_is_not_there_is_the_default_surface(self):
+        result = self.fixture.window(
+            "--config", self.fixture.root / "absent.toml",
+            "--coordinator-pid", COORDINATOR_PID,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_both_surfaces_run_over_one_toast_state_file(self):
+        """Window and pin both run, and both dedup through the run's own toast state — which is
+        what stops the two passes announcing the same thing twice.
+        """
+        result = self.surfaced("both")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        command = self.fixture.window_calls()[0][-1]
+        self.assertIn(f"--toast-state {self.fixture.run_dir.resolve() / TOAST_STATE}", command)
+        # The pin's own pass reads that same file, because it is the one this run directory has.
+        self.assertEqual(
+            [pin["run_dir"] for pin in self.fixture.pins()],
+            [str(self.fixture.run_dir.resolve())],
+        )
+
+    def test_the_registry_the_pin_is_written_into_is_overridable(self):
+        elsewhere = self.fixture.root / "other-pins"
+
+        result = self.surfaced("pin", "--pin-dir", elsewhere)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.pins(elsewhere)), 1)
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_a_pin_written_elsewhere_is_removed_from_there(self):
+        elsewhere = self.fixture.root / "other-pins"
+        self.surfaced("pin", "--pin-dir", elsewhere)
+
+        result = self.fixture.unpin("--pin-dir", elsewhere)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.pins(elsewhere), [])
+
+    def test_an_unknown_surface_is_reported_and_nothing_is_run(self):
+        result = self.surfaced("popup")
+
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("MONITOR ERROR", result.stderr)
+        self.assertEqual(self.fixture.window_calls(), [])
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_the_pin_dispatch_writes_is_the_one_the_statusline_tick_draws(self):
+        """The two halves of the surface meet here: what dispatch writes, `pin` selects and draws.
+
+        The session is the join. Dispatch passes tmux's target spelling, `$7:`, while the tick
+        reads its own session as `$7`, so a second crew's pin is present to make the match do the
+        selecting rather than the sole-pin fallback.
+        """
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.live({"06": "busy", "07": "busy"})
+        self.fixture.window(
+            "--config", self.fixture.config("pin"), "--coordinator-pid", os.getpid(),
+        )
+        self.fixture.pin(
+            run_dir=self.fixture.root / SECOND_RUN_ID, pid=os.getpid(), session=OTHER_SESSION
+        )
+        self.fixture.tmux_says_session(CALLER_SESSION)
+
+        drawn = self.fixture.pin_frame()
+
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(ANSI.sub("", drawn.stdout), self.fixture.dashboard("--no-color").stdout)
+        self.assertEqual(
+            frame(ANSI.sub("", drawn.stdout)).splitlines()[0],
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=2 · elapsed {LIVE_ELAPSED}",
+        )
+
+    def test_a_pinned_surface_without_the_coordinators_pid_is_reported(self):
+        """The pid is the whole crash story, so a pin may never be written without one."""
+        result = self.fixture.window("--config", self.fixture.config("pin"))
+
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("MONITOR ERROR", result.stderr)
+        self.assertEqual(self.fixture.pins(), [])
+        self.assertEqual(self.fixture.window_calls(), [])
 
 
 class CostTests(MonitorTestCase):
