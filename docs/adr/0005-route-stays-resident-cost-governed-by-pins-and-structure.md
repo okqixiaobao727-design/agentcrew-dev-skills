@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted — the body-structure bullet is superseded by ADR-0006
 ---
 
 # /route stays a resident interactive skill; its cost is governed by frontmatter pins and body structure, not forking

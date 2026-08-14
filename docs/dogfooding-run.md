@@ -34,9 +34,12 @@ rather than measuring vendor speed.
 
 Three findings were fixed in `skills/route/SKILL.md` before publishing:
 
-- **`to-tickets` may not be a slash command.** The plugin was installed and the skill present, but
-  the session exposed no `/mattpocock-skills:to-tickets` command. Step 3 now says to read that
-  skill's `SKILL.md` and follow it directly when that happens.
+- **`to-tickets` is invisible to the model by upstream design.** The plugin was installed and the
+  skill present, but the agent could not see it: the skill is `disable-model-invocation: true`, so
+  its description never enters model context and the `Skill` tool refuses it — it is reserved for
+  the user to type. The run's own diagnosis ("may not be a slash command") was wrong, and the
+  read-its-`SKILL.md`-and-follow-it workaround written from it was later removed: spec-only `/route`
+  now prompts the user to type the command (ADR-0006).
 - **Two documents named the ticket path.** That skill's local-file branch writes to a path of its
   own; this repo's convention document said somewhere else. Step 3 now states which one decides.
 - **Contract criteria were written as symptoms.** Four defects in the run traced back to the

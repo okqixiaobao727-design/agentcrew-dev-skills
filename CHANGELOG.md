@@ -7,6 +7,31 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Spec-only `/route` no longer drives `/mattpocock-skills:to-tickets` itself: it
+  prints the command for the user to type, and that user-typed run cuts,
+  confirms, and publishes with `/route`'s rules riding along as additions — the
+  skill's upstream gate against model invocation is honoured, not worked around
+  (ADR-0006).
+- `/route`'s body slims to a thin router. The judgment core — classification
+  tests, table shape, `## Routing` template — moves to `references/classify.md`,
+  force-read at the point of use, superseding ADR-0005's body-structure bullet;
+  the cutting overlay is absorbed into `references/spec-only.md`, which ends
+  with a verification pass over the published tickets.
+- The plugin-tree validator checks relative links in every skill's
+  `references/*.md`, not just its `SKILL.md`, so the moved judgment core keeps
+  its broken-link protection.
+
+### Removed
+- `trackers.md`'s **publish** operation: publication belongs to `to-tickets`,
+  and `/route` reads, edits, and marks.
+
+### Fixed
+- `docs/dogfooding-run.md` recorded a wrong root cause ("`to-tickets` may not
+  be a slash command"); the real cause is the skill's deliberate
+  `disable-model-invocation` gate, which keeps its description out of model
+  context entirely.
+
 ## [0.2.1] - 2026-08-14
 
 ### Fixed

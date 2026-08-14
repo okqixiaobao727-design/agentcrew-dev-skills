@@ -52,9 +52,17 @@ merges, escalations, and rulings copied in verbatim. Its audience is future agen
 the human.
 _Avoid_: decision log (legacy), status report
 
+**Ticket state**:
+The single human-facing vocabulary for where a ticket stands, shared by the dashboard,
+toasts, and the final report: pending, running, waiting, parked, landable, merged,
+failed, vanished — plus duplicate and unknown as anomaly annotations. Source
+vocabularies (tmux process states, monitor internals, settlement verdicts) are mapped
+into it before anything reaches the human.
+_Avoid_: raw source states (busy, idle) in human-facing output
+
 **Dashboard**:
-The script-rendered human view of a run: a live table pane plus milestone and exception
-toasts. The human watches this instead of coordinator prose.
+The script-rendered human view of a run: a live table plus milestone and exception
+toasts, exactly one per run. The human watches this instead of coordinator prose.
 
 **Reference index**:
 The static list of file paths (one descriptive line each, no contents) placed in the
@@ -66,9 +74,10 @@ Any coordinator turn that produces a ruling or an approval. The design goal is t
 run contains no other kind of coordinator turn.
 
 **Judgment core**:
-The part of a skill body that must stay resident because every run consults it — the
-classification tests, checkpoint rules, and completion criteria. Putting it behind a
-pointer makes applying it a coin-flip.
+The judgment material every run consults — the classification tests, checkpoint rules,
+and completion criteria. It lives in one reference file that every branch force-reads at
+its point of use (ADR-0006): the mandatory Read step is what makes applying it reliable,
+where a weakly-worded pointer would make it a coin-flip.
 _Avoid_: essential prose, main content
 
 **Frontmatter pin**:
@@ -91,5 +100,5 @@ _Avoid_: retry, restart
 
 **Mode-gated reference**:
 A reference file only one mode of a skill loads, via an explicit Read instruction in the
-body — e.g. the cutting overlay that spec-only `/route` runs read and route-only runs
-never see. Disclosure earns its cost only when some branch skips the material.
+body — e.g. the spec-only handoff that route-only `/route` runs never see. Disclosure
+earns its cost only when some branch skips the material.
