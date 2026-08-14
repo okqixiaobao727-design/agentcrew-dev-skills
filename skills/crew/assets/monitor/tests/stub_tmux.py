@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 
 def state_dir():
@@ -60,6 +61,20 @@ def main():
         }
         save_windows(table)
         print(window_id)
+        return 0
+
+    if command == "display-message" and "-p" in argv:
+        # What tmux answers a caller asking which session it is in; a fixture that wrote no
+        # session leaves the question unanswered, as tmux does outside a session.
+        path = state_dir() / "tmux-session"
+        if path.exists():
+            print(path.read_text().strip())
+        return 0
+
+    if command == "display-message":
+        delay_path = state_dir() / "display-delay"
+        if delay_path.exists():
+            time.sleep(float(delay_path.read_text().strip()))
         return 0
 
     if command == "list-windows":

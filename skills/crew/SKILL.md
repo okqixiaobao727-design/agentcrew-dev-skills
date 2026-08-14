@@ -182,17 +182,25 @@ python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
   install --settings <worktree>/.claude/settings.local.json --role child --ticket <NN>
 ```
 
-Point the operator's dashboard window at the run, then leave it alone — it draws the whole run,
-every wave of it, and what it says never reaches you:
+Point the operator's dashboard at the run, then leave it alone — it draws the whole run, every
+wave of it, and what it says never reaches you:
 
 ```bash
 python3 <crew-skill-dir>/assets/monitor/monitor.py window --run-dir <run-dir> \
-  --session <tmux session>
+  --session <tmux session> --config <repo-root>/agentcrew.toml --coordinator-pid "$PPID"
 ```
 
 The command owns that one window for the whole run: it prints the id of the live one, and creates
 it only when the run has none. Call it in every wave and after adopting a resumed run — a second
 dashboard is impossible by construction, and a window the operator closed comes back.
+
+Which surface it draws on is the repo's choice, `[dashboard] surface` in that config: `window`,
+the default and today's behaviour; `pin`, which skips the window and draws the same frame into
+your own Claude Code statusline; or `both`. On `pin` or `both` the command also writes the run's
+**pin**, the file that names this live run
+([`docs/monitor-dashboard.md`](../../docs/monitor-dashboard.md#the-pin)). `$PPID` in a Bash call is
+this session's own Claude Code process, and the pin carries it so a crashed run takes its frame
+down with it.
 
 Arm the wake monitors in the background as the backstop for the two things a message cannot carry
 — a child stuck at a permission prompt, and a child that died silently — over the wave's live
@@ -210,7 +218,7 @@ exiting wakes you; re-arm each over only the children still busy under it, and a
 must leave its actionable status before it is re-armed over.
 
 **Done when** every ticket of the wave has a launched child with its escalation hook installed,
-the dashboard window is running, and the monitors are armed.
+the dashboard is running on the surface the repo chose, and the monitors are armed.
 
 ## 5. Rule
 
@@ -333,9 +341,19 @@ That row is what makes the judgment-only design checkable per run — your token
 children's total, out of this run's artifacts alone
 ([ADR-0001](../../docs/adr/0001-coordinator-spends-tokens-only-on-judgment.md)).
 
+With the report written, take the run's pin out of the registry — the final frame lives in the
+report and the machine log, not on the operator's screen, and a run leaves nothing to close:
+
+```bash
+python3 <crew-skill-dir>/assets/monitor/monitor.py unpin --run-dir <run-dir>
+```
+
+A run whose surface was the window wrote no pin and ends through this step all the same: there is
+nothing to remove, and the command says so by succeeding.
+
 **Done when** every ticket and ruling is accounted for, every launched ticket has a duration row,
-the report carries the rollup and the coordinator row, and every outside-worktree action has an
-undo.
+the report carries the rollup and the coordinator row, the run's pin is gone, and every
+outside-worktree action has an undo.
 
 ## 7. Clear on confirmation
 

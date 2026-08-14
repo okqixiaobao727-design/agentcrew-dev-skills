@@ -150,6 +150,18 @@ receiver's behalf), and human takeover.
 variables for the child — run once per child at launch. Empty by default. It is the extension point
 for whatever notification or session-tracking system you already run.
 
+## Operator surface
+
+**Operator surface** — What the human watches a run through, and what no model reads: the wake-up,
+the dashboard, the window, the pin, the receipt check and the cost pass. What each part does is in
+[`monitor-dashboard.md`](monitor-dashboard.md).
+
+**The pin** — The surface that draws the run's frame into the coordinator's own Claude Code
+statusline, so the frame and the coordinator's prompt are on screen at once and nothing is left to
+close when the run ends. Same rows, same states, same annotations as the window; only where the
+frame is drawn is different. The window is unchanged and stays the default
+([ADR-0008](adr/0008-the-pinned-dashboard-lives-in-claude-codes-statusline.md)).
+
 ## Artefacts
 
 **Worktree** — A child's isolated working directory. It isolates *files*, not the world: inside a
@@ -167,6 +179,12 @@ action reaching outside a worktree (production database, remote, deployment, ext
 ruled on in a message that says how to undo it, copied in verbatim. With permissions fully open,
 this log is the only trail of what happened overnight; the run's `report.md` is the read of it a
 human gets at the end.
+
+**Pin** — The file that names a live run: the run directory as an absolute realpath (ADR-0007), the
+coordinator's pid, and the coordinator's tmux session. Written at dispatch into the pin registry
+(`$CLAUDE_CONFIG_DIR/agentcrew/pins/`) and removed when the run ends. It is the run's only trace on
+the operator's screen, and the only thing the pin surface reads to find the run: no pin, nothing
+drawn ([`monitor-dashboard.md`](monitor-dashboard.md)).
 
 **Red line** — The one class of action blocked mechanically: irreversible destruction of data. A
 ticket that hits it is parked for a human.
