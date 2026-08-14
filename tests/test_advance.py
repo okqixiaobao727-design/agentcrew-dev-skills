@@ -318,6 +318,16 @@ class GreenWaveTests(AdvanceTestCase):
                     f"{number} was cut from a commit {landed} is not in",
                 )
 
+    def test_every_child_the_next_wave_started_is_in_the_log(self):
+        """The launch events are dispatch's, so advancing leaves the launched set readable."""
+        self.green_wave_one()
+
+        self.fixture.advance(1)
+
+        started = [record for record in self.fixture.records("launch")
+                   if record["ticket"] in ("08", "09")]
+        self.assertEqual([record["ticket"] for record in started], ["08", "09"], started)
+
     def test_the_milestone_toast_names_the_wave_that_launched(self):
         self.green_wave_one()
 

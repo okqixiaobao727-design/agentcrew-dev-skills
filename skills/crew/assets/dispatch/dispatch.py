@@ -7,6 +7,13 @@
               agents list and the model its own transcript records, a Codex child from the
               model the bridge pinned into its state file
 
+Every artifact path is recorded absolute, whatever spelling `--out-dir` was given: the launch line
+runs in the child's own worktree, so a relative path recorded here would resolve to nothing there.
+Given `--log`, every launched child earns one `launch` event in the run's machine log, written by
+dispatch itself — wave advancement and the dashboard read the launched set with no coordinator
+turn spent on bookkeeping (ADR-0001). Child windows are created detached: a launching wave never
+takes the operator's focus.
+
 The approved wave table is the only routing source this script reads (ADR-0003): a ticket's
 `## Routing` section is advisory input used to build that table, never a second authority. The
 first-turn skeleton, the workflow shapes and the review-lane variants live beside this script in
@@ -45,7 +52,9 @@ Each launched child is confirmed on one line, which is the whole of what the coo
     06 launched claude <model> <effort> window=@3 name=<agent name> pid=<pid> session=<id>
     06 FAILED <what went wrong>
 
-Exit 0 when every child of the wave launched and verified, 1 otherwise.
+Exit 0 when every child of the wave launched, verified, and — under `--log` — was recorded,
+1 otherwise: a child the log missed is one wave advancement cannot see, so the wave has not
+advanced whatever the child is doing.
 """
 
 import argparse
@@ -60,6 +69,8 @@ import time
 import tomllib
 
 TEMPLATES = pathlib.Path(__file__).resolve().parent / "templates" / "shapes.toml"
+# The log's own writer: the event shape and its closed sets stay the log's alone.
+MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 
 EXECUTORS = ("claude", "codex")
 REVIEW_VENDORS = ("claude", "codex")
@@ -448,8 +459,9 @@ def tmux(*args):
 
 
 def new_window(run, ticket, worktree):
+    """The child's own window, detached: a wave leaves the operator's focus where it was."""
     return tmux(
-        "new-window", "-t", run["tmux_session"], "-n", ticket["id"],
+        "new-window", "-d", "-t", run["tmux_session"], "-n", ticket["id"],
         "-c", str(worktree), "-P", "-F", "#{window_id}",
     )
 
@@ -563,11 +575,12 @@ def launch_claude_child(run, ticket, artifacts, timeouts):
     hook = run_launch_hook(run, worktree, window_id, timeouts["hook"])
     tmux("send-keys", "-t", window_id, launch_command(run, ticket, artifacts["launchJson"]), "Enter")
     entry = verify_child(ticket, worktree, timeouts["verify"])
-    return (
+    line = (
         f"{ticket['id']} launched {ticket['executor']} {ticket['model']} {ticket['effort']}"
         f" window={window_id} name={entry['name']} pid={entry['pid']}"
         f" session={entry['sessionId']}{hook_note(hook)}"
     )
+    return line, {"child": entry["name"], "window": window_id, "worktree": str(worktree)}
 
 
 def verify_codex_child(ticket, worktree, state_file):
@@ -627,26 +640,80 @@ def launch_codex_child(run, ticket, artifacts, timeouts):
     if not answer.get("ok"):
         raise LaunchError(f"the codex bridge refused the launch: {answer}")
     window_id = answer.get("windowId")
-    verify_codex_child(ticket, worktree, state_file)
+    state = verify_codex_child(ticket, worktree, state_file)
     hook = run_launch_hook(run, worktree, window_id, timeouts["hook"])
-    return (
+    line = (
         f"{ticket['id']} launched {ticket['executor']} {ticket['model']} {ticket['effort']}"
         f" window={window_id} state={state_file}{hook_note(hook)}"
     )
+    # A Codex child has no agents-list name; the thread the bridge pinned is what identifies it.
+    return line, {
+        "child": state.get("threadId"), "window": window_id, "worktree": str(worktree),
+    }
 
 
-def dispatch_wave(run, tickets, rendered, timeouts):
+# --- the launch event ------------------------------------------------------------------------
+
+
+def log_launch(log, ticket, details):
+    """Append this child's `launch` event through the log's own writer, so its shape stays one.
+
+    Dispatch is what knows a child came up, so dispatch is what records it: wave advancement and
+    the dashboard read the launched set without a coordinator turn spent on bookkeeping
+    (ADR-0001).
+    """
+    arguments = [
+        sys.executable, str(MACHINE_LOG), "--log", str(log), "launch",
+        "--ticket", str(ticket["id"]),
+        "--child", str(details.get("child") or ""),
+        "--workflow", str(ticket["workflow"]),
+        "--executor", str(ticket["executor"]),
+        "--model", str(ticket["model"]),
+        "--effort", str(ticket["effort"]),
+        "--branch", branch_name(ticket),
+        "--worktree", str(details["worktree"]),
+    ]
+    if details.get("window"):
+        arguments += ["--window", str(details["window"])]
+    result = subprocess.run(arguments, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise LaunchError(
+            f"machine log append failed: {(result.stderr or result.stdout).strip()}"
+        )
+
+
+def log_note(log, ticket, details):
+    """Record the launch; returns the note the child's line carries when the log refused it.
+
+    The child is already up by now, so the line still reports it launched — but a launch the log
+    missed is a child wave advancement and the dashboard cannot see, so the note is not the whole
+    report: the caller fails the dispatch on it rather than declaring a wave that advanced.
+    """
+    if not log:
+        return ""
+    try:
+        log_launch(log, ticket, details)
+    except LaunchError as error:
+        return f" log-failed={str(error).replace(chr(10), ' ')}"
+    return ""
+
+
+def dispatch_wave(run, tickets, rendered, timeouts, log=None):
     lines = []
     failed = False
     for ticket, artifacts in zip(tickets, rendered):
         try:
             if ticket["executor"] == "claude":
-                lines.append(launch_claude_child(run, ticket, artifacts, timeouts))
+                line, details = launch_claude_child(run, ticket, artifacts, timeouts)
             else:
-                lines.append(launch_codex_child(run, ticket, artifacts, timeouts))
+                line, details = launch_codex_child(run, ticket, artifacts, timeouts)
         except LaunchError as error:
             failed = True
             lines.append(f"{ticket['id']} FAILED {error}".replace("\n", " "))
+            continue
+        note = log_note(log, ticket, details)
+        failed = failed or bool(note)
+        lines.append(line + note)
     return lines, failed
 
 
@@ -659,6 +726,10 @@ def parse_args(argv):
     parser.add_argument("--table", required=True, help="the approved wave table, as JSON")
     parser.add_argument("--wave", required=True, type=int, help="which wave of it to render")
     parser.add_argument("--out-dir", required=True, help="where launch artifacts are written")
+    parser.add_argument(
+        "--log", help="the run's machine log, where each launched child's `launch` event is"
+                      " appended; without it a dispatch launches and records nothing",
+    )
     parser.add_argument(
         "--base-commit",
         help="the commit this wave's worktrees and reviews are based on, in place of the table's"
@@ -699,14 +770,17 @@ def main(argv=None):
         return 1
 
     run = table["run"]
-    rendered = render_wave(run, tickets, templates, pathlib.Path(args.out_dir))
+    # Absolute before anything is recorded: the launch line runs in the child's own worktree, not
+    # in this process's working directory, so a relative artifact path there resolves to nothing.
+    out_dir = pathlib.Path(os.path.abspath(args.out_dir))
+    rendered = render_wave(run, tickets, templates, out_dir)
     if args.command == "render":
         print(json.dumps({"ok": True, "wave": args.wave, "children": rendered}, indent=2))
         return 0
 
     lines, failed = dispatch_wave(run, tickets, rendered, {
         "verify": args.verify_timeout, "hook": args.hook_timeout,
-    })
+    }, log=os.path.abspath(args.log) if args.log else None)
     for line in lines:
         print(line)
     return 1 if failed else 0

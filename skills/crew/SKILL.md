@@ -160,11 +160,13 @@ ruling hook is installed, and the return branch, base branch, and base commit ar
 ## 4. Launch a wave
 
 One call renders every child's whole first turn from the table, cuts the worktrees, installs the
-guard hooks, launches, and verifies each child came up on the model the table approved:
+guard hooks, launches detached, verifies each child came up on the model the table approved, and
+writes each launch into the log itself:
 
 ```bash
 python3 <crew-skill-dir>/assets/dispatch/dispatch.py dispatch \
-  --table <run-dir>/wave-table.json --wave <N> --out-dir <run-dir>/launch
+  --table <run-dir>/wave-table.json --wave <N> --out-dir <run-dir>/launch \
+  --log <run-dir>/log.jsonl
 ```
 
 It prints one line per child carrying that child's window id, agent name, and pid — the pid is
