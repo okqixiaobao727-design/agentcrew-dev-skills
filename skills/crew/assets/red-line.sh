@@ -31,15 +31,51 @@ deny() {
 REASON_SUFFIX="This is an irreversible deletion. Find a reversible way to do it, or stop and \
 explain what you want to delete and why."
 
+# Resolve the deepest ancestor that exists, then re-append the rest, so a path that names a file
+# still to be created resolves like the directory it will live in. Two spellings of one directory
+# — `/tmp` and `/private/tmp` on macOS, a symlinked checkout anywhere — come back as one string,
+# which is what makes the containment checks below comparisons of places rather than of text.
+resolve() {
+  local p="$1" tail="" dir parent
+  while :; do
+    if dir=$(cd "$p" 2>/dev/null && pwd -P); then
+      printf '%s' "${dir}${tail}"
+      return
+    fi
+    tail="/$(basename "$p")$tail"
+    parent=$(dirname "$p")
+    [ "$parent" != "$p" ] || { printf '%s' "$p$tail"; return; }
+    p="$parent"
+  done
+}
+
 # Strip quotes and grouping parens so quoted paths, SQL, and subshells are matched the same as
 # bare commands, then split on shell separators. Checking each segment on its own keeps one
 # command's arguments from being read as another's, and keeps "git commit -m 'drop table
 # support'" out of the SQL patterns below.
 normalized_full=$(tr -d "\"'()" <<<"$command")
 
-# The install step substitutes this worktree's absolute path; an unsubstituted or relative value
-# disables check 6 only.
+# The install step substitutes this worktree's absolute path. A value that never got substituted,
+# or one that is relative, cannot say where this worktree is — and a guard that cannot answer that
+# question has no way to tell an ordinary command from one aimed at another session's checkout.
+# It says so instead of standing down: a safety check that quietly disables itself is worse than
+# no safety check, because the run goes on believing it is guarded.
 worktree="<WORKTREE_ABSOLUTE_PATH>"
+case "$worktree" in
+  /*) ;;
+  *) deny "Blocked: the red-line guard's worktree path is '$worktree', which is not an \
+absolute path — this guard was installed without one and cannot tell which checkout you are \
+in. Re-install the worktree's guard assets, or escalate with CREW ASK." ;;
+esac
+
+# Where this command runs, resolved once: every containment check below compares against it.
+real_workdir=$(resolve "$workdir")
+case "$real_workdir" in
+  /*) ;;
+  *) deny "Blocked: the red-line guard was handed cwd '$workdir', which is not an absolute path, \
+so it cannot tell whether a command reaches outside this worktree. Escalate with CREW ASK." ;;
+esac
+real_worktree=$(resolve "$worktree")
 cur="$workdir"
 
 while IFS= read -r normalized; do
@@ -69,23 +105,18 @@ if grep -Eq '^[[:space:]]*git([[:space:]]|$)' <<<"$normalized"; then
 
 # 6. Git runs against this worktree only — the shared checkout and every other worktree belong to
 # other sessions, and a git command aimed there moves another session's HEAD or working tree.
-case "$worktree" in
-/*)
-  gitdir="$cur"
-  if grep -Eq '^[[:space:]]*git[[:space:]]+-C[[:space:]]' <<<"$normalized"; then
-    cpath=$(sed -E 's/^[[:space:]]*git[[:space:]]+-C[[:space:]]+([^[:space:]]+).*/\1/' <<<"$normalized")
-    case "$cpath" in /*) gitdir="$cpath" ;; *) gitdir="$cur/$cpath" ;; esac
-  elif grep -Eq -- '--work-tree(=|[[:space:]])|--git-dir(=|[[:space:]])' <<<"$normalized"; then
-    cpath=$(sed -E 's/.*--(work-tree|git-dir)[= ]([^[:space:]]+).*/\2/' <<<"$normalized")
-    case "$cpath" in /*) gitdir="$cpath" ;; *) gitdir="$cur/$cpath" ;; esac
-  fi
-  real_wt=$(cd "$worktree" 2>/dev/null && pwd -P) || real_wt="$worktree"
-  real_git=$(cd "$gitdir" 2>/dev/null && pwd -P) || real_git="$gitdir"
-  if [[ "$real_git" != "$real_wt" && "$real_git" != "$real_wt"/* ]]; then
-    deny "Blocked: git in $real_git, outside this worktree ($real_wt). Git runs against this worktree only; re-run it from inside the worktree, or escalate with CREW ASK if the ticket truly needs another checkout."
-  fi
-  ;;
-esac
+gitdir="$cur"
+if grep -Eq '^[[:space:]]*git[[:space:]]+-C[[:space:]]' <<<"$normalized"; then
+  cpath=$(sed -E 's/^[[:space:]]*git[[:space:]]+-C[[:space:]]+([^[:space:]]+).*/\1/' <<<"$normalized")
+  case "$cpath" in /*) gitdir="$cpath" ;; *) gitdir="$cur/$cpath" ;; esac
+elif grep -Eq -- '--work-tree(=|[[:space:]])|--git-dir(=|[[:space:]])' <<<"$normalized"; then
+  cpath=$(sed -E 's/.*--(work-tree|git-dir)[= ]([^[:space:]]+).*/\2/' <<<"$normalized")
+  case "$cpath" in /*) gitdir="$cpath" ;; *) gitdir="$cur/$cpath" ;; esac
+fi
+real_git=$(resolve "$gitdir")
+if [[ "$real_git" != "$real_worktree" && "$real_git" != "$real_worktree"/* ]]; then
+  deny "Blocked: git in $real_git, outside this worktree ($real_worktree). Git runs against this worktree only; re-run it from inside the worktree, or escalate with CREW ASK if the ticket truly needs another checkout."
+fi
 
 else
 
@@ -128,11 +159,17 @@ if grep -Eq '(^|[^[:alnum:]_])rm[[:space:]]+(-[[:alnum:]]*[rR][[:alnum:]]*[[:spa
   paths=$(sed -E 's/^.*[^[:alnum:]_]rm[[:space:]]+//' <<<"$normalized" | tr ' ' '\n' | grep -Ev '^-' | grep -v '^$')
   while IFS= read -r path; do
     [ -n "$path" ] || continue
+    # A relative target is a target like any other: it is resolved against the directory the
+    # segment will run in, so `rm -rf .` after a `cd` out of the worktree is read as the delete
+    # it is rather than skipped for being spelled without a leading slash.
     case "$path" in
-      /*)  [[ "$path" == "$workdir"/* ]] || deny "Blocked: recursive delete of $path, outside this worktree. $REASON_SUFFIX" ;;
-      '~'*|'$HOME'*) deny "Blocked: recursive delete of $path, outside this worktree. $REASON_SUFFIX" ;;
-      *..*) deny "Blocked: recursive delete of $path escapes this worktree. $REASON_SUFFIX" ;;
+      '~'*|'$HOME'*)
+        deny "Blocked: recursive delete of $path, outside this worktree. $REASON_SUFFIX" ;;
+      /*) target=$(resolve "$path") ;;
+      *)  target=$(resolve "$cur/$path") ;;
     esac
+    [[ "$target" == "$real_workdir"/* ]] \
+      || deny "Blocked: recursive delete of $path ($target), outside this worktree. $REASON_SUFFIX"
   done <<<"$paths"
 fi
 

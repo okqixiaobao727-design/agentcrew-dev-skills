@@ -28,6 +28,17 @@ if [ "${1:-}" = "agents" ] && [ "${2:-}" = "--json" ]; then
     duplicate)
       printf '[{"cwd":"/wave/01","status":"busy"},{"cwd":"/wave/01","status":"busy"},{"cwd":"/wave/02","status":"busy"}]\n'
       ;;
+    aliased-busy)
+      # The child is listed under the directory's canonical spelling while the wave was launched
+      # with an aliased one — the `/tmp` vs `/private/tmp` shape, made portable with a symlink.
+      printf '[{"cwd":"%s","status":"busy"},{"cwd":"/wave/02","status":"busy"}]\n' \
+        "${MONITOR_TEST_REAL_PATH:?}"
+      ;;
+    aliased-duplicate)
+      printf '[{"cwd":"%s","status":"busy"},{"cwd":"%s","status":"busy"},%s]\n' \
+        "${MONITOR_TEST_REAL_PATH:?}" "${MONITOR_TEST_LINK_PATH:?}" \
+        '{"cwd":"/wave/02","status":"busy"}'
+      ;;
     unknown)
       printf '[{"cwd":"/wave/01","status":"paused"},{"cwd":"/wave/02","status":"busy"}]\n'
       ;;
@@ -61,7 +72,11 @@ run_monitor() {
   local parked_file=$2
   local output_file=$3
   local exit_file=$4
+  shift 4
   local state_file="$test_dir/$scenario.state"
+  # The wave's membership, as the caller spells it; two fixed paths unless a case says otherwise.
+  local -a paths=("$@")
+  [ "${#paths[@]}" -gt 0 ] || paths=(/wave/01 /wave/02)
 
   (
     set +e
@@ -70,7 +85,7 @@ run_monitor() {
       CREW_CLAUDE_BIN="$0" \
       CREW_POLL_SECONDS=0.02 \
       perl -e 'alarm 2; exec @ARGV' \
-        "$monitor" "$parked_file" /wave/01 /wave/02 >"$output_file" 2>&1
+        "$monitor" "$parked_file" "${paths[@]}" >"$output_file" 2>&1
     printf '%s\n' "$?" >"$exit_file"
   ) 2>/dev/null
 }
@@ -101,12 +116,13 @@ assert_actionable() {
 assert_error() {
   local scenario=$1
   local expected_message=$2
+  shift 2
   local parked_file="$test_dir/$scenario.parked"
   local output_file="$test_dir/$scenario.output"
   local exit_file="$test_dir/$scenario.exit"
 
   : >"$parked_file"
-  run_monitor "$scenario" "$parked_file" "$output_file" "$exit_file"
+  run_monitor "$scenario" "$parked_file" "$output_file" "$exit_file" "$@"
 
   if [ "$(cat "$exit_file")" -eq 0 ] \
     || ! grep -q "$expected_message" "$output_file"; then
@@ -138,5 +154,28 @@ if [ "$(cat "$busy_exit")" -lt 128 ] || grep -q '^MONITOR ACTIONABLE$' "$busy_ou
   sed -n '1,20p' "$busy_output" >&2
   exit 1
 fi
+
+# A worktree reached by two spellings is one worktree: the wave is launched with the symlinked
+# name while the session is listed under the canonical one, and the monitor must stay armed rather
+# than call a live child vanished.
+mkdir -p "$test_dir/real/worktree-01"
+ln -s "$test_dir/real" "$test_dir/link"
+export MONITOR_TEST_REAL_PATH="$test_dir/real/worktree-01"
+export MONITOR_TEST_LINK_PATH="$test_dir/link/worktree-01"
+
+alias_parked="$test_dir/aliased-busy.parked"
+alias_output="$test_dir/aliased-busy.output"
+alias_exit="$test_dir/aliased-busy.exit"
+: >"$alias_parked"
+run_monitor aliased-busy "$alias_parked" "$alias_output" "$alias_exit" \
+  "$MONITOR_TEST_LINK_PATH" /wave/02
+if [ "$(cat "$alias_exit")" -lt 128 ] || grep -q '^MONITOR ACTIONABLE$' "$alias_output"; then
+  printf 'FAIL aliased-busy monitor did not remain armed\n' >&2
+  sed -n '1,20p' "$alias_output" >&2
+  exit 1
+fi
+
+assert_error aliased-duplicate 'MONITOR ERROR duplicate session' \
+  "$MONITOR_TEST_LINK_PATH" /wave/02
 
 printf 'MONITOR_WAKE_TESTS_OK\n'

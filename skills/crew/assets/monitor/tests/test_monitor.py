@@ -132,17 +132,34 @@ class Fixture:
 
     def agents(self, entries):
         """The agents list `claude agents --json` answers with, keyed by ticket."""
+        self.agents_at([
+            (ticket, self.worktrees[ticket], status) for ticket, status in entries.items()
+        ])
+
+    def agents_at(self, entries):
+        """The same list, each session's `cwd` spelled as the caller wants it spelled."""
         (self.stub_dir / "agents.json").write_text(json.dumps([
             {
                 "pid": 4000 + index,
-                "cwd": str(self.worktrees[ticket]),
+                "cwd": str(cwd),
                 "kind": "interactive",
-                "sessionId": f"session-{ticket}",
+                "sessionId": f"session-{ticket}-{index}",
                 "name": CHILDREN[ticket],
                 "status": status,
             }
-            for index, (ticket, status) in enumerate(entries.items())
+            for index, (ticket, cwd, status) in enumerate(entries)
         ]))
+
+    def alias(self, ticket):
+        """The ticket's worktree addressed through a symlink — the `/tmp` vs `/private/tmp` shape.
+
+        macOS reaches the same directory by two spellings; a symlink is that aliasing made
+        portable, so the comparison under test is the one a real run meets.
+        """
+        link = self.root / "alias"
+        if not link.exists():
+            link.symlink_to(self.root / "worktrees", target_is_directory=True)
+        return link / f"worktree-{ticket}"
 
     def environment(self):
         environment = dict(os.environ)
@@ -163,11 +180,12 @@ class Fixture:
             env=self.environment(),
         )
 
-    def dashboard(self, *extra, tickets=("06", "07")):
+    def dashboard(self, *extra, tickets=("06", "07"), paths=None):
+        """Draw the wave, addressing its worktrees as `paths` spells them when given."""
         return self.run_monitor(
             "dashboard", "--log", self.log, "--wave", WAVE, "--now", NOW_TS,
             "--toast-state", self.toast_state, *extra,
-            *[self.worktrees[ticket] for ticket in tickets],
+            *(paths if paths is not None else [self.worktrees[ticket] for ticket in tickets]),
         )
 
     def calls(self, name):
@@ -464,6 +482,58 @@ class ToastTests(MonitorTestCase):
             all(argv[:1] == ["display-message"] for argv in self.fixture.calls("tmux")),
             self.fixture.calls("tmux"),
         )
+
+
+class AliasedPathTests(MonitorTestCase):
+    """A worktree addressed by a second spelling of the same directory is the same worktree.
+
+    Path equality here decides whether a live child is drawn as `vanished`, toasted as lost, and
+    woken over — so it is decided by what the paths resolve to, never by how they were spelled.
+    """
+
+    def test_a_wave_addressed_by_an_aliased_spelling_draws_what_the_canonical_one_draws(self):
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07")
+        self.fixture.agents({"06": "busy", "07": "waiting"})
+
+        canonical = self.fixture.dashboard()
+        aliased = self.fixture.dashboard(
+            paths=[self.fixture.alias("06"), self.fixture.alias("07")]
+        )
+
+        self.assertEqual(aliased.returncode, 0, aliased.stderr)
+        self.assertEqual(
+            rows(aliased.stdout),
+            [
+                ["1", "06", CHILDREN["06"], "busy", "launch", LIVE_ELAPSED],
+                ["1", "07", CHILDREN["07"], "waiting", "launch", LIVE_ELAPSED],
+            ],
+        )
+        self.assertEqual(rows(aliased.stdout), rows(canonical.stdout))
+
+    def test_a_session_listed_under_an_aliased_cwd_is_not_vanished(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.agents_at([("06", self.fixture.alias("06"), "busy")])
+
+        result = self.fixture.dashboard(tickets=("06",))
+
+        self.assertEqual(rows(result.stdout)[0][3], "busy")
+        self.assertEqual(self.fixture.toasts(), [])
+
+    def test_two_spellings_of_one_worktree_are_one_duplicated_session(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.agents_at([
+            ("06", self.fixture.worktrees["06"], "busy"),
+            ("06", self.fixture.alias("06"), "busy"),
+        ])
+
+        result = self.fixture.dashboard(tickets=("06",))
+
+        self.assertEqual(rows(result.stdout)[0][3], "duplicate")
 
 
 class PaneTests(MonitorTestCase):
