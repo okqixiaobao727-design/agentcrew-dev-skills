@@ -58,6 +58,7 @@ to the machine log or to the operator's own pane, never to you.
 | `<run-dir>/wave-table.json` | the approved wave table: routing, wave membership, blocking edges |
 | `<run-dir>/log.jsonl` | the machine log — every launch, receipt, merge, escalation, ruling and advance decision, one JSON object per line, each stamped `%Y-%m-%dT%H:%M:%SZ` |
 | `<run-dir>/launch/` | each child's rendered first turn and launch JSON |
+| `<run-dir>/dashboard-window` | the id of the run's one dashboard window |
 | `<run-dir>/parked-paths` | the worktree paths the wake monitor reads as parked |
 | `<run-dir>/codex/<NN>.json` | one Codex child's bridge state, its whole channel |
 | `<crew-skill-dir>/assets/dispatch/dispatch.py` | the renderer; its docstring publishes the wave table's schema |
@@ -181,13 +182,17 @@ python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
   install --settings <worktree>/.claude/settings.local.json --role child --ticket <NN>
 ```
 
-Split the operator's dashboard pane once per wave, then leave it alone — it reports to the human,
-and what it says never reaches you:
+Point the operator's dashboard window at the run, then leave it alone — it draws the whole run,
+every wave of it, and what it says never reaches you:
 
 ```bash
-python3 <crew-skill-dir>/assets/monitor/monitor.py pane --session <tmux session> \
-  --log <run-dir>/log.jsonl --wave <N> <worktree-path>...
+python3 <crew-skill-dir>/assets/monitor/monitor.py window --run-dir <run-dir> \
+  --session <tmux session>
 ```
+
+The command owns that one window for the whole run: it prints the id of the live one, and creates
+it only when the run has none. Call it in every wave and after adopting a resumed run — a second
+dashboard is impossible by construction, and a window the operator closed comes back.
 
 Arm the wake monitors in the background as the backstop for the two things a message cannot carry
 — a child stuck at a permission prompt, and a child that died silently — over the wave's live
@@ -205,7 +210,7 @@ exiting wakes you; re-arm each over only the children still busy under it, and a
 must leave its actionable status before it is re-armed over.
 
 **Done when** every ticket of the wave has a launched child with its escalation hook installed,
-the dashboard pane is running, and the monitors are armed.
+the dashboard window is running, and the monitors are armed.
 
 ## 5. Rule
 
@@ -270,8 +275,8 @@ conflict goes to a headless repair session under a hard budget cap, and only a s
 two children's designs disagreeing — or a repair double failure reaches you.
 
 - **Exit 0** — the run advanced or finished. A `launched` decision means the next wave is already
-  running: split its dashboard pane and arm its monitors, as in step 4. A `complete` decision is
-  the last wave; go to step 6.
+  running: re-run the dashboard window command and arm its monitors, as in step 4. A
+  `complete` decision is the last wave; go to step 6.
 - **Exit 1** — the chain halted. The `advance` line in the log names the offending ticket, its
   verdict, its path and its branch. Rule on it, then re-run the same command.
 - **Exit 130** — the operator interrupted the run.

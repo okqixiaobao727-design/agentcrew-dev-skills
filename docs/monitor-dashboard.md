@@ -7,7 +7,8 @@ costs a model token or reaches the coordinator's context
 | Part | Script | What it does |
 | --- | --- | --- |
 | the wake-up | [`monitor-wave.sh`][wake] | armed while every child is busy, exits once one is not |
-| the dashboard | [`monitor.py dashboard`][monitor] | draws the wave as a table in its own pane |
+| the dashboard | [`monitor.py dashboard`][monitor] | draws the whole run as a table |
+| the window | [`monitor.py window`][monitor] | gives the run its one dashboard window |
 | the receipt check | [`monitor.py verify`][monitor] | decides whether a completion receipt holds |
 | the cost pass | [`monitor.py cost`][monitor] | records what each child spent, and the run total |
 
@@ -22,42 +23,100 @@ with the wake-up for the job of stopping a run.
 ## The dashboard
 
 ```sh
-monitor.py dashboard --log <machine log> --wave <N> [--refresh SECONDS]
-                     [--toast-state PATH] [--now TIMESTAMP] <worktree>...
+monitor.py dashboard --run-dir <run dir> [--refresh SECONDS] [--toast-state PATH]
+                     [--now TIMESTAMP] [--no-color]
 ```
 
-One row per launched ticket, drawn from the run's machine log
-([`docs/machine-log.md`](machine-log.md)) joined with the live agents list. The worktree paths are
-the wave's membership — the same arguments the wake-up is given — and a row exists for each one
-the log carries a `launch` for.
+One row per ticket of every wave, drawn from the run directory: the approved wave table
+(`<run-dir>/wave-table.json`), the machine log (`<run-dir>/log.jsonl`,
+[`docs/machine-log.md`](machine-log.md)), and one live-state source per lane — `claude agents
+--json` for Claude children and the bridge state files `<run-dir>/codex/<NN>.json` for Codex
+ones. It takes the run directory and nothing else — no wave number, no worktree list — so the
+frame is the whole run from the first draw, and a ticket nothing has launched yet is drawn
+`pending` rather than missing.
+
+The spec's source list for this dashboard names three sources and stops at the agents list. A
+Codex child never appears there — the bridge is the only thing that knows it is alive — so
+reading the agents list alone draws every Codex ticket of a mixed run `vanished` and toasts it
+lost, which is the very failure the run's realpath work exists to end. The fourth source is that
+deviation, taken deliberately.
 
 ```text
-crew wave 1 — 2026-08-13T09:31:12Z
-WAVE  TICKET  CHILD             STATE      LAST EVENT  ELAPSED
-1     06      crew-06-dispatch  landable   receipt     00:41:07
-1     07      crew-07-log       busy       launch      00:12:31
-1     08      crew-08-monitor   waiting    escalation  00:12:29
+crew crew-run-1 — wave 2/3 · pending=1 running=1 waiting=1 merged=1 · elapsed 00:41:07
+WAVE  TICKET  TITLE                       EXECUTOR                         STATE    ELAPSED
+1     06      Dispatch launch path        claude/claude-opus-4-5-20251101  merged   00:41:07
+2     07      Path handling hardened      codex/gpt-5.6-luna               running  00:12:31
+  ↳ review: codex gpt-5.6-luna running · 00:02:31
+2     08      The run dashboard           claude/claude-opus-4-5-20251101  waiting  00:12:29
+  ↳ last event: escalation · 2026-08-13T09:31:00Z
+3     09      Skill copy and ADR          claude/claude-opus-4-5-20251101  pending  --
 ```
 
 | Column | Where it comes from |
 | --- | --- |
-| `WAVE` | the `--wave` argument: one dashboard shows one wave |
-| `TICKET` | the `ticket` of the worktree's `launch` event |
-| `CHILD` | its `child` |
-| `STATE` | the settled verdict where the log has one, otherwise the child's live status |
-| `LAST EVENT` | the `event` of the ticket's most recent log line |
+| `WAVE` | the wave the table lists that ticket in |
+| `TICKET` | its `id` in the table |
+| `TITLE` | its `title`, given the width the window has left over and cut with `…` to fit |
+| `EXECUTOR` | its `executor` and `model`, as the table approved them |
+| `STATE` | one word of the Ticket state vocabulary ([`docs/glossary.md`](glossary.md)) |
 | `ELAPSED` | `HH:MM:SS` from the `launch` stamp to the settling stamp, or to now while live |
 
-A ticket settles the moment the log carries a `receipt` or an `outcome` for it, and its state is
-then that line's `verdict` or `outcome` — a settled row stops following the agents list, and its
-elapsed time stops moving. An unsettled row shows what `claude agents --json` says about its
-worktree: `busy`, `waiting`, `idle`, `vanished` when the list has no entry for it at all, and
-`duplicate` when it has more than one — the wake-up's own word for a worktree with two sessions in
-it. When that list cannot be read, every unsettled row reads `unknown` and the pane keeps drawing.
+The summary line above the table is the run at a glance: the run id (the run directory's own
+name), how many of its waves have been launched, a count per state, and the run's total elapsed
+time from its first launch.
 
-`--refresh` turns the single render into the pane's loop: the same table, redrawn over itself every
-so many seconds, so the operator watches the run rather than re-running a command. `--now` fixes
-the moment elapsed times are measured from, which is what makes a render reproducible.
+### States
+
+Every source state is mapped into the Ticket state vocabulary before it is drawn, so the operator
+never reads an internal word:
+
+| Drawn | What it is mapped from |
+| --- | --- |
+| `pending` | the log carries no `launch` for that ticket, or an `outcome` of `blocked` |
+| `running` | its lane's source says `busy` |
+| `waiting` | its lane's source says `waiting` or `idle`: a child that stopped short |
+| `parked` | a `receipt` verdict or an `outcome` of `parked`, or the agents list says so |
+| `landable` | a `receipt` verdict of `landable` |
+| `merged` | a `merge` result of `clean` or `repaired`, or an `outcome` of `completed` |
+| `failed` | a `receipt` verdict or an `outcome` of `failed` |
+| `vanished` | it was launched, nothing settled it, and its lane has no live entry for it |
+
+The last settling line the log carries wins, not the first: a landable branch is merged next, and
+where the ticket is *now* is what the operator is looking for. A settled row stops following its
+lane's live source and its elapsed time stops moving. Worktrees are compared by realpath, never as
+strings, so a `/tmp` spelling and a `/private/tmp` one are one worktree.
+
+### Annotation rows
+
+Normal rows stay quiet; a row that owes an explanation carries it underneath, so the table never
+has to grow a column:
+
+| Annotation | Drawn when |
+| --- | --- |
+| `↳ review: <lane> <state> · <elapsed>` | the log's last `review` line says a review is `running` |
+| `↳ anomaly: duplicate · more than one session in <worktree>` | one worktree, two sessions |
+| `↳ anomaly: unknown · <source> could not be read` | the lane's source failed or is unknown |
+| `↳ last event: <event> <word> — <detail> · <stamp>` | the row is `waiting`, `failed`, `vanished` |
+
+`duplicate` and `unknown` are annotations rather than states: both say what a reading did, not
+where the ticket got to, so the row keeps the state its own log lines justify.
+
+The `review` event has no writer yet — the dashboard reads it, and the review-running workflow
+will write it. Until then the review annotation is drawn only for a log a future writer fills in;
+nothing else about the frame depends on it.
+
+### Colour and width
+
+States are drawn in colour when a terminal is watching and plain everywhere else — a pipe, a
+redirect, `--no-color`, or `NO_COLOR` in the environment all give plain text, which is what the
+tests read. The title column absorbs whatever width the window has left after the other five, so
+titles are as readable as the terminal allows.
+
+`--refresh` turns the single render into the window's loop: the same frame, redrawn over itself
+every so many seconds. Once the log carries an `advance` decision of `complete`, `escalated` or
+`interrupted`, the run is over: the renderer draws its last frame, stops refreshing, and stays
+alive holding it — nothing here ever closes the window. `--now` fixes the moment elapsed times are
+measured to, which is what makes a render reproducible.
 
 ## Toasts
 
@@ -67,15 +126,19 @@ written where a model would be handed it.
 
 | Toast | Emitted when |
 | --- | --- |
-| `crew wave <N> complete` | every row of the wave is settled |
-| `crew <NN> stuck at a permission prompt` | an unsettled row's live status is `waiting` |
-| `crew <NN> vanished` | an unsettled row has no entry in the agents list |
+| `crew wave <N> complete` | every ticket of a launched wave is settled |
+| `crew <NN> stuck at a permission prompt` | its lane's source says `waiting` |
+| `crew <NN> stopped without finishing` | its lane's source says `idle` |
+| `crew <NN> vanished` | a launched, unsettled row has no live entry at all |
 | `crew <NN> escalated` | the log carries an `escalation` for that ticket |
 
-Each of these fires once per run. What has already been said is remembered in the toast-state
-file — `--toast-state`, by default `toasts.json` beside the machine log — so a restarted pane
-does not replay a run's exceptions, and a `--refresh` loop does not repeat itself every few
-seconds.
+Both rows a `waiting` state can come from are announced in their own words: a child at a
+permission prompt and a child that finished a turn without settling anything need different things
+from the operator. A wave nobody has launched into has not completed, so a run's later waves never
+toast on the first frame. Each of these fires once per run: what has already been said is
+remembered in the toast-state file — `--toast-state`, by default `<run-dir>/toasts.json` — so a
+restarted window does not replay a run's exceptions, and a `--refresh` loop does not repeat itself
+every few seconds.
 
 ## The receipt check
 
@@ -133,12 +196,27 @@ above and logged with the diagnosis in place of its figures, so an unmeasured ch
 both artifacts. Only a log naming an executor that is neither `claude` nor `codex` stops the pass,
 because nothing in it can be billed.
 
-## The pane
+## The window
 
 ```sh
-monitor.py pane --session <tmux target> --log <machine log> --wave <N> <worktree>...
+monitor.py window --run-dir <run dir> --session <tmux target> [--refresh SECONDS]
 ```
 
-Splits a dedicated pane in the run's tmux session running the dashboard's own refresh loop, and
-prints the pane id. The pane is the operator's window into the run; the coordinator neither reads
-it nor is told what it says.
+One run, one dashboard, one tmux window named `crew-dashboard` running the dashboard's refresh
+loop. This subcommand owns that window's whole lifecycle and is idempotent, so the operator — or
+any script, at any point in the run — can call it again without ever producing a second dashboard:
+
+1. the window's id is recorded in `<run-dir>/dashboard-window`;
+2. if the recorded window is alive, the command prints its id and does nothing else;
+3. if it is gone — the operator closed it, or the run is being resumed after a crash — a new one
+   is created and re-recorded.
+
+Reading the record, asking tmux, creating the window and writing the id back is one decision, so
+it is made under one lock in the run directory: two callers at once still leave one window.
+
+The window is created detached, so a launching or resuming run never takes the operator's focus.
+Nothing here ever closes the window: at end of run the renderer inside it stops refreshing and
+keeps its last frame, and only the human closes what they are reading.
+
+The window is the operator's view of the run; the coordinator neither reads it nor is told what
+it says.

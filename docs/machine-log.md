@@ -60,6 +60,19 @@ ladder's four stops ([ADR-0004](adr/0004-escalation-ladder-script-then-sonnet-th
 `ticket`, `outcome` (`completed`, `failed`, `parked`, or `blocked`), `detail`. These are the four
 outcomes the crew contract gives every ticket.
 
+### `review` — a ticket's trip through its review lane
+
+`ticket`, `lane` (the reviewing vendor and its model, as the wave table approved them), `state`
+(`running` or `returned`), `detail`. One line when a review starts and one when it comes back; the
+last line for a ticket is the one that holds.
+
+The dashboard reads this event and nothing else does: a ticket whose last `review` line says
+`running` carries the review annotation row
+([`docs/monitor-dashboard.md`](monitor-dashboard.md)), and a ticket whose review has `returned`
+goes quiet again. **Nothing writes it yet** — the writer belongs to the workflow that runs the
+review, not to the display that draws it, and lands separately. Until it does, the annotation row
+is drawn for no run; the rest of the frame is unaffected.
+
 ### `advance` — what the run decided after a wave settled
 
 `wave`, `decision`, `detail`. The one event that carries no `ticket`: a decision is about a wave.
