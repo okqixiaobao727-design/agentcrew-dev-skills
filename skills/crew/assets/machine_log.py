@@ -149,9 +149,28 @@ def run_hook(args):
     return 0
 
 
+def absolute(path):
+    """`path` as an absolute path, without following the symlinks along the way.
+
+    A hook runs in the cwd of the session that fired it — a child's worktree — while the paths
+    it was registered with were spelled wherever the install ran. A relative one recorded here
+    would resolve against the wrong directory at fire time and the escalation would land in a
+    file nobody reads, so the spelling is settled at the boundary. Symlinks are left alone: the
+    operator's own name for the run directory is the one the log should be found under.
+    """
+    return os.path.abspath(str(path))
+
+
 def hook_command(script, log, role, ticket):
-    """The shell command a registered hook runs: this script, in hook mode, for that side."""
-    command = f"{shlex.quote(PYTHON)} {shlex.quote(str(script))} --log {shlex.quote(str(log))}"
+    """The shell command a registered hook runs: this script, in hook mode, for that side.
+
+    Both paths in it are absolute, because the cwd it will run in is not the cwd it was written
+    in.
+    """
+    command = (
+        f"{shlex.quote(PYTHON)} {shlex.quote(absolute(script))}"
+        f" --log {shlex.quote(absolute(log))}"
+    )
     command += f" {HOOK_SUBCOMMAND} --role {shlex.quote(role)}"
     if ticket is not None:
         command += f" --ticket {shlex.quote(ticket)}"
@@ -225,11 +244,12 @@ def run_install(args):
     if not settings_shape_is_sound(settings):
         print(f"machine log: {path}: not a settings document", file=sys.stderr)
         return 1
-    command = hook_command(args.hook_script, args.log, args.role, args.ticket)
+    script = absolute(args.hook_script)
+    command = hook_command(script, args.log, args.role, args.ticket)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps(install_hook(settings, command, args.hook_script), indent=2) + "\n",
+            json.dumps(install_hook(settings, command, script), indent=2) + "\n",
             encoding="utf-8",
         )
     except OSError as error:
