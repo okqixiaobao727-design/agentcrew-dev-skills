@@ -54,3 +54,39 @@ so a project file only has to carry the cells it overrides.
 **Done when** the command exits 0.
 
 Then tell the user the config's path and that every cell in it is theirs to edit per repo.
+
+## 4. Offer the pin
+
+**The pin** draws a run's frame into the operator's own Claude Code statusline, so the run and the
+coordinator's prompt are on screen at once —
+[`docs/monitor-dashboard.md`](../../../docs/monitor-dashboard.md#the-pin) is where it is described,
+and the link to give the user. Wiring it edits the user's Claude Code settings, which is theirs and
+not this repo's, so the wizard shows the exact edit and asks before anything is written.
+
+Print what the install would do. It is a dry run: it writes nothing.
+
+```bash
+python3 <plugin-dir>/skills/crew/assets/monitor/monitor.py pin-install
+```
+
+That output is the whole of what you ask about. Read which case it shows and say so:
+
+- `statusLine.command: (absent) -> …` — there is no statusline today, and the install creates one
+  that draws the pin and nothing else.
+- `statusLine.command: <their command> -> …` — a statusline is already there. It keeps running and
+  its output is printed first; the pin's frame is drawn beneath it.
+- `the pin is already installed here; nothing to change` — the wiring is in place. Say so and stop
+  here; there is nothing to ask about.
+
+Show the dry run's lines to the user as they were printed, and ask whether to make that change.
+
+On approval, run the same command with `--apply`. Every file it writes is copied aside first, a
+second `--apply` changes nothing, and `pin-install --uninstall` puts the statusline back exactly.
+Say that a run draws into it once `[dashboard] surface` in `agentcrew.toml` is `"pin"` or `"both"`;
+on the default `"window"` the wiring sits idle.
+
+On a decline, write nothing and say plainly that the settings are untouched and that the same
+command installs the pin whenever they want it.
+
+**Done when** the user has approved and `--apply` has run, or has declined and knows their
+statusline is as it was.
