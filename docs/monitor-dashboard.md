@@ -101,9 +101,11 @@ has to grow a column:
 `duplicate` and `unknown` are annotations rather than states: both say what a reading did, not
 where the ticket got to, so the row keeps the state its own log lines justify.
 
-The `review` event has no writer yet — the dashboard reads it, and the review-running workflow
-will write it. Until then the review annotation is drawn only for a log a future writer fills in;
-nothing else about the frame depends on it.
+The `review` event is written by the review bridge the reviewed child runs — a `running` line as
+the review starts and a `returned` line on every exit path the bridge controls — so the review
+annotation appears and disappears on its own, with no operator action and no model token spent
+([`docs/machine-log.md`](machine-log.md)). A run dispatched without a machine log reviews normally
+and draws no annotation, which is the only case in which the row stays quiet under a review.
 
 ### Colour and width
 
