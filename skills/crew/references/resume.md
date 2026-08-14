@@ -48,5 +48,12 @@ Rebuild the remaining waves and show them for approval because the live run has 
 previously approved table, then write the rebuilt table back to `.crew/wave-table.json`: it is
 what every script the resumed run calls reads.
 
-**Done when** every ticket and run artifact is accounted for, existing work is preserved, and the
-user has approved the reconstructed wave table.
+## Restore the dashboard
+
+Run the dashboard window command from step 4 of `SKILL.md` over the adopted run. The window the
+interrupted run recorded is usually gone with it; the command recreates it and records the new id,
+and where the window survived it prints that id and changes nothing. The resumed run ends with the
+one dashboard every run has, without your judgment being spent on which case this was.
+
+**Done when** every ticket and run artifact is accounted for, existing work is preserved, the run
+has its one dashboard window, and the user has approved the reconstructed wave table.

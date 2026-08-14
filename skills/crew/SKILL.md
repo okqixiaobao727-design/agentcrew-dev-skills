@@ -314,8 +314,27 @@ returned; blocked tickets never ran and have no row. This table is what a later 
 calibrated from — which quadrants a cheaper lane can take — so a launched ticket left out of it is
 a hole in that dataset.
 
+Then run the cost pass once, here at the end of the run. It writes one `session-cost` line per
+child into the log and prints the run's rollup in tokens:
+
+```bash
+python3 <crew-skill-dir>/assets/monitor/monitor.py cost --log <run-dir>/log.jsonl
+```
+
+Put that rollup into the report as it printed, and add one row beneath it labelled `coordinator`:
+the tokens this session spent on the run, in the rollup's own counters and total. Read them from
+your session's usage readout; where this harness shows that only to the human, ask the operator for
+it once, in the same message that hands over the report. A figure no one can read is the pass's own
+`--` plus one line saying why, so an unmeasured session is visible rather than absent. Tokens
+throughout, never money: what a token costs changes, and the run's own numbers do not.
+
+That row is what makes the judgment-only design checkable per run — your tokens against the
+children's total, out of this run's artifacts alone
+([ADR-0001](../../docs/adr/0001-coordinator-spends-tokens-only-on-judgment.md)).
+
 **Done when** every ticket and ruling is accounted for, every launched ticket has a duration row,
-and every outside-worktree action has an undo.
+the report carries the rollup and the coordinator row, and every outside-worktree action has an
+undo.
 
 ## 7. Clear on confirmation
 
