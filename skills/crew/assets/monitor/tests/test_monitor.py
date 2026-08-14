@@ -89,6 +89,8 @@ CODEX_TOTALS = {
     "input": 1000, "output": 700, "cache_read": 4000, "cache_creation": 250, "total": 5950,
 }
 CLAUDE_SESSION = "9d1f4c2a-0000-4000-8000-000000000001"
+# The session driving the run, which works in the repository rather than in any child's worktree.
+COORDINATOR_SESSION = "9d1f4c2a-0000-4000-8000-000000000002"
 CODEX_SESSION = "019ffe0e-e154-7a93-88c2-3be07fd543cd"
 
 # The guard assets the dispatch renderer installs into every Claude worktree before its child
@@ -249,6 +251,10 @@ class Fixture:
             }))
         path.write_text("\n".join(lines) + "\n")
         return path
+
+    def coordinator_transcript(self, session=COORDINATOR_SESSION, turns=CLAUDE_TURNS):
+        """The transcript of the session driving the run, written in the repository itself."""
+        return self.claude_transcript(None, session=session, turns=turns, cwd=self.repo)
 
     def codex_rollout(
         self, ticket, session=CODEX_SESSION, usage=CODEX_USAGE, text=None, cwd=None
@@ -1085,8 +1091,8 @@ class WindowTests(MonitorTestCase):
 class CostTests(MonitorTestCase):
     """The cost pass at run completion: one event per child, and the run's rollup."""
 
-    def cost(self):
-        return self.fixture.run_monitor("cost", "--log", self.fixture.log)
+    def cost(self, *extra):
+        return self.fixture.run_monitor("cost", "--log", self.fixture.log, *extra)
 
     def costs(self):
         """The session-cost events in the log, in the order they were appended."""
@@ -1454,6 +1460,119 @@ class CostTests(MonitorTestCase):
         entry = self.costs()[0]
         self.assertEqual(entry["ticket"], "06")
         self.assertNotIn("total_tokens", entry)
+
+    def coordinator_row(self, output):
+        """The rollup's coordinator row, which sits beneath the total."""
+        return next(row for row in cost_rows(output) if row[0] == "coordinator")
+
+    def test_the_named_session_is_a_coordinator_row_beneath_the_total(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.coordinator_transcript()
+
+        result = self.cost("--coordinator-session", COORDINATOR_SESSION)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = cost_rows(result.stdout)
+        self.assertEqual(rows[-2][0], "TOTAL")
+        self.assertEqual(
+            rows[-1],
+            ["coordinator", "claude", "--"] + [
+                str(CLAUDE_TOTALS[name])
+                for name in ("input", "output", "cache_read", "cache_creation", "total")
+            ],
+        )
+
+    def test_the_coordinator_row_is_left_out_of_the_runs_total(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.coordinator_transcript()
+
+        result = self.cost("--coordinator-session", COORDINATOR_SESSION)
+
+        total = next(row for row in cost_rows(result.stdout) if row[0] == "TOTAL")
+        self.assertEqual(total[-1], str(CLAUDE_TOTALS["total"]))
+
+    def test_the_coordinators_own_transcript_is_not_billed_to_a_child(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.coordinator_transcript()
+
+        self.cost("--coordinator-session", COORDINATOR_SESSION)
+
+        self.assertEqual(self.costs()[0]["total_tokens"], CLAUDE_TOTALS["total"])
+
+    def test_the_coordinator_row_is_printed_and_never_logged(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.coordinator_transcript()
+
+        self.cost("--coordinator-session", COORDINATOR_SESSION)
+
+        self.assertEqual([entry["ticket"] for entry in self.costs()], ["06"])
+
+    def test_a_half_written_last_line_leaves_the_rest_of_the_session_counted(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        transcript = self.fixture.coordinator_transcript()
+        transcript.write_text(transcript.read_text() + "{ the request in flight\n")
+
+        result = self.cost("--coordinator-session", COORDINATOR_SESSION)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.coordinator_row(result.stdout)[-1], str(CLAUDE_TOTALS["total"]))
+
+    def test_a_line_that_does_not_parse_mid_session_is_a_dashed_row_and_a_reason(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        transcript = self.fixture.coordinator_transcript()
+        lines = transcript.read_text().splitlines()
+        transcript.write_text("\n".join([lines[0], "{ half a line", *lines[1:]]) + "\n")
+
+        result = self.cost("--coordinator-session", COORDINATOR_SESSION)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.coordinator_row(result.stdout)[-1], "--")
+        self.assertIn(f"coordinator not measured: {transcript} carries a line", result.stdout)
+
+    def test_a_session_with_no_transcript_is_a_dashed_row_and_a_reason(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+
+        result = self.cost("--coordinator-session", COORDINATOR_SESSION)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.coordinator_row(result.stdout), ["coordinator", "claude", "--", "--", "--", "--",
+                                                  "--", "--"],
+        )
+        self.assertIn(f"coordinator not measured: no transcript named {COORDINATOR_SESSION}",
+                      result.stdout)
+
+    def test_an_empty_session_id_is_a_dashed_row_rather_than_a_failure(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+
+        result = self.cost("--coordinator-session", "")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.coordinator_row(result.stdout)[-1], "--")
+        self.assertIn("coordinator not measured: no session id", result.stdout)
+
+    def test_a_rollup_asked_for_no_coordinator_carries_no_such_row(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+
+        result = self.cost()
+
+        self.assertEqual([row[0] for row in cost_rows(result.stdout)][-1], "TOTAL")
 
     def test_the_cost_pass_costs_the_coordinator_nothing(self):
         self.fixture.worktree("06")
