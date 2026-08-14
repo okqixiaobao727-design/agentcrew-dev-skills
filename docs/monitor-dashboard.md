@@ -186,10 +186,12 @@ TOTAL   --        --                        1024   746     10800       1150     
 08 not measured: no transcript under /Users/me/.codex/sessions was recorded in /repo/wt/08
 ```
 
-Transcripts are found by the worktree they ran in, compared by realpath: Claude sessions under
-`$CLAUDE_CONFIG_DIR` (default `~/.claude`), Codex sessions under `$CODEX_HOME` (default
-`~/.codex`) — the same roots the two executors write to, so what is measured is what ran. Every
-session of a worktree counts toward its ticket, including a replacement child's and a review's.
+Transcripts are found by the worktree they ran in, compared by realpath and path-component
+containment: a cwd at or below the launch event's worktree is that worktree, while a parent,
+sibling, or other outside path is not. Claude sessions are under `$CLAUDE_CONFIG_DIR` (default
+`~/.claude`), Codex sessions under `$CODEX_HOME` (default `~/.codex`) — the same roots the two
+executors write to, so what is measured is what ran. Every session of a worktree counts toward its
+ticket, including a replacement child's and a review's.
 
 A child whose transcript is missing, unreadable, or silent about usage is drawn as the `--` row
 above and logged with the diagnosis in place of its figures, so an unmeasured child is visible in
