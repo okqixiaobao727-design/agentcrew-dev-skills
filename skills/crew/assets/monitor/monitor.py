@@ -6,6 +6,9 @@
     window     draw the run on the surfaces its repo chose: create, reuse or recreate the run's one
                dedicated tmux window running that loop, and write the pin that names the live run
     unpin      at the end of the run, take that pin back out of the registry
+    pin        draw one frame of the live run into the coordinator's Claude Code statusline, or
+               draw nothing at all
+    pin-install  wire that same frame into the operator's Claude Code statusline, reversibly
     verify     decide whether a child's `CREW COMPLETE <sha>` holds, and log the receipt it earns
     cost       at run completion, log what each child's sessions spent and roll the run up
 
@@ -75,14 +78,8 @@ WINDOW_LOCK_NAME = "dashboard-window.lock"
 # One run, one dashboard, one window with this name — so the operator always knows where to look.
 DASHBOARD_WINDOW_NAME = "crew-dashboard"
 
-# The pin registry (`docs/monitor-dashboard.md`): the directory of pin files a statusline tick
-# discovers the live run from, under the operator's own Claude configuration.
-CLAUDE_CONFIG_ENV = "CLAUDE_CONFIG_DIR"
-DEFAULT_CLAUDE_CONFIG_DIR = "~/.claude"
-PIN_REGISTRY_PARTS = ("agentcrew", "pins")
 # A pin is named for the run it names, so a run re-pinning itself every wave still has one pin.
 PIN_NAME_LENGTH = 16
-PIN_SUFFIX = ".json"
 
 # Which surface a run draws itself on, from `[dashboard] surface` in the project's config. The
 # window is the default, so upgrading agentcrew changes nobody's run.
@@ -172,7 +169,31 @@ STATE_COLOURS = {
 }
 COLOUR_RESET = "\x1b[0m"
 
+# The pin registry (`docs/monitor-dashboard.md`): the directory a live run leaves the file naming
+# itself in, under the operator's Claude config, and the three things that file carries.
+PIN_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "agentcrew/pins")
+PIN_SUFFIX = ".json"
+PIN_GLOB = f"*{PIN_SUFFIX}"
+PIN_RUN_DIR = "run_dir"
+PIN_PID = "coordinator_pid"
+PIN_SESSION = "tmux_session"
+# What tmux exports into every session it runs — socket path, client pid, session id — which is
+# where the caller's own session is read from before tmux itself is asked.
+TMUX_ENVIRONMENT = "TMUX"
+TMUX_ENVIRONMENT_FIELDS = 3
+# tmux's own spelling of a session id, and the suffix a session is addressed as a target by.
+SESSION_PREFIX = "$"
+SESSION_TARGET_SUFFIX = ":"
+
 DEFAULT_REFRESH_SECONDS = 5.0
+# How long one statusline tick gives a live source before drawing its row `unknown` instead. The
+# tick draws the status line the operator's whole session depends on, so nothing in it may wait
+# indefinitely.
+DEFAULT_TIMEOUT_SECONDS = 2.0
+# The tick the pin's install sets when the operator has none, in seconds. Deliberately its own
+# constant rather than the window's: one is a redraw loop the operator watches on purpose, the
+# other is a statusline command re-run under every session, and their costs are not the same.
+DEFAULT_PIN_REFRESH_SECONDS = 2
 # How long the renderer sleeps between checks once the run is over: it has stopped drawing, and it
 # stays alive only so the window keeps the last frame until the human closes it.
 HOLD_SECONDS = 3600.0
@@ -204,6 +225,25 @@ SESSION_SEPARATOR = ","
 # the two facts a reader passes back when it cannot answer the question it was asked.
 MALFORMED = object()
 UNDETERMINED = object()
+
+# The operator's Claude Code wiring the pin's install edits, and the environment variable that
+# moves it — the same one the executor itself honours, so the settings edited are the ones in use.
+CLAUDE_SETTINGS = ("CLAUDE_CONFIG_DIR", ".claude", "settings.json")
+# The wrapper the install writes beside those settings: it runs the operator's own statusline
+# first and appends the pin's frame beneath, so nothing the operator already reads is lost.
+PIN_WRAPPER_NAME = "agentcrew-statusline.sh"
+# The line that wrapper carries: what the statusline ran before the install, and whether the
+# install is the one that added the refresh interval. It is what makes `--uninstall` exact and a
+# second `--apply` a no-op, and it lives in the wrapper so nothing else has to be kept in step.
+INSTALL_MARKER = "# agentcrew pin-install "
+INSTALL_RECORD_VERSION = 1
+# What a backup is called: beside the file it copies, so a bad install is recoverable without git.
+BACKUP_SUFFIX = ".agentcrew-backup"
+STATUS_LINE_KEY = "statusLine"
+COMMAND_KEY = "command"
+TYPE_KEY = "type"
+COMMAND_TYPE = "command"
+REFRESH_INTERVAL_KEY = "refreshInterval"
 
 MONITOR_ERROR_EXIT = 3
 
@@ -294,15 +334,22 @@ def read_log(path):
     return records
 
 
-def agent_states(claude_bin):
+def agent_states(claude_bin, timeout=None):
     """Each live session's status by its `cwd`, or None when the agents list cannot be read.
 
     A worktree the list carries twice has no single status, so it is reported as the duplicate the
     wake monitor calls an error — the dashboard draws it and leaves the stopping to the wake-up.
+
+    A list that does not answer within `timeout` is one that could not be read: a caller drawing
+    into a statusline cannot wait on it, and a row drawn `unknown` says more than no frame at all.
     """
-    result = subprocess.run(
-        [claude_bin, "agents", "--json"], capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            [claude_bin, "agents", "--json"],
+            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
     try:
@@ -320,18 +367,35 @@ def agent_states(claude_bin):
     return states
 
 
-def codex_states(run_dir):
+def read_without_blocking(path):
+    """One file's whole text, without ever waiting on what kind of file it turned out to be.
+
+    A path that is not a regular file — a fifo left in the run directory — makes an ordinary
+    read wait for a writer that may never come, and no part of a statusline tick may wait.
+    """
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def codex_states(run_dir, timeout=None):
     """Each live Codex child's status by the worktree its bridge recorded, never by spelling.
 
     A Codex child is invisible to `claude agents --json`, so its bridge state file is the only
     thing that knows it is alive: read nothing here and every Codex ticket of a run is drawn
     `vanished` from the first frame. A file that cannot be read is not a child that stopped, so it
     is passed over rather than counted as one.
+
+    The whole read is bounded by `timeout`, as the other lane's is: a source that has spent its
+    budget answers None — the lane a caller draws `unknown` — rather than holding up the frame.
     """
+    deadline = None if timeout is None else time.monotonic() + timeout
     states = {}
     for path in sorted((pathlib.Path(run_dir) / CODEX_STATE_DIR).glob(CODEX_STATE_GLOB)):
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(read_without_blocking(path))
         except (OSError, ValueError):
             continue
         cwd = state.get("cwd") if isinstance(state, dict) else None
@@ -342,9 +406,9 @@ def codex_states(run_dir):
     return states
 
 
-def live_sources(claude_bin, run_dir):
+def live_sources(claude_bin, run_dir, timeout=None):
     """What each lane says about its own children: the agents list, and the bridge state files."""
-    return {CLAUDE: agent_states(claude_bin), CODEX: codex_states(run_dir)}
+    return {CLAUDE: agent_states(claude_bin, timeout), CODEX: codex_states(run_dir, timeout)}
 
 
 def read_table(run_dir):
@@ -777,27 +841,15 @@ def configured_surface(args):
     return surface
 
 
-def pin_registry(args):
-    """The directory of pin files: under the operator's Claude configuration, or where asked.
-
-    Resolved at this boundary (ADR-0007), so dispatch writing the pin and a later `unpin` run from
-    another working directory or through another spelling of the same path address one registry.
-    """
-    if args.pin_dir:
-        return pathlib.Path(args.pin_dir).expanduser().resolve()
-    root = os.environ.get(CLAUDE_CONFIG_ENV) or DEFAULT_CLAUDE_CONFIG_DIR
-    return pathlib.Path(root).expanduser().resolve().joinpath(*PIN_REGISTRY_PARTS)
-
-
 def pin_path(args, run_dir):
     """This run's one pin, named for the run directory it names.
 
     The name is a digest of the resolved run directory, so every wave of one run writes the same
     pin and the end of the run removes exactly what dispatch wrote — while two runs at once, whose
-    directories differ, never collide.
+    directories differ, never collide. The registry is the one `pin` itself reads.
     """
     digest = hashlib.sha256(str(run_dir).encode("utf-8")).hexdigest()[:PIN_NAME_LENGTH]
-    return pin_registry(args) / f"{digest}{PIN_SUFFIX}"
+    return pin_directory(args) / f"{digest}{PIN_SUFFIX}"
 
 
 def write_pin(args, run_dir):
@@ -815,9 +867,9 @@ def write_pin(args, run_dir):
     path = pin_path(args, run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     pin = {
-        "run_dir": str(run_dir),
-        "coordinator_pid": args.coordinator_pid,
-        "tmux_session": args.session,
+        PIN_RUN_DIR: str(run_dir),
+        PIN_PID: args.coordinator_pid,
+        PIN_SESSION: args.session,
     }
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
@@ -886,8 +938,428 @@ def run_unpin(args):
     return 0
 
 
+def session_key(session):
+    """One tmux session's identity, however the caller or the pin spelled it.
+
+    tmux writes a session id as `$7`, addresses that session as the target `$7:` and exports the
+    bare `7` into the environment, and all three name one session — so the spelling is taken off
+    before two of them are ever compared. A session nobody named is None, which matches no pin.
+    """
+    text = str(session or "").strip().removesuffix(SESSION_TARGET_SUFFIX)
+    return text.removeprefix(SESSION_PREFIX) or None
+
+
+def caller_session(tmux_bin, timeout):
+    """The tmux session this tick was called from, or None when nothing can say.
+
+    The environment is asked first because it costs nothing and cannot hang: tmux exports the
+    session id into every session it runs. tmux itself is only consulted when that variable is
+    absent or is not the three fields it publishes.
+    """
+    fields = os.environ.get(TMUX_ENVIRONMENT, "").split(",")
+    if len(fields) == TMUX_ENVIRONMENT_FIELDS and session_key(fields[-1]):
+        return session_key(fields[-1])
+    try:
+        result = subprocess.run(
+            [tmux_bin, "display-message", "-p", "#{session_id}"],
+            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return session_key(result.stdout) if result.returncode == 0 else None
+
+
+def read_pin(path):
+    """One pin as the run wrote it, or None when that file is not a pin at all.
+
+    A pin names its run directory as an absolute realpath (ADR-0007), so it is resolved here and
+    an aliased spelling never becomes a second run.
+    """
+    try:
+        pin = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(pin, dict):
+        return None
+    run_dir = pin.get(PIN_RUN_DIR)
+    pid = pin.get(PIN_PID)
+    if not run_dir or not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    return {
+        "run_dir": pathlib.Path(worktree_key(run_dir)),
+        "pid": pid,
+        "session": session_key(pin.get(PIN_SESSION)),
+    }
+
+
+def read_pins(pin_dir):
+    """Every pin the registry carries, in a fixed order; a file that is not one is passed over."""
+    try:
+        paths = sorted(pathlib.Path(pin_dir).glob(PIN_GLOB))
+    except OSError:
+        return []
+    return [pin for pin in (read_pin(path) for path in paths) if pin is not None]
+
+
+def select_pin(pins, session):
+    """The one run this tick draws, or None when the registry cannot name a single one.
+
+    The caller's own session decides, so two crews at once never cross frames. A registry holding
+    one pin is drawn whatever session that pin records — the single-run case must work from a
+    session the run was never told about. Two pins recording one session name a single run no
+    better than two unmatched pins do, so both draw nothing.
+    """
+    matching = [pin for pin in pins if session is not None and pin["session"] == session]
+    if matching:
+        return matching[0] if len(matching) == 1 else None
+    return pins[0] if len(pins) == 1 else None
+
+
+def alive(pid):
+    """Whether the coordinator that wrote this pin is still running.
+
+    The whole crash story: a run whose coordinator is gone has no frame to draw, and there is no
+    watchdog, no heartbeat and no liveness file behind that.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A process this user may not signal is still a process, so the pid is not free.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def pin_directory(args):
+    """The pin registry this tick reads, and the one the run writes its pin into.
+
+    Resolved at this boundary (ADR-0007), so a run that writes its pin at dispatch and removes it
+    at the end of the run addresses one registry however the two calls spelled the path or
+    whatever directory each ran from.
+    """
+    given = pathlib.Path(args.pin_dir) if args.pin_dir else transcript_root(PIN_REGISTRY)
+    return given.expanduser().resolve()
+
+
+def pin_colour(args):
+    """Whether the frame is painted: unlike the dashboard's, this stdout is always a pipe.
+
+    Claude Code passes raw ANSI through to the statusline it draws, so colour is on by default
+    here and only the operator's own two ways of refusing it turn it off.
+    """
+    return not args.no_color and not os.environ.get("NO_COLOR")
+
+
+def pin_frame(args, run_dir, moment):
+    """The frame that run has to draw right now, or None when it has none.
+
+    A run the log says is over is a run whose final frame lives in the report and the machine log
+    rather than on the operator's screen.
+    """
+    records = read_log(run_dir / MACHINE_LOG_NAME)
+    if over(records):
+        return None
+    waves = read_table(run_dir)
+    sources = live_sources(args.claude_bin, run_dir, args.timeout)
+    rows = build_rows(waves, records, moment, sources)
+    return render(rows, run_dir.name, len(waves), moment, colour=pin_colour(args))
+
+
+def run_pin(args):
+    """Draw the live run's one frame for a statusline tick, or draw nothing; returns 0.
+
+    Every failure here is silence. A statusline that spews diagnostics across the operator's
+    prompt is worse than one that goes quiet, so this is the one command that neither writes to
+    stderr nor returns a `MONITOR ERROR` line — the frame is built whole before a byte of it is
+    printed, and anything that goes wrong on the way leaves the statusline as it was.
+
+    Claude Code writes its own JSON to this command's stdin. Nothing here reads it, and no source
+    this spawns inherits it, so a tick can neither block on that stream nor eat what is on it.
+    """
+    try:
+        pin = select_pin(
+            read_pins(pin_directory(args)), caller_session(args.tmux_bin, args.timeout)
+        )
+        if pin is None or not alive(pin["pid"]):
+            return 0
+        frame = pin_frame(args, pin["run_dir"], args.now or now())
+    except Exception:  # noqa: BLE001 — the silence contract: a tick never reports its own failure
+        return 0
+    if frame is not None:
+        print(frame, flush=True)
+    return 0
+
+
+def claude_settings_path():
+    """The settings file Claude Code reads on this machine, as this machine has it configured."""
+    variable, home, name = CLAUDE_SETTINGS
+    configured = os.environ.get(variable)
+    return pathlib.Path(configured or pathlib.Path.home() / home) / name
+
+
+def pin_settings_path(args):
+    """The settings file this install edits: the operator's real one unless told otherwise.
+
+    Absolute and resolved (ADR-0007), because the path this writes into `statusLine.command` is
+    run from whatever directory the session happens to be in.
+    """
+    settings = pathlib.Path(args.settings) if args.settings else claude_settings_path()
+    return settings.expanduser().resolve()
+
+
+def pin_wrapper_path(args, settings_file):
+    """The wrapper script this install writes, absolute: beside the settings it is wired into."""
+    if args.statusline:
+        return pathlib.Path(args.statusline).expanduser().resolve()
+    return settings_file.parent / PIN_WRAPPER_NAME
+
+
+def pin_command():
+    """The command line the wrapper runs to draw one frame: this script's own pin."""
+    return shlex.join([sys.executable, str(pathlib.Path(__file__).resolve()), "pin"])
+
+
+def wrapper_text(previous, added_interval):
+    """The wrapper's whole text: the record it is undone from, then the commands it runs."""
+    record = json.dumps({
+        "version": INSTALL_RECORD_VERSION,
+        "previous": previous,
+        "refresh_interval_added": added_interval,
+    })
+    lines = [
+        "#!/bin/sh",
+        "# Written by monitor.py pin-install. Change the settings rather than this file:",
+        "# `pin-install --uninstall` reads the record below to put the statusline back exactly.",
+        INSTALL_MARKER + record,
+        "",
+    ]
+    if previous:
+        lines += [
+            # Claude Code writes its JSON to stdin and both commands are entitled to it, so it is
+            # read once and handed on. The substitution drops the trailing newlines and exactly one
+            # is put back: the frame starts on its own line, and a readout that printed nothing
+            # costs no row, because Claude Code drops a blank line rather than drawing it.
+            "payload=$(cat)",
+            f'previous=$(printf %s "$payload" | {previous})',
+            'if [ -n "$previous" ]; then printf \'%s\\n\' "$previous"; fi',
+            "",
+        ]
+    lines += [f"exec {pin_command()} </dev/null", ""]
+    return "\n".join(lines)
+
+
+def file_text(path):
+    """The file's text, or None when it is not there or cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def install_record(wrapper):
+    """What this installer recorded in that wrapper, or None if it did not write it."""
+    text = file_text(wrapper)
+    for line in (text or "").splitlines():
+        if line.startswith(INSTALL_MARKER):
+            try:
+                record = json.loads(line[len(INSTALL_MARKER):])
+            except json.JSONDecodeError:
+                return None
+            return record if isinstance(record, dict) else None
+    return None
+
+
+def read_settings(path):
+    """The operator's settings as a dict; a file that cannot be parsed is refused, never guessed."""
+    text = file_text(path)
+    if text is None or not text.strip():
+        return {}
+    try:
+        settings = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise MonitorError(f"{path} is not valid JSON ({error}); nothing was written")
+    if not isinstance(settings, dict):
+        raise MonitorError(f"{path} is not a JSON object; nothing was written")
+    return settings
+
+
+def status_line_of(settings):
+    """The settings' `statusLine`, as a dict that can be edited without touching the original."""
+    existing = settings.get(STATUS_LINE_KEY)
+    return dict(existing) if isinstance(existing, dict) else {}
+
+
+def wrapped_command(status_line, wrapper):
+    """What the statusline ran before this install, and whether the install adds the interval.
+
+    Read from the wrapper's own record once the pin is in place, so a second run wraps what the
+    first one wrapped rather than wrapping itself, and from the settings before that.
+    """
+    record = install_record(wrapper)
+    if record is not None and status_line.get(COMMAND_KEY) == str(wrapper):
+        return record.get("previous"), bool(record.get("refresh_interval_added"))
+    command = status_line.get(COMMAND_KEY)
+    previous = command if isinstance(command, str) and command != str(wrapper) else None
+    return previous, REFRESH_INTERVAL_KEY not in status_line
+
+
+def plan_install(settings, settings_file, wrapper):
+    """The settings and wrapper an `--apply` would leave, and the lines describing the edits.
+
+    No lines means the install is already in place, which is what makes a second `--apply` a
+    no-op rather than a second layer of wrapping.
+    """
+    status_line = status_line_of(settings)
+    previous, adds_interval = wrapped_command(status_line, wrapper)
+    wanted = dict(status_line)
+    wanted[TYPE_KEY] = COMMAND_TYPE
+    wanted[COMMAND_KEY] = str(wrapper)
+    if adds_interval:
+        wanted[REFRESH_INTERVAL_KEY] = DEFAULT_PIN_REFRESH_SECONDS
+    text = wrapper_text(previous, adds_interval)
+
+    lines = []
+    if file_text(wrapper) != text:
+        lines.append(f"{'rewrite' if wrapper.exists() else 'create'} {wrapper}")
+        lines.append(
+            f"  runs {previous} first, then draws the pin's frame beneath it" if previous
+            else "  runs the pin, and nothing else"
+        )
+    if settings.get(STATUS_LINE_KEY) != wanted:
+        lines.append(f"edit {settings_file}")
+        lines.append(
+            f"  {STATUS_LINE_KEY}.{COMMAND_KEY}: {previous or '(absent)'} -> {wrapper}"
+        )
+        if adds_interval:
+            lines.append(
+                f"  {STATUS_LINE_KEY}.{REFRESH_INTERVAL_KEY}: (absent) -> "
+                f"{DEFAULT_PIN_REFRESH_SECONDS}"
+            )
+        else:
+            lines.append(
+                f"  {STATUS_LINE_KEY}.{REFRESH_INTERVAL_KEY}: "
+                f"{status_line.get(REFRESH_INTERVAL_KEY)}, left as it is"
+            )
+    after = dict(settings)
+    after[STATUS_LINE_KEY] = wanted
+    return after, text, lines
+
+
+def plan_uninstall(settings, settings_file, wrapper):
+    """The settings an `--apply --uninstall` would put back, and the lines describing the undo.
+
+    The wrapper's record is the whole of what is restored: the command the operator had, and
+    whether the refresh interval beside it is this install's to remove or the operator's to keep.
+    """
+    record = install_record(wrapper)
+    if record is None:
+        return None, []
+    previous = record.get("previous")
+    after = dict(settings)
+    edits = []
+    if previous:
+        restored = status_line_of(settings)
+        restored[COMMAND_KEY] = previous
+        if record.get("refresh_interval_added"):
+            restored.pop(REFRESH_INTERVAL_KEY, None)
+            edits.append(
+                f"  {STATUS_LINE_KEY}.{REFRESH_INTERVAL_KEY}: removed — this install added it"
+            )
+        after[STATUS_LINE_KEY] = restored
+        edits.insert(0, f"  {STATUS_LINE_KEY}.{COMMAND_KEY}: {wrapper} -> {previous}")
+    else:
+        after.pop(STATUS_LINE_KEY, None)
+        edits.append(f"  {STATUS_LINE_KEY}: removed — this install is what created it")
+    lines = []
+    if after != settings:
+        lines = [f"edit {settings_file}", *edits]
+    if wrapper.exists():
+        lines.append(f"remove {wrapper}")
+    return after, lines
+
+
+def uninstall_drift(settings, wrapper):
+    """What the statusline runs now, when that is no longer this install's wrapper; else None.
+
+    An operator who has rewired the statusline since the install has said what they want it to
+    run, and putting the command this wrapper replaced back over the top of that would undo a
+    decision this command never saw.
+    """
+    command = status_line_of(settings).get(COMMAND_KEY)
+    return None if command == str(wrapper) else (command or "(nothing)")
+
+
+def back_up(path):
+    """Copy `path` aside before it is written or removed; a file that is not there needs none."""
+    if path.exists():
+        shutil.copy2(str(path), str(path) + BACKUP_SUFFIX)
+
+
+def write_settings(path, settings):
+    """Write the settings back, having first put a copy of what was there beside it."""
+    back_up(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+def write_wrapper(wrapper, text):
+    """Write the wrapper and make it runnable, having first backed up whatever it replaces."""
+    back_up(wrapper)
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(text, encoding="utf-8")
+    wrapper.chmod(0o755)
+
+
+def run_pin_install(args):
+    """Print the edits that wire the pin into the operator's statusline, or make them; returns 0.
+
+    Nothing is written without `--apply`, so the operator authorises the exact edit rather than the
+    general permission to edit, and every file is copied aside before it is written.
+    """
+    settings_file = pin_settings_path(args)
+    wrapper = pin_wrapper_path(args, settings_file)
+    settings = read_settings(settings_file)
+    if args.uninstall:
+        drift = uninstall_drift(settings, wrapper) if install_record(wrapper) else None
+        if drift is not None:
+            raise MonitorError(
+                f"{settings_file} now runs {drift} rather than {wrapper}; "
+                "the statusline has moved on since the install and nothing was written"
+            )
+        after, lines = plan_uninstall(settings, settings_file, wrapper)
+        if not lines:
+            print("the pin is not installed here; nothing to undo")
+            return 0
+    else:
+        after, text, lines = plan_install(settings, settings_file, wrapper)
+        if not lines:
+            print("the pin is already installed here; nothing to change")
+            return 0
+    for line in lines:
+        print(line)
+    if not args.apply:
+        print("dry run — nothing written. Re-run with --apply to make these changes.")
+        return 0
+    if args.uninstall:
+        write_settings(settings_file, after)
+        back_up(wrapper)
+        wrapper.unlink(missing_ok=True)
+    else:
+        # The wrapper first: the settings must never name a script that is not there yet.
+        write_wrapper(wrapper, text)
+        write_settings(settings_file, after)
+    return 0
+
+
 def transcript_root(spec):
-    """The directory one executor keeps its transcripts in, as this machine has it configured."""
+    """A directory under an executor's configured home: a transcript root, or the pin registry.
+
+    The same three parts every time — the variable that moves the home, the home's own name under
+    `~`, and the fixed subdirectory inside it.
+    """
     variable, home, subdirectory = spec
     configured = os.environ.get(variable)
     return pathlib.Path(configured or pathlib.Path.home() / home) / subdirectory
@@ -1416,12 +1888,47 @@ def build_parser():
     unpin.add_argument("--run-dir", required=True, help="the run's directory")
     unpin.add_argument("--pin-dir", help="the pin registry this run's pin was written into")
 
+    pin = commands.add_parser(
+        "pin", help="draw the live run's one frame into the coordinator's Claude Code statusline"
+    )
+    pin.set_defaults(handler=run_pin)
+    pin.add_argument("--pin-dir", help="the pin registry the live run is discovered through")
+    pin.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
+        help="how long a live source is given to answer before its row is drawn"
+             f" {UNKNOWN} (default: {DEFAULT_TIMEOUT_SECONDS})",
+    )
+    pin.add_argument(
+        "--no-color", action="store_true", help="draw plain text rather than the state's colour"
+    )
+    pin.add_argument(
+        "--now", type=timestamp_argument,
+        help="the moment elapsed times are measured to, stamped as the log stamps (default: now)",
+    )
+
     cost = commands.add_parser("cost", help="record what each child spent and roll the run up")
     cost.set_defaults(handler=run_cost)
     cost.add_argument("--log", required=True, help="the run's machine log")
     cost.add_argument(
         "--coordinator-session",
         help="the id of the session driving the run, whose transcript becomes the coordinator row",
+    )
+
+    pin_install = commands.add_parser(
+        "pin-install", help="wire the pin into the operator's Claude Code statusline"
+    )
+    pin_install.set_defaults(handler=run_pin_install)
+    pin_install.add_argument(
+        "--apply", action="store_true", help="make the edits instead of printing them"
+    )
+    pin_install.add_argument(
+        "--uninstall", action="store_true", help="put the statusline back the way it was"
+    )
+    pin_install.add_argument(
+        "--settings", help="the Claude Code settings file to edit (default: the real one)"
+    )
+    pin_install.add_argument(
+        "--statusline", help="the wrapper script to write (default: beside those settings)"
     )
 
     verify = commands.add_parser("verify", help="check a child's completion receipt")
