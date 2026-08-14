@@ -1,6 +1,6 @@
 # The monitor's operator surface
 
-The wave monitor is what the human watches a run through. It has four parts, and none of them
+The wave monitor is what the human watches a run through. It has six parts, and none of them
 costs a model token or reaches the coordinator's context
 ([ADR-0001](adr/0001-coordinator-spends-tokens-only-on-judgment.md)):
 
@@ -9,6 +9,7 @@ costs a model token or reaches the coordinator's context
 | the wake-up | [`monitor-wave.sh`][wake] | armed while every child is busy, exits once one is not |
 | the dashboard | [`monitor.py dashboard`][monitor] | draws the whole run as a table |
 | the window | [`monitor.py window`][monitor] | gives the run its one dashboard window |
+| the pin | [`monitor.py pin`][monitor] | draws one frame into the coordinator's Claude Code statusline |
 | the receipt check | [`monitor.py verify`][monitor] | decides whether a completion receipt holds |
 | the cost pass | [`monitor.py cost`][monitor] | records what each child spent, the run total, and the coordinator's own |
 
@@ -239,3 +240,51 @@ keeps its last frame, and only the human closes what they are reading.
 
 The window is the operator's view of the run; the coordinator neither reads it nor is told what
 it says.
+
+## The pin
+
+```sh
+monitor.py pin [--pin-dir <dir>]
+```
+
+The same frame as the dashboard, drawn into the coordinator's own Claude Code statusline instead of
+a tmux window, so the run and the coordinator's prompt are on screen at once and there is nothing
+for the operator to close afterwards. Claude Code's `statusLine` runs a shell command and draws
+whatever it prints, and its `refreshInterval` re-runs that command every N seconds whether or not
+anyone is typing — so the statusline's own tick is the refresh loop, and each tick renders one
+frame on demand. There is no background process and no frame file. The rows, states, annotations
+and summary line are the window's, unchanged; only where the frame is drawn is new.
+
+Like every other part, the pin costs no model token. The frame is a rendered display region: it is
+never added to the coordinator's context and it makes no API call
+([ADR-0001](adr/0001-coordinator-spends-tokens-only-on-judgment.md)). Why the statusline rather
+than tmux's status lines is
+[ADR-0008](adr/0008-the-pinned-dashboard-lives-in-claude-codes-statusline.md), and the measurements
+behind it are in [`docs/dashboard-pinning-research.md`](dashboard-pinning-research.md). The window
+is not replaced, deprecated or changed by any of this, and it stays the default surface.
+
+### The pin registry
+
+`pin` takes no `--run-dir`. It discovers the live run from the **pin registry**: a directory of pin
+files at `$CLAUDE_CONFIG_DIR/agentcrew/pins/`, falling back to `~/.claude/agentcrew/pins/`,
+overridable with `--pin-dir`. A pin file is JSON naming the run — the run directory as an absolute
+realpath ([ADR-0007](adr/0007-paths-are-absolute-at-the-boundary-and-compared-by-realpath.md)), the
+coordinator's pid, and the coordinator's tmux session. The run writes its pin at dispatch and
+removes it when the run ends, after the report is written: the final frame lives in the report and
+the machine log, not on the screen.
+
+One pin is selected per tick, in this order:
+
+1. the pin whose recorded tmux session matches the caller's own;
+2. if no pin matches and exactly one pin exists, that one — the single-run case must work without
+   configuration, including from a session the run does not know about;
+3. if several pins exist and none matches, nothing is drawn, because two crews at once must never
+   cross frames.
+
+### When nothing is drawn
+
+Nothing is drawn, and the exit status is still 0, when there is no pin, when the run directory is
+gone or unreadable, when the coordinator's pid is not alive, or when the machine log carries a
+final `advance` decision. The last two are the whole liveness story: a dead pid is a crashed or
+killed run, a final `advance` is a run that is over, and there is no watchdog, no heartbeat and no
+separate liveness file behind either.
