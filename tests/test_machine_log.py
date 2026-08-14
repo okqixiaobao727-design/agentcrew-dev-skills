@@ -201,6 +201,101 @@ class EventTests(MachineLogTestCase):
         # A decision is about a wave, so it carries no ticket at all.
         self.assertNotIn("ticket", entry)
 
+    def test_a_session_cost_records_the_usage_one_child_spent(self):
+        result = run_cli(
+            "session-cost",
+            "--ticket", "07",
+            "--executor", "claude",
+            "--model", "claude-opus-4-6-20260401",
+            "--session", "9d1f4c2a-0000-4000-8000-000000000001",
+            "--input-tokens", "1200",
+            "--output-tokens", "3400",
+            "--cache-read-tokens", "560000",
+            "--cache-creation-tokens", "78000",
+            "--total-tokens", "642600",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "session-cost")
+        self.assertEqual(entry["ticket"], "07")
+        self.assertEqual(entry["executor"], "claude")
+        self.assertEqual(entry["model"], "claude-opus-4-6-20260401")
+        self.assertEqual(entry["session"], "9d1f4c2a-0000-4000-8000-000000000001")
+        self.assertEqual(entry["input_tokens"], 1200)
+        self.assertEqual(entry["output_tokens"], 3400)
+        self.assertEqual(entry["cache_read_tokens"], 560000)
+        self.assertEqual(entry["cache_creation_tokens"], 78000)
+        self.assertEqual(entry["total_tokens"], 642600)
+
+    def test_a_session_cost_that_could_not_be_read_carries_the_diagnosis_alone(self):
+        result = run_cli(
+            "session-cost", "--ticket", "07", "--executor", "codex",
+            "--model", "gpt-5.6-luna",
+            "--detail", "no rollout under /run/codex names worktree /repo/worktrees/07",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["event"], "session-cost")
+        self.assertEqual(
+            entry["detail"], "no rollout under /run/codex names worktree /repo/worktrees/07"
+        )
+        for field in (
+            "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_creation_tokens", "total_tokens", "session",
+        ):
+            self.assertNotIn(field, entry)
+
+    def session_cost(self, *args):
+        return run_cli(
+            "session-cost", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-opus-4-6-20260401", *args, log=self.log,
+        )
+
+    def test_a_session_cost_carrying_both_figures_and_a_diagnosis_is_refused(self):
+        result = self.session_cost(
+            "--input-tokens", "1", "--output-tokens", "2", "--cache-read-tokens", "3",
+            "--cache-creation-tokens", "4", "--total-tokens", "10",
+            "--detail", "the transcript was unreadable",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_session_cost_that_neither_counts_nor_diagnoses_is_refused(self):
+        result = self.session_cost("--session", "9d1f4c2a-0000-4000-8000-000000000001")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_session_cost_missing_one_of_its_five_figures_is_refused(self):
+        result = self.session_cost("--input-tokens", "1", "--total-tokens", "1")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_session_cost_whose_total_is_not_its_parts_is_refused(self):
+        result = self.session_cost(
+            "--input-tokens", "1", "--output-tokens", "2", "--cache-read-tokens", "3",
+            "--cache-creation-tokens", "4", "--total-tokens", "11",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_session_cost_for_an_executor_outside_the_closed_set_is_refused(self):
+        result = run_cli(
+            "session-cost", "--ticket", "07", "--executor", "gemini",
+            "--model", "gemini-3-pro", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
     def test_every_advance_decision_is_accepted_and_an_unknown_one_is_refused(self):
         for decision in ("launched", "escalated", "complete", "interrupted"):
             self.assertEqual(
