@@ -10,7 +10,7 @@ costs a model token or reaches the coordinator's context
 | the dashboard | [`monitor.py dashboard`][monitor] | draws the whole run as a table |
 | the window | [`monitor.py window`][monitor] | gives the run its one dashboard window |
 | the receipt check | [`monitor.py verify`][monitor] | decides whether a completion receipt holds |
-| the cost pass | [`monitor.py cost`][monitor] | records what each child spent, and the run total |
+| the cost pass | [`monitor.py cost`][monitor] | records what each child spent, the run total, and the coordinator's own |
 
 [wake]: ../skills/crew/assets/monitor-wave.sh
 [monitor]: ../skills/crew/assets/monitor/monitor.py
@@ -171,7 +171,7 @@ receipt per launched ticket.
 ## The cost pass
 
 ```sh
-monitor.py cost --log <machine log>
+monitor.py cost --log <machine log> [--coordinator-session ID]
 ```
 
 Run once at run completion. For every ticket the log carries a `launch` for, it reads the usage
@@ -179,14 +179,29 @@ out of the transcripts that ran in that child's worktree, appends one `session-c
 child ([`docs/machine-log.md`](machine-log.md)), and prints the run's rollup for the report:
 
 ```text
-TICKET  EXECUTOR  MODEL                     INPUT  OUTPUT  CACHE-READ  CACHE-CREATION  TOTAL
-06      claude    claude-opus-4-5-20251101  24     46      6800        900             7770
-07      codex     gpt-5.6-luna              1000   700     4000        250             5950
-08      codex     gpt-5.6-luna              --     --      --          --              --
-TOTAL   --        --                        1024   746     10800       1150            13720
+TICKET       EXECUTOR  MODEL                     INPUT  OUTPUT  CACHE-READ  CACHE-CREATION  TOTAL
+06           claude    claude-opus-4-5-20251101  24     46      6800        900             7770
+07           codex     gpt-5.6-luna              1000   700     4000        250             5950
+08           codex     gpt-5.6-luna              --     --      --          --              --
+TOTAL        --        --                        1024   746     10800       1150            13720
+coordinator  claude    --                        169    44772   5132660     197257          5374858
 
 08 not measured: no transcript under /Users/me/.codex/sessions was recorded in /repo/wt/08
 ```
+
+`--coordinator-session` adds that last row: the session driving the run, read from the transcript
+named `<id>.jsonl` under the Claude root. The coordinator can take its own figure rather than ask
+the operator for it, because Claude Code writes the id it needs into `$CLAUDE_CODE_SESSION_ID`.
+The row sits beneath the total and stays out of it — the judgment the run cost, measured against
+the children's work rather than added to it
+([ADR-0001](adr/0001-coordinator-spends-tokens-only-on-judgment.md)) — and is printed only, never
+logged, because a `session-cost` line belongs to a launched ticket. Two things follow from the
+session measuring itself: the figure is the whole session's, not the run's alone, so it is honest
+as it stands only where the session did nothing else; and the transcript is still open as it is
+read, so its last line alone is forgiven for not parsing — that one is the request in flight, and
+unbilled either way. A line that does not parse with more of the session written after it is a
+hole in the history, and takes the row to `--` like any other.
+Without the flag the rollup ends at `TOTAL`, as it always did.
 
 Transcripts are found by the worktree they ran in, compared by realpath and path-component
 containment: a cwd at or below the launch event's worktree is that worktree, while a parent,
