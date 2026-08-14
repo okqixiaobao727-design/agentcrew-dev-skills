@@ -3,8 +3,8 @@
 
 Every fixture is a real git repository with a worktree per ticket, a machine log written by hand
 in the schema `docs/machine-log.md` publishes, and a stub PATH carrying `claude` and `tmux`.
-Assertions are on external behaviour only — the table the pane draws, the toasts tmux was asked to
-display, the verdict line, the log lines that follow it, and the exit code.
+Assertions are on external behaviour only — the frame the dashboard window draws, the toasts tmux
+was asked to display, the verdict line, the log lines that follow it, and the exit code.
 """
 
 import json
@@ -21,18 +21,49 @@ import unittest
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 MONITOR = TESTS_DIR.parent / "monitor.py"
 
-# One wave, stamped in the run's one timestamp format, so every elapsed time below is arithmetic
-# a reader can check: 09:00:00 to 09:12:31 is twelve minutes and thirty-one seconds.
-WAVE = 1
+# Stamped in the run's one timestamp format, so every elapsed time below is arithmetic a reader
+# can check: 09:00:00 to 09:12:31 is twelve minutes and thirty-one seconds.
 LAUNCH_TS = "2026-08-13T09:00:00Z"
 NOW_TS = "2026-08-13T09:12:31Z"
 LIVE_ELAPSED = "00:12:31"
 SETTLED_TS = "2026-08-13T09:41:07Z"
 SETTLED_ELAPSED = "00:41:07"
 
-CHILDREN = {"06": "crew-06-dispatch", "07": "crew-07-log"}
+CHILDREN = {"06": "crew-06-dispatch", "07": "crew-07-log", "08": "crew-08-skill"}
 MODEL = "claude-opus-4-5-20251101"
 CODEX_MODEL = "gpt-5.6-luna"
+
+# The run the dashboard draws: three tickets over two waves, so a frame carries both a launched
+# wave and a wave nobody has reached yet. The run id is the run directory's own name.
+RUN_ID = "crew-run-1"
+TITLES = {"06": "Dispatch launch path", "07": "Path handling", "08": "Skill copy"}
+EXECUTORS = {"06": "claude", "07": "codex", "08": "claude"}
+MODELS = {"06": MODEL, "07": CODEX_MODEL, "08": MODEL}
+WAVES = {1: ("06", "07"), 2: ("08",)}
+REVIEW_TS = "2026-08-13T09:10:00Z"
+REVIEW_ELAPSED = "00:02:31"
+REVIEW_LANE = "codex gpt-5.6-sol"
+
+# The dashboard window's fixed name, and the file in the run dir that remembers its id.
+WINDOW_NAME = "crew-dashboard"
+WINDOW_RECORD = "dashboard-window"
+
+# What the executor column shows for each lane of this run, and what a row with no clock shows.
+CLAUDE_LANE = f"claude/{MODEL}"
+CODEX_LANE = f"codex/{CODEX_MODEL}"
+NO_ELAPSED = "--"
+
+# The table's alignment, as the spec asks for it: every column as wide as its widest cell, two
+# spaces between them. These are this run's widths — `WAVE` and `TICKET` are their own headers,
+# the title is "Dispatch launch path", the executor is the Claude lane above — and the two that
+# move are passed in: the state column when a frame shows a longer state than `running`, and the
+# title column when the window is too narrow to give it its content.
+COLUMN_GAP = "  "
+WAVE_WIDTH = len("WAVE")
+TICKET_WIDTH = len("TICKET")
+TITLE_WIDTH = len("Dispatch launch path")
+EXECUTOR_WIDTH = len(CLAUDE_LANE)
+STATE_WIDTH = len("running")
 
 # Two assistant turns of a fabricated Claude transcript, and what the four disjoint counters come
 # to once both are counted: 11+13 in, 22+24 out, 3300+3500 read from cache, 440+460 written to it,
@@ -84,9 +115,13 @@ class Fixture:
         run_git(self.repo, "commit", "-m", "base")
         self.base_commit = run_git(self.repo, "rev-parse", "HEAD")
 
-        self.log = self.root / "run" / "machine-log.jsonl"
-        self.log.parent.mkdir()
-        self.toast_state = self.root / "run" / "toasts.json"
+        # The run directory the crew skill lays out: its wave table and its machine log, under a
+        # directory whose name is the run's id.
+        self.run_dir = self.root / RUN_ID
+        self.run_dir.mkdir()
+        self.log = self.run_dir / "log.jsonl"
+        self.table_path = self.run_dir / "wave-table.json"
+        self.toast_state = self.run_dir / "toasts.json"
 
         # Where the two executors keep the transcripts the cost pass reads, pointed at this
         # fixture so nothing on the machine running the tests is ever opened.
@@ -101,6 +136,7 @@ class Fixture:
         self._link_stub("tmux", "stub_tmux.py")
 
         self.worktrees = {}
+        self.columns = 100
 
     def _link_stub(self, name, script):
         target = self.bin_dir / name
@@ -108,6 +144,34 @@ class Fixture:
             "#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, TESTS_DIR / script)
         )
         target.chmod(0o755)
+
+    def table(self, waves=WAVES):
+        """The approved wave table: every ticket of every wave, in the schema dispatch reads."""
+        self.table_path.write_text(json.dumps({
+            "run": {
+                "repo_root": str(self.repo),
+                "integration_branch": "crew/feature",
+                "integration_base_commit": self.base_commit,
+            },
+            "waves": [
+                {
+                    "wave": wave,
+                    "tickets": [
+                        {
+                            "id": ticket,
+                            "title": TITLES[ticket],
+                            "path": str(self.root / f"{ticket}.md"),
+                            "workflow": "tdd",
+                            "executor": EXECUTORS[ticket],
+                            "model": MODELS[ticket],
+                            "effort": "medium",
+                        }
+                        for ticket in tickets
+                    ],
+                }
+                for wave, tickets in waves.items()
+            ],
+        }))
 
     def worktree(self, ticket, commits=1):
         """The ticket's worktree, cut from the base commit and carrying `commits` of its own."""
@@ -147,11 +211,12 @@ class Fixture:
         with self.log.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
 
-    def launch(self, ticket, ts=LAUNCH_TS, executor="claude", model=MODEL):
+    def launch(self, ticket, ts=LAUNCH_TS, executor="claude", model=MODEL, worktree=None):
         self.append(
             ts, "launch", ticket=ticket, child=CHILDREN[ticket], workflow="tdd",
             executor=executor, model=model, effort="medium",
-            branch=f"worktree-{ticket}", worktree=str(self.worktrees[ticket]),
+            branch=f"worktree-{ticket}",
+            worktree=str(worktree if worktree is not None else self.worktrees[ticket]),
             window=f"@{ticket}",
         )
 
@@ -228,6 +293,31 @@ class Fixture:
             for index, (ticket, cwd, status) in enumerate(entries)
         ]))
 
+    def codex_state(self, ticket, status="busy", cwd=None):
+        """The bridge state file a Codex child's launch writes: where it runs, and how it is."""
+        path = self.run_dir / "codex" / f"{ticket}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 1,
+            "name": CHILDREN[ticket],
+            "cwd": str(cwd if cwd is not None else self.worktrees[ticket]),
+            "model": CODEX_MODEL,
+            "status": status,
+        }))
+        return path
+
+    def live(self, statuses):
+        """What each lane's own source says about its children: the agents list for a Claude
+        child, its bridge state file for a Codex one. A ticket left out has no live entry at all.
+        """
+        self.agents({
+            ticket: status for ticket, status in statuses.items()
+            if EXECUTORS[ticket] == "claude"
+        })
+        for ticket, status in statuses.items():
+            if EXECUTORS[ticket] == "codex":
+                self.codex_state(ticket, status)
+
     def alias(self, ticket):
         """The ticket's worktree addressed through a symlink — the `/tmp` vs `/private/tmp` shape.
 
@@ -242,6 +332,9 @@ class Fixture:
     def environment(self):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
+        # The window width the title column absorbs, fixed here so a frame is the same frame
+        # whatever terminal the suite runs in.
+        environment["COLUMNS"] = str(self.columns)
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
         environment["CLAUDE_CONFIG_DIR"] = str(self.claude_home)
         environment["CODEX_HOME"] = str(self.codex_home)
@@ -260,13 +353,32 @@ class Fixture:
             env=self.environment(),
         )
 
-    def dashboard(self, *extra, tickets=("06", "07"), paths=None):
-        """Draw the wave, addressing its worktrees as `paths` spells them when given."""
+    def dashboard(self, *extra):
+        """Draw the whole run once, at the fixed moment the elapsed times are measured to."""
         return self.run_monitor(
-            "dashboard", "--log", self.log, "--wave", WAVE, "--now", NOW_TS,
-            "--toast-state", self.toast_state, *extra,
-            *(paths if paths is not None else [self.worktrees[ticket] for ticket in tickets]),
+            "dashboard", "--run-dir", self.run_dir, "--now", NOW_TS, *extra
         )
+
+    def window(self, *extra):
+        """Ask for the run's dashboard window, as a script re-running the command would."""
+        return self.run_monitor("window", "--run-dir", self.run_dir, "--session", "$7:", *extra)
+
+    def live_windows(self):
+        path = self.stub_dir / "tmux-windows.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def close_window(self, window_id):
+        """What the operator's own `tmux kill-window` leaves behind: the id no longer exists."""
+        table = self.live_windows()
+        del table[window_id]
+        (self.stub_dir / "tmux-windows.json").write_text(json.dumps(table))
+
+    def recorded_window(self):
+        path = self.run_dir / WINDOW_RECORD
+        return path.read_text().strip() if path.exists() else None
+
+    def window_calls(self):
+        return [argv for argv in self.calls("tmux") if argv[0] == "new-window"]
 
     def calls(self, name):
         path = self.stub_dir / f"{name}-calls.jsonl"
@@ -281,11 +393,25 @@ class Fixture:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def rows(output):
-    """The dashboard's data rows, each split into its six fields."""
-    lines = output.splitlines()
-    header = next(index for index, line in enumerate(lines) if line.startswith("WAVE"))
-    return [line.split() for line in lines[header + 1:] if line.strip()]
+def frame(output):
+    """The one frame a single draw wrote, without the trailing newline."""
+    return output.rstrip("\n")
+
+
+def row(wave, ticket, text, executor, state, elapsed, width=STATE_WIDTH, title=TITLE_WIDTH):
+    """One line of the table, aligned as the frame aligns it."""
+    return COLUMN_GAP.join([
+        wave.ljust(WAVE_WIDTH),
+        ticket.ljust(TICKET_WIDTH),
+        text.ljust(title),
+        executor.ljust(EXECUTOR_WIDTH),
+        state.ljust(width),
+        elapsed,
+    ]).rstrip()
+
+
+def header(width=STATE_WIDTH, title=TITLE_WIDTH):
+    return row("WAVE", "TICKET", "TITLE", "EXECUTOR", "STATE", "ELAPSED", width, title)
 
 
 def cost_rows(output):
@@ -414,80 +540,227 @@ class ReceiptVerificationTests(MonitorTestCase):
 
 
 class DashboardTests(MonitorTestCase):
-    def test_one_row_per_launched_ticket_carries_the_wave_ticket_child_state_and_elapsed(self):
+    """The whole run in one frame: every ticket of every wave, whatever has happened to it."""
+
+    def launch_wave_one(self):
+        self.fixture.table()
         self.fixture.worktree("06")
         self.fixture.worktree("07")
         self.fixture.launch("06")
-        self.fixture.launch("07")
-        self.fixture.agents({"06": "busy", "07": "waiting"})
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+
+    def test_the_frame_carries_a_summary_line_a_row_per_ticket_and_pending_for_the_unlaunched(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy", "07": "busy"})
 
         result = self.fixture.dashboard()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("LAST EVENT", result.stdout)
+        self.assertEqual(frame(result.stdout), "\n".join([
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=2 · elapsed {LIVE_ELAPSED}",
+            header(),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
+        ]))
+
+    def test_an_abnormal_row_explains_its_last_event_and_a_normal_row_stays_quiet(self):
+        self.launch_wave_one()
+        self.fixture.append(NOW_TS, "escalation", ticket="07", role="child",
+                            message="CREW ASK 07 stuck — ts=1755060042")
+        self.fixture.live({"06": "busy", "07": "idle"})
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(frame(result.stdout), "\n".join([
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=1 waiting=1 · elapsed {LIVE_ELAPSED}",
+            header(),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            row("1", "07", TITLES["07"], CODEX_LANE, "waiting", LIVE_ELAPSED),
+            f"  ↳ last event: escalation · {NOW_TS}",
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
+        ]))
+
+    def test_a_ticket_under_review_carries_the_review_lane_state_and_elapsed_beneath_it(self):
+        self.launch_wave_one()
+        self.fixture.append(REVIEW_TS, "review", ticket="06", lane=REVIEW_LANE, state="running")
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            f"\n  ↳ review: {REVIEW_LANE} running · {REVIEW_ELAPSED}\n", result.stdout
+        )
         self.assertEqual(
-            rows(result.stdout),
-            [
-                ["1", "06", CHILDREN["06"], "busy", "launch", LIVE_ELAPSED],
-                ["1", "07", CHILDREN["07"], "waiting", "launch", LIVE_ELAPSED],
-            ],
+            frame(result.stdout).splitlines()[2],
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
         )
 
-    def test_a_settled_ticket_shows_its_verdict_and_stops_its_clock(self):
-        self.fixture.worktree("06")
-        self.fixture.launch("06")
+    def test_a_review_that_has_returned_no_longer_annotates_its_row(self):
+        self.launch_wave_one()
+        self.fixture.append(REVIEW_TS, "review", ticket="06", lane=REVIEW_LANE, state="running")
+        self.fixture.append(NOW_TS, "review", ticket="06", lane=REVIEW_LANE, state="returned")
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertNotIn("↳ review:", result.stdout)
+
+    def test_a_settled_ticket_shows_its_state_and_stops_its_clock(self):
+        self.launch_wave_one()
         self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
                             sha=self.fixture.head("06"))
-        self.fixture.agents({"06": "idle"})
-
-        result = self.fixture.dashboard(tickets=("06",))
-
-        self.assertEqual(
-            rows(result.stdout),
-            [["1", "06", CHILDREN["06"], "landable", "receipt", SETTLED_ELAPSED]],
-        )
-
-    def test_a_child_missing_from_the_agents_list_is_vanished(self):
-        self.fixture.worktree("06")
-        self.fixture.worktree("07")
-        self.fixture.launch("06")
-        self.fixture.launch("07")
-        self.fixture.agents({"06": "busy"})
+        self.fixture.append(SETTLED_TS, "merge", ticket="06", result="clean",
+                            branch="worktree-06", into="crew/feature")
+        self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed",
+                            detail="the child never finished")
+        self.fixture.live({})
 
         result = self.fixture.dashboard()
 
-        self.assertEqual(
-            [row[1:4] for row in rows(result.stdout)],
-            [["06", CHILDREN["06"], "busy"], ["07", CHILDREN["07"], "vanished"]],
+        self.assertEqual(frame(result.stdout), "\n".join([
+            f"crew {RUN_ID} — wave 1/2 · pending=1 merged=1 failed=1 · elapsed {LIVE_ELAPSED}",
+            header(),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "merged", SETTLED_ELAPSED),
+            row("1", "07", TITLES["07"], CODEX_LANE, "failed", SETTLED_ELAPSED),
+            f"  ↳ last event: receipt failed — the child never finished · {SETTLED_TS}",
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
+        ]))
+
+    def test_a_settled_ticket_stops_following_its_lanes_live_source(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="landable",
+                            sha=self.fixture.head("07"))
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "landable", SETTLED_ELAPSED, width=8),
+            result.stdout,
         )
 
-    def test_an_unreadable_agents_list_draws_unknown_and_keeps_the_pane(self):
-        self.fixture.worktree("06")
-        self.fixture.launch("06")
+    def test_a_launched_claude_child_missing_from_the_agents_list_is_vanished(self):
+        self.launch_wave_one()
+        self.fixture.live({"07": "busy"})
 
-        result = self.fixture.dashboard(tickets=("06",))
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "vanished", LIVE_ELAPSED, width=8),
+            result.stdout,
+        )
+        self.assertIn(f"  ↳ last event: launch · {LAUNCH_TS}\n", result.stdout)
+
+    def test_a_launched_codex_child_with_no_bridge_state_is_vanished(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "vanished", LIVE_ELAPSED, width=8),
+            result.stdout,
+        )
+
+    def test_a_codex_child_the_bridge_calls_stopped_is_vanished(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy", "07": "stopped"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "vanished", LIVE_ELAPSED, width=8),
+            result.stdout,
+        )
+
+    def test_an_idle_child_is_waiting_and_says_so(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "idle", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+            result.stdout,
+        )
+
+    def test_a_worktree_with_two_sessions_keeps_its_row_and_carries_the_anomaly(self):
+        # Wide enough that the temporary worktree path in the annotation is not cut to fit.
+        self.fixture.columns = 200
+        self.launch_wave_one()
+        self.fixture.agents_at([
+            ("06", self.fixture.worktrees["06"], "busy"),
+            ("06", self.fixture.worktrees["06"], "busy"),
+        ])
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
+        self.assertIn(
+            f"  ↳ anomaly: duplicate · more than one session in {self.fixture.worktrees['06']}\n",
+            result.stdout,
+        )
+
+    def test_an_unreadable_agents_list_is_an_anomaly_and_the_frame_still_draws(self):
+        self.launch_wave_one()
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(rows(result.stdout)[0][3], "unknown")
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
+        self.assertIn("  ↳ anomaly: unknown · the agents list could not be read\n", result.stdout)
+        # The other lane is read from its own source, so it is unaffected.
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
 
-    def test_a_worktree_with_no_launch_is_not_a_row(self):
-        self.fixture.worktree("06")
-        self.fixture.worktree("07")
-        self.fixture.launch("06")
-        self.fixture.agents({"06": "busy", "07": "busy"})
+    def test_the_title_column_absorbs_the_window_width_and_is_cut_when_it_will_not_fit(self):
+        # Ten columns is what this run's other five leave of a 76-column window, so the two long
+        # titles are cut to it and the short one is not.
+        self.fixture.columns = 76
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy", "07": "busy"})
 
         result = self.fixture.dashboard()
 
-        self.assertEqual([row[1] for row in rows(result.stdout)], ["06"])
+        for line in frame(result.stdout).splitlines():
+            self.assertLessEqual(len(line), 76, line)
+        self.assertIn(
+            row("1", "06", "Dispatch…", CLAUDE_LANE, "running", LIVE_ELAPSED, title=10),
+            result.stdout,
+        )
+        self.assertIn(
+            row("1", "07", "Path hand…", CODEX_LANE, "running", LIVE_ELAPSED, title=10),
+            result.stdout,
+        )
+        self.assertIn(
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED, title=10),
+            result.stdout,
+        )
 
-    def test_the_pane_redraws_as_the_log_changes(self):
-        self.fixture.worktree("06")
-        self.fixture.launch("06")
-        self.fixture.agents({"06": "busy"})
+    def test_the_frame_is_plain_text_when_nothing_is_watching_a_terminal(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "waiting", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertNotIn("\x1b[", result.stdout)
+
+    def test_the_frame_redraws_as_the_log_changes(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy", "07": "busy"})
         process = self.fixture.start_monitor(
-            "dashboard", "--log", self.fixture.log, "--wave", WAVE, "--now", NOW_TS,
-            "--toast-state", self.fixture.toast_state, "--refresh", "0.05",
-            self.fixture.worktrees["06"],
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
         )
         self.addCleanup(process.kill)
 
@@ -498,20 +771,50 @@ class DashboardTests(MonitorTestCase):
         process.terminate()
         output = process.communicate(timeout=10)[0]
 
-        self.assertIn("busy", output)
+        self.assertIn("running", output)
         self.assertIn("landable", output)
-        self.assertGreater(output.count(CHILDREN["06"]), 1)
+        self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
+
+    def test_a_finished_run_stops_refreshing_and_keeps_its_last_frame(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed")
+        self.fixture.append(SETTLED_TS, "advance", wave=2, decision="escalated")
+        self.fixture.live({})
+        process = self.fixture.start_monitor(
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
+        )
+        self.addCleanup(process.kill)
+
+        time.sleep(0.5)
+        self.assertIsNone(process.poll(), "the renderer left the window without a frame in it")
+        process.terminate()
+        output = process.communicate(timeout=10)[0]
+
+        self.assertEqual(output.count(f"crew {RUN_ID} —"), 1)
+        self.assertIn("landable", output)
+
+    def test_a_run_dir_with_no_wave_table_is_a_monitor_error_rather_than_an_empty_frame(self):
+        result = self.fixture.dashboard()
+
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("MONITOR ERROR", result.stderr)
 
 
 class ToastTests(MonitorTestCase):
-    def test_a_stuck_child_a_vanished_child_and_an_escalation_each_toast(self):
+    def launch_wave_one(self):
+        self.fixture.table()
         self.fixture.worktree("06")
         self.fixture.worktree("07")
         self.fixture.launch("06")
-        self.fixture.launch("07")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+
+    def test_a_stuck_child_a_vanished_child_and_an_escalation_each_toast(self):
+        self.launch_wave_one()
         self.fixture.append(NOW_TS, "escalation", ticket="06", role="child",
                             message="CREW ASK 06 stuck — ts=1755060042")
-        self.fixture.agents({"06": "waiting"})
+        self.fixture.live({"06": "waiting"})
 
         self.fixture.dashboard()
 
@@ -524,15 +827,26 @@ class ToastTests(MonitorTestCase):
             ]),
         )
 
+    def test_a_child_that_stopped_without_finishing_is_not_toasted_as_a_permission_prompt(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "idle", "07": "idle"})
+
+        self.fixture.dashboard()
+
+        self.assertEqual(
+            sorted(self.fixture.toasts()),
+            sorted([
+                "crew 06 stopped without finishing",
+                "crew 07 stopped without finishing",
+            ]),
+        )
+
     def test_a_wave_whose_every_ticket_is_settled_toasts_once(self):
-        self.fixture.worktree("06")
-        self.fixture.worktree("07")
-        self.fixture.launch("06")
-        self.fixture.launch("07")
+        self.launch_wave_one()
         self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
                             sha=self.fixture.head("06"))
         self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed")
-        self.fixture.agents({})
+        self.fixture.live({})
 
         self.fixture.dashboard()
         self.fixture.dashboard()
@@ -540,34 +854,37 @@ class ToastTests(MonitorTestCase):
         self.assertEqual(self.fixture.toasts(), ["crew wave 1 complete"])
 
     def test_an_unfinished_wave_does_not_toast_complete(self):
-        self.fixture.worktree("06")
-        self.fixture.worktree("07")
-        self.fixture.launch("06")
-        self.fixture.launch("07")
+        self.launch_wave_one()
         self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
                             sha=self.fixture.head("06"))
-        self.fixture.agents({"07": "busy"})
+        self.fixture.live({"07": "busy"})
+
+        self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.toasts(), [])
+
+    def test_a_wave_nobody_has_launched_does_not_toast_complete(self):
+        self.fixture.table()
+        self.fixture.live({})
 
         self.fixture.dashboard()
 
         self.assertEqual(self.fixture.toasts(), [])
 
     def test_an_exception_is_not_toasted_twice(self):
-        self.fixture.worktree("06")
-        self.fixture.launch("06")
-        self.fixture.agents({"06": "waiting"})
+        self.launch_wave_one()
+        self.fixture.live({"06": "waiting", "07": "busy"})
 
-        self.fixture.dashboard(tickets=("06",))
-        self.fixture.dashboard(tickets=("06",))
+        self.fixture.dashboard()
+        self.fixture.dashboard()
 
         self.assertEqual(self.fixture.toasts(), ["crew 06 stuck at a permission prompt"])
 
     def test_nothing_the_monitor_emits_reaches_the_coordinator(self):
-        self.fixture.worktree("06")
-        self.fixture.launch("06")
-        self.fixture.agents({"06": "waiting"})
+        self.launch_wave_one()
+        self.fixture.live({"06": "waiting", "07": "busy"})
 
-        self.fixture.dashboard(tickets=("06",))
+        self.fixture.dashboard()
 
         self.assertEqual(self.fixture.calls("claude"), [["agents", "--json"]])
         self.assertTrue(
@@ -583,39 +900,43 @@ class AliasedPathTests(MonitorTestCase):
     woken over — so it is decided by what the paths resolve to, never by how they were spelled.
     """
 
-    def test_a_wave_addressed_by_an_aliased_spelling_draws_what_the_canonical_one_draws(self):
-        self.fixture.worktree("06")
-        self.fixture.worktree("07")
-        self.fixture.launch("06")
-        self.fixture.launch("07")
-        self.fixture.agents({"06": "busy", "07": "waiting"})
-
-        canonical = self.fixture.dashboard()
-        aliased = self.fixture.dashboard(
-            paths=[self.fixture.alias("06"), self.fixture.alias("07")]
-        )
-
-        self.assertEqual(aliased.returncode, 0, aliased.stderr)
-        self.assertEqual(
-            rows(aliased.stdout),
-            [
-                ["1", "06", CHILDREN["06"], "busy", "launch", LIVE_ELAPSED],
-                ["1", "07", CHILDREN["07"], "waiting", "launch", LIVE_ELAPSED],
-            ],
-        )
-        self.assertEqual(rows(aliased.stdout), rows(canonical.stdout))
-
     def test_a_session_listed_under_an_aliased_cwd_is_not_vanished(self):
+        self.fixture.table(waves={1: ("06",)})
         self.fixture.worktree("06")
         self.fixture.launch("06")
         self.fixture.agents_at([("06", self.fixture.alias("06"), "busy")])
 
-        result = self.fixture.dashboard(tickets=("06",))
+        result = self.fixture.dashboard()
 
-        self.assertEqual(rows(result.stdout)[0][3], "busy")
+        self.assertIn("running", result.stdout)
+        self.assertNotIn("vanished", result.stdout)
         self.assertEqual(self.fixture.toasts(), [])
 
+    def test_a_codex_bridge_state_under_an_aliased_cwd_is_not_vanished(self):
+        self.fixture.table(waves={1: ("07",)})
+        self.fixture.worktree("07")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.codex_state("07", cwd=self.fixture.alias("07"))
+
+        result = self.fixture.dashboard()
+
+        self.assertIn("running", result.stdout)
+        self.assertNotIn("vanished", result.stdout)
+        self.assertEqual(self.fixture.toasts(), [])
+
+    def test_a_launch_recorded_under_an_aliased_spelling_finds_its_session(self):
+        self.fixture.table(waves={1: ("06",)})
+        self.fixture.worktree("06")
+        self.fixture.launch("06", worktree=self.fixture.alias("06"))
+        self.fixture.agents({"06": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn("running", result.stdout)
+        self.assertNotIn("vanished", result.stdout)
+
     def test_two_spellings_of_one_worktree_are_one_duplicated_session(self):
+        self.fixture.table(waves={1: ("06",)})
         self.fixture.worktree("06")
         self.fixture.launch("06")
         self.fixture.agents_at([
@@ -623,31 +944,77 @@ class AliasedPathTests(MonitorTestCase):
             ("06", self.fixture.alias("06"), "busy"),
         ])
 
-        result = self.fixture.dashboard(tickets=("06",))
+        result = self.fixture.dashboard()
 
-        self.assertEqual(rows(result.stdout)[0][3], "duplicate")
+        self.assertIn("↳ anomaly: duplicate", result.stdout)
 
 
-class PaneTests(MonitorTestCase):
-    def test_the_pane_runs_the_dashboard_refresh_loop_in_the_run_session(self):
-        self.fixture.worktree("06")
-        self.fixture.launch("06")
+class WindowTests(MonitorTestCase):
+    """The run's one dashboard window: created once, reused, recreated, never closed."""
 
-        result = self.fixture.run_monitor(
-            "pane", "--session", "$7:", "--log", self.fixture.log, "--wave", WAVE,
-            self.fixture.worktrees["06"],
-        )
+    def setUp(self):
+        super().setUp()
+        self.fixture.table()
+
+    def test_the_window_is_created_detached_under_the_runs_fixed_name_and_recorded(self):
+        result = self.fixture.window()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "%9")
-        argv = self.fixture.calls("tmux")[0]
-        self.assertEqual(argv[0], "split-window")
-        self.assertIn("$7:", argv)
-        command = argv[-1]
+        window_id = result.stdout.strip()
+        self.assertEqual(self.fixture.recorded_window(), window_id)
+        self.assertEqual(list(self.fixture.live_windows()), [window_id])
+        created = self.fixture.window_calls()
+        self.assertEqual(len(created), 1, self.fixture.calls("tmux"))
+        self.assertIn("-d", created[0])
+        self.assertIn(WINDOW_NAME, created[0])
+        self.assertIn("$7:", created[0])
+        command = created[0][-1]
         self.assertIn("dashboard", command)
         self.assertIn("--refresh", command)
-        self.assertIn(str(self.fixture.log), command)
-        self.assertIn(str(self.fixture.worktrees["06"]), command)
+        self.assertIn(str(self.fixture.run_dir), command)
+
+    def test_calling_it_again_reuses_the_recorded_window(self):
+        first = self.fixture.window()
+
+        second = self.fixture.window()
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout.strip(), first.stdout.strip())
+        self.assertEqual(len(self.fixture.window_calls()), 1)
+        self.assertEqual(len(self.fixture.live_windows()), 1)
+
+    def test_overlapping_calls_still_produce_one_window(self):
+        processes = [
+            self.fixture.start_monitor(
+                "window", "--run-dir", self.fixture.run_dir, "--session", "$7:"
+            )
+            for _ in range(4)
+        ]
+        printed = {process.communicate(timeout=30)[0].strip() for process in processes}
+
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        self.assertEqual(len(self.fixture.live_windows()), 1)
+        self.assertEqual(printed, {self.fixture.recorded_window()})
+
+    def test_a_window_that_vanished_is_recreated_and_re_recorded(self):
+        first = self.fixture.window().stdout.strip()
+        self.fixture.close_window(first)
+
+        second = self.fixture.window()
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotEqual(second.stdout.strip(), first)
+        self.assertEqual(self.fixture.recorded_window(), second.stdout.strip())
+        self.assertEqual(list(self.fixture.live_windows()), [second.stdout.strip()])
+
+    def test_the_tool_never_closes_the_window(self):
+        window_id = self.fixture.window().stdout.strip()
+        self.fixture.window()
+
+        self.assertEqual(
+            [argv[0] for argv in self.fixture.calls("tmux") if argv[0].startswith("kill")], []
+        )
+        self.assertEqual(list(self.fixture.live_windows()), [window_id])
 
 
 class CostTests(MonitorTestCase):
