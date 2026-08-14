@@ -220,7 +220,9 @@ class Fixture:
             window=f"@{ticket}",
         )
 
-    def claude_transcript(self, ticket, session=CLAUDE_SESSION, turns=CLAUDE_TURNS, model=MODEL):
+    def claude_transcript(
+        self, ticket, session=CLAUDE_SESSION, turns=CLAUDE_TURNS, model=MODEL, cwd=None
+    ):
         """A Claude transcript for that worktree, one assistant record per turn's usage."""
         path = self.claude_home / "projects" / f"project-{session}" / f"{session}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,7 +233,7 @@ class Fixture:
                 "uuid": f"{session}-{number}",
                 "requestId": f"req_{session}_{number}",
                 "sessionId": session,
-                "cwd": str(self.worktrees[ticket]),
+                "cwd": str(cwd if cwd is not None else self.worktrees[ticket]),
                 "message": {
                     "id": f"msg_{session}_{number}",
                     "model": model,
@@ -246,7 +248,9 @@ class Fixture:
         path.write_text("\n".join(lines) + "\n")
         return path
 
-    def codex_rollout(self, ticket, session=CODEX_SESSION, usage=CODEX_USAGE, text=None):
+    def codex_rollout(
+        self, ticket, session=CODEX_SESSION, usage=CODEX_USAGE, text=None, cwd=None
+    ):
         """A Codex rollout for that worktree: its session meta, then its last token count."""
         path = self.codex_home / "sessions" / "2026" / "08" / "13" / f"rollout-{session}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,7 +260,7 @@ class Fixture:
                     "type": "session_meta",
                     "payload": {
                         "id": session,
-                        "cwd": str(self.worktrees[ticket]),
+                        "cwd": str(cwd if cwd is not None else self.worktrees[ticket]),
                         "originator": "agentcrew_codex_bridge",
                     },
                 }),
@@ -267,6 +271,16 @@ class Fixture:
             ]) + "\n"
         path.write_text(text)
         return path
+
+    @staticmethod
+    def set_claude_cwds(transcript, cwds):
+        """Set each assistant record's cwd without making tests know its JSON layout."""
+        records = [json.loads(line) for line in transcript.read_text().splitlines()]
+        if len(records) != len(cwds):
+            raise AssertionError("one cwd is required for each Claude record")
+        for record, cwd in zip(records, cwds):
+            record["cwd"] = str(cwd)
+        transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n")
 
     def log_lines(self):
         if not self.log.exists():
@@ -1054,6 +1068,98 @@ class CostTests(MonitorTestCase):
             }],
         )
 
+    def test_a_claude_transcript_with_a_subdirectory_after_the_worktree_is_measured(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        transcript = self.fixture.claude_transcript("06")
+        subdirectory = worktree / "tests"
+        subdirectory.mkdir()
+        self.fixture.set_claude_cwds(transcript, [worktree, subdirectory])
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertEqual(entry["input_tokens"], CLAUDE_TOTALS["input"])
+        self.assertEqual(entry["output_tokens"], CLAUDE_TOTALS["output"])
+        self.assertEqual(entry["cache_read_tokens"], CLAUDE_TOTALS["cache_read"])
+        self.assertEqual(entry["cache_creation_tokens"], CLAUDE_TOTALS["cache_creation"])
+        self.assertEqual(entry["total_tokens"], CLAUDE_TOTALS["total"])
+
+    def test_a_claude_transcript_whose_only_cwd_is_a_subdirectory_is_measured_once(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        subdirectory = worktree / "tests"
+        subdirectory.mkdir()
+        self.fixture.claude_transcript("06", cwd=subdirectory)
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertEqual(entry["input_tokens"], CLAUDE_TOTALS["input"])
+        self.assertEqual(entry["output_tokens"], CLAUDE_TOTALS["output"])
+        self.assertEqual(entry["cache_read_tokens"], CLAUDE_TOTALS["cache_read"])
+        self.assertEqual(entry["cache_creation_tokens"], CLAUDE_TOTALS["cache_creation"])
+        self.assertEqual(entry["total_tokens"], CLAUDE_TOTALS["total"])
+
+    def test_several_subdirectories_in_one_claude_transcript_are_one_identity(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        transcript = self.fixture.claude_transcript("06")
+        first_subdirectory = worktree / "first"
+        second_subdirectory = worktree / "second"
+        first_subdirectory.mkdir()
+        second_subdirectory.mkdir()
+        self.fixture.set_claude_cwds(transcript, [first_subdirectory, second_subdirectory])
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.costs()[0]["total_tokens"], CLAUDE_TOTALS["total"])
+
+    def test_a_symlinked_subdirectory_resolving_inside_the_worktree_is_measured(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        target = worktree / "real-tests"
+        target.mkdir()
+        symlink = worktree / "tests"
+        symlink.symlink_to(target, target_is_directory=True)
+        transcript = self.fixture.claude_transcript("06")
+        self.fixture.set_claude_cwds(transcript, [worktree, symlink])
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.costs()[0]["total_tokens"], CLAUDE_TOTALS["total"])
+
+    def test_a_symlinked_path_resolving_outside_the_worktree_is_diagnosed(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        outside = worktree.parent / "outside"
+        outside.mkdir()
+        symlink = worktree / "outside-link"
+        symlink.symlink_to(outside, target_is_directory=True)
+        transcript = self.fixture.claude_transcript("06")
+        self.fixture.set_claude_cwds(transcript, [worktree, symlink])
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertIn(str(symlink), entry["detail"])
+        self.assertNotIn("total_tokens", entry)
+
+    def test_a_launch_worktree_and_transcript_with_aliased_spellings_are_one_worktree(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06", worktree=self.fixture.alias("06"))
+        self.fixture.claude_transcript("06")
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.costs()[0]["total_tokens"], CLAUDE_TOTALS["total"])
+
     def test_a_codex_child_costs_what_its_rollouts_last_token_count_reports(self):
         self.fixture.worktree("07")
         self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
@@ -1067,6 +1173,23 @@ class CostTests(MonitorTestCase):
         self.assertEqual(entry["executor"], "codex")
         self.assertEqual(entry["model"], CODEX_MODEL)
         self.assertEqual(entry["session"], CODEX_SESSION)
+        self.assertEqual(entry["input_tokens"], CODEX_TOTALS["input"])
+        self.assertEqual(entry["output_tokens"], CODEX_TOTALS["output"])
+        self.assertEqual(entry["cache_read_tokens"], CODEX_TOTALS["cache_read"])
+        self.assertEqual(entry["cache_creation_tokens"], CODEX_TOTALS["cache_creation"])
+        self.assertEqual(entry["total_tokens"], CODEX_TOTALS["total"])
+
+    def test_a_codex_rollout_with_a_subdirectory_of_the_worktree_is_measured(self):
+        worktree = self.fixture.worktree("07")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        subdirectory = worktree / "package"
+        subdirectory.mkdir()
+        self.fixture.codex_rollout("07", cwd=subdirectory)
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
         self.assertEqual(entry["input_tokens"], CODEX_TOTALS["input"])
         self.assertEqual(entry["output_tokens"], CODEX_TOTALS["output"])
         self.assertEqual(entry["cache_read_tokens"], CODEX_TOTALS["cache_read"])
@@ -1192,6 +1315,22 @@ class CostTests(MonitorTestCase):
         self.assertIn(CODEX_SESSION, entry["detail"])
         self.assertNotIn("total_tokens", entry)
 
+    def test_two_transcripts_claiming_one_session_are_diagnosed_even_from_subdirectories(self):
+        worktree = self.fixture.worktree("07")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        first_subdirectory = worktree / "first"
+        first_subdirectory.mkdir()
+        first = self.fixture.codex_rollout("07", cwd=first_subdirectory)
+        second = first.with_name(f"rollout-copy-{CODEX_SESSION}.jsonl")
+        second.write_text(first.read_text())
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertIn(CODEX_SESSION, entry["detail"])
+        self.assertNotIn("total_tokens", entry)
+
     def test_a_transcript_that_names_two_worktrees_is_diagnosed(self):
         self.fixture.worktree("06")
         self.fixture.worktree("07")
@@ -1207,6 +1346,50 @@ class CostTests(MonitorTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         entry = self.costs()[0]
         self.assertIn(str(rollout), entry["detail"])
+        self.assertNotIn("total_tokens", entry)
+
+    def test_a_claude_transcript_that_leaves_the_worktree_is_diagnosed(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        transcript = self.fixture.claude_transcript("06")
+        outside = worktree.parent / "outside"
+        outside.mkdir()
+        self.fixture.set_claude_cwds(transcript, [worktree, outside])
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertIn(str(outside), entry["detail"])
+        self.assertNotIn("total_tokens", entry)
+
+    def test_a_sibling_worktree_with_a_shared_prefix_is_outside(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        transcript = self.fixture.claude_transcript("06")
+        sibling = worktree.with_name(worktree.name + "-2")
+        sibling.mkdir()
+        self.fixture.set_claude_cwds(transcript, [worktree, sibling])
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertIn(str(sibling), entry["detail"])
+        self.assertNotIn("total_tokens", entry)
+
+    def test_a_parent_of_the_worktree_is_outside(self):
+        worktree = self.fixture.worktree("06")
+        self.fixture.launch("06")
+        transcript = self.fixture.claude_transcript("06")
+        parent = worktree.parent
+        self.fixture.set_claude_cwds(transcript, [worktree, parent])
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertIn(str(parent), entry["detail"])
         self.assertNotIn("total_tokens", entry)
 
     def test_a_session_from_another_worktree_is_not_this_childs_cost(self):

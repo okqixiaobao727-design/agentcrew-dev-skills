@@ -764,9 +764,14 @@ def transcript_root(spec):
     return pathlib.Path(configured or pathlib.Path.home() / home) / subdirectory
 
 
-def same_path(one, other):
-    """Whether two paths name the same place once every alias between them is resolved."""
-    return os.path.realpath(str(one)) == os.path.realpath(str(other))
+def within_path(path, root):
+    """Whether `path` is `root` or below it after aliases and symlinks are resolved."""
+    resolved_path = os.path.realpath(str(path))
+    resolved_root = os.path.realpath(str(root))
+    try:
+        return os.path.commonpath((resolved_path, resolved_root)) == resolved_root
+    except ValueError:
+        return False
 
 
 def transcript_records(path):
@@ -832,7 +837,7 @@ def claude_usage(records, worktree):
     """
     counters = zero_counters()
     session = None
-    home = None
+    first_cwd = None
     damaged = False
     already = set()
     for record in records:
@@ -841,12 +846,12 @@ def claude_usage(records, worktree):
             continue
         cwd = record.get("cwd")
         if cwd is not None:
-            if home is None:
-                if not same_path(cwd, worktree):
+            if first_cwd is None:
+                if not within_path(cwd, worktree):
                     return None
-                home = cwd
-            elif not same_path(cwd, home):
-                return unusable(f"it names both {home} and {cwd}")
+                first_cwd = cwd
+            elif not within_path(cwd, worktree):
+                return unusable(f"it names both {first_cwd} and {cwd}")
         session = record.get("sessionId") or session
         message = record.get("message")
         usage = message.get("usage") if isinstance(message, dict) else None
@@ -863,7 +868,7 @@ def claude_usage(records, worktree):
             "cache_read": integer(usage.get("cache_read_input_tokens")),
             "cache_creation": integer(usage.get("cache_creation_input_tokens")),
         })
-    if home is None:
+    if first_cwd is None:
         # Nothing in it said where it ran, so whose tokens these are was never established.
         return UNDETERMINED if damaged else None
     if damaged:
@@ -892,7 +897,7 @@ def codex_usage(records, worktree):
         if record.get("type") == "session_meta":
             cwd = payload.get("cwd")
             if home is None:
-                if cwd is None or not same_path(cwd, worktree):
+                if cwd is None or not within_path(cwd, worktree):
                     return None
                 home = cwd
                 session = payload.get("id") or session
