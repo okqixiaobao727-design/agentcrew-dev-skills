@@ -209,6 +209,8 @@ stays inert; the other four still run.
 - [`docs/glossary.md`](docs/glossary.md) — the vocabulary both skills speak.
 - [`docs/dogfooding-run.md`](docs/dogfooding-run.md) — the run in the demo above: what it did, what
   it found, and what it left open.
+- [`docs/cost-baseline.md`](docs/cost-baseline.md) — the measured predecessor run ADR-0001 was
+  decided on: where a coordinator's money actually goes, and what a future run is graded against.
 - [`config/agentcrew.default.toml`](config/agentcrew.default.toml) — the shipped defaults, commented.
 
 ## License

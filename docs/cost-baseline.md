@@ -1,9 +1,5 @@
 # The predecessor cost baseline
 
-> **Awaiting operator approval for publication.** The content below is complete and transcribed
-> from the operator-private forensics document; what remains is the operator's read-through and
-> sign-off. See `docs/acceptance-25.md`.
-
 [ADR-0001](adr/0001-coordinator-spends-tokens-only-on-judgment.md) decided that the coordinator
 spends model tokens only on judgment, and it decided that on measured numbers: a forensic audit of
 one real `/orchestrate` run under the predecessor design. That audit lived only in an
