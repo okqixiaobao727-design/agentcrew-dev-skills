@@ -101,9 +101,11 @@ has to grow a column:
 `duplicate` and `unknown` are annotations rather than states: both say what a reading did, not
 where the ticket got to, so the row keeps the state its own log lines justify.
 
-The `review` event has no writer yet — the dashboard reads it, and the review-running workflow
-will write it. Until then the review annotation is drawn only for a log a future writer fills in;
-nothing else about the frame depends on it.
+The `review` event is written by the review bridge the reviewed child runs — a `running` line as
+the review starts and a `returned` line on every exit path the bridge controls — so the review
+annotation appears and disappears on its own, with no operator action and no model token spent
+([`docs/machine-log.md`](machine-log.md)). A run dispatched without a machine log reviews normally
+and draws no annotation, which is the only case in which the row stays quiet under a review.
 
 ### Colour and width
 
@@ -186,10 +188,12 @@ TOTAL   --        --                        1024   746     10800       1150     
 08 not measured: no transcript under /Users/me/.codex/sessions was recorded in /repo/wt/08
 ```
 
-Transcripts are found by the worktree they ran in, compared by realpath: Claude sessions under
-`$CLAUDE_CONFIG_DIR` (default `~/.claude`), Codex sessions under `$CODEX_HOME` (default
-`~/.codex`) — the same roots the two executors write to, so what is measured is what ran. Every
-session of a worktree counts toward its ticket, including a replacement child's and a review's.
+Transcripts are found by the worktree they ran in, compared by realpath and path-component
+containment: a cwd at or below the launch event's worktree is that worktree, while a parent,
+sibling, or other outside path is not. Claude sessions are under `$CLAUDE_CONFIG_DIR` (default
+`~/.claude`), Codex sessions under `$CODEX_HOME` (default `~/.codex`) — the same roots the two
+executors write to, so what is measured is what ran. Every session of a worktree counts toward its
+ticket, including a replacement child's and a review's.
 
 A child whose transcript is missing, unreadable, or silent about usage is drawn as the `--` row
 above and logged with the diagnosis in place of its figures, so an unmeasured child is visible in

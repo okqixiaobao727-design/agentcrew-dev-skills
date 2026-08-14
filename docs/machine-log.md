@@ -69,9 +69,18 @@ last line for a ticket is the one that holds.
 The dashboard reads this event and nothing else does: a ticket whose last `review` line says
 `running` carries the review annotation row
 ([`docs/monitor-dashboard.md`](monitor-dashboard.md)), and a ticket whose review has `returned`
-goes quiet again. **Nothing writes it yet** — the writer belongs to the workflow that runs the
-review, not to the display that draws it, and lands separately. Until it does, the annotation row
-is drawn for no run; the rest of the frame is unaffected.
+goes quiet again.
+
+The writer is the review bridge — the [Codex
+one](../skills/crew/assets/review/scripts/tui_review_bridge.py) or the [Claude
+one](../skills/crew/assets/review/scripts/claude_review_bridge.py) — given the run's log and the
+ticket, which the dispatch renderer fills into the review command the reviewed child runs. The
+bridge writes the event rather than the child because it is the only party that deterministically
+knows both ends: a child asked in prose to log it may skip the line, and a child whose session
+dies mid-review could never write `returned` at all. So `returned` goes down on every exit path
+the bridge controls, a review that failed or was interrupted included. A bridge given no log path
+writes nothing, and a log it cannot write changes neither its exit status nor the report the child
+reads. Each round of a review is a review, so round two writes its own pair.
 
 ### `advance` — what the run decided after a wave settled
 
@@ -121,6 +130,8 @@ machine_log.py --log <path> receipt --ticket NN --verdict landable|parked|failed
 machine_log.py --log <path> merge   --ticket NN --result clean|conflict|repaired|escalated \
                                     [--branch B] [--into B] [--sha SHA] [--detail TEXT]
 machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parked|blocked \
+                                    [--detail TEXT]
+machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state running|returned \
                                     [--detail TEXT]
 machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted \
