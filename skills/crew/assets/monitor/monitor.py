@@ -6,6 +6,7 @@
     window     create, reuse or recreate the run's one dedicated tmux window running that loop
     pin        draw one frame of the live run into the coordinator's Claude Code statusline, or
                draw nothing at all
+    pin-install  wire that same frame into the operator's Claude Code statusline, reversibly
     verify     decide whether a child's `CREW COMPLETE <sha>` holds, and log the receipt it earns
     cost       at run completion, log what each child's sessions spent and roll the run up
 
@@ -171,6 +172,10 @@ DEFAULT_REFRESH_SECONDS = 5.0
 # tick draws the status line the operator's whole session depends on, so nothing in it may wait
 # indefinitely.
 DEFAULT_TIMEOUT_SECONDS = 2.0
+# The tick the pin's install sets when the operator has none, in seconds. Deliberately its own
+# constant rather than the window's: one is a redraw loop the operator watches on purpose, the
+# other is a statusline command re-run under every session, and their costs are not the same.
+DEFAULT_PIN_REFRESH_SECONDS = 2
 # How long the renderer sleeps between checks once the run is over: it has stopped drawing, and it
 # stays alive only so the window keeps the last frame until the human closes it.
 HOLD_SECONDS = 3600.0
@@ -202,6 +207,25 @@ SESSION_SEPARATOR = ","
 # the two facts a reader passes back when it cannot answer the question it was asked.
 MALFORMED = object()
 UNDETERMINED = object()
+
+# The operator's Claude Code wiring the pin's install edits, and the environment variable that
+# moves it — the same one the executor itself honours, so the settings edited are the ones in use.
+CLAUDE_SETTINGS = ("CLAUDE_CONFIG_DIR", ".claude", "settings.json")
+# The wrapper the install writes beside those settings: it runs the operator's own statusline
+# first and appends the pin's frame beneath, so nothing the operator already reads is lost.
+PIN_WRAPPER_NAME = "agentcrew-statusline.sh"
+# The line that wrapper carries: what the statusline ran before the install, and whether the
+# install is the one that added the refresh interval. It is what makes `--uninstall` exact and a
+# second `--apply` a no-op, and it lives in the wrapper so nothing else has to be kept in step.
+INSTALL_MARKER = "# agentcrew pin-install "
+INSTALL_RECORD_VERSION = 1
+# What a backup is called: beside the file it copies, so a bad install is recoverable without git.
+BACKUP_SUFFIX = ".agentcrew-backup"
+STATUS_LINE_KEY = "statusLine"
+COMMAND_KEY = "command"
+TYPE_KEY = "type"
+COMMAND_TYPE = "command"
+REFRESH_INTERVAL_KEY = "refreshInterval"
 
 MONITOR_ERROR_EXIT = 3
 
@@ -953,6 +977,267 @@ def run_pin(args):
     return 0
 
 
+def claude_settings_path():
+    """The settings file Claude Code reads on this machine, as this machine has it configured."""
+    variable, home, name = CLAUDE_SETTINGS
+    configured = os.environ.get(variable)
+    return pathlib.Path(configured or pathlib.Path.home() / home) / name
+
+
+def pin_settings_path(args):
+    """The settings file this install edits: the operator's real one unless told otherwise.
+
+    Absolute and resolved (ADR-0007), because the path this writes into `statusLine.command` is
+    run from whatever directory the session happens to be in.
+    """
+    settings = pathlib.Path(args.settings) if args.settings else claude_settings_path()
+    return settings.expanduser().resolve()
+
+
+def pin_wrapper_path(args, settings_file):
+    """The wrapper script this install writes, absolute: beside the settings it is wired into."""
+    if args.statusline:
+        return pathlib.Path(args.statusline).expanduser().resolve()
+    return settings_file.parent / PIN_WRAPPER_NAME
+
+
+def pin_command():
+    """The command line the wrapper runs to draw one frame: this script's own pin."""
+    return shlex.join([sys.executable, str(pathlib.Path(__file__).resolve()), "pin"])
+
+
+def wrapper_text(previous, added_interval):
+    """The wrapper's whole text: the record it is undone from, then the commands it runs."""
+    record = json.dumps({
+        "version": INSTALL_RECORD_VERSION,
+        "previous": previous,
+        "refresh_interval_added": added_interval,
+    })
+    lines = [
+        "#!/bin/sh",
+        "# Written by monitor.py pin-install. Change the settings rather than this file:",
+        "# `pin-install --uninstall` reads the record below to put the statusline back exactly.",
+        INSTALL_MARKER + record,
+        "",
+    ]
+    if previous:
+        lines += [
+            # Claude Code writes its JSON to stdin and both commands are entitled to it, so it is
+            # read once and handed on. The substitution drops the trailing newlines and exactly one
+            # is put back: the frame starts on its own line, and a readout that printed nothing
+            # costs no row, because Claude Code drops a blank line rather than drawing it.
+            "payload=$(cat)",
+            f'previous=$(printf %s "$payload" | {previous})',
+            'if [ -n "$previous" ]; then printf \'%s\\n\' "$previous"; fi',
+            "",
+        ]
+    lines += [f"exec {pin_command()} </dev/null", ""]
+    return "\n".join(lines)
+
+
+def file_text(path):
+    """The file's text, or None when it is not there or cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def install_record(wrapper):
+    """What this installer recorded in that wrapper, or None if it did not write it."""
+    text = file_text(wrapper)
+    for line in (text or "").splitlines():
+        if line.startswith(INSTALL_MARKER):
+            try:
+                record = json.loads(line[len(INSTALL_MARKER):])
+            except json.JSONDecodeError:
+                return None
+            return record if isinstance(record, dict) else None
+    return None
+
+
+def read_settings(path):
+    """The operator's settings as a dict; a file that cannot be parsed is refused, never guessed."""
+    text = file_text(path)
+    if text is None or not text.strip():
+        return {}
+    try:
+        settings = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise MonitorError(f"{path} is not valid JSON ({error}); nothing was written")
+    if not isinstance(settings, dict):
+        raise MonitorError(f"{path} is not a JSON object; nothing was written")
+    return settings
+
+
+def status_line_of(settings):
+    """The settings' `statusLine`, as a dict that can be edited without touching the original."""
+    existing = settings.get(STATUS_LINE_KEY)
+    return dict(existing) if isinstance(existing, dict) else {}
+
+
+def wrapped_command(status_line, wrapper):
+    """What the statusline ran before this install, and whether the install adds the interval.
+
+    Read from the wrapper's own record once the pin is in place, so a second run wraps what the
+    first one wrapped rather than wrapping itself, and from the settings before that.
+    """
+    record = install_record(wrapper)
+    if record is not None and status_line.get(COMMAND_KEY) == str(wrapper):
+        return record.get("previous"), bool(record.get("refresh_interval_added"))
+    command = status_line.get(COMMAND_KEY)
+    previous = command if isinstance(command, str) and command != str(wrapper) else None
+    return previous, REFRESH_INTERVAL_KEY not in status_line
+
+
+def plan_install(settings, settings_file, wrapper):
+    """The settings and wrapper an `--apply` would leave, and the lines describing the edits.
+
+    No lines means the install is already in place, which is what makes a second `--apply` a
+    no-op rather than a second layer of wrapping.
+    """
+    status_line = status_line_of(settings)
+    previous, adds_interval = wrapped_command(status_line, wrapper)
+    wanted = dict(status_line)
+    wanted[TYPE_KEY] = COMMAND_TYPE
+    wanted[COMMAND_KEY] = str(wrapper)
+    if adds_interval:
+        wanted[REFRESH_INTERVAL_KEY] = DEFAULT_PIN_REFRESH_SECONDS
+    text = wrapper_text(previous, adds_interval)
+
+    lines = []
+    if file_text(wrapper) != text:
+        lines.append(f"{'rewrite' if wrapper.exists() else 'create'} {wrapper}")
+        lines.append(
+            f"  runs {previous} first, then draws the pin's frame beneath it" if previous
+            else "  runs the pin, and nothing else"
+        )
+    if settings.get(STATUS_LINE_KEY) != wanted:
+        lines.append(f"edit {settings_file}")
+        lines.append(
+            f"  {STATUS_LINE_KEY}.{COMMAND_KEY}: {previous or '(absent)'} -> {wrapper}"
+        )
+        if adds_interval:
+            lines.append(
+                f"  {STATUS_LINE_KEY}.{REFRESH_INTERVAL_KEY}: (absent) -> "
+                f"{DEFAULT_PIN_REFRESH_SECONDS}"
+            )
+        else:
+            lines.append(
+                f"  {STATUS_LINE_KEY}.{REFRESH_INTERVAL_KEY}: "
+                f"{status_line.get(REFRESH_INTERVAL_KEY)}, left as it is"
+            )
+    after = dict(settings)
+    after[STATUS_LINE_KEY] = wanted
+    return after, text, lines
+
+
+def plan_uninstall(settings, settings_file, wrapper):
+    """The settings an `--apply --uninstall` would put back, and the lines describing the undo.
+
+    The wrapper's record is the whole of what is restored: the command the operator had, and
+    whether the refresh interval beside it is this install's to remove or the operator's to keep.
+    """
+    record = install_record(wrapper)
+    if record is None:
+        return None, []
+    previous = record.get("previous")
+    after = dict(settings)
+    edits = []
+    if previous:
+        restored = status_line_of(settings)
+        restored[COMMAND_KEY] = previous
+        if record.get("refresh_interval_added"):
+            restored.pop(REFRESH_INTERVAL_KEY, None)
+            edits.append(
+                f"  {STATUS_LINE_KEY}.{REFRESH_INTERVAL_KEY}: removed — this install added it"
+            )
+        after[STATUS_LINE_KEY] = restored
+        edits.insert(0, f"  {STATUS_LINE_KEY}.{COMMAND_KEY}: {wrapper} -> {previous}")
+    else:
+        after.pop(STATUS_LINE_KEY, None)
+        edits.append(f"  {STATUS_LINE_KEY}: removed — this install is what created it")
+    lines = []
+    if after != settings:
+        lines = [f"edit {settings_file}", *edits]
+    if wrapper.exists():
+        lines.append(f"remove {wrapper}")
+    return after, lines
+
+
+def uninstall_drift(settings, wrapper):
+    """What the statusline runs now, when that is no longer this install's wrapper; else None.
+
+    An operator who has rewired the statusline since the install has said what they want it to
+    run, and putting the command this wrapper replaced back over the top of that would undo a
+    decision this command never saw.
+    """
+    command = status_line_of(settings).get(COMMAND_KEY)
+    return None if command == str(wrapper) else (command or "(nothing)")
+
+
+def back_up(path):
+    """Copy `path` aside before it is written or removed; a file that is not there needs none."""
+    if path.exists():
+        shutil.copy2(str(path), str(path) + BACKUP_SUFFIX)
+
+
+def write_settings(path, settings):
+    """Write the settings back, having first put a copy of what was there beside it."""
+    back_up(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+def write_wrapper(wrapper, text):
+    """Write the wrapper and make it runnable, having first backed up whatever it replaces."""
+    back_up(wrapper)
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(text, encoding="utf-8")
+    wrapper.chmod(0o755)
+
+
+def run_pin_install(args):
+    """Print the edits that wire the pin into the operator's statusline, or make them; returns 0.
+
+    Nothing is written without `--apply`, so the operator authorises the exact edit rather than the
+    general permission to edit, and every file is copied aside before it is written.
+    """
+    settings_file = pin_settings_path(args)
+    wrapper = pin_wrapper_path(args, settings_file)
+    settings = read_settings(settings_file)
+    if args.uninstall:
+        drift = uninstall_drift(settings, wrapper) if install_record(wrapper) else None
+        if drift is not None:
+            raise MonitorError(
+                f"{settings_file} now runs {drift} rather than {wrapper}; "
+                "the statusline has moved on since the install and nothing was written"
+            )
+        after, lines = plan_uninstall(settings, settings_file, wrapper)
+        if not lines:
+            print("the pin is not installed here; nothing to undo")
+            return 0
+    else:
+        after, text, lines = plan_install(settings, settings_file, wrapper)
+        if not lines:
+            print("the pin is already installed here; nothing to change")
+            return 0
+    for line in lines:
+        print(line)
+    if not args.apply:
+        print("dry run — nothing written. Re-run with --apply to make these changes.")
+        return 0
+    if args.uninstall:
+        write_settings(settings_file, after)
+        back_up(wrapper)
+        wrapper.unlink(missing_ok=True)
+    else:
+        # The wrapper first: the settings must never name a script that is not there yet.
+        write_wrapper(wrapper, text)
+        write_settings(settings_file, after)
+    return 0
+
+
 def transcript_root(spec):
     """A directory under an executor's configured home: a transcript root, or the pin registry.
 
@@ -1496,6 +1781,23 @@ def build_parser():
     cost.add_argument(
         "--coordinator-session",
         help="the id of the session driving the run, whose transcript becomes the coordinator row",
+    )
+
+    pin_install = commands.add_parser(
+        "pin-install", help="wire the pin into the operator's Claude Code statusline"
+    )
+    pin_install.set_defaults(handler=run_pin_install)
+    pin_install.add_argument(
+        "--apply", action="store_true", help="make the edits instead of printing them"
+    )
+    pin_install.add_argument(
+        "--uninstall", action="store_true", help="put the statusline back the way it was"
+    )
+    pin_install.add_argument(
+        "--settings", help="the Claude Code settings file to edit (default: the real one)"
+    )
+    pin_install.add_argument(
+        "--statusline", help="the wrapper script to write (default: beside those settings)"
     )
 
     verify = commands.add_parser("verify", help="check a child's completion receipt")

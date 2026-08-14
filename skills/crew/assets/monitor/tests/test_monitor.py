@@ -117,6 +117,18 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RUNNING_COLOUR = "\x1b[36m"
 COLOUR_RESET = "\x1b[0m"
 
+# The statusline the operator already runs, and the one line it prints — the context, cost and
+# rate-limit readout the install has to keep, recognisable in the wrapper's output.
+PREVIOUS_STATUSLINE = "opus | main | 42% context"
+# The tick rate the installer sets when the operator has none, in seconds. Only a fresh install
+# ever sees it: a value already there is left alone, however large.
+PIN_REFRESH_INTERVAL = 2
+# A refresh interval of the operator's own, larger than the one above, so "left alone" and "never
+# lowered" are the same assertion.
+OPERATOR_REFRESH_INTERVAL = 30
+# A settings key that is none of the installer's business, so an edit that loses it is visible.
+UNRELATED_SETTING = ("model", "opus")
+
 
 def run_git(repo, *args):
     return subprocess.run(
@@ -151,6 +163,15 @@ class Fixture:
         # fixture so nothing on the machine running the tests is ever opened.
         self.claude_home = self.root / "claude-config"
         self.codex_home = self.root / "codex-home"
+
+        # The operator's own Claude Code wiring the installer edits: the settings file, the
+        # statusline script it already points at, and the wrapper the installer writes. All three
+        # are under the fixture root, so no test can reach the machine it runs on.
+        self.settings_dir = self.root / "claude-settings"
+        self.settings_dir.mkdir()
+        self.settings_path = self.settings_dir / "settings.json"
+        self.wrapper_path = self.settings_dir / "agentcrew-statusline.sh"
+        self.statusline_path = self.settings_dir / "statusline.sh"
 
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
@@ -511,6 +532,41 @@ class Fixture:
     def window(self, *extra):
         """Ask for the run's dashboard window, as a script re-running the command would."""
         return self.run_monitor("window", "--run-dir", self.run_dir, "--session", "$7:", *extra)
+
+    def statusline(self, output=PREVIOUS_STATUSLINE):
+        """The statusline command the operator already runs, printing one recognisable line."""
+        self.statusline_path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n")
+        self.statusline_path.chmod(0o755)
+        return self.statusline_path
+
+    def settings(self, text=None, **fields):
+        """The operator's settings file, as JSON fields or as the exact text `text` spells."""
+        self.settings_path.write_text(text if text is not None else json.dumps(fields, indent=2))
+        return self.settings_path
+
+    def settings_json(self):
+        return json.loads(self.settings_path.read_text())
+
+    def pin_install(self, *extra):
+        """Wire the pin in, against this fixture's settings file and wrapper path."""
+        return self.run_monitor(
+            "pin-install", "--settings", self.settings_path, "--statusline", self.wrapper_path,
+            *extra,
+        )
+
+    def run_statusline(self, payload='{"session_id":"pin-install-test"}'):
+        """Run the installed wrapper as Claude Code runs it: the JSON on its stdin."""
+        return subprocess.run(
+            ["/bin/sh", str(self.wrapper_path)], input=payload,
+            capture_output=True, text=True, env=self.environment(),
+        )
+
+    def backups(self, path):
+        """Every file the installer left beside `path` — a backup is the only thing that does."""
+        return sorted(
+            entry for entry in path.parent.iterdir()
+            if entry != path and entry.name.startswith(path.name)
+        )
 
     def live_windows(self):
         path = self.stub_dir / "tmux-windows.json"
@@ -1961,6 +2017,189 @@ class CostTests(MonitorTestCase):
         self.fixture.claude_transcript("06")
 
         self.cost()
+
+        self.assertEqual(self.fixture.calls("claude"), [])
+        self.assertEqual(self.fixture.calls("tmux"), [])
+
+
+class PinInstallTests(MonitorTestCase):
+    """Wiring the pin into the operator's statusline: authorised, reversible, safe to repeat."""
+
+    def setUp(self):
+        super().setUp()
+        self.statusline = self.fixture.statusline()
+
+    def wired(self, **extra):
+        """Settings whose statusline is the operator's own script, as they are before an install."""
+        fields = {UNRELATED_SETTING[0]: UNRELATED_SETTING[1]}
+        fields["statusLine"] = {"type": "command", "command": str(self.statusline), **extra}
+        return self.fixture.settings(**fields)
+
+    def status_line(self):
+        return self.fixture.settings_json()["statusLine"]
+
+    @staticmethod
+    def spelled(path):
+        """How the installer spells a path it was given: absolute and resolved (ADR-0007), because
+        `statusLine.command` is run from whatever directory the session happens to be in."""
+        return str(path.resolve())
+
+    def test_a_dry_run_prints_the_change_and_writes_nothing(self):
+        self.wired()
+        before = self.fixture.settings_path.read_text()
+
+        result = self.fixture.pin_install()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.spelled(self.fixture.settings_path), result.stdout)
+        self.assertIn(self.spelled(self.fixture.wrapper_path), result.stdout)
+        self.assertIn(str(self.statusline), result.stdout)
+        self.assertIn("--apply", result.stdout)
+        self.assertEqual(self.fixture.settings_path.read_text(), before)
+        self.assertFalse(self.fixture.wrapper_path.exists())
+        self.assertEqual(self.fixture.backups(self.fixture.settings_path), [])
+
+    def test_applying_over_an_existing_statusline_keeps_it_and_prints_it_first(self):
+        self.wired()
+        before = self.fixture.settings_path.read_text()
+
+        result = self.fixture.pin_install("--apply")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.status_line()["command"], self.spelled(self.fixture.wrapper_path))
+        self.assertEqual(
+            self.fixture.settings_json()[UNRELATED_SETTING[0]], UNRELATED_SETTING[1]
+        )
+        drawn = self.fixture.run_statusline()
+        self.assertEqual(drawn.stdout.splitlines()[0], PREVIOUS_STATUSLINE)
+        backups = self.fixture.backups(self.fixture.settings_path)
+        self.assertEqual([backup.read_text() for backup in backups], [before])
+
+    def test_the_pins_own_command_runs_beneath_the_previous_one(self):
+        self.wired()
+
+        self.fixture.pin_install("--apply")
+
+        wrapper = self.fixture.wrapper_path.read_text()
+        self.assertIn(str(MONITOR), wrapper)
+        self.assertIn("pin", wrapper.split(str(MONITOR))[1].splitlines()[0])
+        self.assertLess(wrapper.index(str(self.statusline)), wrapper.index(str(MONITOR)))
+
+    def test_a_second_apply_changes_nothing(self):
+        self.wired()
+        self.fixture.pin_install("--apply")
+        settings = self.fixture.settings_path.read_text()
+        wrapper = self.fixture.wrapper_path.read_text()
+        backups = self.fixture.backups(self.fixture.settings_path)
+
+        result = self.fixture.pin_install("--apply")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.settings_path.read_text(), settings)
+        self.assertEqual(self.fixture.wrapper_path.read_text(), wrapper)
+        self.assertEqual(self.fixture.backups(self.fixture.settings_path), backups)
+
+    def test_with_no_statusline_at_all_one_is_created_that_is_just_the_pin(self):
+        self.fixture.settings(**{UNRELATED_SETTING[0]: UNRELATED_SETTING[1]})
+
+        result = self.fixture.pin_install("--apply")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.status_line()["command"], self.spelled(self.fixture.wrapper_path))
+        # The pin is the whole of what the statusline runs: no other command is in the wrapper,
+        # and the operator's script — which this settings file never named — is not summoned.
+        wrapper = self.fixture.wrapper_path.read_text()
+        self.assertNotIn(str(self.statusline), wrapper)
+        self.assertEqual(
+            [line for line in wrapper.splitlines() if line and not line.startswith("#")],
+            [f"exec {sys.executable} {MONITOR} pin </dev/null"],
+        )
+
+    def test_an_install_onto_a_fresh_machine_sets_the_pins_refresh_interval(self):
+        self.fixture.settings(**{UNRELATED_SETTING[0]: UNRELATED_SETTING[1]})
+
+        self.fixture.pin_install("--apply")
+
+        self.assertEqual(self.status_line()["refreshInterval"], PIN_REFRESH_INTERVAL)
+
+    def test_a_refresh_interval_the_operator_set_is_left_alone(self):
+        self.wired(refreshInterval=OPERATOR_REFRESH_INTERVAL)
+
+        self.fixture.pin_install("--apply")
+
+        self.assertEqual(self.status_line()["refreshInterval"], OPERATOR_REFRESH_INTERVAL)
+
+    def test_unparseable_settings_are_refused_without_writing_anything(self):
+        self.fixture.settings(text='{"statusLine": {"command": "mine.sh"')
+        before = self.fixture.settings_path.read_text()
+
+        result = self.fixture.pin_install("--apply")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.fixture.settings_path.read_text(), before)
+        self.assertFalse(self.fixture.wrapper_path.exists())
+        self.assertEqual(self.fixture.backups(self.fixture.settings_path), [])
+
+    def test_uninstalling_restores_the_previous_command_exactly(self):
+        self.wired()
+        before = self.fixture.settings_json()
+        self.fixture.pin_install("--apply")
+
+        result = self.fixture.pin_install("--uninstall", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.settings_json(), before)
+
+    def test_uninstalling_leaves_the_refresh_interval_it_did_not_add(self):
+        self.wired(refreshInterval=OPERATOR_REFRESH_INTERVAL)
+        before = self.fixture.settings_json()
+        self.fixture.pin_install("--apply")
+
+        self.fixture.pin_install("--uninstall", "--apply")
+
+        self.assertEqual(self.fixture.settings_json(), before)
+
+    def test_uninstalling_a_statusline_the_installer_created_takes_it_away(self):
+        self.fixture.settings(**{UNRELATED_SETTING[0]: UNRELATED_SETTING[1]})
+        self.fixture.pin_install("--apply")
+
+        self.fixture.pin_install("--uninstall", "--apply")
+
+        self.assertEqual(
+            self.fixture.settings_json(), {UNRELATED_SETTING[0]: UNRELATED_SETTING[1]}
+        )
+
+    def test_uninstalling_refuses_when_the_statusline_has_moved_on(self):
+        self.wired()
+        self.fixture.pin_install("--apply")
+        moved = self.fixture.settings_json()
+        chosen = str(self.fixture.settings_dir / "chosen-since.sh")
+        moved["statusLine"] = {"type": "command", "command": chosen}
+        self.fixture.settings(**moved)
+        before = self.fixture.settings_path.read_text()
+
+        result = self.fixture.pin_install("--uninstall", "--apply")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.fixture.settings_path.read_text(), before)
+        self.assertTrue(self.fixture.wrapper_path.exists())
+
+    def test_uninstalling_is_a_dry_run_until_it_is_applied(self):
+        self.wired()
+        self.fixture.pin_install("--apply")
+        installed = self.fixture.settings_path.read_text()
+
+        result = self.fixture.pin_install("--uninstall")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(self.statusline), result.stdout)
+        self.assertEqual(self.fixture.settings_path.read_text(), installed)
+        self.assertTrue(self.fixture.wrapper_path.exists())
+
+    def test_the_install_costs_the_coordinator_nothing(self):
+        self.wired()
+
+        self.fixture.pin_install("--apply")
 
         self.assertEqual(self.fixture.calls("claude"), [])
         self.assertEqual(self.fixture.calls("tmux"), [])
