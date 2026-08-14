@@ -18,7 +18,7 @@ Every line carries these two keys first, in this order:
 | Key | Value |
 | --- | --- |
 | `ts` | the moment the event was recorded, `%Y-%m-%dT%H:%M:%SZ` in UTC |
-| `event` | `launch`, `receipt`, `merge`, `outcome`, `advance`, `escalation`, `ruling`, `message` |
+| `event` | one of the events [below](#events), which are the whole set a line can carry |
 
 `ts` is the run's one timestamp format — the same one the crew skill reads with
 `date -u +%Y-%m-%dT%H:%M:%SZ` — so any two lines subtract to a duration.
@@ -73,6 +73,22 @@ outcomes the crew contract gives every ticket.
 | `escalated` | a ticket failed, parked or did not land, and the chain stopped |
 | `interrupted` | the operator stopped the run |
 
+### `session-cost` — what one child's session spent, in tokens
+
+`ticket`, `executor`, `model`, `session`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
+`cache_creation_tokens`, `total_tokens`, `detail`. One line per launched child, appended by the
+cost pass at run completion ([`docs/monitor-dashboard.md`](monitor-dashboard.md)), so a run's
+usage is in its own artifacts rather than in transcripts a later agent would have to dig through.
+
+The four token counters are disjoint and `total_tokens` is their sum, in both lanes: Codex reports
+its cached tokens inside its input count and Claude reports them beside it, so the Codex figures
+are converted before they are written. `session` names every session that ran in the child's
+worktree, comma-separated — a resumed or replaced child spent the ticket's tokens too.
+
+A child whose transcript could not be read carries `detail` and no figures at all: the line says
+what went wrong and where to look, which is what makes a missing measurement visible rather than
+a gap in the log.
+
 ### `escalation`, `ruling`, `message` — an outgoing message, copied verbatim
 
 Written by the SendMessage hook below, never by hand: `role` (`coordinator` or `child`), `to`,
@@ -96,6 +112,10 @@ machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parke
 machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted \
                                     [--detail TEXT]
+machine_log.py --log <path> session-cost --ticket NN --executor claude|codex --model ID \
+                                    [--session IDS] [--input-tokens N] [--output-tokens N] \
+                                    [--cache-read-tokens N] [--cache-creation-tokens N] \
+                                    [--total-tokens N] [--detail TEXT]
 ```
 
 Each call appends exactly one line and exits 0. A value outside a closed set is a usage error:
