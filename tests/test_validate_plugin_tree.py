@@ -514,6 +514,15 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.write(CONFIG, self.tree.read(CONFIG) + '\n[implementer.tdd-refactor.core-tricky]\n')
         self.assert_rejects("core-tricky")
 
+    def test_shipped_defaults_without_a_dashboard_surface_are_rejected(self):
+        """The surface the run reads has to be answered by the file every project inherits."""
+        self.tree.edit_config('[dashboard]\nsurface = "window"\n', "")
+        self.assert_rejects("dashboard")
+
+    def test_dashboard_surface_that_is_not_a_surface_is_rejected(self):
+        self.tree.edit_config('surface = "window"', 'surface = "popup"')
+        self.assert_rejects("popup")
+
 
 class ProjectConfigTests(unittest.TestCase):
     """`--config`: the file the setup wizard writes at a project root."""
@@ -581,6 +590,15 @@ class ProjectConfigTests(unittest.TestCase):
 
     def test_an_unknown_case_is_rejected(self):
         self.assert_rejects("[reviewer.core-tricky]\n", "core-tricky")
+
+    def test_a_project_choosing_another_surface_is_accepted(self):
+        self.assert_accepts('[dashboard]\nsurface = "both"\n')
+
+    def test_a_project_choosing_a_surface_that_is_not_one_is_rejected(self):
+        self.assert_rejects('[dashboard]\nsurface = "popup"\n', "popup")
+
+    def test_an_unknown_dashboard_field_is_rejected(self):
+        self.assert_rejects('[dashboard]\nposition = "top"\n', "position")
 
     def test_a_hook_env_holding_a_non_string_value_is_rejected(self):
         self.assert_rejects("[hooks.on-child-launch.env]\nPORT = 123\n", "PORT")

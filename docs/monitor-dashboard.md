@@ -220,6 +220,7 @@ because nothing in it can be billed.
 
 ```sh
 monitor.py window --run-dir <run dir> --session <tmux target> [--refresh SECONDS]
+                  [--config <agentcrew.toml>] [--coordinator-pid PID] [--pin-dir <dir>]
 ```
 
 One run, one dashboard, one tmux window named `crew-dashboard` running the dashboard's refresh
@@ -240,6 +241,28 @@ keeps its last frame, and only the human closes what they are reading.
 
 The window is the operator's view of the run; the coordinator neither reads it nor is told what
 it says.
+
+### Which surface the run draws itself on
+
+This is also the command that chooses the surface, because it is the one dispatch already calls in
+every wave. `--config` names the project's `agentcrew.toml`, whose `[dashboard] surface` is
+`window`, `pin`, or `both`:
+
+| `surface` | The window | The pin |
+| --- | --- | --- |
+| `window` | created, reused, recreated as above | never written |
+| `pin` | not launched at all | written |
+| `both` | as above | written |
+
+A run whose config names no surface, whose config has no `[dashboard]` section, and a run given no
+`--config` at all, all get `window` — so upgrading agentcrew changes nobody's run. On `both`, the
+two passes dedup their toasts through the one file the run directory holds, which is what stops
+the same thing being announced twice.
+
+Writing the pin needs `--coordinator-pid`, the pid of the session driving the run: a pin is the
+handle on a live coordinator, and one written without a pid to check would be a frame nothing
+could take down. The pin is written into the registry — `--pin-dir` overrides where — under a name
+derived from the run directory, so the whole run has one pin however many waves re-write it.
 
 ## The pin
 
@@ -269,9 +292,22 @@ is not replaced, deprecated or changed by any of this, and it stays the default 
 files at `$CLAUDE_CONFIG_DIR/agentcrew/pins/`, falling back to `~/.claude/agentcrew/pins/`,
 overridable with `--pin-dir`. A pin file is JSON naming the run — the run directory as an absolute
 realpath ([ADR-0007](adr/0007-paths-are-absolute-at-the-boundary-and-compared-by-realpath.md)), the
-coordinator's pid, and the coordinator's tmux session. The run writes its pin at dispatch and
-removes it when the run ends, after the report is written: the final frame lives in the report and
-the machine log, not on the screen.
+coordinator's pid, and the coordinator's tmux session, under those three keys:
+
+```json
+{"run_dir": "/abs/realpath/of/the/run", "coordinator_pid": 4242, "tmux_session": "$7"}
+```
+
+The run writes its pin at dispatch — `monitor.py window`, on a `pin` or `both` surface — and
+removes it when the run ends, after the report is written:
+
+```sh
+monitor.py unpin --run-dir <run dir> [--pin-dir <dir>]
+```
+
+The final frame lives in the report and the machine log, not on the screen. `unpin` is how a run
+ends whatever surface it ran on: a run that wrote no pin has nothing to remove, and that is a
+success rather than a complaint.
 
 One pin is selected per tick, in this order:
 
