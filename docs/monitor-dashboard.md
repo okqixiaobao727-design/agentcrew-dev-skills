@@ -1,6 +1,6 @@
 # The monitor's operator surface
 
-The wave monitor is what the human watches a run through. It has three parts, and none of them
+The wave monitor is what the human watches a run through. It has four parts, and none of them
 costs a model token or reaches the coordinator's context
 ([ADR-0001](adr/0001-coordinator-spends-tokens-only-on-judgment.md)):
 
@@ -9,6 +9,7 @@ costs a model token or reaches the coordinator's context
 | the wake-up | [`monitor-wave.sh`][wake] | armed while every child is busy, exits once one is not |
 | the dashboard | [`monitor.py dashboard`][monitor] | draws the wave as a table in its own pane |
 | the receipt check | [`monitor.py verify`][monitor] | decides whether a completion receipt holds |
+| the cost pass | [`monitor.py cost`][monitor] | records what each child spent, and the run total |
 
 [wake]: ../skills/crew/assets/monitor-wave.sh
 [monitor]: ../skills/crew/assets/monitor/monitor.py
@@ -101,6 +102,36 @@ A landable verdict appends one `receipt` line to `--log`, which is what puts the
 the dashboard. An invalid receipt appends nothing: the ticket is not settled by it — the crew
 contract gives that child one more chance to finish or fail — and the log carries exactly one
 receipt per launched ticket.
+
+## The cost pass
+
+```sh
+monitor.py cost --log <machine log>
+```
+
+Run once at run completion. For every ticket the log carries a `launch` for, it reads the usage
+out of the transcripts that ran in that child's worktree, appends one `session-cost` line per
+child ([`docs/machine-log.md`](machine-log.md)), and prints the run's rollup for the report:
+
+```text
+TICKET  EXECUTOR  MODEL                     INPUT  OUTPUT  CACHE-READ  CACHE-CREATION  TOTAL
+06      claude    claude-opus-4-5-20251101  24     46      6800        900             7770
+07      codex     gpt-5.6-luna              1000   700     4000        250             5950
+08      codex     gpt-5.6-luna              --     --      --          --              --
+TOTAL   --        --                        1024   746     10800       1150            13720
+
+08 not measured: no transcript under /Users/me/.codex/sessions was recorded in /repo/wt/08
+```
+
+Transcripts are found by the worktree they ran in, compared by realpath: Claude sessions under
+`$CLAUDE_CONFIG_DIR` (default `~/.claude`), Codex sessions under `$CODEX_HOME` (default
+`~/.codex`) — the same roots the two executors write to, so what is measured is what ran. Every
+session of a worktree counts toward its ticket, including a replacement child's and a review's.
+
+A child whose transcript is missing, unreadable, or silent about usage is drawn as the `--` row
+above and logged with the diagnosis in place of its figures, so an unmeasured child is visible in
+both artifacts. Only a log naming an executor that is neither `claude` nor `codex` stops the pass,
+because nothing in it can be billed.
 
 ## The pane
 
