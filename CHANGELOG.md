@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-08-14
+
 ### Added
 - `monitor.py cost --coordinator-session ID` reads the session driving the run
   out of its own transcript and prints it as a `coordinator` row beneath the
