@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-08-14
+
 The two defects the first `/crew` run of the fixed code exposed in its own
 records (#26, #27): a run now shows a review while it is running, and bills a
 child that worked in a subdirectory of its own worktree.
