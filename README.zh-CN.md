@@ -195,6 +195,8 @@ MY_PROJECT_MODE = "unattended"
 - [`docs/glossary.md`](docs/glossary.md)——两个技能所讲的术语。
 - [`docs/dogfooding-run.md`](docs/dogfooding-run.md)——上面那段演示对应的真实运行：做了什么、发现了
   什么、还留下了什么。
+- [`docs/cost-baseline.md`](docs/cost-baseline.md)——ADR-0001 所依据的那次实测运行：协调者的钱到底
+  花在哪，以及以后的运行拿什么来对照。
 - [`config/agentcrew.default.toml`](config/agentcrew.default.toml)——随插件发布的带注释默认配置。
 
 ## 许可证
