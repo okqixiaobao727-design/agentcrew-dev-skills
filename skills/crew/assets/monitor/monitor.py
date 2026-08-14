@@ -21,6 +21,7 @@ worktree paths it is given are the wave's membership — the same arguments the 
 import argparse
 import datetime
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -98,6 +99,17 @@ def elapsed(start, end):
     return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
+def worktree_key(path):
+    """One worktree's identity: what its path resolves to, never how it was spelled.
+
+    A run reaches the same directory by several names — `/tmp` and `/private/tmp` on macOS, a
+    symlinked checkout anywhere — and two of them compared as strings make a live child look
+    vanished, which is a false toast and a false wake-up. A path that resolves to nothing keeps
+    its own text, which is still a stable key for the row it belongs to.
+    """
+    return os.path.realpath(str(path))
+
+
 def git(worktree, *args):
     """The trimmed stdout of one git command, or a MonitorError carrying why it failed."""
     result = subprocess.run(
@@ -168,7 +180,7 @@ def agent_states(claude_bin):
     for agent in snapshot:
         if not isinstance(agent, dict) or "cwd" not in agent:
             continue
-        cwd = str(agent["cwd"])
+        cwd = worktree_key(agent["cwd"])
         states[cwd] = DUPLICATE_STATE if cwd in states else str(agent.get("status", UNKNOWN_STATE))
     return states
 
@@ -197,10 +209,10 @@ def build_rows(records, worktrees, wave, moment, states):
     launched twice into the same worktree — a replacement child — is the one row its last launch
     describes.
     """
-    wanted = {str(path) for path in worktrees}
+    wanted = {worktree_key(path) for path in worktrees}
     launches = {}
     for record in records:
-        if record.get("event") == "launch" and str(record.get("worktree")) in wanted:
+        if record.get("event") == "launch" and worktree_key(record.get("worktree")) in wanted:
             launches[str(record.get("ticket"))] = record
 
     rows = []
@@ -214,7 +226,7 @@ def build_rows(records, worktrees, wave, moment, states):
             state = UNKNOWN_STATE
             end = moment
         else:
-            state = states.get(str(launch.get("worktree")), VANISHED_STATE)
+            state = states.get(worktree_key(launch.get("worktree")), VANISHED_STATE)
             end = moment
         rows.append({
             "wave": str(wave),
