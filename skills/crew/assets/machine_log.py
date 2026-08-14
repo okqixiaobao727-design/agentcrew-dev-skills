@@ -12,7 +12,7 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome|advance|session-cost ...
+    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|session-cost ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
 
@@ -53,6 +53,9 @@ ESCALATION_VERB = "CREW ASK"
 VERDICTS = ("landable", "parked", "failed")
 OUTCOMES = ("completed", "failed", "parked", "blocked")
 MERGE_RESULTS = ("clean", "conflict", "repaired", "escalated")
+# The two ends of one review. A review that started and never came back is a row the dashboard
+# would leave standing, so the vocabulary is closed at "it is running" and "it is not".
+REVIEW_STATES = ("running", "returned")
 # What the run decided about carrying on after a wave. One of these per decision, and a decision
 # is about a wave rather than a ticket, so this is the one event that carries no ticket.
 DECISIONS = ("launched", "escalated", "complete", "interrupted")
@@ -353,6 +356,14 @@ def build_parser():
     outcome = event_command("outcome", "a ticket's one report outcome")
     outcome.add_argument("--outcome", required=True, choices=OUTCOMES)
     outcome.add_argument("--detail")
+
+    review = event_command("review", "one end of a ticket's trip through its review lane")
+    review.add_argument(
+        "--lane", required=True,
+        help="the reviewing vendor and its model, as the wave table approved them",
+    )
+    review.add_argument("--state", required=True, choices=REVIEW_STATES)
+    review.add_argument("--detail")
 
     cost = event_command("session-cost", "what one child's session spent, in tokens")
     cost.set_defaults(handler=run_session_cost)

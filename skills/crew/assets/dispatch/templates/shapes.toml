@@ -158,6 +158,10 @@ on it, ends the review: send your coordinator a CREW ASK carrying both positions
 than opening another round.
 '''
 
+# `<review log>` is what lets the bridge write the run's `review` event: the run's machine log and
+# the ticket it is reviewing, as flags spliced into the invocation. A run dispatched without a
+# machine log fills it with nothing, and the command it leaves behind is a whole review invocation.
+#
 # The reviewer is always the vendor that did not implement, so the variant is keyed by that vendor.
 [review.codex]
 block = '''
@@ -167,7 +171,7 @@ for it. A foreground Bash call is killed at ten minutes, which a review of this 
 outlasts; in the background it runs to completion and wakes you when it exits.
 
 python3 <crew-skill-dir>/assets/review/scripts/tui_review_bridge.py \
-  --cwd <worktree-abs-path> --model <review model> --effort <review effort> \
+  --cwd <worktree-abs-path> --model <review model> --effort <review effort><review log> \
   -- 'the changes in this worktree since <ticket base commit>'
 
 This command is the ticket's only review; it satisfies every review step any skill you invoke
@@ -184,7 +188,7 @@ no `reviewSessionId` for a review you know you started — recover the review yo
 rather than starting a second one:
 
 python3 <crew-skill-dir>/assets/review/scripts/tui_review_bridge.py \
-  --cwd <worktree-abs-path> --recover-session
+  --cwd <worktree-abs-path><review log> --recover-session
 
 It re-attaches to the review pane still running for this worktree, waits out the turn in flight,
 and prints the same JSON object with `recovered` true and the original `reviewSessionId`. Exit
@@ -202,7 +206,7 @@ Review: claude at model <review model>, effort <review effort>. You have no Clau
 own, so a headless one reviews for you. Once the work is in place and before you commit it, run:
 
 python3 <crew-skill-dir>/assets/review/scripts/claude_review_bridge.py \
-  --cwd <worktree-abs-path> --model <review model> --effort <review effort> \
+  --cwd <worktree-abs-path> --model <review model> --effort <review effort><review log> \
   'the changes in this worktree since <ticket base commit>'
 
 This command is the ticket's only review; it satisfies every review step any skill you invoke

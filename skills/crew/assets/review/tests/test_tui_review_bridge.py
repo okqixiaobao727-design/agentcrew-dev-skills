@@ -662,13 +662,12 @@ class FakeCodexSession:
         return None
 
 
-class RecoveryTests(unittest.TestCase):
-    """A driver killed mid-review is recovered, not restarted.
+class FakePaneTestCase(unittest.TestCase):
+    """One stubbed Codex pane, driven through the bridge's own entry points.
 
-    The whole path runs through `run_bridge` against a stubbed pane: the first
-    call is killed the way the harness kills it — the record is written, the
-    pane lives on, nothing is printed — and the second call has only its own
-    owner identity to work from.
+    Everything the bridge would reach the machine through — the pane, the
+    app-server connection, the worktree identity — is stubbed, so a test drives
+    a whole review and asserts on what the bridge left behind.
     """
 
     TMUX = "/private/tmp/tmux-501/default,11028,2"
@@ -743,6 +742,16 @@ class RecoveryTests(unittest.TestCase):
         records = sorted(self.state_dir.glob("*.json"))
         self.assertEqual(len(records), 1, records)
         return json.loads(records[0].read_text(encoding="utf-8"))
+
+
+class RecoveryTests(FakePaneTestCase):
+    """A driver killed mid-review is recovered, not restarted.
+
+    The whole path runs through `run_bridge` against a stubbed pane: the first
+    call is killed the way the harness kills it — the record is written, the
+    pane lives on, nothing is printed — and the second call has only its own
+    owner identity to work from.
+    """
 
     def test_a_killed_driver_leaves_a_recoverable_record_and_a_live_pane(self):
         state = self.kill_the_driver()
@@ -843,6 +852,109 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(code, self.bridge.NO_LIVE_SESSION_EXIT)
         self.assertNotEqual(self.bridge.NO_LIVE_SESSION_EXIT, 1)
         self.assertEqual(self.codex.panes, [])
+
+
+class MachineLogTests(FakePaneTestCase):
+    """The pair of `review` lines every review leaves in the run's machine log.
+
+    The bridge is the writer because it is the only party that deterministically
+    knows both that a review started and that it ended: the reviewed child may
+    skip a line it was asked for in prose, and a child whose session dies
+    mid-review can never write the `returned` line at all.
+    """
+
+    TICKET = "26"
+    MODEL = "gpt-5.6-luna"
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = self.root / "run" / "log.jsonl"
+
+    def main(self, *arguments):
+        argv = ["tui_review_bridge.py", "--cwd", str(self.worktree), *arguments]
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(stdout):
+                return self.bridge.main()
+
+    def review_argv(self, *arguments, timeout="5"):
+        return (
+            "HEAD",
+            "--model", self.MODEL,
+            "--effort", "max",
+            "--timeout", timeout,
+            "--startup-timeout", "5",
+            "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET,
+            *arguments,
+        )
+
+    def reviews(self):
+        if not self.machine_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.machine_log.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line).get("event") == "review"
+        ]
+
+    def assertPair(self, records):
+        """Exactly one `running` line and its `returned` pair, for this ticket, in that order."""
+        self.assertEqual([record["state"] for record in records], ["running", "returned"])
+        for record in records:
+            self.assertEqual(record["ticket"], self.TICKET)
+            # Vendor then model, the spelling the dashboard's annotation row prints verbatim.
+            self.assertEqual(record["lane"], f"codex {self.MODEL}")
+
+    def test_a_review_leaves_its_running_line_and_its_returned_pair(self):
+        self.codex.finish("two spec findings, one standards finding")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertPair(self.reviews())
+
+    def test_a_review_with_no_log_configured_writes_nothing(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            "HEAD", "--model", self.MODEL, "--timeout", "5", "--startup-timeout", "5"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertFalse(self.machine_log.exists())
+
+    def test_a_review_that_never_came_back_still_writes_its_returned_line(self):
+        """The turn never finishes, so the review fails — and the row must not stay standing."""
+        code = self.main(*self.review_argv(timeout="0.2"))
+
+        self.assertEqual(code, 1)
+        self.assertPair(self.reviews())
+
+    def test_a_log_that_cannot_be_written_leaves_the_exit_status_alone(self):
+        blocked = self.root / "not-a-directory"
+        blocked.write_text("this is a file, so nothing can be created beneath it\n")
+        self.machine_log = blocked / "log.jsonl"
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+
+    def test_round_two_writes_its_own_pair_for_the_same_ticket(self):
+        self.codex.finish("round one findings")
+        self.main(*self.review_argv())
+        session = self.stored_session()["reviewSessionId"]
+
+        code = self.main(*self.review_argv("--resume-session", session))
+
+        self.assertEqual(code, 0)
+        records = self.reviews()
+        self.assertEqual(
+            [record["state"] for record in records],
+            ["running", "returned", "running", "returned"],
+        )
+        self.assertEqual({record["ticket"] for record in records}, {self.TICKET})
 
 
 class RecoveryParserTests(unittest.TestCase):
