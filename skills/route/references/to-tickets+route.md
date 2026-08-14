@@ -1,4 +1,4 @@
-# Spec-only — the to-tickets handoff
+# To-tickets+route — the user-typed handoff
 
 A spec with no tickets. `/mattpocock-skills:to-tickets` owns the cutting, the approval quiz, and the
 publication; everything here is an **addition** riding along on that run — that skill is the source
@@ -11,11 +11,11 @@ the gate is deliberate. Print one line for the user to send, with both blanks fi
 path, and the absolute path of `classify.md` resolved from this file's own location:
 
 ```
-/mattpocock-skills:to-tickets <spec-path> — while drafting, read <absolute-path-to>/classify.md and apply the additions already loaded from spec-only.md
+/mattpocock-skills:to-tickets <spec-path> — while drafting, read <absolute-path-to>/classify.md and apply the additions already loaded from to-tickets+route.md
 ```
 
 Then wait. If the line comes back unexpanded — the harness treats it as plain text because
-mattpocock-skills is not installed — stop and tell the user: spec-only needs that plugin installed;
+mattpocock-skills is not installed — stop and tell the user: this mode needs that plugin installed;
 until then `/route` can only classify tickets that already exist.
 
 **Done when** the user has sent the line and the `to-tickets` skill body has arrived.

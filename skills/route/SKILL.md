@@ -27,8 +27,8 @@ Settle the tracker: [`references/trackers.md`](../../references/trackers.md) tur
 `docs/agents/issue-tracker.md` into the **read**, **edit**, and **mark** operations the steps below
 call. Then look for the feature's tickets, where that tracker keeps them.
 
-A spec with no tickets is **spec-only**: hand over to
-[`references/spec-only.md`](references/spec-only.md) — `/mattpocock-skills:to-tickets` cuts,
+A spec with no tickets is **to-tickets+route**: hand over to
+[`references/to-tickets+route.md`](references/to-tickets+route.md) — `/mattpocock-skills:to-tickets` cuts,
 confirms, and publishes there with the routing rules riding along, and steps 2–4 below never run.
 Tickets found is **route-only**: read the feature's spec, then **read** every ticket — body,
 `Blocked by:` edges resolved into dependents as well as blockers, and its existing `## Routing`
