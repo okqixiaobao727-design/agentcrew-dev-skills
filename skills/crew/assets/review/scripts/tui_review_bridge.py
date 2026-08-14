@@ -725,7 +725,12 @@ async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
 
 
 async def start_thread(client, cwd, sandbox, approval):
-    """Returns a new thread id with its unattended approval and sandbox policy."""
+    """Returns a new thread id with its unattended approval and sandbox policy.
+
+    Thread start takes the sandbox as a bare enum string, unlike the tagged
+    sandbox object used by turn start; the session approval policy suppresses
+    per-tool prompts in this unattended review.
+    """
     result = await client.request(
         "thread/start",
         {
@@ -1006,7 +1011,7 @@ async def run_new_review(args, owner, store):
         )
         try:
             thread_id = await start_thread(
-                client, args.cwd, args.sandbox, args.approval
+                client, cwd=args.cwd, sandbox=args.sandbox, approval=args.approval
             )
             await wait_for_mcp_startup(client, pane_id, args.startup_timeout)
             await start_turn(client, thread_id, prompt, args.model, args.effort)

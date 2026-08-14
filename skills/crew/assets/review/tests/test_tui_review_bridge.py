@@ -203,9 +203,7 @@ class McpReadinessGateTests(unittest.TestCase):
         self.run_new_review(client)
 
         self.assertEqual(client.thread_start_params["approvalPolicy"], "never")
-        self.assertEqual(
-            client.thread_start_params["sandbox"], "danger-full-access"
-        )
+        self.assertEqual(client.thread_start_params["sandbox"], "danger-full-access")
 
     def test_the_record_is_on_disk_before_the_pane_is_handed_the_thread(self):
         """Otherwise a driver killed in between orphans a live, running review.
