@@ -12,8 +12,9 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome|advance ...  # a script's own event
-    machine_log.py --log <path> hook --role coordinator|child            # a hook, on stdin
+    machine_log.py --log <path> launch|receipt|merge|outcome|advance|session-cost ...
+                                                              # a script's own event
+    machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
 
 The hook never speaks on a channel a model reads: it writes nothing to stdout on the happy path,
 writes nothing to stderr ever, and exits 0 even when the log cannot be written, because a send
@@ -55,6 +56,14 @@ MERGE_RESULTS = ("clean", "conflict", "repaired", "escalated")
 # What the run decided about carrying on after a wave. One of these per decision, and a decision
 # is about a wave rather than a ticket, so this is the one event that carries no ticket.
 DECISIONS = ("launched", "escalated", "complete", "interrupted")
+# The two lanes a child runs in. A usage figure is only readable against the executor that wrote
+# it, so an executor this log does not know is an executor whose figures nobody can check.
+EXECUTORS = ("claude", "codex")
+# What a session cost is made of: four disjoint counters and the total they must come to. A line
+# carrying some of them, or a total that is not their sum, is arithmetic a later agent would trust
+# and be wrong to, so it is refused like a value outside a closed set.
+COST_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens")
+COST_TOTAL = "total_tokens"
 
 LOG_FILE_MODE = 0o644
 
@@ -254,6 +263,40 @@ def run_event(args):
     return 0
 
 
+def cost_problem(args):
+    """Why this session cost contradicts itself, or None when it holds together.
+
+    A session cost answers one of two questions and never both: what the child spent, in all five
+    figures, or why nobody could tell. Anything between the two is a line whose reader cannot know
+    which of the two it is holding.
+    """
+    counters = [getattr(args, name) for name in COST_COUNTERS]
+    total = getattr(args, COST_TOTAL)
+    figures = [value for value in counters + [total] if value is not None]
+    if not figures:
+        if args.detail is None:
+            return "a session cost with no figures carries the diagnosis that says why"
+        return None
+    if len(figures) < len(COST_COUNTERS) + 1:
+        return f"a session cost carries all of {', '.join(COST_COUNTERS)} and {COST_TOTAL}, or none"
+    if args.detail is not None:
+        return "a session cost carries its figures or a diagnosis, never both"
+    if any(value < 0 for value in figures):
+        return "a token count is never negative"
+    if total != sum(counters):
+        return f"{COST_TOTAL} {total} is not the sum of the four counters"
+    return None
+
+
+def run_session_cost(args):
+    """Append one session cost; returns 0, or 2 for a record that contradicts itself."""
+    problem = cost_problem(args)
+    if problem is not None:
+        print(f"machine log: session-cost: {problem}", file=sys.stderr)
+        return 2
+    return run_event(args)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--log", required=True, help="the run's machine log")
@@ -290,6 +333,17 @@ def build_parser():
     outcome = event_command("outcome", "a ticket's one report outcome")
     outcome.add_argument("--outcome", required=True, choices=OUTCOMES)
     outcome.add_argument("--detail")
+
+    cost = event_command("session-cost", "what one child's session spent, in tokens")
+    cost.set_defaults(handler=run_session_cost)
+    cost.add_argument("--executor", required=True, choices=EXECUTORS)
+    cost.add_argument("--model", required=True, help="the full model ID, never an alias")
+    cost.add_argument("--session", help="the session whose transcript these figures were read off")
+    for tokens in ("input", "output", "cache-read", "cache-creation", "total"):
+        cost.add_argument(f"--{tokens}-tokens", type=int, help=f"{tokens} tokens, as counted")
+    # Left unset when the transcript could not be read, which is what makes `detail` the diagnosis
+    # rather than a note: a line with no figures and no detail would be a silent gap.
+    cost.add_argument("--detail", help="why the figures are missing, when they are")
 
     advance = subcommands.add_parser("advance", help="what the run decided after a wave settled")
     advance.set_defaults(handler=run_event)
