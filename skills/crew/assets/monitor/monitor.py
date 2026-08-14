@@ -106,6 +106,9 @@ VANISHED = "vanished"
 STATE_ORDER = (PENDING, RUNNING, WAITING, PARKED, LANDABLE, MERGED, FAILED, VANISHED)
 # The states that owe the operator an explanation; every other row stays quiet.
 ABNORMAL_STATES = (WAITING, FAILED, VANISHED)
+# The existing Claude Code statusline occupies two rows before the pin's frame is appended.
+STATUSLINE_RESERVE_LINES = 2
+FINAL_STATES = (MERGED, FAILED)
 
 # The two anomalies, which are annotations rather than states: no row is ever `duplicate` or
 # `unknown`, because both describe what the agents list did, not where the ticket is.
@@ -589,6 +592,11 @@ def terminal_width():
     return shutil.get_terminal_size(fallback=(FALLBACK_WIDTH, 24)).columns
 
 
+def terminal_height():
+    """How tall the terminal is, as the statusline environment or the terminal reports it."""
+    return shutil.get_terminal_size(fallback=(FALLBACK_WIDTH, 24)).lines
+
+
 def cut(text, width):
     """`text` in at most `width` columns, the last one spent saying it was cut."""
     if width <= 0:
@@ -618,7 +626,54 @@ def paint(text, state, colour):
     return f"\x1b[{code}m{text}{COLOUR_RESET}" if code else text
 
 
-def render(rows, run_id, waves, moment, width=None, colour=False):
+def fit_rows(rows, row_blocks, available, width):
+    """Spend the rows left below the summary and header in the contract's fixed order.
+
+    Settled ticket rows give up space first, annotations second, and live or pending ticket rows
+    last. Once a ticket row is omitted, one of the remaining rows is reserved for the marker.
+    """
+    selected = list(range(len(rows)))
+    omitted = 0
+    content_budget = available
+
+    def line_count(indexes, include_annotations):
+        return sum(
+            1 + (len(rows[index]["annotations"]) if include_annotations else 0)
+            for index in indexes
+        )
+
+    while line_count(selected, True) > content_budget:
+        settled_index = next(
+            (index for index in selected if rows[index]["state"] in FINAL_STATES),
+            None,
+        )
+        if settled_index is None:
+            break
+        selected.remove(settled_index)
+        omitted += 1
+        # The marker is itself a row, so a dropped ticket consumes one line for it.
+        content_budget = max(available - 1, 0)
+
+    include_annotations = line_count(selected, True) <= content_budget
+
+    if line_count(selected, include_annotations) > content_budget:
+        if omitted == 0:
+            content_budget = max(available - 1, 0)
+        row_capacity = content_budget
+        omitted += len(selected) - row_capacity
+        selected = selected[:row_capacity]
+
+    lines = [
+        line
+        for index in selected
+        for line in (row_blocks[index] if include_annotations else row_blocks[index][:1])
+    ]
+    if omitted:
+        lines.append(cut(f"{ELLIPSIS} +{omitted} more", width))
+    return lines
+
+
+def render(rows, run_id, waves, moment, width=None, colour=False, max_lines=None):
     """The whole frame: the summary line, the header, and each row with its annotations."""
     width = width or terminal_width()
     cells = [list(COLUMNS)] + [
@@ -630,18 +685,37 @@ def render(rows, run_id, waves, moment, width=None, colour=False):
     fixed = sum(widths) - widths[TITLE_COLUMN] + len(COLUMN_GAP) * (len(COLUMNS) - 1)
     widths[TITLE_COLUMN] = max(min(widths[TITLE_COLUMN], width - fixed), 0)
 
-    lines = [cut(summary(rows, run_id, waves, moment), width)]
-    for index, values in enumerate(cells):
+    def block(index, values):
         values = list(values)
         values[TITLE_COLUMN] = cut(values[TITLE_COLUMN], widths[TITLE_COLUMN])
         padded = [value.ljust(size) for value, size in zip(values, widths)]
         if index:
             padded[STATE_COLUMN] = paint(padded[STATE_COLUMN], rows[index - 1]["state"], colour)
-        lines.append(COLUMN_GAP.join(padded).rstrip())
+        block_lines = [COLUMN_GAP.join(padded).rstrip()]
         if index:
-            lines += [
+            block_lines += [
                 cut(ANNOTATION_PREFIX + note, width) for note in rows[index - 1]["annotations"]
             ]
+        return block_lines
+
+    lines = [cut(summary(rows, run_id, waves, moment), width)]
+    header_lines = block(0, cells[0])
+    row_blocks = [block(index, values) for index, values in enumerate(cells[1:], 1)]
+    if max_lines is None:
+        return "\n".join(
+            lines + header_lines + [
+                line for block_lines in row_blocks for line in block_lines
+            ]
+        )
+
+    budget = max(max_lines, 0)
+    if budget <= 1:
+        return "\n".join(lines)
+    lines += header_lines
+    if budget <= len(lines):
+        return "\n".join(lines)
+
+    lines += fit_rows(rows, row_blocks, budget - len(lines), width)
     return "\n".join(lines)
 
 
@@ -692,22 +766,27 @@ def write_said(path, said):
         pass
 
 
-def display(tmux_bin, text):
+def display(tmux_bin, text, timeout=None):
     """Show one toast in the operator's terminal. A tmux that will not show it is not an error."""
     try:
-        subprocess.run([tmux_bin, "display-message", text], capture_output=True, text=True)
-    except OSError:
+        subprocess.run(
+            [tmux_bin, "display-message", text],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
-def emit_toasts(rows, state_path, tmux_bin):
+def emit_toasts(rows, state_path, tmux_bin, timeout=None):
     """Display the toasts this pass has grounds for and has not shown; returns their texts."""
     said = read_said(state_path)
     shown = []
     for key, text in toasts(rows):
         if key in said:
             continue
-        display(tmux_bin, text)
+        display(tmux_bin, text, timeout=timeout)
         said.add(key)
         shown.append(text)
     if shown:
@@ -1053,8 +1132,8 @@ def pin_colour(args):
     return not args.no_color and not os.environ.get("NO_COLOR")
 
 
-def pin_frame(args, run_dir, moment):
-    """The frame that run has to draw right now, or None when it has none.
+def pin_frame_data(args, run_dir, moment):
+    """The frame and rows that run has to draw right now, or None when it has none.
 
     A run the log says is over is a run whose final frame lives in the report and the machine log
     rather than on the operator's screen.
@@ -1065,7 +1144,18 @@ def pin_frame(args, run_dir, moment):
     waves = read_table(run_dir)
     sources = live_sources(args.claude_bin, run_dir, args.timeout)
     rows = build_rows(waves, records, moment, sources)
-    return render(rows, run_dir.name, len(waves), moment, colour=pin_colour(args))
+    frame = render(
+        rows, run_dir.name, len(waves), moment,
+        colour=pin_colour(args), max_lines=pin_line_budget(args),
+    )
+    return frame, rows
+
+
+def pin_line_budget(args):
+    """The number of frame rows available to the pin, with an explicit override for tests/users."""
+    if args.max_lines is not None:
+        return max(args.max_lines, 0)
+    return max(terminal_height() - STATUSLINE_RESERVE_LINES, 0)
 
 
 def run_pin(args):
@@ -1085,11 +1175,20 @@ def run_pin(args):
         )
         if pin is None or not alive(pin["pid"]):
             return 0
-        frame = pin_frame(args, pin["run_dir"], args.now or now())
+        data = pin_frame_data(args, pin["run_dir"], args.now or now())
+        if data is None:
+            return 0
+        frame, rows = data
+        print(frame, flush=True)
+        if not args.no_toast:
+            emit_toasts(
+                rows,
+                toast_state_path(args, pin["run_dir"]),
+                args.tmux_bin,
+                timeout=args.timeout,
+            )
     except Exception:  # noqa: BLE001 — the silence contract: a tick never reports its own failure
         return 0
-    if frame is not None:
-        print(frame, flush=True)
     return 0
 
 
@@ -1893,6 +1992,10 @@ def build_parser():
     )
     pin.set_defaults(handler=run_pin)
     pin.add_argument("--pin-dir", help="the pin registry the live run is discovered through")
+    pin.add_argument("--toast-state", help="where this run remembers what it has toasted")
+    pin.add_argument(
+        "--no-toast", action="store_true", help="draw the frame without displaying toasts"
+    )
     pin.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
         help="how long a live source is given to answer before its row is drawn"
@@ -1904,6 +2007,10 @@ def build_parser():
     pin.add_argument(
         "--now", type=timestamp_argument,
         help="the moment elapsed times are measured to, stamped as the log stamps (default: now)",
+    )
+    pin.add_argument(
+        "--max-lines", type=int,
+        help="the maximum number of frame rows (default: LINES minus the statusline reserve)",
     )
 
     cost = commands.add_parser("cost", help="record what each child spent and roll the run up")
