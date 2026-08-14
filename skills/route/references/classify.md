@@ -2,7 +2,7 @@
 
 The four-dimension tests, the routing table's shape, and the `## Routing` template — the judgment
 core both branches consume, read at the point of use: route-only reads it before classifying, and a
-spec-only `to-tickets` run reads it when drafting begins (ADR-0006).
+to-tickets+route run reads it when drafting begins (ADR-0006).
 
 Two passes per ticket: workflow first, then implementer. Every call cites the test that decided it.
 

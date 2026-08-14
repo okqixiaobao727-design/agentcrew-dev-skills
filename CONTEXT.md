@@ -100,5 +100,5 @@ _Avoid_: retry, restart
 
 **Mode-gated reference**:
 A reference file only one mode of a skill loads, via an explicit Read instruction in the
-body — e.g. the spec-only handoff that route-only `/route` runs never see. Disclosure
+body — e.g. the to-tickets+route handoff that route-only `/route` runs never see. Disclosure
 earns its cost only when some branch skips the material.
