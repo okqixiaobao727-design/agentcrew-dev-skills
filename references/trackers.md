@@ -18,7 +18,6 @@ user with the rest of what that step reports.
 | Operation | github | local |
 | --- | --- | --- |
 | **read** — a ticket's body, its `Blocked by:` edges, and its current `## Routing` | `gh issue view <n> --comments`, and the convention document's list command for the whole feature | read the ticket file at the path the convention document gives that feature |
-| **publish** — a new ticket, in dependency order | `gh issue create`, so each ticket's blocking edges name real issue numbers | write one file per ticket under the feature's directory, numbered from `01` in dependency order |
 | **edit** — replace a ticket's body with new text | `gh issue edit <n> --body-file -` with the complete new text, so the edit is one atomic replacement | rewrite the whole file |
 | **mark** — declare who may pick the ticket up | the triage labels `ready-for-agent` and `ready-for-human` | the same two role strings on the ticket's `Status:` line |
 | **close** — record a finished ticket and take it out of the pickup queue | `gh issue close <n>` with its pickup label removed; the undo is reopening it and restoring the label | set `Status:` to the finished value the convention document names, `done` where it names none; the undo is restoring the value it held |

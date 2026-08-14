@@ -26,9 +26,9 @@ Upstream contracts, all from mattpocock-skills and all unmodified (see the Matt-
 
 **The issue tracker is configurable.** Both skills read the repo's `docs/agents/issue-tracker.md` to
 learn where tickets are read from and where status is written back, and hard-code neither. Two
-trackers are exercised: GitHub issues, and local markdown files — where `/route` publishes ticket
-files and touches no remote, and `/crew` writes each finished ticket's `Status:` line instead of
-closing an issue. Every other tracker runs on its convention document alone and is declared
+trackers are exercised: GitHub issues, and local markdown files — where every ticket operation is a
+file read or write in the working tree, and `/crew` writes each finished ticket's `Status:` line
+instead of closing an issue. Every other tracker runs on its convention document alone and is declared
 untested; the operations are in [`trackers.md`](../references/trackers.md).
 
 ## 2. The run loop
@@ -188,8 +188,9 @@ picks a table cell is not configurable — that is the product opinion.
 - **A resident teammate process** — rejected when no message channel existed between sessions.
   Cross-session messaging removed that constraint, and §7 adopts it as the primary channel.
 - **Vendoring Matt's `/to-tickets` prompt text into `/route`** — it would drift from upstream and
-  reads as appropriating his work. `/route` invokes his skill and layers routing rules on top
-  instead.
+  reads as appropriating his work. `/route` has the user type his skill's command and layers
+  additions on top instead; the skill's own gate against model invocation is honoured, not worked
+  around (ADR-0006).
 - **A built-in integration for child launches** — see [ADR 0001](adr/0001-on-child-launch-hook.md).
 - **Binding to mattpocock-skills through the repo name** — see
   [ADR 0002](adr/0002-description-layer-binding.md).
