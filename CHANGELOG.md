@@ -7,6 +7,28 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- `validate_plugin_tree.py --config` accepted a project `agentcrew.toml` that
+  named no `[repair] model` and no `[tracker] kind` — the exact file a run then
+  stopped on in preflight. Both keys were checked only when the config had to
+  be complete, which the shipped defaults are and a project file is not; but
+  neither key is inherited from the shipped defaults, so a project file is the
+  only place either can be answered. They are now required of every config this
+  validates, and the verdict says why nothing inherits them. The setup wizard
+  runs this command, so the wizard was the surface reporting the green (#54).
+- The setup wizard read a missing `[repair]` or `[tracker]` as an override the
+  project had declined and kept the file as it was, which is how a config
+  written before 0.4.0 reached its first run of the driver intact and stopped
+  it. A missing section is now named as a hole and appended from the shipped
+  defaults, leaving every edit above it untouched (#54).
+- `[tracker] kind` was copied into every new project as `"local"`, the shipped
+  placeholder, and never reconciled with the `docs/agents/issue-tracker.md` the
+  wizard had just settled. A repo whose tickets are GitHub issues would close
+  its merged tickets by editing markdown `Status:` lines instead — not a
+  failure, a quiet write to the wrong place. Settling it is now a step of the
+  wizard: read the convention document, propose the kind it describes, and
+  write what the user confirms (#54).
+
 ## [0.4.0] - 2026-08-15
 
 The coordinator stops running the run and starts only ruling on it. A scripted

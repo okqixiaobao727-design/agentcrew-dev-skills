@@ -10,9 +10,9 @@ effort: medium
 
 `/route <path-to-feature-dir>` classifies every ticket of a feature on four dimensions — workflow,
 executor, model, effort — plus the review lane the reviewed workflows carry, and writes each
-conclusion into its ticket as a `## Routing` section. That section is **advisory input**: `/crew`
-builds its wave table from it, and from approval onward the wave table is the sole routing
-authority.
+conclusion into its ticket as a `## Routing` section. That section is **advisory input**: `/crew`'s
+driver builds and validates its wave table from it, and from that validation onward the wave table
+is the sole routing authority.
 
 Routing is a **suggestion**: steps 1–3 read and propose, step 4 is the first write, and the user
 decides at the one checkpoint between them.
@@ -21,7 +21,7 @@ decides at the one checkpoint between them.
 
 A repo with no `agentcrew.toml` at its root is a first run: go to the setup wizard in
 [`references/setup.md`](references/setup.md), and resume here once it is done. The same wizard
-reconfigures a repo whenever the user asks.
+reconfigures a repo whenever the user asks, and fills a config an upgrade left a key short.
 
 Settle the tracker: [`references/trackers.md`](../../references/trackers.md) turns this repo's
 `docs/agents/issue-tracker.md` into the **read**, **edit**, and **mark** operations the steps below
