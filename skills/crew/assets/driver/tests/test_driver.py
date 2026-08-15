@@ -11,6 +11,7 @@ recorded, and the repository's own branch state.
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ import unittest
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 DRIVER = TESTS_DIR.parent / "driver.py"
+MACHINE_LOG = DRIVER.parent.parent / "machine_log.py"
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -37,6 +39,12 @@ RUN_DIR_NAME = ".crew"
 FEATURE_NAME = "demo"
 INTEGRATION_BRANCH = "crew/demo"
 BASE_BRANCH = "main"
+# The two decisions the project's config carries, which the driver records into the run.
+REPAIR_MODEL = "claude-sonnet-5"
+TRACKER = "local"
+# The loop's dials, wound down so a test drives a run in seconds rather than in poll intervals.
+POLL_SECONDS = "0.2"
+LOOP_TIMEOUT = "20"
 
 ROUTING = f"""## Routing
 
@@ -83,7 +91,8 @@ class Fixture:
         git(self.repo, "config", "user.email", "crew@example.invalid")
         git(self.repo, "config", "user.name", "Crew Test")
         (self.repo / "README.md").write_text("fixture\n")
-        git(self.repo, "add", "README.md")
+        self.write_config()
+        git(self.repo, "add", "-A")
         git(self.repo, "commit", "-m", "base")
         git(self.repo, "remote", "add", "origin", str(self.origin))
         git(self.repo, "push", "-u", "origin", BASE_BRANCH)
@@ -102,6 +111,8 @@ class Fixture:
         self.bin_dir.mkdir()
         self._link_stub("claude", "stub_claude.py")
         self._link_stub("tmux", "stub_tmux.py")
+        self._link_stub("gh", "stub_gh.py")
+        self.running = []
         # The one session the stub server holds: a window asked for in any other is refused, as a
         # real tmux refuses a session it does not have.
         (self.stub_dir / "tmux-session").write_text(TMUX_SESSION)
@@ -113,6 +124,23 @@ class Fixture:
             "#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, TESTS_DIR / script)
         )
         target.chmod(0o755)
+
+    # --- the project's config -------------------------------------------------------------
+
+    def write_config(self, repair_model=REPAIR_MODEL, tracker=TRACKER):
+        """The project config the run reads its repair model and its tracker out of."""
+        lines = []
+        if repair_model is not None:
+            lines += ["[repair]", f'model = "{repair_model}"']
+        if tracker is not None:
+            lines += ["[tracker]", f'kind = "{tracker}"']
+        (self.repo / "agentcrew.toml").write_text("\n".join(lines) + "\n")
+
+    def configure(self, **values):
+        """Rewrite and commit the project config, because an uncommitted fix is not one."""
+        self.write_config(**values)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "config")
 
     # --- the feature ----------------------------------------------------------------------
 
@@ -145,21 +173,134 @@ class Fixture:
         environment.update(overrides or {})
         return environment
 
+    def start_argv(self, extra=()):
+        return [
+            sys.executable, str(DRIVER), "start",
+            "--feature-dir", str(self.feature_dir),
+            "--coordinator-name", COORDINATOR_NAME,
+            "--coordinator-pid", str(COORDINATOR_PID),
+            "--permission-mode", PERMISSION_MODE,
+            "--tmux-session", TMUX_SESSION,
+            "--codex-bridge", str(self.codex_bridge),
+            "--poll-seconds", POLL_SECONDS,
+            "--timeout", LOOP_TIMEOUT,
+            *extra,
+        ]
+
     def start(self, extra=(), env_overrides=None):
+        """Start a run and wait for it to end, which a run nobody drives does on its timeout."""
         return subprocess.run(
-            [
-                sys.executable, str(DRIVER), "start",
-                "--feature-dir", str(self.feature_dir),
-                "--coordinator-name", COORDINATOR_NAME,
-                "--coordinator-pid", str(COORDINATOR_PID),
-                "--permission-mode", PERMISSION_MODE,
-                "--tmux-session", TMUX_SESSION,
-                "--codex-bridge", str(self.codex_bridge),
-                *extra,
-            ],
+            self.start_argv(extra),
             capture_output=True, text=True, env=self.environment(env_overrides),
             cwd=str(self.repo),
         )
+
+    def launch(self, extra=(), env_overrides=None):
+        """Start a run and leave its loop running; returns the driver process.
+
+        The loop is the driver now, so a test that watches a run drives it while it runs rather
+        than reading what it left behind.
+        """
+        process = subprocess.Popen(
+            self.start_argv(extra),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.environment(env_overrides), cwd=str(self.repo),
+        )
+        self.running.append(process)
+        return process
+
+    def resume(self, extra=()):
+        """Put the loop back where a ruling stopped it, and leave it running."""
+        process = subprocess.Popen(
+            [
+                sys.executable, str(DRIVER), "resume",
+                "--feature-dir", str(self.feature_dir),
+                "--coordinator-pid", str(COORDINATOR_PID),
+                "--tmux-session", TMUX_SESSION,
+                "--poll-seconds", POLL_SECONDS,
+                "--timeout", LOOP_TIMEOUT,
+                *extra,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.environment(), cwd=str(self.repo),
+        )
+        self.running.append(process)
+        return process
+
+    def run_command(self, command, extra=()):
+        """Run a command the driver itself printed, as the coordinator would type it back."""
+        process = subprocess.Popen(
+            [*shlex.split(command), *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.environment(), cwd=str(self.repo),
+        )
+        self.running.append(process)
+        return process
+
+    def ended(self, process, timeout=90.0):
+        """What that driver printed and exited with, once it has ended of its own accord."""
+        out, err = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+
+    # --- driving the run's children -----------------------------------------------------------
+
+    def launch_record(self, ticket):
+        """What the log says about the child launched on that ticket."""
+        for record in reversed(self.log_records()):
+            if record.get("event") == "launch" and record.get("ticket") == ticket:
+                return record
+        return None
+
+    def worktree(self, ticket):
+        return pathlib.Path(self.launch_record(ticket)["worktree"])
+
+    def commit_work(self, ticket, text="work\n", name=None):
+        """Commit something in that child's worktree, and return the sha its receipt would claim."""
+        worktree = self.worktree(ticket)
+        name = name if name is not None else f"{ticket}.txt"
+        (worktree / name).write_text(text)
+        git(worktree, "add", name)
+        git(worktree, "commit", "-m", f"{ticket} work")
+        return git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    def says(self, ticket, message):
+        """Write into the log what a child's own hook writes when it sends that message."""
+        subprocess.run(
+            [
+                sys.executable, str(MACHINE_LOG), "--log", str(self.run_dir / "log.jsonl"),
+                "message", "--role", "child", "--ticket", ticket,
+                "--to", COORDINATOR_NAME, "--message", message,
+            ],
+            check=True, capture_output=True,
+        )
+
+    def completes(self, ticket, text="work\n", name=None):
+        """The whole of what a child that finished does: commit the work, send the receipt."""
+        self.says(ticket, f"CREW COMPLETE {self.commit_work(ticket, text, name)}")
+
+    def agents(self):
+        path = self.stub_dir / "agents.json"
+        return json.loads(path.read_text()) if path.exists() else []
+
+    def set_agents(self, agents):
+        (self.stub_dir / "agents.json").write_text(json.dumps(agents))
+
+    def goes(self, ticket, status):
+        """Put that child into the status the agents list reports it in."""
+        worktree = os.path.realpath(self.worktree(ticket))
+        agents = self.agents()
+        for agent in agents:
+            if os.path.realpath(agent.get("cwd", "")) == worktree:
+                agent["status"] = status
+        self.set_agents(agents)
+
+    def vanishes(self, ticket):
+        """Take that child's session off the agents list, as a session that died leaves it."""
+        worktree = os.path.realpath(self.worktree(ticket))
+        self.set_agents([
+            agent for agent in self.agents()
+            if os.path.realpath(agent.get("cwd", "")) != worktree
+        ])
 
     # --- what the run left behind -----------------------------------------------------------
 
@@ -193,6 +334,17 @@ class Fixture:
 
     def tmux_calls(self):
         return self.records(self.stub_dir / "tmux-calls.jsonl")
+
+    def gh_calls(self):
+        return self.records(self.stub_dir / "gh-calls.jsonl")
+
+    def issues(self, table=None):
+        """The issues the stubbed `gh` answers for, written or read."""
+        path = self.stub_dir / "gh-issues.json"
+        if table is not None:
+            path.write_text(json.dumps(table))
+            return table
+        return json.loads(path.read_text()) if path.exists() else {}
 
     def windows(self):
         path = self.stub_dir / "tmux-windows.json"
@@ -244,6 +396,10 @@ class Fixture:
         )
 
     def cleanup(self):
+        for process in self.running:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
         self.stop_monitors()
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -269,6 +425,20 @@ class DriverTestCase(unittest.TestCase):
         self.assertEqual(self.fixture.launches(), [])
         self.assertNotIn(INTEGRATION_BRANCH, self.fixture.branches())
         self.assertFalse(self.fixture.run_dir.exists(), "a failed start left a run directory")
+
+    def started(self, extra=()):
+        """A run that passed preflight, caught while its loop is still running.
+
+        A start no longer ends at the launch — the loop is the same process — so what a passing
+        preflight looks like is a run directory with a table in it, not an exit code.
+        """
+        process = self.fixture.launch(extra=extra)
+        self.assertTrue(
+            self.fixture.wait_for(lambda: (self.fixture.run_dir / "wave-table.json").exists()),
+            f"the run never started:\n{self.fixture.ended(process, timeout=60).stdout}",
+        )
+        self.assertEqual(self.fixture.windows_named(PREFLIGHT_WINDOW), {})
+        return process
 
     def assert_preflight_failed(self, result, problems):
         """A preflight failure: nothing launched, one snapshot line, the full list shown."""
@@ -298,10 +468,7 @@ class PreflightTests(DriverTestCase):
         self.fixture.commit_feature()
         (self.fixture.repo / "scratch.txt").write_text("not mine\n")
 
-        result = self.fixture.start()
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.fixture.windows_named(PREFLIGHT_WINDOW), {})
+        self.started()
 
     def test_a_base_branch_that_cannot_fast_forward_stops_the_run(self):
         """The check reads what origin holds now: this checkout has never fetched the divergence."""
@@ -344,9 +511,8 @@ class PreflightTests(DriverTestCase):
         self.fixture.commit_feature()
         git(self.fixture.repo, "branch", "local-base")
 
-        result = self.fixture.start(extra=("--base-branch", "local-base"))
+        self.started(extra=("--base-branch", "local-base"))
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.fixture.table()["run"]["base_branch"], "local-base")
 
     def test_a_base_branch_origin_has_deleted_starts_from_what_is_local(self):
@@ -359,10 +525,8 @@ class PreflightTests(DriverTestCase):
             check=True, capture_output=True,
         )
 
-        result = self.fixture.start()
+        self.started()
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.fixture.windows_named(PREFLIGHT_WINDOW), {})
         self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
 
     def test_a_base_branch_that_does_not_resolve_stops_the_run(self):
@@ -484,6 +648,47 @@ class PreflightTests(DriverTestCase):
         self.assertIn("2 problems", snapshot["detail"])
         self.assert_nothing_launched()
 
+    def test_a_config_naming_no_repair_model_stops_the_run(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure(repair_model=None)
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("repair", notice)
+
+    def test_an_aliased_repair_model_is_rejected_as_a_routed_one_is(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure(repair_model="sonnet")
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("full model ID", notice)
+
+    def test_a_config_naming_no_tracker_stops_the_run(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure(tracker=None)
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("tracker", notice)
+
+    def test_a_tracker_no_run_closes_tickets_in_stops_the_run(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure(tracker="jira")
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("jira", notice)
+        self.assertIn("github", notice)
+
     def test_a_passing_start_clears_the_notice_of_the_start_before_it(self):
         self.fixture.ticket("01", "no routing", routing="")
         self.fixture.commit_feature()
@@ -492,26 +697,43 @@ class PreflightTests(DriverTestCase):
         git(self.fixture.repo, "add", "-A", "features")
         git(self.fixture.repo, "commit", "-m", "route it")
 
-        result = self.fixture.start()
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.fixture.windows_named(PREFLIGHT_WINDOW), {})
+        self.started()
 
 
 class LaunchTests(DriverTestCase):
+    """What one start puts on the ground before its wave loop settles anything.
+
+    The driver goes on running after the launch — the loop is the same process — so each of these
+    watches a live run rather than reading what a finished one left behind.
+    """
+
     def start_a_run(self, extra=(), env_overrides=None):
         self.fixture.ticket("01", "first thing")
         self.fixture.ticket("02", "second thing", blocked_by=("01",))
         self.fixture.commit_feature()
-        return self.fixture.start(extra=extra, env_overrides=env_overrides)
+        return self.launched(extra=extra, env_overrides=env_overrides)
+
+    def launched(self, extra=(), env_overrides=None):
+        """A run whose first wave is fully up, still running its loop.
+
+        Waited for by the last thing the launch writes rather than the first, so a test that reads
+        a hook, a window or the run directory is never racing the launch that puts them there.
+        """
+        process = self.fixture.launch(extra=extra, env_overrides=env_overrides)
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.launch_record("01") is not None
+                and (self.fixture.run_dir / "parked-paths").exists()
+            ),
+            "wave 1 never launched",
+        )
+        return process
 
     def test_the_launch_line_names_the_run_directory(self):
-        result = self.start_a_run()
+        process = self.start_a_run()
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        self.assertEqual(len(lines), 1, f"stdout was not one line:\n{result.stdout}")
-        self.assertIn(str(self.fixture.run_dir), lines[0])
+        line = process.stdout.readline().strip()
+        self.assertIn(str(self.fixture.run_dir), line)
 
     def test_the_table_carries_every_ticket_in_its_wave_with_the_routing_it_declared(self):
         self.start_a_run()
@@ -550,15 +772,16 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(run["coordinator_pid"], COORDINATOR_PID)
         self.assertEqual(run["tmux_session"], TMUX_SESSION)
         self.assertEqual(run["permission_mode"], PERMISSION_MODE)
+        self.assertEqual(run["repair_model"], REPAIR_MODEL)
+        self.assertEqual(run["tracker"], TRACKER)
 
     def test_a_relative_path_is_recorded_absolute(self):
         """Every path the table carries is read in a child's worktree, never in this cwd."""
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
 
-        result = self.fixture.start(extra=("--spec", "features/demo/spec.md"))
+        self.launched(extra=("--spec", "features/demo/spec.md"))
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.fixture.table()["run"]["spec_path"], str(self.fixture.spec_path))
 
     def test_the_integration_branch_is_cut_and_checked_out(self):
@@ -632,9 +855,8 @@ class LaunchTests(DriverTestCase):
         self.fixture.ticket("01", "first thing", routing=CODEX_ROUTING)
         self.fixture.commit_feature()
 
-        result = self.fixture.start()
+        self.launched()
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(
             self.fixture.wait_for_codex_watch(),
             "no wake monitor watched the wave's Codex child",
@@ -645,7 +867,10 @@ class LaunchTests(DriverTestCase):
         self.assertIn(str(self.fixture.run_dir / "codex" / "01.json"), watch["argv"])
 
     def test_a_child_that_will_not_come_up_exits_with_a_driver_error_snapshot(self):
-        result = self.start_a_run(
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+
+        result = self.fixture.start(
             env_overrides={"AGENTCREW_STUB_TRANSCRIPT_MODEL": "claude-haiku-4-5-20251001"}
         )
 
@@ -654,6 +879,444 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(snapshot["reason"], "driver-error")
         self.assertEqual(snapshot["ticket"], "01")
         self.assertIn(str(self.fixture.run_dir), snapshot["pointer"])
+
+
+class LoopTests(DriverTestCase):
+    """The rule table, row by row, driven at the driver's own command line.
+
+    Every child is stubbed, so the run is driven the way the run itself observes one: work is
+    committed in a real worktree, the child's word is written into the machine log by the same
+    writer its hook uses, and the agents list is rewritten to make a session idle or vanish.
+    """
+
+    def feature(self, *tickets, shared=None):
+        """A feature of tickets, and a file in the base commit two children can collide over."""
+        for number, blockers in tickets:
+            self.fixture.ticket(number, f"thing {number}", blocked_by=blockers)
+        if shared is not None:
+            (self.fixture.repo / "shared.txt").write_text(shared)
+            git(self.fixture.repo, "add", "shared.txt")
+        self.fixture.commit_feature()
+
+    def start(self, *tickets, shared=None):
+        """A run with its first wave up and its loop running."""
+        self.feature(*tickets, shared=shared)
+        process = self.fixture.launch()
+        for number, _ in tickets:
+            if not _:
+                self.assertTrue(
+                    self.fixture.wait_for(
+                        lambda number=number: self.fixture.launch_record(number) is not None
+                    ),
+                    f"{number} never launched",
+                )
+        return process
+
+    # --- what the log says ------------------------------------------------------------------
+
+    def events(self, event, **fields):
+        return [
+            record for record in self.fixture.log_records()
+            if record.get("event") == event
+            and all(record.get(key) == value for key, value in fields.items())
+        ]
+
+    def verdict(self, ticket):
+        """The word the run's last settling event settled that ticket into."""
+        settled = [
+            record for record in self.fixture.log_records()
+            if record.get("ticket") == ticket and record.get("event") in ("receipt", "outcome")
+        ]
+        last = settled[-1] if settled else {}
+        return last.get("verdict") or last.get("outcome")
+
+    def instructions(self, ticket, marker):
+        return [
+            record for record in self.events("ruling", ticket=ticket)
+            if str(record.get("message", "")).startswith(marker)
+        ]
+
+    def wait_for_verdict(self, ticket, verdict):
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.verdict(ticket) == verdict),
+            f"{ticket} never settled {verdict}; the log says {self.verdict(ticket)}",
+        )
+
+    def wait_for_instruction(self, ticket, marker):
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.instructions(ticket, marker)),
+            f"{ticket} was never sent a {marker}",
+        )
+        return self.instructions(ticket, marker)[-1]["message"]
+
+    def woken(self, process, reason):
+        """The wake snapshot the driver exited on, asserted to be the reason expected."""
+        result = self.fixture.ended(process)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, f"the driver printed nothing:\n{result.stderr}")
+        snapshot = json.loads(lines[-1])
+        self.assertEqual(snapshot["reason"], reason, f"{snapshot}\n{result.stderr}")
+        return snapshot
+
+    # --- a whole run, with nothing outside the table in it ------------------------------------
+
+    def test_a_clean_run_settles_every_wave_and_ends_without_one_wake(self):
+        process = self.start(("01", ()), ("02", ("01",)))
+
+        self.fixture.completes("01")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            "the run never advanced to wave 2",
+        )
+        self.fixture.completes("02")
+        snapshot = self.woken(process, "run-complete")
+
+        self.assertEqual(snapshot["ticket"], None)
+        self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+        self.assertEqual(
+            [record["result"] for record in self.events("merge")], ["clean", "clean"]
+        )
+        self.assertEqual(
+            [record["decision"] for record in self.events("advance")], ["launched", "complete"]
+        )
+        self.assertEqual(self.events("ruling"), [], "a clean run instructed a child")
+
+    def test_a_receipt_that_verifies_settles_the_ticket_without_a_word_to_anyone(self):
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        landable = self.events("receipt", ticket="01", verdict="landable")
+        self.assertEqual(len(landable), 1, self.fixture.log_records())
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_no_row_of_the_rule_table_wakes_the_coordinator(self):
+        """The wake surface, stated as what is not on it.
+
+        One run carrying every settlement the table owns at once — a verified receipt, a receipt
+        re-asked and settled failed, a nudged child that went silent, a vanished child, and a
+        parked one — ends without a single judgment wake, and the four tickets it stopped on are
+        settled in the log rather than handed up.
+        """
+        process = self.start(("01", ()), ("02", ()), ("03", ()), ("04", ()), ("05", ()))
+
+        self.fixture.completes("01")
+        self.fixture.says("02", "CREW COMPLETE " + "0" * 40)
+        self.wait_for_instruction("02", "CREW RECHECK")
+        self.fixture.says("02", "CREW COMPLETE " + "1" * 40)
+        self.fixture.goes("03", "idle")
+        self.wait_for_instruction("03", "CREW NUDGE")
+        self.fixture.vanishes("04")
+        self.fixture.says("05", "CREW PARKED features/demo/checklist.md")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(
+            [self.verdict(number) for number in ("01", "02", "03", "04", "05")],
+            ["completed", "failed", "failed", "failed", "parked"],
+        )
+
+    # --- the receipt rungs ----------------------------------------------------------------
+
+    def test_an_invalid_receipt_is_re_asked_once_and_the_valid_one_after_it_settles(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
+        instruction = self.wait_for_instruction("01", "CREW RECHECK")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertIn("01", instruction)
+        self.assertIn("CREW COMPLETE", instruction)
+        self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_second_invalid_receipt_settles_the_ticket_failed(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
+        self.wait_for_instruction("01", "CREW RECHECK")
+        self.fixture.says("01", "CREW COMPLETE " + "1" * 40)
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
+
+    def test_a_parked_receipt_is_recorded_by_the_driver_and_its_worktree_listed(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW PARKED features/demo/checklist.md")
+        self.wait_for_verdict("01", "parked")
+        self.woken(process, "run-complete")
+
+        parked = (self.fixture.run_dir / "parked-paths").read_text()
+        self.assertIn(str(self.fixture.worktree("01")), parked)
+        self.assertIn("checklist.md", self.events("receipt", ticket="01")[-1]["detail"])
+
+    def test_a_parked_ticket_with_descendants_blocks_them_and_ends_the_run(self):
+        """The parked verdict and the blocked descendants are both rules; neither is judgment."""
+        process = self.start(("01", ()), ("02", ("01",)))
+
+        self.fixture.says("01", "CREW PARKED features/demo/checklist.md")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.verdict("02"), "blocked")
+        self.assertIsNone(self.fixture.launch_record("02"))
+
+    def test_a_failure_receipt_is_recorded_by_the_driver(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW FAILED the approach does not work")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertIn(
+            "does not work", self.events("receipt", ticket="01")[-1]["detail"]
+        )
+
+    # --- the wake monitor's rungs -----------------------------------------------------------
+
+    def test_an_idle_child_with_no_receipt_is_nudged_once_and_settles_on_the_receipt(self):
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "idle")
+        instruction = self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.goes("01", "busy")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertIn("CREW COMPLETE", instruction)
+        self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
+    def test_a_second_idle_silence_settles_the_ticket_failed(self):
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "idle")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
+    def test_a_vanished_child_settles_the_ticket_failed(self):
+        process = self.start(("01", ()))
+
+        self.fixture.vanishes("01")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertIn("vanished", self.events("receipt", ticket="01")[-1]["detail"])
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_a_child_waiting_at_a_permission_prompt_wakes_the_coordinator(self):
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "waiting")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("waiting", snapshot["detail"])
+
+    def test_a_run_that_does_nothing_at_all_wakes_the_coordinator_rather_than_hanging(self):
+        self.feature(("01", ()))
+
+        process = self.fixture.launch(extra=("--timeout", "3"))
+        result = self.fixture.ended(process)
+
+        snapshot = json.loads(
+            [line for line in result.stdout.splitlines() if line.strip()][-1]
+        )
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn("nothing", snapshot["detail"])
+        self.assertIn("resume", snapshot, "a stopped run's snapshot did not say how it goes on")
+
+    def test_the_command_a_driver_error_names_puts_the_same_run_back_on_its_feet(self):
+        """A driver error is recovered exactly as a ruling is: by the command the snapshot names."""
+        self.feature(("01", ()))
+        stopped = self.fixture.ended(self.fixture.launch(extra=("--timeout", "3")))
+        snapshot = json.loads(
+            [line for line in stopped.stdout.splitlines() if line.strip()][-1]
+        )
+
+        resumed = self.fixture.run_command(snapshot["resume"])
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("01") is not None),
+            "the resumed run lost the wave it was carrying on",
+        )
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+
+    # --- the escalation, which is never anything but a wake ---------------------------------
+
+    def test_a_crew_ask_wakes_the_coordinator_carrying_the_ticket_and_the_ask_itself(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("which table?", snapshot["detail"])
+        self.assertIn("resume", snapshot)
+        self.assertIsNone(self.verdict("01"), "an answered ASK is not an outcome")
+
+    def test_a_second_escalation_after_a_ruling_wakes_the_coordinator_again(self):
+        """A resume steps past the ASK it was run for, and past nothing else that ticket says."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.fixture.says("01", "CREW ASK 01 scope — and which column? ts=2")
+        snapshot = self.woken(resumed, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("which column?", snapshot["detail"])
+
+    def test_an_escalation_the_coordinator_was_never_shown_wakes_it_on_the_resume(self):
+        """Two children asking at once is one snapshot, so the second ASK is the next wake.
+
+        The escalation the driver exits on is the only one it can say was handed over; an ASK that
+        was standing at the same moment and never reached a snapshot is unread, and settling it
+        because the run came back would lose a child's question in silence.
+        """
+        process = self.start(("01", ()), ("02", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.fixture.says("02", "CREW ASK 02 scope — which column? ts=1")
+        first = self.woken(process, "judgment-needed")
+        second = self.woken(self.fixture.resume(), "judgment-needed")
+
+        self.assertEqual(first["ticket"], "01")
+        self.assertEqual(second["ticket"], "02")
+        self.assertIn("which column?", second["detail"])
+
+    def test_resuming_after_a_ruling_carries_the_same_wave_on(self):
+        process = self.start(("01", ()), ("02", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+        dispatched = len(self.fixture.launches())
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.fixture.completes("01")
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(
+            len(self.fixture.launches()), dispatched, "a resumed run re-dispatched a live ticket"
+        )
+        self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    # --- the merge ladder --------------------------------------------------------------------
+
+    def test_a_semantic_conflict_is_answered_by_the_template_before_any_coordinator_turn(self):
+        process = self.start(("01", ()), ("02", ()), shared="one\n")
+
+        self.fixture.completes("01", "01 rewrote\n", name="shared.txt")
+        self.fixture.completes("02", "02 rewrote\n", name="shared.txt")
+        instruction = self.wait_for_instruction("02", "CREW MERGE")
+
+        self.assertIn(INTEGRATION_BRANCH, instruction)
+        self.assertIn("CREW COMPLETE", instruction)
+        self.assertIn(
+            "semantic", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
+        )
+
+    def test_a_semantic_conflict_bounced_back_a_second_time_wakes_the_coordinator(self):
+        process = self.start(("01", ()), ("02", ()), shared="one\n")
+
+        self.fixture.completes("01", "01 rewrote\n", name="shared.txt")
+        self.fixture.completes("02", "02 rewrote\n", name="shared.txt")
+        self.wait_for_instruction("02", "CREW MERGE")
+        self.fixture.completes("02", "02 rewrote again\n", name="shared.txt")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn("second time", snapshot["detail"])
+        self.assertEqual(len(self.instructions("02", "CREW MERGE")), 1)
+
+    def test_a_mechanical_conflict_goes_to_the_repair_rung_on_the_configured_model(self):
+        process = self.start(("01", ()), ("02", ()), shared="one\n")
+
+        self.fixture.completes("01", "one\nfrom 01\n", name="shared.txt")
+        self.fixture.completes("02", "one\nfrom 02\n", name="shared.txt")
+        self.woken(process, "judgment-needed")
+
+        repairs = [
+            call for call in self.fixture.claude_calls()
+            if "--print" in call["argv"] and REPAIR_MODEL in call["argv"]
+        ]
+        self.assertTrue(
+            repairs, f"the repair rung was never reached: {self.fixture.claude_calls()}"
+        )
+        self.assertIn(
+            "mechanical", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
+        )
+        self.assertEqual(self.instructions("02", "CREW MERGE"), [])
+
+    # --- closing what landed -----------------------------------------------------------------
+
+    def test_a_merged_ticket_is_closed_in_the_tracker_with_its_undo_recorded(self):
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        closed = self.events("outcome", ticket="01", outcome="completed")
+        self.assertEqual(len(closed), 1, self.fixture.log_records())
+        self.assertIn(TRACKER, closed[0]["detail"])
+        self.assertIn("undo:", closed[0]["detail"])
+        self.assertIn("Status: done", (self.fixture.feature_dir / "01.md").read_text())
+
+    def test_a_local_close_leaves_the_working_tree_clean_for_the_next_wave(self):
+        """A close is a write inside the repo, and an uncommitted one stops the merge after it."""
+        process = self.start(("01", ()), ("02", ("01",)))
+
+        self.fixture.completes("01")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            "the run never advanced past the wave it closed a ticket in",
+        )
+        self.fixture.completes("02")
+        self.woken(process, "run-complete")
+
+        # Untracked paths are the run's own directory and the guard assets, which the run's own
+        # clean-tree rule allows; what a merge refuses is a tracked file left uncommitted.
+        left = git(self.fixture.repo, "status", "--porcelain", "--untracked-files=no").stdout
+        self.assertEqual(left.strip(), "")
+
+    def test_a_github_run_closes_the_issue_and_records_reopening_it_as_the_undo(self):
+        self.fixture.configure(tracker="github")
+        self.fixture.issues({"01": {"labels": ["ready-for-agent", "area/driver"], "closed": False}})
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        issue = self.fixture.issues()["01"]
+        self.assertTrue(issue["closed"])
+        self.assertEqual(issue["labels"], ["area/driver"], "a label that is not a pickup was taken")
+        detail = self.events("outcome", ticket="01", outcome="completed")[0]["detail"]
+        self.assertIn("github", detail)
+        self.assertIn("gh issue reopen 01", detail)
+        self.assertIn("--add-label ready-for-agent", detail)
+
+    def test_a_github_close_names_no_repository_and_is_made_in_the_run_s_own_checkout(self):
+        """`gh` takes an OWNER/REPO slug, never a path: the checkout it runs in is what names it."""
+        self.fixture.configure(tracker="github")
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        calls = self.fixture.gh_calls()
+        self.assertTrue(calls, "the tracker was never reached")
+        for call in calls:
+            self.assertNotIn("--repo", call["argv"], f"gh was handed a repository: {call['argv']}")
+            self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.repo))
 
 
 if __name__ == "__main__":

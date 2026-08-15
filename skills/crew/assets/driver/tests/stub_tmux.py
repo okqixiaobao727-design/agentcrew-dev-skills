@@ -7,8 +7,10 @@ live in `tmux-windows.json` there: `new-window` records one and prints its id, `
 prints them in the format it was asked for, and `kill-window` takes one away.
 
 `send-keys` runs the keys it was given through `sh -c` in the window's own directory, so a stubbed
-launch reaches the stub `claude` exactly as a real one reaches the real CLI. A window's own command
-is recorded and never run: the dashboard's refresh loop would otherwise outlive the test.
+launch reaches the stub `claude` exactly as a real one reaches the real CLI — unless they were sent
+with `-l`, which is text typed at whoever is reading the pane and is recorded rather than run. A
+window's own command is recorded and never run: the dashboard's refresh loop would otherwise
+outlive the test.
 """
 
 import json
@@ -107,8 +109,17 @@ def kill_window(argv):
 
 
 def send_keys(argv):
+    """Keys sent as a command are run; keys sent literally are typed and nothing else.
+
+    `-l` is how tmux is told the argument is text for whoever is reading the pane rather than a
+    line for a shell — the driver instructing a child sends it that way, and running that text
+    through `sh` would be the stub answering for a child that never saw it. Every call is recorded
+    either way, so a test reads what was typed out of `tmux-calls.jsonl`.
+    """
     target = flag(argv, "-t")
     keys = [value for value in argv[argv.index(target) + 1:] if value != "Enter"]
+    if "-l" in argv:
+        return 0
     window = windows().get(target, {})
     result = subprocess.run(
         ["sh", "-c", " ".join(keys)], cwd=window.get("cwd") or os.getcwd()
