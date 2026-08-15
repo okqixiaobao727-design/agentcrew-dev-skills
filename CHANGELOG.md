@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-08-15
+
 Watching a run stops meaning leaving it. The dashboard can now be drawn into
 the coordinator's own Claude Code statusline, so the frame and the
 coordinator's prompt are on screen at once and there is nothing to close when
