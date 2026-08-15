@@ -2407,7 +2407,7 @@ class Loop:
 
         A coordinator that restarted has a new pid, so every Claude child of the run is holding a
         trust anchor on a dead socket — and its refusal of the new socket's messages is that anchor
-        working (`references/resume.md`). The run's own record is rewritten first, because the
+        working. The run's own record is rewritten first, because the
         identity it carries is the one every ticket dispatched from here on is handed.
 
         A Codex child is not re-anchored: its channel is a state file on disk, which the new

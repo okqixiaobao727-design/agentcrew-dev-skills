@@ -122,10 +122,24 @@ missing, so tracker configuration stays in its one canonical place.
 
 ## Roles and messages
 
-**Coordinator** — The scheduling session in the main tmux window that runs `/crew`. It writes no
-product code, but it may give design and debugging direction on what children escalate. Its job:
-build the dependency graph, open windows and worktrees, watch children, rule on escalations, merge
-finished branches, and report the outcome.
+**Coordinator** — The session in the main tmux window that runs `/crew`, and the run's **oracle**:
+its whole job is judgment. It launches the driver, rules on what children escalate and on what the
+rule table has no row for, and points at the report. It writes no product code and opens no run
+file — it rules from what a message shows it
+([ADR-0010](adr/0010-the-driver-runs-the-run-the-coordinator-rules.md)).
+
+**Driver** — The scripted state machine that runs everything else, as a background task of the
+coordinator's session: preflight, the validated wave table, the branch and run directory, dispatch,
+receipt verification, the rule table's settlements, merges, tracker closes, wave advancement,
+monitor re-arming, and the report. It drives the existing scripts at their published command lines
+and holds no state of its own — every count it acts on is read back out of the machine log,
+which is what makes adopting an unfinished run the same code path as carrying one on.
+
+**Wake surface** — The exhaustive list of what reaches the coordinator mid-run: a `CREW ASK` of any
+kind, a semantic merge conflict a child has bounced back a second time, and any state the rule table
+has no row for (a driver crash, a timeout, an unknown status, a permission prompt, a failed
+monitor). Each arrives as one JSON **wake snapshot** the driver prints as it exits, carrying the
+reason, the ticket, a pointer for the ruling, and the command that resumes the loop.
 
 **Child agent** — An execution session in its own tmux window and its own worktree, one window per
 ticket, with model and effort assigned per ticket by the routing. It is a full interactive session:

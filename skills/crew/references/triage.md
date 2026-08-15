@@ -1,8 +1,9 @@
 # Triage: rule on a child
 
-Reached from a `CREW ASK` — sent by a Claude child as a message, by a Codex child as its turn's
-`finalMessage` — or when the monitor reports a Claude child `waiting` at a permission prompt (read
-that question with `tmux capture-pane -p -t <window-id>`).
+Reached from a `judgment-needed` or `driver-error` wake snapshot, whose `detail`, `ticket`, `child`
+and `window` are what you rule from: a `CREW ASK` a child sent, a semantic conflict it bounced back
+a second time, or a state the rule table has no row for. A Claude child `waiting` at a permission
+prompt is that last case — read the question with `tmux capture-pane -p -t <window>`.
 
 ## Decide
 
@@ -51,25 +52,20 @@ tmux send-keys -t <window-id> Enter
 
 The ruling hook copies every Claude message you send into the machine log verbatim as you send it,
 so an answer is logged by being sent. A Codex answer goes through `codex_bridge.py send`, which
-records the prompt in the same way from the state file's machine-log configuration. What the log
-then holds is exactly what you wrote: name the effect and its exact reversal inside the ruling
-itself whenever you approve something outside the worktree, because the report is built from these
-lines.
+records the prompt in the same way from the state file's machine-log configuration. The driver
+builds the report from these lines, so name the effect and its exact reversal inside the ruling
+itself whenever you approve something outside the worktree.
 
-An answer sent as tmux keys passes no hook and so reaches no log: it is a ruling only the report
-will carry, so carry it there.
+An answer sent as tmux keys passes no hook and so reaches no log. The driver has already written a
+`CREW RULED` line for the escalation it woke you on; where the ruling itself belongs in the record,
+send it to that child as a message too.
 
 ## Park
 
-When no credible undo exists, leave the child where it stands, append its exact worktree path to
-`<run-dir>/parked-paths` so the wake monitor reads it as parked, and settle the ticket:
+When no credible undo exists, tell the child to leave the work where it stands, write its parked
+checklist, and send `CREW PARKED <checklist path>`. The driver records the parked receipt, puts the
+child's worktree where the wake monitor reads it as parked, and blocks that ticket's descendants
+when the wave settles.
 
-```bash
-python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
-  receipt --ticket <NN> --verdict parked --detail '<the blocked action and its worktree path>'
-```
-
-Descendants of that ticket are blocked, which the advance driver marks when the wave settles.
-
-**Done when** the answer is sent and logged, or the parked ticket's verdict, blocked action, and
-parked path are all recorded.
+**Done when** the answer is sent and logged, or the child has been told to park and settle by
+receipt.

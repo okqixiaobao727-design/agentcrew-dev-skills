@@ -26,6 +26,15 @@ The coordinator's pid (the trust anchor) is known before launch, so no post-laun
 injection channel is needed. tmux `paste-buffer` was measured to submit one turn per
 pasted line — it shreds a multi-line brief — and is rejected as an injection route.
 
+## Amendment (ADR-0010)
+
+The wave table is now built and validated by the driver rather than by the coordinator, and the
+**validated** table is the run's routing authority: user invocation of `/crew` is the run's
+sign-off, and the interactive approval step is gone
+([ADR-0010](0010-the-driver-runs-the-run-the-coordinator-rules.md)). Everything above holds
+unchanged — one routing authority, scripted verification, the accepted impersonation surface — with
+"approved table" read as "validated table" throughout.
+
 ## Consequences
 
 - **Model names are always full IDs, never aliases.** Measured: `--model haiku` under
