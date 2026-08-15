@@ -2,7 +2,8 @@
 """The crew driver: the one command a run is started by, and the state machine it runs on.
 
     start   preflight the run, build and validate its wave table, prepare the branch and the run
-            directory, dispatch wave 1, start the dashboard, and run the wave loop to its end
+            directory, dispatch wave 1, start the dashboard, and run the wave loop to its end —
+            or, where the feature already carries an unfinished run, adopt that one instead
     clear   inventory one recorded run, ask the operator, and remove its recorded artefacts
     resume  put that loop back where a ruling stopped it
 
@@ -39,6 +40,16 @@ count and the display surface, and shows the full problem list to the operator i
 window named `crew-preflight` in the run's own session, ending with the reminder that fixes must be
 committed. That notice is the run's only diagnosis surface: it is killed by name, in that session
 alone, at the start of the next run, so a stale notice can never outlive its fix.
+
+**Starting and resuming are one action.** A feature that already carries a run directory is a run
+`start` adopts rather than one it starts beside: no branch is cut, no settled ticket is dispatched
+a second time, the children keep the worktrees and windows they have, their hooks are put back
+where their worktrees still stand, a coordinator that restarted re-anchors the run and the live
+children it answers, the dashboard is drawn again, and the loop picks the run up from its log —
+which is where every count it acts on lives, so an adopted run and an uninterrupted one are the
+same code path. What ends adoption is the log's own final advance decision: a run that has
+completed is not adopted, and the driver says so and points at the run's report. So re-typing the
+crew command is the whole of what an interruption, a driver crash or a coordinator restart costs.
 
 **The wave loop is a rule table, and the rule table is exhaustive.** Between the launch and the
 report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
@@ -195,7 +206,11 @@ FAILED_VERB = "CREW FAILED"
 RECHECK_MARKER = "CREW RECHECK"
 NUDGE_MARKER = "CREW NUDGE"
 MERGE_MARKER = "CREW MERGE"
+ANCHOR_MARKER = "CREW ANCHOR"
 HANDED_OVER_MARKER = "CREW RULED"
+
+# The socket a Claude child authenticates its coordinator by, spelled as the first turn spells it.
+COORDINATOR_SOCKET = "uds:/tmp/cc-socks/{pid}.sock"
 
 HANDED_OVER = (
     "{marker} {ticket} — this escalation was handed to the coordinator, which is where it is"
@@ -214,6 +229,12 @@ NUDGE_TEMPLATE = (
     " CREW COMPLETE <sha> if the work is committed, CREW PARKED <checklist path> if finishing it"
     " needs a human, or CREW FAILED <reason>. This is the one nudge — a second idle silence"
     " settles this ticket failed."
+)
+ANCHOR_TEMPLATE = (
+    "{marker} {ticket} — this run is driven by a coordinator session that has restarted, so the"
+    " socket your first turn told you to trust is dead. Your coordinator is the Claude session"
+    " `{name}` now, and its messages arrive from `{socket}` — that socket is the identity. Reply"
+    " with SendMessage to `{name}`; nothing else about your ticket has changed."
 )
 MERGE_TEMPLATE = (
     "{marker} {ticket} — your branch {branch} conflicts with {integration} in a way no script can"
@@ -259,6 +280,15 @@ class DriverError(Exception):
         super().__init__(message)
         self.ticket = ticket
         self.pointer = pointer
+
+
+class Unreachable(DriverError):
+    """The child's own channel could not be reached: its window is gone, or it never had one.
+
+    A driver error like any other wherever an instruction has to arrive — but told apart from one,
+    because a run taking over children it did not launch has to be able to leave a child it cannot
+    talk to for the rule that settles it, and must not do the same to a log write that failed.
+    """
 
 
 class ClearError(Exception):
@@ -821,8 +851,9 @@ def prepare_branches(repo, base_branch, integration_branch, pull):
             )
     if git_output(repo, "rev-parse", "--verify", f"refs/heads/{integration_branch}"):
         raise DriverError(
-            f"the integration branch {integration_branch} already exists: this run has been"
-            " started before, and adopting an unfinished run is not this command's to do"
+            f"the integration branch {integration_branch} already exists, and this feature holds no"
+            " wave table to adopt the run that cut it from: a run was started here and its record"
+            " is gone, which no fresh start may cut a branch over"
         )
     result = git(repo, "switch", "-c", integration_branch)
     if result.returncode != 0:
@@ -1143,8 +1174,7 @@ def clear_inventory(run_dir, table, run, records, log_path):
     dashboard_window = clear_dashboard_window(dashboard_path)
     if dashboard_window:
         lines.append(f"dashboard window: {dashboard_window}")
-    report = pathlib.Path(run.get("feature_dir") or run_dir.parent) / REPORT_NAME
-    lines.append(f"report: {report} (kept)")
+    lines.append(f"report: {report_path(run_dir, run)} (kept)")
     return lines, ClearPlan(rows, launches, dashboard_window)
 
 
@@ -1349,6 +1379,10 @@ def run_start(args):
     clear_notice(args.tmux_session)
 
     run_dir = feature_dir / RUN_DIR_NAME
+    table_path = run_dir / TABLE_NAME
+    if table_path.exists():
+        return adopt(args, repo, run_dir, table_path)
+
     base_branch = args.base_branch or default_base_branch(repo)
     tickets = read_tickets(feature_dir)
     # The table preflight validates: everything the run section carries but the commit the run has
@@ -1384,14 +1418,13 @@ def run_start(args):
     run = run_section(
         args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit, config
     )
-    table = run_dir / TABLE_NAME
-    table.write_text(
+    table_path.write_text(
         json.dumps({"run": run, "waves": assign_waves(tickets)}, indent=2) + "\n",
         encoding="utf-8",
     )
 
     install_hook(log, repo / SETTINGS_PATH, "coordinator")
-    dispatch_wave(table, log, launch_dir, run_dir)
+    dispatch_wave(table_path, log, launch_dir, run_dir)
     children = launched_children(log)
     for child in children:
         install_hook(
@@ -1399,7 +1432,46 @@ def run_start(args):
         )
     start_dashboard(args, repo, run_dir)
     print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
-    return wave_loop(args, repo, run_dir, table)
+    return wave_loop(args, repo, run_dir, table_path)
+
+
+def adopt(args, repo, run_dir, table_path):
+    """Take over the unfinished run this feature already carries; returns the exit code it earns.
+
+    Starting and resuming are the same action, so this is what `start` does whenever the feature
+    holds a run directory: nothing is cut, dispatched or approved again. The children keep the
+    worktrees, branches and windows the interrupted run left them, and what they lost — the process
+    watching them — is what this puts back.
+
+    One thing stands between the log and the loop: a run whose log holds the final advance decision
+    has nothing to adopt. It is finished, and saying so and pointing at its report is the whole of
+    what a re-typed command may do to it. Everything an unfinished one needs is the loop's own —
+    what it puts back before it starts polling is `Loop.adopt`, and what it reads from the log is
+    what it would have read had it never stopped.
+    """
+    log = run_dir / LOG_NAME
+    records = read_records(log)
+    if run_is_complete(records):
+        table = json.loads(table_path.read_text(encoding="utf-8"))
+        # The same snapshot the run's own ending emitted, because a coordinator reading it has no
+        # way to tell — and no reason to care — whether this run finished a moment ago or last week.
+        report = report_path(run_dir, table.get("run") or {})
+        snapshot(RUN_COMPLETE, pointer=str(report), report=str(report))
+        return 0
+    print(f"crew adopted wave {current_wave(records)}, run directory {run_dir}", flush=True)
+    return wave_loop(args, repo, run_dir, table_path, adopting=True)
+
+
+def run_is_complete(records):
+    """Whether the log holds the advance decision that ends a run.
+
+    The one decision that is final: a wave that escalated or was interrupted is re-run by the run
+    that adopts it, which is how such a run carries on at all.
+    """
+    return any(
+        record.get("event") == "advance" and record.get("decision") == COMPLETE
+        for record in records
+    )
 
 
 def dispatch_wave(table, log, launch_dir, run_dir):
@@ -1982,12 +2054,24 @@ class Loop:
             return
         window = launch.get("window")
         if not window:
-            raise DriverError(
+            raise Unreachable(
                 f"{ticket} has no window to reach its child through, so nothing can be asked of it",
                 ticket=ticket, pointer=str(self.log),
             )
-        tmux(["send-keys", "-t", window, "-l", text], f"{ticket} could not be reached at {window}")
-        tmux(["send-keys", "-t", window, "Enter"], f"{ticket} could not be reached at {window}")
+        # Only the channel to the child is an Unreachable: what happens after the keys land — the
+        # log this writes the instruction into — is the run's own record, and a failure there is a
+        # driver error for whoever asked for the instruction.
+        try:
+            tmux(
+                ["send-keys", "-t", window, "-l", text],
+                f"{ticket} could not be reached at {window}",
+            )
+            tmux(
+                ["send-keys", "-t", window, "Enter"],
+                f"{ticket} could not be reached at {window}",
+            )
+        except DriverError as error:
+            raise Unreachable(str(error), ticket=ticket, pointer=str(self.log)) from error
         self.record_ruling(ticket, launch, text)
 
     def record_ruling(self, ticket, launch, text):
@@ -2295,6 +2379,61 @@ class Loop:
                 ticket=number, pointer=str(self.log),
             )
 
+    # --- taking over a run already on the ground -----------------------------------------------
+
+    def adopt(self):
+        """Put back what the run's children lost when its driver stopped; returns nothing.
+
+        They keep the worktrees, branches and windows they were launched with; what an interruption
+        takes from them is the process that was watching, the hook that carries their word into the
+        log where a worktree was prepared but never reached one, the dashboard the stopped run's
+        window went with, and — where the coordinator itself restarted — the identity they answer.
+
+        Nothing here reads a receipt or a status: what has already been settled, what is still live
+        and which monitors that leaves to arm are the loop's own reading of the log, and doing any
+        of it twice is what an adoption that kept its own state would risk.
+        """
+        records = self.records()
+        install_hook(self.log, self.repo / SETTINGS_PATH, COORDINATOR_ROLE)
+        for ticket, launch in sorted(launch_records(records).items()):
+            worktree = launch.get("worktree")
+            if worktree and pathlib.Path(worktree).is_dir():
+                install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
+        self.reanchor(records)
+        start_dashboard(self.args, self.repo, self.run_dir)
+
+    def reanchor(self, records):
+        """Point the run and its live children at the coordinator driving it now; returns nothing.
+
+        A coordinator that restarted has a new pid, so every Claude child of the run is holding a
+        trust anchor on a dead socket — and its refusal of the new socket's messages is that anchor
+        working (`references/resume.md`). The run's own record is rewritten first, because the
+        identity it carries is the one every ticket dispatched from here on is handed.
+
+        A Codex child is not re-anchored: its channel is a state file on disk, which the new
+        coordinator opens exactly as the old one did. Neither is a child that cannot be reached —
+        its window went with the session, and the loop's own rules settle it on the next poll,
+        which is where a child nobody can talk to belongs. Nothing else is passed over: an
+        instruction that landed and could not be recorded is a driver error, and it wakes the
+        coordinator here as it does everywhere else.
+        """
+        name, pid = self.args.coordinator_name, self.args.coordinator_pid
+        if (self.run.get("coordinator_name"), self.run.get("coordinator_pid")) == (name, pid):
+            return
+        self.run["coordinator_name"], self.run["coordinator_pid"] = name, pid
+        pathlib.Path(self.table_path).write_text(
+            json.dumps(self.table, indent=2) + "\n", encoding="utf-8"
+        )
+        settled = settled_states(records)
+        for ticket, launch in sorted(launch_records(records).items()):
+            if ticket in settled or lane_of(launch) == CODEX:
+                continue
+            with contextlib.suppress(Unreachable):
+                self.deliver(ticket, launch, ANCHOR_TEMPLATE.format(
+                    marker=ANCHOR_MARKER, ticket=ticket, name=name,
+                    socket=COORDINATOR_SOCKET.format(pid=pid),
+                ))
+
     # --- the loop itself ----------------------------------------------------------------------
 
     def arm(self, wave, records):
@@ -2536,16 +2675,22 @@ def gh_or_raise(repo, number, message, *arguments):
 # --- the loop's two entry points ---------------------------------------------------------------
 
 
-def wave_loop(args, repo, run_dir, table_path):
+def wave_loop(args, repo, run_dir, table_path, adopting=False):
     """Run the wave loop over a prepared run; returns the exit code its ending earns.
 
     Every way out of the loop carries the command that puts it back: a run stopped by a driver
     error is one the operator fixes and the coordinator carries on, exactly as a run stopped by a
     ruling is, so the snapshot that says it stopped has to say how it goes on.
+
+    A loop taking over a run its own process did not launch reconciles it first, inside this
+    handling: a run that cannot be adopted wakes the coordinator with a snapshot exactly as one
+    that cannot be carried on does.
     """
     loop = Loop(args, repo, run_dir, table_path)
     resume = resume_command(args)
     try:
+        if adopting:
+            loop.adopt()
         return loop.run_until_woken()
     except Wake as wake:
         snapshot(
