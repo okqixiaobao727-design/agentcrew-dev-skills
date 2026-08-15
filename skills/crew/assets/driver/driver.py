@@ -71,6 +71,7 @@ launch directory, the Codex state, and the parked paths.
 import argparse
 import contextlib
 from dataclasses import dataclass
+import datetime
 import json
 import os
 import pathlib
@@ -96,6 +97,8 @@ ADVANCE = ASSETS / "advance.py"
 # what a ticket's branch is called. Advance imports it the same way, from the same place.
 sys.path.insert(0, str(DISPATCH.parent))
 import dispatch  # noqa: E402
+sys.path.insert(0, str(ASSETS))
+import machine_log  # noqa: E402
 
 # The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
 RUN_DIR_NAME = ".crew"
@@ -104,6 +107,7 @@ TABLE_NAME = "wave-table.json"
 LAUNCH_DIR_NAME = "launch"
 CODEX_DIR_NAME = "codex"
 PARKED_PATHS_NAME = "parked-paths"
+REPORT_NAME = "report.md"
 
 # The operator's preflight surface: one detached window, found and cleared by this name.
 NOTICE_WINDOW_NAME = "crew-preflight"
@@ -223,6 +227,7 @@ LANDABLE = "landable"
 PARKED = "parked"
 FAILED = "failed"
 COMPLETED = "completed"
+BLOCKED = "blocked"
 LAUNCHED = "launched"
 COMPLETE = "complete"
 LANDED_RESULTS = ("clean", "repaired")
@@ -744,6 +749,7 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
         "integration_base_commit": base_commit,
         "coordinator_name": args.coordinator_name,
         "coordinator_pid": args.coordinator_pid,
+        "coordinator_session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
         "crew_skill_dir": str(CREW_SKILL_DIR),
         "tmux_session": args.tmux_session,
         "permission_mode": args.permission_mode,
@@ -1137,7 +1143,7 @@ def clear_inventory(run_dir, table, run, records, log_path):
     dashboard_window = clear_dashboard_window(dashboard_path)
     if dashboard_window:
         lines.append(f"dashboard window: {dashboard_window}")
-    report = pathlib.Path(run.get("feature_dir") or run_dir.parent) / "report.md"
+    report = pathlib.Path(run.get("feature_dir") or run_dir.parent) / REPORT_NAME
     lines.append(f"report: {report} (kept)")
     return lines, ClearPlan(rows, launches, dashboard_window)
 
@@ -1627,6 +1633,280 @@ def semantic_conflicts(records):
     }
 
 
+# --- the report and wind-down -----------------------------------------------------------------
+
+
+REPORT_TIMESTAMP_FORMAT = machine_log.TIMESTAMP_FORMAT
+REPORT_OUTCOMES = (COMPLETED, FAILED, PARKED, BLOCKED)
+
+
+def report_ticket_sort_key(ticket):
+    """Sort numeric ticket ids by number, retaining a stable fallback for non-numeric ids."""
+    value = str(ticket)
+    return (0, int(value)) if value.isdigit() else (1, value)
+
+
+def report_tickets(table):
+    """Every ticket in the approved table, keyed by the id the log records."""
+    return {
+        str(ticket["id"]): ticket
+        for ticket in dispatch.walk_tickets(table)
+    }
+
+
+def report_launches(records):
+    """The last launch for each ticket, matching the cost table's replacement-child row."""
+    launches = {}
+    for record in records:
+        if record.get("event") == "launch" and record.get("ticket") is not None:
+            launches[str(record["ticket"])] = record
+    return launches
+
+
+def report_starts(records):
+    """The first launch for each ticket, which starts the full duration span."""
+    starts = {}
+    for record in records:
+        if record.get("event") == "launch" and record.get("ticket") is not None:
+            starts.setdefault(str(record["ticket"]), record)
+    return starts
+
+
+def report_settlements(records, ticket):
+    """The ticket's receipt/outcome events, in log order."""
+    return [
+        record for record in records
+        if str(record.get("ticket")) == ticket
+        and record.get("event") in ("receipt", "outcome")
+    ]
+
+
+def report_outcome(records, ticket, launched):
+    """The one report outcome a ticket settled into, or a clear error if the log has a hole."""
+    settlements = report_settlements(records, ticket)
+    for record in reversed(settlements):
+        if record.get("event") == "outcome" and record.get("outcome") in REPORT_OUTCOMES:
+            return record["outcome"]
+    for record in reversed(settlements):
+        verdict = record.get("verdict")
+        if verdict == PARKED:
+            return PARKED
+        if verdict == FAILED:
+            return FAILED
+        if verdict == LANDABLE and any(
+            record_for_ticket.get("event") == "merge"
+            and record_for_ticket.get("result") in LANDED_RESULTS
+            for record_for_ticket in records
+            if str(record_for_ticket.get("ticket")) == ticket
+        ):
+            return COMPLETED
+    state = "launched" if launched else "not launched"
+    raise DriverError(f"ticket {ticket} has no report outcome in the machine log ({state})")
+
+
+def report_received(records, ticket):
+    """The last receipt or outcome, which closes the ticket's full duration span."""
+    settlements = report_settlements(records, ticket)
+    return settlements[-1] if settlements else None
+
+
+def report_moment(value, label):
+    """Parse the machine log's UTC timestamp, refusing arithmetic on an invented value."""
+    try:
+        return datetime.datetime.strptime(value, REPORT_TIMESTAMP_FORMAT)
+    except (TypeError, ValueError) as error:
+        raise DriverError(f"{label} is not {REPORT_TIMESTAMP_FORMAT}: {value!r}") from error
+
+
+def report_duration(launched, received, ticket):
+    """The elapsed wall time between a ticket's launch and the event the run received."""
+    start = report_moment(launched.get("ts"), f"ticket {ticket} launch timestamp")
+    end = report_moment(received.get("ts"), f"ticket {ticket} received timestamp")
+    seconds = int((end - start).total_seconds())
+    if seconds < 0:
+        raise DriverError(f"ticket {ticket} was received before it was launched")
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def report_terminal_details(records, ticket, outcome):
+    """The receipt or outcome detail belonging to a parked or failed report row."""
+    for record in reversed(report_settlements(records, ticket)):
+        if record.get("event") == "outcome" and record.get("outcome") == outcome:
+            return str(record.get("detail") or "")
+        if record.get("event") == "receipt" and record.get("verdict") == outcome:
+            return str(record.get("detail") or "")
+    return ""
+
+
+def report_rulings(records):
+    """Every coordinator ruling, verbatim as the machine log recorded it."""
+    return [record for record in records if record.get("event") == "ruling"]
+
+
+def report_undo_effects(records):
+    """Every completed tracker outcome, whose detail carries the exact undo."""
+    return [
+        record for record in records
+        if record.get("event") == "outcome"
+        and record.get("outcome") == COMPLETED
+        and isinstance(record.get("detail"), str)
+    ]
+
+
+def render_report(run, tickets, records, cost_output):
+    """Render the complete human report from the table, machine log and cost-pass output."""
+    ticket_ids = sorted(tickets, key=report_ticket_sort_key)
+    launches = report_launches(records)
+    starts = report_starts(records)
+    outcomes = {
+        ticket: report_outcome(records, ticket, ticket in launches)
+        for ticket in ticket_ids
+    }
+    lines = ["# Crew run report", "", "## Outcomes", "", "| Ticket | Title | Outcome |"]
+    lines.append("| --- | --- | --- |")
+    for ticket in ticket_ids:
+        lines.append(
+            f"| {ticket} | {tickets[ticket].get('title', ticket)} | {outcomes[ticket]} |"
+        )
+
+    lines += ["", "## Parked checklists", ""]
+    parked = [ticket for ticket in ticket_ids if outcomes[ticket] == PARKED]
+    if parked:
+        lines.extend(
+            f"- {ticket}: {report_terminal_details(records, ticket, PARKED)}"
+            for ticket in parked
+        )
+    else:
+        lines.append("- none recorded")
+
+    lines += ["", "## Failed receipts and sessions", ""]
+    failed = [ticket for ticket in ticket_ids if outcomes[ticket] == FAILED]
+    if failed:
+        lines.extend(
+            f"- {ticket}: {report_terminal_details(records, ticket, FAILED)}"
+            for ticket in failed
+        )
+    else:
+        lines.append("- none recorded")
+
+    lines += ["", "## Rulings", ""]
+    rulings = report_rulings(records)
+    if rulings:
+        for record in rulings:
+            ticket = record.get("ticket") or "run"
+            lines.append(f"- {ticket}: {record.get('message', '')}")
+    else:
+        lines.append("- none recorded")
+
+    lines += ["", "## Outside-worktree effects", ""]
+    effects = report_undo_effects(records)
+    if effects:
+        for record in effects:
+            ticket = record.get("ticket") or "run"
+            value = record.get("detail") or record.get("message") or ""
+            lines.append(f"- {ticket}: {value}")
+    else:
+        lines.append("- none recorded")
+
+    integration = str(run.get("integration_branch") or "")
+    base = str(run.get("base_branch") or "")
+    lines += [
+        "", "## Integration branch", "",
+        f"- Integration branch: `{integration}`",
+        f"- Base branch: `{base}`",
+        f"- Merging `{integration}` into `{base}` is the human's decision.",
+    ]
+
+    lines += [
+        "", "## Durations", "",
+        "| NN | Workflow | Executor | Model | Effort | Outcome | Launched | Received | Duration |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for ticket in sorted(launches, key=report_ticket_sort_key):
+        launched = launches[ticket]
+        started = starts.get(ticket, launched)
+        received = report_received(records, ticket)
+        if received is None:
+            raise DriverError(f"ticket {ticket} has no received event in the machine log")
+        lines.append(
+            f"| {ticket} | {launched.get('workflow', '--')} | {launched.get('executor', '--')} |"
+            f" {launched.get('model', '--')} | {launched.get('effort', '--')} |"
+            f" {outcomes[ticket]} | {started.get('ts', '--')} | {received.get('ts', '--')} |"
+            f" {report_duration(started, received, ticket)} |"
+        )
+
+    lines += [
+        "", "## Cost", "", "```text", cost_output.rstrip("\n"), "```",
+        "",
+        "The coordinator row is a session-wide upper bound if this session did anything outside"
+        " this run.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def report_path(run_dir, run):
+    """The report's feature-level path, outside the durable run directory."""
+    return pathlib.Path(run.get("feature_dir") or run_dir.parent) / REPORT_NAME
+
+
+def run_cost_pass(log, run):
+    """Run the existing cost CLI and retain its exact rollup for the report."""
+    session = run.get("coordinator_session")
+    if session is None:
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return run_command(
+        [
+            sys.executable, MONITOR, "cost", "--log", log,
+            "--coordinator-session", session,
+        ],
+        "the run cost pass could not be completed",
+        pointer=str(log),
+    )
+
+
+def remove_run_pin(run_dir):
+    """Remove the run's pin through the monitor CLI; an absent pin is already success."""
+    run_command(
+        [sys.executable, MONITOR, "unpin", "--run-dir", run_dir],
+        "the run pin could not be removed",
+        pointer=str(run_dir),
+    )
+
+
+def uninstall_run_hooks(run_dir, run, records):
+    """Remove this run's log hook from the coordinator and every launched child worktree."""
+    settings = [pathlib.Path(run["repo_root"]) / SETTINGS_PATH]
+    for record in records:
+        worktree = record.get("worktree") if record.get("event") == "launch" else None
+        if worktree:
+            settings.append(pathlib.Path(worktree) / SETTINGS_PATH)
+    seen = set()
+    for path in settings:
+        path = path.resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        run_command(
+            [sys.executable, MACHINE_LOG, "--log", run_dir / LOG_NAME,
+             "uninstall", "--settings", path],
+            f"the run hook could not be uninstalled from {path}",
+            pointer=str(path),
+        )
+
+
+def write_report(run_dir, run, table, records, cost_output):
+    """Write the complete report after the cost pass has appended its child rows."""
+    path = report_path(run_dir, run)
+    path.write_text(
+        render_report(run, report_tickets(table), records, cost_output),
+        encoding="utf-8",
+    )
+    return path
+
+
 # --- the loop's own context --------------------------------------------------------------------
 
 
@@ -2102,8 +2382,17 @@ class Loop:
             time.sleep(self.args.poll_seconds)
 
     def finish(self):
-        """Every wave has landed: the run is over and its exit is the last wake."""
-        snapshot(RUN_COMPLETE, pointer=str(self.run_dir))
+        """Render and close the run, then emit its final wake snapshot."""
+        try:
+            cost_output = run_cost_pass(self.log, self.run)
+            records = self.records()
+            report = write_report(self.run_dir, self.run, self.table, records, cost_output)
+        finally:
+            try:
+                remove_run_pin(self.run_dir)
+            finally:
+                uninstall_run_hooks(self.run_dir, self.run, self.records())
+        snapshot(RUN_COMPLETE, pointer=str(report), report=str(report))
         return 0
 
 

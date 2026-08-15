@@ -11,6 +11,7 @@ recorded, and the repository's own branch state.
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -127,13 +128,15 @@ class Fixture:
 
     # --- the project's config -------------------------------------------------------------
 
-    def write_config(self, repair_model=REPAIR_MODEL, tracker=TRACKER):
+    def write_config(self, repair_model=REPAIR_MODEL, tracker=TRACKER, surface=None):
         """The project config the run reads its repair model and its tracker out of."""
         lines = []
         if repair_model is not None:
             lines += ["[repair]", f'model = "{repair_model}"']
         if tracker is not None:
             lines += ["[tracker]", f'kind = "{tracker}"']
+        if surface is not None:
+            lines += ["[dashboard]", f'surface = "{surface}"']
         (self.repo / "agentcrew.toml").write_text("\n".join(lines) + "\n")
 
     def configure(self, **values):
@@ -141,6 +144,24 @@ class Fixture:
         self.write_config(**values)
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-m", "config")
+
+    def coordinator_transcript(self, session, usage=None):
+        """Write a coordinator transcript where the monitor's cost reader looks for it."""
+        usage = usage or {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cache_read_input_tokens": 1,
+            "cache_creation_input_tokens": 1,
+        }
+        path = self.config_dir / "projects" / f"{session}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "type": "assistant",
+            "requestId": f"request-{session}",
+            "cwd": str(self.repo),
+            "message": {"usage": usage},
+        }) + "\n")
+        return path
 
     # --- the feature ----------------------------------------------------------------------
 
@@ -898,10 +919,10 @@ class LoopTests(DriverTestCase):
             git(self.fixture.repo, "add", "shared.txt")
         self.fixture.commit_feature()
 
-    def start(self, *tickets, shared=None):
+    def start(self, *tickets, shared=None, env_overrides=None):
         """A run with its first wave up and its loop running."""
         self.feature(*tickets, shared=shared)
-        process = self.fixture.launch()
+        process = self.fixture.launch(env_overrides=env_overrides)
         for number, _ in tickets:
             if not _:
                 self.assertTrue(
@@ -980,6 +1001,135 @@ class LoopTests(DriverTestCase):
             [record["decision"] for record in self.events("advance")], ["launched", "complete"]
         )
         self.assertEqual(self.events("ruling"), [], "a clean run instructed a child")
+
+    def test_a_completed_run_writes_the_report_and_names_it_in_the_final_snapshot(self):
+        process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
+
+        self.fixture.completes("01")
+        snapshot = self.woken(process, "run-complete")
+
+        report_path = self.fixture.feature_dir / "report.md"
+        self.assertTrue(report_path.exists())
+        self.assertEqual(snapshot["report"], str(report_path))
+        report = report_path.read_text()
+        self.assertIn(
+            "| NN | Workflow | Executor | Model | Effort | Outcome | Launched | Received | Duration |",
+            report,
+        )
+        self.assertRegex(
+            report,
+            rf"\| 01 \| tdd \| claude \| {re.escape(CLAUDE_MODEL)} \| {CLAUDE_EFFORT} \|"
+            r" completed \|",
+        )
+        self.assertIn(INTEGRATION_BRANCH, report)
+        self.assertIn("human", report.lower())
+        self.assertIn("TOTAL", report)
+        cost = report.split("## Cost", 1)[1]
+        self.assertRegex(cost, r"(?m)^coordinator\s+claude(?:\s+--){6}\s*$")
+        self.assertIn("coordinator not measured:", cost)
+        self.assertIn("session-wide upper bound", report)
+        self.assertEqual(
+            [record["ticket"] for record in self.events("session-cost")], ["01"]
+        )
+        self.assertEqual(snapshot["reason"], "run-complete")
+
+    def test_a_pin_surface_removes_its_pin_and_a_window_surface_has_none_to_remove(self):
+        self.fixture.configure(surface="pin")
+        process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
+        pin_dir = self.fixture.config_dir / "agentcrew" / "pins"
+        self.assertTrue(
+            self.fixture.wait_for(lambda: list(pin_dir.glob("*.json"))),
+            "the pin surface did not write its run pin",
+        )
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(list(pin_dir.glob("*.json")), [])
+        self.assertEqual(self.fixture.windows_named(DASHBOARD_WINDOW), {})
+
+    def test_a_report_render_error_still_removes_the_pin_and_run_hooks(self):
+        self.fixture.configure(surface="pin")
+        process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
+        pin_dir = self.fixture.config_dir / "agentcrew" / "pins"
+        self.assertTrue(self.fixture.wait_for(lambda: list(pin_dir.glob("*.json"))))
+
+        records = self.fixture.log_records()
+        records[0]["ts"] = "not-a-machine-log-timestamp"
+        (self.fixture.run_dir / "log.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+        self.fixture.completes("01")
+
+        self.woken(process, "driver-error")
+        self.assertEqual(list(pin_dir.glob("*.json")), [])
+        log = str(self.fixture.run_dir / "log.jsonl")
+        coordinator_settings = self.fixture.settings(
+            self.fixture.repo / ".claude" / "settings.local.json"
+        )
+        self.assertNotIn(log, json.dumps(coordinator_settings))
+        child_settings = self.fixture.worktree("01") / ".claude" / "settings.local.json"
+        self.assertNotIn(log, json.dumps(self.fixture.settings(child_settings)))
+
+    def test_the_cost_pass_reads_the_coordinator_transcript_into_its_own_row(self):
+        session = "fixture-coordinator-session"
+        self.fixture.coordinator_transcript(session)
+        process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": session})
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        report = (self.fixture.feature_dir / "report.md").read_text()
+        self.assertEqual(self.fixture.table()["run"]["coordinator_session"], session)
+        coordinator_line = next(
+            line for line in report.splitlines() if line.startswith("coordinator")
+        )
+        self.assertRegex(coordinator_line, r"\b\d+\s+\d+\s+\d+\s+\d+\s+\d+$")
+
+    def test_the_report_accounts_for_each_outcome_ruling_undo_and_duration_row(self):
+        process = self.start(
+            ("01", ()), ("02", ()), ("03", ()), ("04", ("02",)),
+            env_overrides={"CLAUDE_CODE_SESSION_ID": ""},
+        )
+
+        self.fixture.completes("01")
+        self.fixture.says("02", "CREW PARKED features/demo/checklist-02.md")
+        self.fixture.says("03", "CREW COMPLETE " + "0" * 40)
+        self.wait_for_instruction("03", "CREW RECHECK")
+        self.fixture.says("03", "CREW COMPLETE " + "1" * 40)
+        self.woken(process, "run-complete")
+
+        report = (self.fixture.feature_dir / "report.md").read_text()
+        self.assertIn("## Outcomes", report)
+        self.assertIn("| 01 | thing 01 | completed |", report)
+        self.assertIn("| 02 | thing 02 | parked |", report)
+        self.assertIn("| 03 | thing 03 | failed |", report)
+        self.assertIn("| 04 | thing 04 | blocked |", report)
+        self.assertIn("features/demo/checklist-02.md", report)
+        self.assertIn("## Failed receipts and sessions", report)
+        failed_section = report.split("## Failed receipts and sessions", 1)[1].split(
+            "## Rulings", 1
+        )[0]
+        self.assertIn("- 03:", failed_section)
+        self.assertIn("second receipt", failed_section)
+        self.assertIn("## Rulings", report)
+        self.assertIn("CREW RECHECK 03", report)
+        self.assertIn("## Outside-worktree effects", report)
+        self.assertIn("undo:", report)
+        self.assertIn("## Integration branch", report)
+        self.assertIn("## Durations", report)
+        self.assertIn("| 01 | tdd | claude |", report)
+        self.assertIn("| 03 | tdd | claude |", report)
+        self.assertNotIn("| 04 | tdd |", report)
+        self.assertIn("## Cost", report)
+        cost_section = report.split("## Cost", 1)[1]
+        self.assertIn("TOTAL", cost_section)
+        self.assertRegex(cost_section, r"(?m)^coordinator\s+claude(?:\s+--){6}\s*$")
+        self.assertIn("coordinator not measured:", cost_section)
+        self.assertEqual(
+            sorted(record["ticket"] for record in self.events("session-cost")),
+            ["01", "02", "03"],
+        )
 
     def test_a_receipt_that_verifies_settles_the_ticket_without_a_word_to_anyone(self):
         process = self.start(("01", ()))
