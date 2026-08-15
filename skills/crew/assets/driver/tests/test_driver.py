@@ -35,6 +35,7 @@ TMUX_SESSION = "$7:"
 
 PREFLIGHT_WINDOW = "crew-preflight"
 DASHBOARD_WINDOW = "crew-dashboard"
+REPORT_NAME = "report.md"
 RUN_DIR_NAME = ".crew"
 FEATURE_NAME = "demo"
 INTEGRATION_BRANCH = "crew/demo"
@@ -449,6 +450,39 @@ class DriverTestCase(unittest.TestCase):
         self.assertEqual(snapshot["count"], problems)
         self.assert_nothing_launched()
         return self.notice()
+
+    # --- what the run's log says --------------------------------------------------------------
+
+    def events(self, event, **fields):
+        return [
+            record for record in self.fixture.log_records()
+            if record.get("event") == event
+            and all(record.get(key) == value for key, value in fields.items())
+        ]
+
+    def verdict(self, ticket):
+        """The word the run's last settling event settled that ticket into."""
+        settled = [
+            record for record in self.fixture.log_records()
+            if record.get("ticket") == ticket and record.get("event") in ("receipt", "outcome")
+        ]
+        last = settled[-1] if settled else {}
+        return last.get("verdict") or last.get("outcome")
+
+    def wait_for_verdict(self, ticket, verdict):
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.verdict(ticket) == verdict),
+            f"{ticket} never settled {verdict}; the log says {self.verdict(ticket)}",
+        )
+
+    def woken(self, process, reason):
+        """The wake snapshot the driver exited on, asserted to be the reason expected."""
+        result = self.fixture.ended(process)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, f"the driver printed nothing:\n{result.stderr}")
+        snapshot = json.loads(lines[-1])
+        self.assertEqual(snapshot["reason"], reason, f"{snapshot}\n{result.stderr}")
+        return snapshot
 
 
 class PreflightTests(DriverTestCase):
@@ -914,33 +948,11 @@ class LoopTests(DriverTestCase):
 
     # --- what the log says ------------------------------------------------------------------
 
-    def events(self, event, **fields):
-        return [
-            record for record in self.fixture.log_records()
-            if record.get("event") == event
-            and all(record.get(key) == value for key, value in fields.items())
-        ]
-
-    def verdict(self, ticket):
-        """The word the run's last settling event settled that ticket into."""
-        settled = [
-            record for record in self.fixture.log_records()
-            if record.get("ticket") == ticket and record.get("event") in ("receipt", "outcome")
-        ]
-        last = settled[-1] if settled else {}
-        return last.get("verdict") or last.get("outcome")
-
     def instructions(self, ticket, marker):
         return [
             record for record in self.events("ruling", ticket=ticket)
             if str(record.get("message", "")).startswith(marker)
         ]
-
-    def wait_for_verdict(self, ticket, verdict):
-        self.assertTrue(
-            self.fixture.wait_for(lambda: self.verdict(ticket) == verdict),
-            f"{ticket} never settled {verdict}; the log says {self.verdict(ticket)}",
-        )
 
     def wait_for_instruction(self, ticket, marker):
         self.assertTrue(
@@ -948,15 +960,6 @@ class LoopTests(DriverTestCase):
             f"{ticket} was never sent a {marker}",
         )
         return self.instructions(ticket, marker)[-1]["message"]
-
-    def woken(self, process, reason):
-        """The wake snapshot the driver exited on, asserted to be the reason expected."""
-        result = self.fixture.ended(process)
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        self.assertTrue(lines, f"the driver printed nothing:\n{result.stderr}")
-        snapshot = json.loads(lines[-1])
-        self.assertEqual(snapshot["reason"], reason, f"{snapshot}\n{result.stderr}")
-        return snapshot
 
     # --- a whole run, with nothing outside the table in it ------------------------------------
 
@@ -1317,6 +1320,260 @@ class LoopTests(DriverTestCase):
         for call in calls:
             self.assertNotIn("--repo", call["argv"], f"gh was handed a repository: {call['argv']}")
             self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.repo))
+
+
+class AdoptionTests(DriverTestCase):
+    """Starting and resuming as one action: the same command over a run already on the ground.
+
+    Each scenario drives the driver's own `start` seam a second time over a run directory an
+    earlier driver left behind — its children stubbed, its branches cut, its log intact — which is
+    the whole of what re-typing the crew command after an interruption does.
+    """
+
+    def feature(self, *tickets, routing=ROUTING):
+        for number, blockers in tickets:
+            self.fixture.ticket(number, f"thing {number}", routing=routing, blocked_by=blockers)
+        self.fixture.commit_feature()
+
+    def running(self, *tickets, routing=ROUTING):
+        """A run of those tickets with its first wave up and its loop running."""
+        self.feature(*tickets, routing=routing)
+        process = self.fixture.launch()
+        for number, blockers in tickets:
+            if blockers:
+                continue
+            self.assertTrue(
+                self.fixture.wait_for(
+                    lambda number=number: self.fixture.launch_record(number) is not None
+                ),
+                f"{number} never launched",
+            )
+        return process
+
+    def interrupted(self, *tickets, routing=ROUTING):
+        """The same run, handed back with the driver that started it killed where it stood.
+
+        The kill is the interruption every one of these is about: a driver that died mid-wave, a
+        coordinator restarted under it, an operator who stopped the run — from the run directory
+        they are one state, which is a run whose log records no final advance decision.
+        """
+        self.crash(self.running(*tickets, routing=routing))
+
+    def crash(self, process):
+        process.kill()
+        process.communicate()
+
+    def test_re_invoking_the_driver_over_an_unfinished_run_adopts_it(self):
+        self.interrupted(("01", ()), ("02", ("01",)))
+        run = self.fixture.table()["run"]
+
+        adopted = self.fixture.launch()
+        line = adopted.stdout.readline()
+        self.fixture.completes("01")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            "the adopted run never advanced to wave 2",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        self.assertIn(str(self.fixture.run_dir), line)
+        # A start that began again would have cut its integration branch afresh and recorded the
+        # commit it cut it from; the run the adoption carried on is the one already on the ground.
+        self.assertEqual(self.fixture.table()["run"], run, "the adopted run was started afresh")
+        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
+        self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    def test_a_settled_ticket_is_not_dispatched_again_by_the_run_that_adopts_it(self):
+        self.interrupted(("01", ()), ("02", ()))
+        self.fixture.completes("01")
+
+        adopted = self.fixture.launch()
+        self.wait_for_verdict("01", "landable")
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="02")), 1, "02 was dispatched twice")
+        self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    def test_a_run_whose_log_holds_a_final_advance_decision_is_not_adopted(self):
+        finished = self.running(("01", ()))
+        self.fixture.completes("01")
+        self.woken(finished, "run-complete")
+        self.assertEqual(
+            [record["decision"] for record in self.events("advance")], ["complete"]
+        )
+        launches = len(self.fixture.launches())
+        branches = self.fixture.branches()
+
+        result = self.fixture.start()
+
+        snapshot = self.snapshot(result)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snapshot["reason"], "run-complete")
+        self.assertEqual(snapshot["pointer"], str(self.fixture.feature_dir / REPORT_NAME))
+        self.assertEqual(len(self.fixture.launches()), launches, "a finished run was re-dispatched")
+        self.assertEqual(self.fixture.branches(), branches)
+
+    def test_adoption_after_a_crash_mid_wave_settles_the_receipt_it_missed(self):
+        """The receipt arrives with no driver alive to read it; the run that adopts settles it."""
+        self.interrupted(("01", ()), ("02", ("01",)))
+        self.fixture.completes("01")
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            "the adopted run never carried the wave on",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    def test_a_child_that_vanished_while_nothing_watched_settles_by_the_loop_s_rule(self):
+        self.interrupted(("01", ()))
+        self.fixture.vanishes("01")
+
+        adopted = self.fixture.launch()
+        self.wait_for_verdict("01", "failed")
+        self.woken(adopted, "run-complete")
+
+        self.assertIn("vanished", self.events("receipt", ticket="01")[-1]["detail"])
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_the_adopted_run_arms_its_monitors_over_the_live_children_alone(self):
+        """A settled ticket is watched by nothing: the lane a snapshot names is the live one."""
+        running = self.running(("01", ()), ("02", ()), routing=CODEX_ROUTING)
+        self.fixture.says("01", "CREW FAILED the approach does not work")
+        self.wait_for_verdict("01", "failed")
+        self.crash(running)
+        already = len(self.fixture.codex_calls())
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: any(
+                    call["argv"][:1] == ["watch"]
+                    for call in self.fixture.codex_calls()[already:]
+                )
+            ),
+            "the adopted run armed no monitor over its live child",
+        )
+        watches = [
+            call for call in self.fixture.codex_calls()[already:] if call["argv"][:1] == ["watch"]
+        ]
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        for watch in watches:
+            self.assertIn(str(self.fixture.run_dir / "codex" / "02.json"), watch["argv"])
+            self.assertNotIn(str(self.fixture.run_dir / "codex" / "01.json"), watch["argv"])
+
+    def test_a_coordinator_that_restarted_re_anchors_the_run_and_its_live_children(self):
+        """A restarted coordinator has a new pid, and the socket a child trusts is the old one."""
+        self.interrupted(("01", ()), ("02", ("01",)))
+        restarted = ("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
+
+        adopted = self.fixture.launch(extra=restarted)
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.events("ruling", ticket="01")),
+            "the live child was never re-anchored",
+        )
+        anchor = self.events("ruling", ticket="01")
+        self.fixture.completes("01")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            "the adopted run never advanced to wave 2",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(
+            self.fixture.table()["run"]["coordinator_name"], "crew-coordinator-2a"
+        )
+        self.assertEqual(len(anchor), 1, f"01 was not re-anchored once: {anchor}")
+        self.assertIn("uds:/tmp/cc-socks/2601.sock", anchor[0]["message"])
+        self.assertIn("crew-coordinator-2a", anchor[0]["message"])
+        launched = [
+            call for call in self.fixture.launches()
+            if str(self.fixture.repo / ".claude" / "worktrees" / "02-02") in json.dumps(call)
+        ]
+        self.assertEqual(len(launched), 1, "02 was not launched once")
+        self.assertIn("uds:/tmp/cc-socks/2601.sock", json.dumps(launched[0]))
+
+    def test_a_run_adopted_by_the_coordinator_that_started_it_re_anchors_nobody(self):
+        self.interrupted(("01", ()))
+
+        adopted = self.fixture.launch()
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(self.fixture.table()["run"]["coordinator_pid"], COORDINATOR_PID)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_a_codex_child_is_not_re_anchored_because_its_channel_is_a_file(self):
+        self.interrupted(("01", ()), routing=CODEX_ROUTING)
+
+        adopted = self.fixture.launch(
+            extra=("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
+        )
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.table()["run"]["coordinator_pid"] == 2601
+            ),
+            "the adopted run kept the coordinator that started it",
+        )
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+        self.assertEqual(
+            [call for call in self.fixture.codex_calls() if call["argv"][:1] == ["send"]], []
+        )
+
+    def test_a_child_that_cannot_be_reached_is_left_to_the_rule_that_settles_it(self):
+        """A window that went with its session is not a driver error: it is a vanished child."""
+        self.interrupted(("01", ()), ("02", ()))
+        self.kill_window(self.fixture.launch_record("01")["window"])
+        self.fixture.vanishes("01")
+
+        adopted = self.fixture.launch(
+            extra=("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
+        )
+        self.wait_for_verdict("01", "failed")
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+        anchor = self.events("ruling", ticket="02")
+        self.assertEqual(len(anchor), 1, f"02 was not re-anchored once: {anchor}")
+        self.assertIn("uds:/tmp/cc-socks/2601.sock", anchor[0]["message"])
+
+    def kill_window(self, window):
+        subprocess.run(
+            [str(self.fixture.bin_dir / "tmux"), "kill-window", "-t", window],
+            check=True, capture_output=True, env=self.fixture.environment(),
+        )
+
+    def test_the_adopted_run_draws_the_dashboard_the_interrupted_one_left(self):
+        """The window an interrupted run recorded goes with it; the run that adopts has one."""
+        self.interrupted(("01", ()))
+        for window in self.fixture.windows_named(DASHBOARD_WINDOW):
+            self.kill_window(window)
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.windows_named(DASHBOARD_WINDOW)),
+            "the adopted run drew no dashboard",
+        )
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        windows = self.fixture.windows_named(DASHBOARD_WINDOW)
+        self.assertEqual(len(windows), 1, f"dashboard windows: {windows}")
+        recorded = (self.fixture.run_dir / "dashboard-window").read_text().strip()
+        self.assertEqual(recorded, next(iter(windows)))
 
 
 if __name__ == "__main__":

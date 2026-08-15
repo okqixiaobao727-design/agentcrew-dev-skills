@@ -118,9 +118,15 @@ def send_keys(argv):
     """
     target = flag(argv, "-t")
     keys = [value for value in argv[argv.index(target) + 1:] if value != "Enter"]
+    table = windows()
+    if target not in table:
+        # What a real tmux answers for a window that has gone, which is how a run learns that the
+        # child it is holding a recorded id for cannot be reached any more.
+        print(f"can't find window: {target}", file=sys.stderr)
+        return 1
     if "-l" in argv:
         return 0
-    window = windows().get(target, {})
+    window = table.get(target, {})
     result = subprocess.run(
         ["sh", "-c", " ".join(keys)], cwd=window.get("cwd") or os.getcwd()
     )
