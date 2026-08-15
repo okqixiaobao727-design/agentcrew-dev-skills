@@ -7,6 +7,73 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Watching a run stops meaning leaving it. The dashboard can now be drawn into
+the coordinator's own Claude Code statusline, so the frame and the
+coordinator's prompt are on screen at once and there is nothing to close when
+the run ends (#29). Separately, the review bridge stops being a file this repo
+owns and becomes a copy pinned to Review-Switch, held to that pin by CI.
+
+The tmux window is unchanged, undeprecated and still the default surface, so
+upgrading changes nobody's run.
+
+### Added
+- `monitor.py pin` draws the dashboard's frame — the same rows, states,
+  annotations and summary line — into Claude Code's `statusLine`. The
+  statusline's own `refreshInterval` tick is the refresh loop: each tick
+  renders one frame on demand, so there is no background process and no frame
+  file. Why the statusline rather than tmux's status lines, popups, floating
+  panes or a terminal's own status bar, each measured against the three
+  requirements that decided it, is ADR-0008; the measurements are in
+  `docs/dashboard-pinning-research.md`. Like every other part of the dashboard
+  the frame costs no model token — it is a rendered display region, never added
+  to the coordinator's context and never an API call (ADR-0001) (#32).
+- The **pin registry**, the run's only trace: a directory of JSON pin files at
+  `$CLAUDE_CONFIG_DIR/agentcrew/pins/`, falling back to
+  `~/.claude/agentcrew/pins/` and overridable with `--pin-dir`. `pin` takes no
+  `--run-dir`; it discovers the live run from the registry, preferring the pin
+  whose tmux session matches the caller's own, accepting a lone pin where none
+  matches so the single-run case needs no configuration, and drawing nothing
+  when several pins exist and none matches, because two crews at once must
+  never cross frames. The run writes its pin at dispatch and `monitor.py unpin`
+  removes it after the report is written; a run that wrote no pin has nothing
+  to remove, and that is a success rather than a complaint (#32, #35).
+- `[dashboard] surface` in `agentcrew.toml` chooses where a run draws itself:
+  `window` (the default), `pin`, or `both` — which runs each and dedupes toasts
+  through the run's one toast state (#35).
+- `monitor.py pin-install` wires the pin into the operator's Claude Code
+  settings. It edits a file that is the user's and not this repo's, so it is a
+  dry run that writes nothing until `--apply`, it names the exact change for
+  each of the three cases (no statusline, an existing statusline the pin is
+  drawn beneath, already installed), it copies every file it writes aside
+  first, a second `--apply` changes nothing, and `--uninstall` puts the
+  statusline back exactly (#34).
+- The setup wizard offers the pin install as its own step, showing the dry
+  run's lines to the user and asking before anything is written (#36).
+- The pinned frame is bounded: the renderer caps itself against `LINES`,
+  because rows past the bottom of the terminal are lost silently rather than
+  scrolled to, and toast updates are bounded with it (#33).
+- The pin's contract — the registry, what a pin file carries, how one is
+  selected, and every condition under which nothing is drawn — is stated in
+  `docs/monitor-dashboard.md`, with ADR-0008 and the glossary entries beside it
+  (#31).
+- A drift check for the vendored Review-Switch review bridge:
+  `tui_review_bridge.py` carries a header naming its upstream repo and pinned
+  commit, `scripts/sync-bridge.sh` holds that pin and restores the header after
+  the upstream shebang, and CI re-runs the sync and fails on any diff. The pin
+  is a fixed commit, never a branch, so an upstream commit cannot reach this
+  repo or break its CI without someone moving the pin.
+- ADR-0009 records why: Review-Switch, now its own published repo, owns the
+  bridge, and this repo ships a Vendored Copy it does not edit. It supersedes
+  the opposite ownership direction recorded in #16, which was settled while
+  Review-Switch was still a folder in a private repo.
+
+### Fixed
+- The setup wizard named `monitor.py` by a literal path under the plugin root
+  when printing the pin's dry run, which the plugin-tree validator rejects and
+  which is correct only on the machine it was written on. It now records
+  `<crew-skill-dir>` and names the asset relative to it, the placeholder every
+  other reference to that asset already used (#38).
+
 ## [0.3.7] - 2026-08-14
 
 ### Added
