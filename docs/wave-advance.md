@@ -29,9 +29,10 @@ authority (ADR-0003). The repair flags are the merge driver's and are passed str
 3. **Land it.** [`merge_driver.py land`](merge-driver.md) merges every landable branch. A wave the
    driver refuses to start at all — a repository carrying uncommitted work of its own — is the
    same non-decision: the driver's reason is printed and nothing is recorded.
-4. **Read the wave back out of the log.** The wave is green when every one of its tickets settled
-   `landable` *and* every one of them merged `clean` or `repaired`. Both halves are read from the
-   log rather than from the driver's output, so what advances the run is what the run recorded.
+4. **Read the wave back out of the log.** The wave is green when every ticket either settled
+   `landable` and merged `clean` or `repaired`, or settled `parked` and has no descendants in the
+   wave table. Both halves are read from the log rather than from the driver's output, so what
+   advances the run is what the run recorded.
 5. **Launch the next wave**, when there is one and the wave was green, through
    [`dispatch.py dispatch`](../skills/crew/assets/dispatch/dispatch.py) — cut from what the wave
    just landed, not from where the run began. The driver reads the integration branch's head after
@@ -47,7 +48,7 @@ Each is recorded once, as one `advance` event in the machine log
 | --- | --- | --- |
 | `launched` | the next wave is running; the operator is toasted `crew wave <N> launched` | 0 |
 | `complete` | that was the last wave, and there is nothing to advance to | 0 |
-| `escalated` | a ticket failed, parked, or did not land — the chain stops here | 1 |
+| `escalated` | failed, parked with descendants, or did not land — chain stops | 1 |
 | `interrupted` | the operator stopped the run | 130 |
 
 `launched` is recorded against the wave that started; the other three against the wave that ended.
@@ -62,6 +63,9 @@ An `escalated` decision carries the reason and the pointers a ruling starts from
 ticket's number, its verdict, its path and its branch — and there is exactly one per halted wave,
 however many tickets are in it.
 
+A parked ticket with no descendants is not an offender. When one is passed over as settled, the
+decision detail carries a separate `passed over as settled` note so the report can account for it.
+
 It reaches the coordinator by being in the log, not by being sent: this script writes nothing into
 anybody's context (ADR-0001), and the coordinator is already awake, woken by the child's own
 `CREW FAILED` or `CREW ASK` or by the merge driver's own escalation. A halt does not re-tell it
@@ -72,8 +76,8 @@ what it was already told.
 A halt marks every ticket that can no longer start `blocked`, as one `outcome` event each, which
 is one of the four outcomes the crew contract gives every ticket. Reached this way:
 
-- the **roots** are the wave's tickets that settled `failed` or `parked` — a ticket awaiting a
-  ruling on its merge is not one, because a ruling may yet land it;
+- the **roots** are the wave's tickets that settled `failed`, or `parked` while having descendants
+  — a ticket awaiting a ruling on its merge is not one, because a ruling may yet land it;
 - the **descendants** are every ticket that reaches a root through the wave table's `blocked_by`
   edges, however far down: a ticket blocked by a ticket blocked by a failure is blocked too;
 - a descendant the log carries a `launch` or a settling event for is left alone — it already ran,

@@ -119,8 +119,9 @@ a gap in the log.
 
 ### `escalation`, `ruling`, `message` — an outgoing message, copied verbatim
 
-Written by the SendMessage hook below, never by hand: `role` (`coordinator` or `child`), `to`,
-`message`, and `ticket` where the installing side knew one.
+Claude messages are written by the SendMessage hook below; Codex turn messages are written by
+`codex_bridge.py` through the same machine-log writer. Neither path writes by hand: `role`
+(`coordinator` or `child`), `to`, `message`, and `ticket` where the sender knows one.
 
 `message` is the argument the sender gave the tool, byte for byte — no truncation, no
 reformatting, no summary. A structured message is recorded as the object it was.
@@ -143,6 +144,8 @@ machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted \
                                     [--detail TEXT]
 machine_log.py --log <path> monitor-error --monitor NAME --reason TEXT
+machine_log.py --log <path> message --role coordinator|child [--ticket NN] [--to NAME] \
+                                    --message TEXT
 machine_log.py --log <path> session-cost --ticket NN --executor claude|codex --model ID \
                                     [--session IDS] [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \
@@ -159,25 +162,54 @@ A `PostToolUse` hook matching `SendMessage` copies the message that was just sen
 It is installed on both sides of the channel: coordinator-side it captures rulings, child-side it
 captures escalations. Nothing about it costs a model token.
 
+The Codex bridge records a child's non-empty final turn when `watch` observes it finish, and a
+coordinator's prompt when `send` submits it. A launch given `--machine-log` and `--ticket` stores
+those values in the state file, so later `watch` and `send` calls use the state for the correct
+ticket; callers without a log path remain unlogged.
+
 Installing it is the `install` entry point, run once per side against the settings file that side
 starts with — the coordinator's own, and each child's `.claude/settings.local.json` in its
 worktree, alongside the guard hooks:
 
 ```sh
-machine_log.py --log <path> install --settings <settings.json> --role child --ticket NN
-machine_log.py --log <path> install --settings <settings.json> --role coordinator
+machine_log.py --log <path> install   --settings <settings.json> --role child --ticket NN
+machine_log.py --log <path> install   --settings <settings.json> --role coordinator
+machine_log.py --log <path> uninstall --settings <settings.json>
 ```
 
 `--role` says which side is being installed; `--ticket` is added where that side knows one — the
-coordinator's hook serves every child at once and omits it. `--hook-script` names the copy of
-this script the hook should run, defaulting to the one being invoked, so a script copied into a
-worktree registers the copy rather than the original. Installing twice replaces the entry instead
-of doubling it — the script path is what identifies an entry as one this install owns — and every
-other hook already in the file is left where it is.
+coordinator's hook serves every child at once and omits it. Installing twice replaces the entry
+instead of doubling it — the log an entry writes is what identifies it as this run's, whichever
+version of this script it runs — and every other hook already in the file is left where it is.
 
-A missing or empty settings file is a fresh document to write; a file with content that does not
-parse, or whose `hooks` are not the shape this writes through, is refused and left untouched,
-because the guard hooks live in that file too.
+The command registered runs the run's own copy of this script, written beside the log the first
+time a run installs and refreshed on every install after it. The plugin is installed one directory
+per version, so an entry naming the plugin's own copy stops working at the next upgrade; the run
+directory carries no version and outlives every one of them (#37). A caller that keeps its own
+copy names it with `--hook-script`, and that path is registered exactly as it was given.
+
+`uninstall` removes every entry installed for the `--log` it is given, and nothing else — an entry
+an older plugin version wrote for that run included, which is what keeps an upgrade from leaving
+two writers on one log. It is called when the run ends, once for the coordinator's settings file
+and once for each launched child's, and again when the run is cleared, so a finished run leaves no
+hook behind. It is idempotent: a settings file carrying none of ours is left byte for byte as it
+was found, and a block emptied of its only entry goes with it.
+
+A missing or empty settings file is a fresh document to write — and nothing to uninstall from; a
+file with content that does not parse, or whose `hooks` are not the shape this writes through, is
+refused and left untouched, because the guard hooks live in that file too.
+
+### Which side writes the line
+
+A child's worktree sits inside the repository the coordinator runs in, and the enclosing
+checkout's settings load in the child's session too, so every hook both files register fires on
+one send. Each installed entry therefore carries `--scope`: the directory whose sends it copies —
+the coordinator's checkout, or the child's worktree — taken from the settings file being written
+(`<project>/.claude/settings.local.json` scopes to `<project>`) unless `--scope` names another.
+
+The match is that directory exactly, never a directory beneath it, because a worktree is a
+descendant of the checkout above it. A send from anywhere else is another side's, and the hook
+writes nothing: one message, one line, under the role of the session that sent it.
 
 The event name comes from the message the sender wrote, so the log reads the way the run ran:
 

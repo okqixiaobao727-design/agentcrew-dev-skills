@@ -7,6 +7,35 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `machine_log.py uninstall --settings <file>` removes every SendMessage hook
+  entry installed for its `--log` and nothing else. The log an entry writes is
+  what identifies it as that run's — whichever plugin version registered it —
+  so another live run's entry, the guard hooks, and a third party's watcher all
+  stay where they are. It is idempotent: a settings file carrying none of ours
+  is left byte for byte as it was found. The crew skill calls it when the run
+  ends, for the coordinator's settings file and each launched child's, and
+  again when the run is cleared, so a finished run leaves no hook behind (#37).
+
+### Fixed
+- Every message a child sent was copied into the machine log twice: once as the
+  child's, once more as a coordinator `ruling`. A child's worktree sits inside
+  the repository the coordinator runs in, so the coordinator's hook loads in
+  the child's session too and both hooks fired on the one send — which put the
+  child's words in the log under the coordinator's role and doubled every
+  message count a later auditor would take from the file. Each installed entry
+  now carries the directory it was installed for and copies only what was sent
+  from exactly that directory, so a message is logged once, by the side that
+  sent it (#37).
+- Installed hook commands named the plugin's own copy of `machine_log.py`,
+  whose path carries the plugin version, so upgrading the plugin left every
+  registered hook pointing at a file that was no longer there — a failing hook
+  on every `SendMessage` of a run in progress. The install now registers the
+  run's own copy beside the log, refreshed on each install, which carries no
+  version and outlives every upgrade (#37).
+- Codex child turn messages and coordinator rulings now enter the machine log through the bridge,
+  with the same event classification and timestamp format as Claude child messages (#43).
+
 ## [0.3.8] - 2026-08-15
 
 Watching a run stops meaning leaving it. The dashboard can now be drawn into

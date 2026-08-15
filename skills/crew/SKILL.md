@@ -351,9 +351,25 @@ python3 <crew-skill-dir>/assets/monitor/monitor.py unpin --run-dir <run-dir>
 A run whose surface was the window wrote no pin and ends through this step all the same: there is
 nothing to remove, and the command says so by succeeding.
 
+Take this run's hooks out of the settings files they were installed in — your own, and every
+launched child's worktree, whose files outlive the run until it is cleared — so this run's
+bookkeeping stops when the run does and no finished run writes into another run's log:
+
+```bash
+python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
+  uninstall --settings .claude/settings.local.json
+python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
+  uninstall --settings <worktree>/.claude/settings.local.json   # once per launched child
+```
+
+Each call removes every entry installed for this run's log, whichever plugin version wrote it, and
+leaves every other hook in the file — the guard hooks, another live run's entry — where it is. A
+settings file that is already gone is nothing to uninstall from, and the call says so by
+succeeding.
+
 **Done when** every ticket and ruling is accounted for, every launched ticket has a duration row,
-the report carries the rollup and the coordinator row, the run's pin is gone, and every
-outside-worktree action has an undo.
+the report carries the rollup and the coordinator row, the run's pin is gone, this run's hook is
+uninstalled, and every outside-worktree action has an undo.
 
 ## 7. Clear on confirmation
 
@@ -371,6 +387,14 @@ On approval only:
    branches with `git branch -D`.
 4. Switch to `<return-branch>` and delete the integration branch with `git branch -D`.
 5. Remove `<run-dir>/codex/`.
+6. Take this run's hook out of your own settings, in case the run is being cleared without having
+   ended through section 6 — the same command, which removes nothing twice (the children's
+   settings files went with their worktrees in step 2):
+
+   ```bash
+   python3 <crew-skill-dir>/assets/machine_log.py --log <run-dir>/log.jsonl \
+     uninstall --settings .claude/settings.local.json
+   ```
 
 Operate only on the recorded paths and ids; never use a glob. `<run-dir>` and the report remain as
 the durable record, with the machine log at their centre.

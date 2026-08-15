@@ -48,6 +48,13 @@ def receipt_message():
 def first_turn_result(active_scenario):
     if active_scenario == "question":
         return "completed", "Should I extend the existing view or create a new one?"
+    if active_scenario == "escalation":
+        return "completed", (
+            "CREW ASK 18 scope — choose option A or option B.\n"
+            "ts=1755060060"
+        )
+    if active_scenario == "message":
+        return "completed", "ordinary child update"
     if active_scenario == "failed-turn":
         return "failed", ""
     return "completed", receipt_message()
