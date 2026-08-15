@@ -7,6 +7,11 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex child turn messages and coordinator rulings now enter the machine log through the bridge,
+  with the same event classification and timestamp format as Claude child messages (#43).
+
 ## [0.3.8] - 2026-08-15
 
 Watching a run stops meaning leaving it. The dashboard can now be drawn into

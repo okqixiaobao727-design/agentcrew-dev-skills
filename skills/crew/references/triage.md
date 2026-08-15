@@ -49,10 +49,12 @@ tmux send-keys -t <window-id> Enter
 
 ## Log
 
-The ruling hook copies every message you send into the machine log verbatim as you send it, so an
-answer is logged by being sent. What the log then holds is exactly what you wrote: name the effect
-and its exact reversal inside the ruling itself whenever you approve something outside the
-worktree, because the report is built from these lines.
+The ruling hook copies every Claude message you send into the machine log verbatim as you send it,
+so an answer is logged by being sent. A Codex answer goes through `codex_bridge.py send`, which
+records the prompt in the same way from the state file's machine-log configuration. What the log
+then holds is exactly what you wrote: name the effect and its exact reversal inside the ruling
+itself whenever you approve something outside the worktree, because the report is built from these
+lines.
 
 An answer sent as tmux keys passes no hook and so reaches no log: it is a ruling only the report
 will carry, so carry it there.

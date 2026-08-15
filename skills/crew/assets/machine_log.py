@@ -12,7 +12,7 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|session-cost ...
+    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|session-cost|message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
 
@@ -286,6 +286,23 @@ def run_event(args):
     return 0
 
 
+def run_message(args):
+    """Append one outgoing message; returns 0, or 1 on an OSError."""
+    record = entry(
+        message_event(args.message, args.role),
+        ticket=args.ticket,
+        role=args.role,
+        to=args.to,
+        message=args.message,
+    )
+    try:
+        append(args.log, record)
+    except OSError as error:
+        print(f"machine log: {args.log}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cost_problem(args):
     """Why this session cost contradicts itself, or None when it holds together.
 
@@ -381,6 +398,13 @@ def build_parser():
     advance.add_argument("--wave", required=True, help="the wave the decision is about")
     advance.add_argument("--decision", required=True, choices=DECISIONS)
     advance.add_argument("--detail")
+
+    message = subcommands.add_parser("message", help="record an outgoing message")
+    message.set_defaults(handler=run_message)
+    message.add_argument("--role", required=True, choices=(COORDINATOR, CHILD))
+    message.add_argument("--ticket")
+    message.add_argument("--to")
+    message.add_argument("--message", required=True)
 
     hook = subcommands.add_parser("hook", help="copy an outgoing SendMessage into the log")
     hook.set_defaults(handler=run_hook)

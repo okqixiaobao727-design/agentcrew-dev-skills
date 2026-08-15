@@ -590,6 +590,23 @@ class CodexRenderTests(DispatchTestCase):
             self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertEqual(self.fixture.launches(), [])
 
+    def test_a_logged_codex_launch_carries_the_log_and_ticket_to_the_bridge(self):
+        log = self.fixture.root / "run" / "log.jsonl"
+
+        result = self.fixture.run_dispatch(
+            "dispatch", self.table, extra=("--log", str(log)),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        argv = self.fixture.codex_launches()[0]["argv"]
+        self.assertIn("--machine-log", argv)
+        self.assertEqual(
+            argv[argv.index("--machine-log") + 1],
+            os.path.abspath(log),
+        )
+        self.assertIn("--ticket", argv)
+        self.assertEqual(argv[argv.index("--ticket") + 1], "07")
+
     def test_a_codex_state_file_naming_no_working_directory_is_a_launch_failure(self):
         result = self.fixture.run_dispatch(
             "dispatch", self.table, env_overrides={"AGENTCREW_STUB_STATE_CWD": ""},

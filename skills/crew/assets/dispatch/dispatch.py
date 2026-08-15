@@ -625,24 +625,29 @@ def verify_codex_child(ticket, worktree, state_file):
     return state
 
 
-def launch_codex_child(run, ticket, artifacts, timeouts):
+def launch_codex_child(run, ticket, artifacts, timeouts, log=None):
     worktree = prepare_worktree(run, ticket)
     codex = run["codex"]
     state_file = pathlib.Path(codex["state_dir"]) / f"{ticket['id']}.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
     environment.update(hook_environment(run))
+    command = [
+        sys.executable, str(codex["bridge"]), "launch",
+        "--cwd", str(worktree),
+        "--tmux-session", run["tmux_session"],
+        "--window-name", ticket["id"],
+        "--state-file", str(state_file),
+        "--model", ticket["model"],
+        "--effort", ticket["effort"],
+        "--prompt-file", artifacts["turnFile"],
+    ]
+    if log:
+        command.extend(
+            ["--machine-log", str(log), "--ticket", str(ticket["id"])]
+        )
     result = subprocess.run(
-        [
-            sys.executable, str(codex["bridge"]), "launch",
-            "--cwd", str(worktree),
-            "--tmux-session", run["tmux_session"],
-            "--window-name", ticket["id"],
-            "--state-file", str(state_file),
-            "--model", ticket["model"],
-            "--effort", ticket["effort"],
-            "--prompt-file", artifacts["turnFile"],
-        ],
+        command,
         capture_output=True, text=True, env=environment,
     )
     try:
@@ -720,7 +725,9 @@ def dispatch_wave(run, tickets, rendered, timeouts, log=None):
             if ticket["executor"] == "claude":
                 line, details = launch_claude_child(run, ticket, artifacts, timeouts)
             else:
-                line, details = launch_codex_child(run, ticket, artifacts, timeouts)
+                line, details = launch_codex_child(
+                    run, ticket, artifacts, timeouts, log=log
+                )
         except LaunchError as error:
             failed = True
             lines.append(f"{ticket['id']} FAILED {error}".replace("\n", " "))

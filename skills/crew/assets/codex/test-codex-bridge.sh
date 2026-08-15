@@ -12,6 +12,11 @@ REAL_TMUX=$(command -v tmux) || { echo "tmux not found"; exit 1; }
 STUB_SHA="1234567890abcdef1234567890abcdef12345678"
 PINNED_MODEL="model-x"
 PINNED_EFFORT="effort-y"
+CHILD_MESSAGE="ordinary child update"
+ESCALATION_MESSAGE="CREW ASK 18 scope — choose option A or option B.
+ts=1755060060"
+RULING_MESSAGE="Use option A; it is reversible.
+ts=1755060070"
 
 WORK=$(mktemp -d -t codex-bridge-test)
 BIN="$WORK/bin"
@@ -47,6 +52,26 @@ for key in sys.argv[2:]:
         print("")
         sys.exit(0)
 print(value if value is not None else "")
+PY
+}
+
+assert_log_event() { # <log> <index> <event> <role> <ticket> <message>
+  "$PYTHON" - "$@" <<'PY'
+import json
+import re
+import sys
+
+path, index, expected_event, expected_role, expected_ticket, expected_message = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    records = [json.loads(line) for line in stream if line.strip()]
+
+entry = records[int(index)]
+assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", entry["ts"]), entry
+assert entry["event"] == expected_event, entry
+assert entry["role"] == expected_role, entry
+assert entry["ticket"] == expected_ticket, entry
+assert entry["message"] == expected_message, entry
+assert set(entry) <= {"ts", "event", "role", "ticket", "to", "message"}, entry
 PY
 }
 
@@ -145,6 +170,77 @@ test_receipt() {
     *) fail "receipt: receipt missing from finalMessage" ;;
   esac
   [ "$(json_field "$sf" status)" = "idle" ] || fail "receipt: state file not updated"
+}
+
+# --- Test 16: a Codex CREW ASK read by watch is copied to the machine log ---
+test_escalation_logging() {
+  local dir; dir=$(make_child t16 escalation)
+  local sf="$WORK/t16.state.json" out="$WORK/t16.launch.json" snap="$WORK/t16.watch.json"
+  local log="$WORK/t16.log.jsonl"
+  launch_with_options "$dir" "$sf" 18 "$out" \
+    --machine-log "$log" --ticket 18 \
+    || { fail "escalation-log: launch exited $?"; return; }
+  watch "$snap" "$sf" \
+    || { fail "escalation-log: watch exited $? ($(cat "$snap.err"))"; return; }
+  assert_log_event "$log" 0 escalation child 18 "$ESCALATION_MESSAGE" \
+    && ok "escalation-log: CREW ASK appended with child fields" \
+    || fail "escalation-log: event did not match the machine-log contract"
+  watch "$WORK/t16.watch-again.json" "$sf" \
+    || { fail "escalation-log: repeated watch exited $?"; return; }
+  "$PYTHON" - "$log" <<'PY' \
+    && ok "escalation-log: repeated observation did not duplicate the event" \
+    || fail "escalation-log: repeated observation duplicated the event"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    records = [json.loads(line) for line in stream if line.strip()]
+assert len(records) == 1, records
+PY
+}
+
+# --- Test 17: a ruling sent through the bridge is copied to the machine log ---
+test_ruling_logging() {
+  local dir; dir=$(make_child t17 message)
+  local sf="$WORK/t17.state.json" out="$WORK/t17.launch.json" snap="$WORK/t17.watch.json"
+  local log="$WORK/t17.log.jsonl" answer="$WORK/t17.answer"
+  launch_with_options "$dir" "$sf" 19 "$out" \
+    --machine-log "$log" --ticket 19 \
+    || { fail "ruling-log: launch exited $?"; return; }
+  watch "$snap" "$sf" \
+    || { fail "ruling-log: watch exited $? ($(cat "$snap.err"))"; return; }
+  printf '%s' "$RULING_MESSAGE" > "$answer"
+  "$PYTHON" "$BRIDGE" send --state-file "$sf" --prompt-file "$answer" \
+    > "$WORK/t17.send.json" 2> "$WORK/t17.send.err" \
+    || { fail "ruling-log: send exited $? ($(cat "$WORK/t17.send.err"))"; return; }
+  assert_log_event "$log" 0 message child 19 "$CHILD_MESSAGE" \
+    || { fail "ruling-log: child message was not classified"; return; }
+  assert_log_event "$log" 1 ruling coordinator 19 "$RULING_MESSAGE" \
+    && ok "ruling-log: ruling appended with coordinator fields" \
+    || fail "ruling-log: event did not match the machine-log contract"
+}
+
+# --- Test 18: a resumed state keeps its logging configuration ---
+test_resume_keeps_logging_configuration() {
+  local dir; dir=$(make_child t18 escalation)
+  local sf="$WORK/t18.state.json" out="$WORK/t18.launch.json"
+  local log="$WORK/t18.log.jsonl"
+  launch_with_options "$dir" "$sf" 18 "$out" \
+    --machine-log "$log" --ticket 18 \
+    || { fail "resume-log: initial launch exited $?"; return; }
+  local thread_id; thread_id=$(json_field "$sf" threadId)
+  local window_id; window_id=$(json_field "$sf" windowId)
+  tmux kill-window -t "$window_id" \
+    || { fail "resume-log: could not kill initial window"; return; }
+  sleep 0.2
+  launch_with_options "$dir" "$sf" 20 "$WORK/t18.resume.json" \
+    --thread-id "$thread_id" \
+    || { fail "resume-log: resumed launch exited $?"; return; }
+  watch "$WORK/t18.watch.json" "$sf" \
+    || { fail "resume-log: watch exited $?"; return; }
+  assert_log_event "$log" 0 escalation child 18 "$ESCALATION_MESSAGE" \
+    && ok "resume-log: logging configuration survived resume" \
+    || fail "resume-log: resumed state did not log the escalation"
 }
 
 # --- Test 11: pinned model and effort reach both Codex argv lists and state ---
@@ -379,6 +475,9 @@ test_stop() {
 }
 
 test_receipt
+test_escalation_logging
+test_ruling_logging
+test_resume_keeps_logging_configuration
 test_model_effort_overrides
 test_without_model_effort_overrides
 test_resume_keeps_pinned_model_effort

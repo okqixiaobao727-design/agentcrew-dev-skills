@@ -113,8 +113,9 @@ a gap in the log.
 
 ### `escalation`, `ruling`, `message` — an outgoing message, copied verbatim
 
-Written by the SendMessage hook below, never by hand: `role` (`coordinator` or `child`), `to`,
-`message`, and `ticket` where the installing side knew one.
+Claude messages are written by the SendMessage hook below; Codex turn messages are written by
+`codex_bridge.py` through the same machine-log writer. Neither path writes by hand: `role`
+(`coordinator` or `child`), `to`, `message`, and `ticket` where the sender knows one.
 
 `message` is the argument the sender gave the tool, byte for byte — no truncation, no
 reformatting, no summary. A structured message is recorded as the object it was.
@@ -136,6 +137,8 @@ machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state ru
 machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted \
                                     [--detail TEXT]
+machine_log.py --log <path> message --role coordinator|child [--ticket NN] [--to NAME] \
+                                    --message TEXT
 machine_log.py --log <path> session-cost --ticket NN --executor claude|codex --model ID \
                                     [--session IDS] [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \
@@ -151,6 +154,11 @@ log a later agent cannot trust.
 A `PostToolUse` hook matching `SendMessage` copies the message that was just sent into the log.
 It is installed on both sides of the channel: coordinator-side it captures rulings, child-side it
 captures escalations. Nothing about it costs a model token.
+
+The Codex bridge records a child's non-empty final turn when `watch` observes it finish, and a
+coordinator's prompt when `send` submits it. A launch given `--machine-log` and `--ticket` stores
+those values in the state file, so later `watch` and `send` calls use the state for the correct
+ticket; callers without a log path remain unlogged.
 
 Installing it is the `install` entry point, run once per side against the settings file that side
 starts with — the coordinator's own, and each child's `.claude/settings.local.json` in its
