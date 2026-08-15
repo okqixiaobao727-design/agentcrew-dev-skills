@@ -77,6 +77,10 @@ run_monitor() {
   # The wave's membership, as the caller spells it; two fixed paths unless a case says otherwise.
   local -a paths=("$@")
   [ "${#paths[@]}" -gt 0 ] || paths=(/wave/01 /wave/02)
+  local -a monitor_args=("$parked_file" "${paths[@]}")
+  if [ -n "${MONITOR_TEST_LOG_FILE:-}" ]; then
+    monitor_args=(--log "$MONITOR_TEST_LOG_FILE" "${monitor_args[@]}")
+  fi
 
   (
     set +e
@@ -85,7 +89,7 @@ run_monitor() {
       CREW_CLAUDE_BIN="$0" \
       CREW_POLL_SECONDS=0.02 \
       perl -e 'alarm 2; exec @ARGV' \
-        "$monitor" "$parked_file" "${paths[@]}" >"$output_file" 2>&1
+        "$monitor" "${monitor_args[@]}" >"$output_file" 2>&1
     printf '%s\n' "$?" >"$exit_file"
   ) 2>/dev/null
 }
@@ -132,6 +136,41 @@ assert_error() {
   fi
 }
 
+assert_error_records_log() {
+  local scenario=$1
+  local expected_reason=$2
+  local log_mode=${3:-explicit}
+  local record_dir="$test_dir/recorded-$scenario-$log_mode"
+  local parked_file="$record_dir/parked-paths"
+  local output_file="$record_dir/output"
+  local exit_file="$record_dir/exit"
+  local log_file="$record_dir/log.jsonl"
+
+  mkdir -p "$record_dir"
+  : >"$parked_file"
+  if [ "$log_mode" = "explicit" ]; then
+    MONITOR_TEST_LOG_FILE="$log_file" run_monitor \
+      "$scenario" "$parked_file" "$output_file" "$exit_file"
+  else
+    MONITOR_TEST_LOG_FILE= run_monitor \
+      "$scenario" "$parked_file" "$output_file" "$exit_file"
+  fi
+
+  if [ "$(cat "$exit_file")" -eq 0 ] \
+    || ! grep -q "MONITOR ERROR $expected_reason" "$output_file" \
+    || ! jq -s -e --arg reason "$expected_reason" '
+      length == 1
+      and .[0].event == "monitor-error"
+      and .[0].monitor == "monitor-wave.sh"
+      and .[0].reason == $reason
+    ' "$log_file" >/dev/null 2>&1; then
+    printf 'FAIL monitor error was not recorded: %s\n' "$scenario" >&2
+    [ -f "$output_file" ] && sed -n '1,20p' "$output_file" >&2
+    [ -f "$log_file" ] && sed -n '1,20p' "$log_file" >&2
+    return 1
+  fi
+}
+
 set -e
 
 assert_actionable waiting-busy waiting
@@ -143,6 +182,11 @@ assert_error duplicate 'MONITOR ERROR duplicate session'
 assert_error unknown 'MONITOR ERROR unknown status'
 assert_error invalid-json 'MONITOR ERROR invalid claude agents JSON'
 assert_error cli-failure 'MONITOR ERROR claude agents --json failed'
+assert_error_records_log cli-failure 'claude agents --json failed'
+assert_error_records_log invalid-json 'invalid claude agents JSON'
+assert_error_records_log duplicate 'duplicate session for /wave/01'
+assert_error_records_log unknown "unknown status 'paused' for /wave/01"
+assert_error_records_log cli-failure 'claude agents --json failed' default
 
 busy_parked="$test_dir/all-busy.parked"
 busy_output="$test_dir/all-busy.output"

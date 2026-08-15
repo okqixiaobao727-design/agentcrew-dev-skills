@@ -95,6 +95,12 @@ reads. Each round of a review is a review, so round two writes its own pair.
 | `escalated` | a ticket failed, parked or did not land, and the chain stopped |
 | `interrupted` | the operator stopped the run |
 
+### `monitor-error` — a monitor that exited with an error
+
+`monitor`, `reason`. The wake monitor writes this line before it exits nonzero, so a failure is
+visible in the run's record as well as on stderr. `monitor` names the monitor script and `reason`
+is the same explanation printed after `MONITOR ERROR`.
+
 ### `session-cost` — what one child's session spent, in tokens
 
 `ticket`, `executor`, `model`, `session`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
@@ -137,6 +143,7 @@ machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state ru
 machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted \
                                     [--detail TEXT]
+machine_log.py --log <path> monitor-error --monitor NAME --reason TEXT
 machine_log.py --log <path> message --role coordinator|child [--ticket NN] [--to NAME] \
                                     --message TEXT
 machine_log.py --log <path> session-cost --ticket NN --executor claude|codex --model ID \

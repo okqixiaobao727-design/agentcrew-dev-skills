@@ -12,7 +12,8 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|session-cost|message ...
+    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|monitor-error|
+                                  session-cost|message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
     machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
@@ -580,6 +581,13 @@ def build_parser():
     advance.add_argument("--wave", required=True, help="the wave the decision is about")
     advance.add_argument("--decision", required=True, choices=DECISIONS)
     advance.add_argument("--detail")
+
+    monitor_error = subcommands.add_parser(
+        "monitor-error", help="record a monitor that exited with an error"
+    )
+    monitor_error.set_defaults(handler=run_event)
+    monitor_error.add_argument("--monitor", required=True, help="the monitor that failed")
+    monitor_error.add_argument("--reason", required=True, help="why the monitor failed")
 
     message = subcommands.add_parser("message", help="record an outgoing message")
     message.set_defaults(handler=run_message)
