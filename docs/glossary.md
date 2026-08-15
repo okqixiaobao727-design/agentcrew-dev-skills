@@ -195,3 +195,8 @@ is reversibility itself, so a hook that fails to catch something does not change
 
 **Vendored codex bridge** — `codex_bridge.py`, the Codex-side transport, maintained inside this repo
 rather than installed as a separate skill.
+
+**Vendored review bridge** — `tui_review_bridge.py`, the review lane's transport, copied into this
+repo from Review-Switch and pinned to one upstream commit. Unlike the codex bridge it is *not*
+maintained here: Review-Switch owns it, `scripts/sync-bridge.sh` holds the pin, and CI fails on any
+drift from it (ADR-0009). A fix goes upstream first and arrives by moving the pin.
