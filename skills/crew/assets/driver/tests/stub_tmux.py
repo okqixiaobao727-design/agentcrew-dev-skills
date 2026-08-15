@@ -132,6 +132,10 @@ def main():
     with (state_dir() / "tmux-calls.jsonl").open("a") as handle:
         handle.write(json.dumps({"argv": argv}) + "\n")
 
+    if (state_dir() / "tmux-server-gone").exists():
+        print("error connecting to tmux server (No such file or directory)", file=sys.stderr)
+        return 1
+
     if not argv:
         return 1
     command = argv[0]
