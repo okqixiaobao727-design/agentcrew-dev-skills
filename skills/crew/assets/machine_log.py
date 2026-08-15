@@ -15,6 +15,7 @@ schema this writes.
     machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|session-cost ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
+    machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
 
 The hook never speaks on a channel a model reads: it writes nothing to stdout on the happy path,
 writes nothing to stderr ever, and exits 0 even when the log cannot be written, because a send
@@ -28,6 +29,7 @@ import os
 import pathlib
 import shlex
 import sys
+import tempfile
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -39,6 +41,13 @@ HOOK_EVENT = "PostToolUse"
 # What a registered hook runs, and the subcommand that marks a registration as one of ours.
 PYTHON = "python3"
 HOOK_SUBCOMMAND = "hook"
+# The name the run's own copy of this script is installed under, beside the log it writes. The
+# copy is what keeps a registered command version-independent: the plugin directory a run installs
+# from carries the version in its path, so an upgrade would leave the entry naming a file that is
+# no longer there, while the run directory outlives every upgrade (#37).
+SCRIPT_NAME = "machine_log.py"
+# The directory a settings file lives in when it belongs to a checkout: `<project>/.claude/`.
+SETTINGS_DIRECTORY = ".claude"
 
 COORDINATOR = "coordinator"
 CHILD = "child"
@@ -139,6 +148,28 @@ def hook_record(payload, role, ticket):
     )
 
 
+def sent_from_scope(payload, scope):
+    """Whether this send came from the session whose settings registered this hook.
+
+    A child's worktree sits inside the repository the coordinator runs in, and Claude Code loads
+    the enclosing checkout's settings in the child's session too: every hook both files register
+    fires on one send. Without this check the coordinator's hook copies the child's message in a
+    second time and labels it a ruling, so the log counts two messages where the run had one and
+    attributes the child's words to the coordinator (#37).
+
+    The scope is the directory the install was registered for, and the match is that directory
+    exactly — a worktree is a descendant of the checkout above it, so containment would let the
+    same duplicate through. A hook registered without a scope is one an older install wrote, and
+    it copies what it is handed as it always did.
+    """
+    if scope is None:
+        return True
+    sender = payload.get("cwd")
+    if not isinstance(sender, str):
+        return False
+    return os.path.realpath(sender) == os.path.realpath(scope)
+
+
 def run_hook(args):
     """Copy the message that was just sent into the log; returns 0 always, and always will.
 
@@ -148,6 +179,8 @@ def run_hook(args):
     try:
         payload = json.loads(sys.stdin.read())
     except (ValueError, OSError):
+        return 0
+    if not isinstance(payload, dict) or not sent_from_scope(payload, args.scope):
         return 0
     record = hook_record(payload, args.role, args.ticket)
     if record is None:
@@ -173,11 +206,11 @@ def absolute(path):
     return os.path.abspath(str(path))
 
 
-def hook_command(script, log, role, ticket):
+def hook_command(script, log, role, ticket, scope):
     """The shell command a registered hook runs: this script, in hook mode, for that side.
 
-    Both paths in it are absolute, because the cwd it will run in is not the cwd it was written
-    in.
+    Every path in it is absolute, because the cwd it will run in is not the cwd it was written
+    in — and the scope is the one it may write for.
     """
     command = (
         f"{shlex.quote(PYTHON)} {shlex.quote(absolute(script))}"
@@ -186,7 +219,50 @@ def hook_command(script, log, role, ticket):
     command += f" {HOOK_SUBCOMMAND} --role {shlex.quote(role)}"
     if ticket is not None:
         command += f" --ticket {shlex.quote(ticket)}"
+    command += f" --scope {shlex.quote(absolute(scope))}"
     return command
+
+
+def settings_scope(settings):
+    """The directory whose sessions a settings file governs: the checkout it sits in.
+
+    A settings file lives at `<project>/.claude/settings.local.json`, so the project above it is
+    the cwd its sessions send from. Anywhere else, the file's own directory is the best answer
+    there is, and `--scope` is there for a caller who knows better.
+    """
+    directory = pathlib.Path(absolute(pathlib.Path(settings).parent))
+    if directory.name == SETTINGS_DIRECTORY:
+        return directory.parent
+    return directory
+
+
+def run_script(log):
+    """Where a run keeps the copy of this script its hooks run: beside its own log.
+
+    The run directory carries no plugin version, which is the whole point — an entry pointing into
+    the versioned plugin tree stops working the moment the plugin is upgraded (#37).
+    """
+    return pathlib.Path(absolute(pathlib.Path(log).parent / SCRIPT_NAME))
+
+
+def materialise_script(source, destination):
+    """Put a copy of `source` at `destination`, replacing whatever was there; raises OSError.
+
+    Written to a neighbouring temporary file and moved into place, so a hook firing during an
+    install runs either the old copy or the new one and never half of either.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if absolute(source) == str(destination):
+        return destination
+    handle, temporary = tempfile.mkstemp(dir=str(destination.parent), prefix=f".{SCRIPT_NAME}.")
+    try:
+        with open(handle, "wb") as copy:
+            copy.write(pathlib.Path(source).read_bytes())
+        os.replace(temporary, destination)
+    except BaseException:
+        pathlib.Path(temporary).unlink(missing_ok=True)
+        raise
+    return destination
 
 
 def settings_shape_is_sound(settings):
@@ -211,64 +287,170 @@ def settings_shape_is_sound(settings):
     )
 
 
-def install_hook(settings, command, script):
+def command_log(command):
+    """The log a registered command writes in hook mode, or None when it is not one of ours.
+
+    The command is read as the shell will read it — split into its words, the `--log` argument
+    taken whole — rather than searched for a substring, because one log's path is a prefix of
+    another's the moment a run directory is named after it and a hook nobody installed here must
+    never be mistaken for one this script owns.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if HOOK_SUBCOMMAND not in words or "--role" not in words:
+        return None
+    for index, word in enumerate(words):
+        if word == "--log" and index + 1 < len(words):
+            return absolute(words[index + 1])
+        if word.startswith("--log="):
+            return absolute(word[len("--log="):])
+    return None
+
+
+def registered_for(hook, log):
+    """Whether this registered hook is an entry an install for `log` wrote.
+
+    The log it writes is what identifies it, not the script that runs it: an upgrade changes
+    the registered path — the plugin's copy carries its version — and an entry the new install
+    failed to recognise would be left beside the new one, firing an old writer at the same log
+    (#37). One run owns one entry per settings file, whichever version wrote it; another run's
+    entry, and a hook that is not this script's at all, are nobody's business but their owners'.
+    """
+    if not isinstance(hook, dict):
+        return False
+    return command_log(str(hook.get("command", ""))) == absolute(log)
+
+
+def message_blocks(settings):
+    """Every block of the settings document that claims the outgoing-message matcher."""
+    events = settings.get("hooks", {}).get(HOOK_EVENT, [])
+    return [
+        block for block in events
+        if isinstance(block, dict) and block.get("matcher") == MESSAGE_TOOL
+    ]
+
+
+def install_hook(settings, command, log):
     """The settings document with this hook registered in it, and nothing else disturbed.
 
-    An entry already running `script` is replaced rather than added to, so installing twice — a
-    resumed run, a re-prepared worktree — leaves one hook and not two. The path is what identifies
-    it: two copies of this script are two different hooks, and a hook that is not this script's is
-    nobody's business but its owner's.
+    An entry already writing `log` is replaced rather than added to, so installing twice — a
+    resumed run, a re-prepared worktree, a run that outlived a plugin upgrade — leaves one hook
+    and not two.
     """
     hooks = settings.setdefault("hooks", {})
     events = hooks.setdefault(HOOK_EVENT, [])
-    for block in events:
-        if isinstance(block, dict) and block.get("matcher") == MESSAGE_TOOL:
-            break
+    blocks = message_blocks(settings)
+    if blocks:
+        block = blocks[0]
     else:
         block = {"matcher": MESSAGE_TOOL, "hooks": []}
         events.append(block)
-    installed = shlex.quote(str(script))
     block["hooks"] = [
-        hook
-        for hook in block.get("hooks", [])
-        if not (
-            isinstance(hook, dict)
-            and installed in str(hook.get("command", ""))
-            and f" {HOOK_SUBCOMMAND} --role " in str(hook.get("command", ""))
-        )
+        hook for hook in block.get("hooks", []) if not registered_for(hook, log)
     ]
     block["hooks"].append({"type": "command", "command": command})
     return settings
 
 
-def run_install(args):
-    """Register the hook in a settings file; returns 0, or 1 when that file cannot be read."""
-    path = pathlib.Path(args.settings)
+def uninstall_hook(settings, log):
+    """The settings document with every entry installed for `log` taken out of it.
+
+    Every other hook stays exactly where it is, and a block this leaves empty goes with the entry
+    that was its only occupant — an empty matcher block registers nothing and was not there before
+    the install. Returns whether anything was removed, so a file with nothing of ours in it is
+    left byte for byte as it was found.
+    """
+    removed = False
+    events = settings.get("hooks", {}).get(HOOK_EVENT, [])
+    for block in message_blocks(settings):
+        registered = block.get("hooks", [])
+        kept = [hook for hook in registered if not registered_for(hook, log)]
+        if len(kept) == len(registered):
+            continue
+        removed = True
+        block["hooks"] = kept
+        if not kept:
+            events.remove(block)
+    return removed
+
+
+def read_settings(path):
+    """The settings document at `path`, or the reason it must not be rewritten.
+
+    Returns the document and None, or None and the message to print: a missing or empty file is a
+    fresh document to write, and anything this script did not write and does not understand is a
+    file it refuses to touch, because the guard hooks live there too.
+    """
     try:
         text = path.read_text(encoding="utf-8") if path.exists() else ""
-        # A missing or empty file is a fresh document to write: the refusal below exists to
-        # protect the guard hooks that live in this file, and an empty file holds none.
         settings = json.loads(text.strip() or "{}")
     except (OSError, UnicodeDecodeError, ValueError) as error:
-        # Never overwrite a settings file that was not understood: the guard hooks live there.
-        print(f"machine log: {path}: {error}", file=sys.stderr)
-        return 1
+        return None, f"machine log: {path}: {error}"
     if not settings_shape_is_sound(settings):
-        print(f"machine log: {path}: not a settings document", file=sys.stderr)
-        return 1
-    script = absolute(args.hook_script)
-    command = hook_command(script, args.log, args.role, args.ticket)
+        return None, f"machine log: {path}: not a settings document"
+    return settings, None
+
+
+def write_settings(path, settings):
+    """Write the settings document back; returns 0, or 1 when it cannot be written."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(install_hook(settings, command, script), indent=2) + "\n",
-            encoding="utf-8",
-        )
+        path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     except OSError as error:
         print(f"machine log: {path}: {error}", file=sys.stderr)
         return 1
     print(path)
     return 0
+
+
+def run_install(args):
+    """Register the hook in a settings file; returns 0, or 1 when that file cannot be read.
+
+    By default the command registered runs the run's own copy of this script rather than the one
+    installing, because the plugin is installed one directory per version: an entry naming the
+    plugin's copy stops working at the next upgrade, while the run directory outlives every one of
+    them (#37). The copy is refreshed from the script that is installing, so an upgraded plugin's
+    log writer is the one a resumed run's hooks go on running. A caller that keeps its own copy
+    names it with `--hook-script` and that path is registered as it was given.
+    """
+    path = pathlib.Path(args.settings)
+    settings, problem = read_settings(path)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
+    try:
+        script = (
+            absolute(args.hook_script) if args.hook_script is not None
+            else str(materialise_script(pathlib.Path(__file__).resolve(), run_script(args.log)))
+        )
+    except OSError as error:
+        print(f"machine log: {error}", file=sys.stderr)
+        return 1
+    scope = args.scope if args.scope is not None else settings_scope(path)
+    command = hook_command(script, args.log, args.role, args.ticket, scope)
+    return write_settings(path, install_hook(settings, command, args.log))
+
+
+def run_uninstall(args):
+    """Take this run's hooks out of a settings file; returns 0, or 1 on a file it must not touch.
+
+    What it removes is every entry writing this run's log, whichever version of this script
+    installed it, and nothing else. Idempotent by construction: a file that carries none of ours
+    is left exactly as it was found and a second call has nothing left to do. Every other hook
+    in the file — the guard hooks, another run's entry, a watcher — stays where it is.
+    """
+    path = pathlib.Path(args.settings)
+    if not path.exists():
+        return 0
+    settings, problem = read_settings(path)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
+    if not uninstall_hook(settings, args.log):
+        return 0
+    return write_settings(path, settings)
 
 
 def run_event(args):
@@ -386,6 +568,10 @@ def build_parser():
     hook.set_defaults(handler=run_hook)
     hook.add_argument("--role", required=True, choices=(COORDINATOR, CHILD))
     hook.add_argument("--ticket", help="the ticket this side of the channel serves, where known")
+    hook.add_argument(
+        "--scope",
+        help="the directory whose sends this hook copies; anything else is another side's",
+    )
 
     install = subcommands.add_parser("install", help="register that hook in a settings file")
     install.set_defaults(handler=run_install)
@@ -394,9 +580,18 @@ def build_parser():
     install.add_argument("--ticket", help="the ticket this side of the channel serves, where known")
     install.add_argument(
         "--hook-script",
-        default=pathlib.Path(__file__).resolve(),
-        help="the copy of this script the hook should run (default: this one)",
+        help="a copy of this script to register as given (default: the run's own, beside the log)",
     )
+    install.add_argument(
+        "--scope",
+        help="the directory this settings file's sessions run in (default: the checkout above it)",
+    )
+
+    uninstall = subcommands.add_parser(
+        "uninstall", help="remove every entry installed for this log from a settings file"
+    )
+    uninstall.set_defaults(handler=run_uninstall)
+    uninstall.add_argument("--settings", required=True, help="the settings file to remove from")
 
     return parser
 
