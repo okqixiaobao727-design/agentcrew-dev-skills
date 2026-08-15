@@ -33,6 +33,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
   on every `SendMessage` of a run in progress. The install now registers the
   run's own copy beside the log, refreshed on each install, which carries no
   version and outlives every upgrade (#37).
+- Codex child turn messages and coordinator rulings now enter the machine log through the bridge,
+  with the same event classification and timestamp format as Claude child messages (#43).
 
 ## [0.3.8] - 2026-08-15
 

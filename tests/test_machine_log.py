@@ -404,6 +404,34 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.lines()), 1)
 
+    def test_a_direct_message_uses_the_hook_classification_for_both_roles(self):
+        cases = (
+            ("child", ESCALATION, "escalation"),
+            ("coordinator", RULING, "ruling"),
+        )
+
+        for role, message, event in cases:
+            result = run_cli(
+                "message",
+                "--role", role,
+                "--ticket", "07",
+                "--message", message,
+                log=self.log,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        recorded = self.lines()
+        self.assertEqual(
+            [entry["event"] for entry in recorded],
+            [event for _role, _message, event in cases],
+        )
+        for entry, (role, message, _event) in zip(recorded, cases):
+            self.assertUniformTimestamp(entry)
+            self.assertEqual(entry["role"], role)
+            self.assertEqual(entry["ticket"], "07")
+            self.assertEqual(entry["message"], message)
+
 
 class AppendOnlyTests(MachineLogTestCase):
     def test_events_accumulate_in_the_order_they_were_recorded(self):

@@ -44,6 +44,7 @@ DEFAULT_WATCH_TIMEOUT_SECONDS = 7200
 DEFAULT_WATCH_INTERVAL_SECONDS = 2.0
 CONSECUTIVE_FAILURE_LIMIT = 3
 MARKER_PREFIX = "agentcrew"
+MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 
 
 class BridgeError(RuntimeError):
@@ -299,6 +300,36 @@ def read_prompt(args):
     raise BridgeError("Provide --prompt or --prompt-file")
 
 
+def log_message(state, role, message, log=None, ticket=None):
+    """Copy a bridge message through the machine-log writer's existing schema."""
+    log = log if log is not None else state.get("machineLog")
+    ticket = ticket if ticket is not None else state.get("ticket")
+    if not log:
+        return
+    command = [
+        sys.executable,
+        str(MACHINE_LOG),
+        "--log",
+        os.path.abspath(str(log)),
+        "message",
+        "--role",
+        role,
+        "--message",
+        message,
+    ]
+    if ticket is not None:
+        command.extend(["--ticket", str(ticket)])
+    try:
+        subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        pass
+
+
 def model_config_overrides(args):
     overrides = []
     if args.model:
@@ -429,7 +460,7 @@ def run_pane(args):
 
 def build_state(args, runtime_dir, window_id, pane_id, thread_id, marker):
     now = time.time()
-    return {
+    state = {
         "version": STATE_VERSION,
         "name": args.window_name,
         "cwd": str(pathlib.Path(args.cwd).resolve()),
@@ -447,6 +478,11 @@ def build_state(args, runtime_dir, window_id, pane_id, thread_id, marker):
         "createdAt": now,
         "updatedAt": now,
     }
+    if args.machine_log:
+        state["machineLog"] = os.path.abspath(args.machine_log)
+    if args.ticket is not None:
+        state["ticket"] = args.ticket
+    return state
 
 
 def inherit_resume_pins(args):
@@ -460,6 +496,10 @@ def inherit_resume_pins(args):
         args.model = previous_state.get("model")
     if not args.effort:
         args.effort = previous_state.get("effort")
+    if not args.machine_log:
+        args.machine_log = previous_state.get("machineLog")
+    if not args.ticket:
+        args.ticket = previous_state.get("ticket")
 
 
 async def cmd_launch(args):
@@ -540,7 +580,8 @@ async def connect_existing(state, timeout_seconds=3):
 async def cmd_send(args):
     state = read_state(args.state_file)
     marker = new_marker()
-    prompt = f"{marker}\n{read_prompt(args)}"
+    message = read_prompt(args)
+    prompt = f"{marker}\n{message}"
 
     client = await connect_existing(state)
     try:
@@ -560,6 +601,13 @@ async def cmd_send(args):
     finally:
         await client.__aexit__(None, None, None)
 
+    log_message(
+        state,
+        "coordinator",
+        message,
+        log=args.machine_log,
+        ticket=args.ticket,
+    )
     state["marker"] = marker
     state["status"] = "busy"
     state["turnStatus"] = None
@@ -610,6 +658,7 @@ async def cmd_watch(args):
         actionable = False
         for path in state_files:
             state = read_state(path)
+            previous_status = state.get("status")
             try:
                 status, turn_status, message = await evaluate_session(state)
                 failures[path] = 0
@@ -622,6 +671,8 @@ async def cmd_watch(args):
                     ) from error
                 status, turn_status, message = "busy", None, None
             if status != state.get("status") or turn_status != state.get("turnStatus"):
+                if previous_status == "busy" and status == "idle" and message:
+                    log_message(state, "child", message)
                 state["status"] = status
                 state["turnStatus"] = turn_status
                 state["finalMessage"] = message
@@ -668,6 +719,14 @@ def add_prompt_arguments(parser):
     group.add_argument("--prompt-file")
 
 
+def add_log_arguments(parser):
+    parser.add_argument(
+        "--machine-log",
+        help="the run's machine log, when logging is enabled",
+    )
+    parser.add_argument("--ticket", help="the ticket this bridge session serves")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -684,12 +743,14 @@ def build_parser():
     launch.add_argument("--approval", default="never")
     launch.add_argument("--model")
     launch.add_argument("--effort")
+    add_log_arguments(launch)
     launch.add_argument("--startup-timeout", type=float,
                         default=DEFAULT_STARTUP_TIMEOUT_SECONDS)
     add_prompt_arguments(launch)
 
     send = commands.add_parser("send", help="Send a follow-up turn to a session")
     send.add_argument("--state-file", required=True)
+    add_log_arguments(send)
     add_prompt_arguments(send)
 
     watch = commands.add_parser(
