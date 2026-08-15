@@ -389,6 +389,57 @@ class GreenWaveTests(AdvanceTestCase):
         self.assertEqual(self.fixture.launches(), [])
 
 
+class ParkedAdvanceTests(AdvanceTestCase):
+    """A parked ticket only stops the chain when the table has descendants to block."""
+
+    def test_a_parked_ticket_with_no_descendants_is_settled_for_advancement(self):
+        self.fixture.settled_ticket("08", "monitor-dashboard")
+        self.fixture.settled_ticket("09", "merge-driver", verdict="parked")
+
+        result = self.fixture.advance(2)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        event = self.assertOneDecision(3, "launched")
+        detail = event.get("detail", "")
+        self.assertIn("09", detail)
+        self.assertIn("parked", detail)
+        self.assertIn("settled", detail)
+        self.assertIn("passed over as settled", result.stdout)
+        launched = sorted(
+            pathlib.Path(launch["cwd"]).name for launch in self.fixture.launches()
+        )
+        self.assertEqual(launched, ["11-skill-body"])
+
+    def test_a_last_wave_with_only_a_parked_ticket_records_completion(self):
+        self.fixture.settled_ticket("11", "skill-body", verdict="parked")
+
+        result = self.fixture.advance(3)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        event = self.assertOneDecision(3, "complete")
+        detail = event.get("detail", "")
+        self.assertIn("11", detail)
+        self.assertIn("parked", detail)
+        self.assertIn("settled", detail)
+        self.assertEqual(self.fixture.launches(), [])
+
+    def test_a_parked_ticket_without_descendants_is_not_an_escalation_root(self):
+        self.fixture.settled_ticket("08", "monitor-dashboard", verdict="failed")
+        self.fixture.settled_ticket("09", "merge-driver", verdict="parked")
+
+        result = self.fixture.advance(2)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        event = self.assertOneDecision(2, "escalated")
+        detail = event.get("detail", "")
+        self.assertIn("08", detail)
+        self.assertIn("failed", detail)
+        self.assertIn("09", detail)
+        self.assertIn("passed over as settled", detail)
+        blocked = sorted(record["ticket"] for record in self.fixture.records("outcome"))
+        self.assertEqual(blocked, ["11"])
+
+
 class HaltingTests(AdvanceTestCase):
     """A failure or an escalation stops the chain and wakes nobody twice."""
 
@@ -457,8 +508,10 @@ class BlockedDescendantTests(AdvanceTestCase):
         self.fixture.settled_ticket("06", "dispatch-renderer", verdict="parked")
         self.fixture.settled_ticket("07", "machine-log")
 
-        self.fixture.advance(1)
+        result = self.fixture.advance(1)
 
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertOneDecision(1, "escalated")
         blocked = sorted(record["ticket"] for record in self.fixture.records("outcome"))
         self.assertEqual(blocked, ["08", "11"])
 
