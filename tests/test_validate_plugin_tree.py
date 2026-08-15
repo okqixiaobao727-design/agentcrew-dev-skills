@@ -551,6 +551,19 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.edit_config('surface = "window"', 'surface = "popup"')
         self.assert_rejects("popup")
 
+    def test_shipped_defaults_without_a_repair_model_are_rejected(self):
+        """The repair rung has no default: the file every project inherits has to answer it."""
+        self.tree.edit_config('[repair]\nmodel = "claude-sonnet-5"\n', "")
+        self.assert_rejects("repair")
+
+    def test_an_aliased_repair_model_is_rejected(self):
+        self.tree.edit_config('model = "claude-sonnet-5"', 'model = "sonnet"')
+        self.assert_rejects("alias")
+
+    def test_shipped_defaults_without_a_tracker_are_rejected(self):
+        self.tree.edit_config('[tracker]\nkind = "local"\n', "")
+        self.assert_rejects("tracker")
+
 
 class ProjectConfigTests(unittest.TestCase):
     """`--config`: the file the setup wizard writes at a project root."""
@@ -627,6 +640,18 @@ class ProjectConfigTests(unittest.TestCase):
 
     def test_an_unknown_dashboard_field_is_rejected(self):
         self.assert_rejects('[dashboard]\nposition = "top"\n', "position")
+
+    def test_a_project_naming_its_own_repair_model_is_accepted(self):
+        self.assert_accepts('[repair]\nmodel = "claude-haiku-5"\n')
+
+    def test_a_project_naming_an_aliased_repair_model_is_rejected(self):
+        self.assert_rejects('[repair]\nmodel = "haiku"\n', "alias")
+
+    def test_a_project_naming_a_tracker_that_is_not_exercised_is_rejected(self):
+        self.assert_rejects('[tracker]\nkind = "jira"\n', "jira")
+
+    def test_an_unknown_tracker_field_is_rejected(self):
+        self.assert_rejects('[tracker]\nrepo = "owner/name"\n', "repo")
 
     def test_a_hook_env_holding_a_non_string_value_is_rejected(self):
         self.assert_rejects("[hooks.on-child-launch.env]\nPORT = 123\n", "PORT")

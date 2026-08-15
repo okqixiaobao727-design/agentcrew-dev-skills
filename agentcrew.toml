@@ -129,3 +129,18 @@ effort = "medium"
 command = ""
 
 [hooks.on-child-launch.env]
+
+# --- Merge repair -----------------------------------------------------------
+# The model the merge ladder's repair rung runs on, cheap on purpose: a mechanical conflict is
+# repaired here rather than on the coordinator's model. A full model ID, never an alias, and no
+# default — a missing or aliased value stops the run in preflight.
+
+[repair]
+model = "claude-sonnet-5"
+
+# --- Issue tracker ----------------------------------------------------------
+# Which tracker this repo's runs close merged tickets in: `github` or `local`. This repo keeps its
+# tickets as markdown files under `features/<feature>/tickets/`, so its close is a `Status:` line.
+
+[tracker]
+kind = "local"
