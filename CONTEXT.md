@@ -98,6 +98,12 @@ driver process that launched it, so a lost handle is recovered rather than repla
 a second review of one diff is the failure recovery exists to prevent.
 _Avoid_: retry, restart
 
+**Vendored Copy**:
+A file this repo ships but does not own — today only the review bridge, pinned to one
+Review-Switch commit by `scripts/sync-bridge.sh` and held to that pin by CI. A change to it
+is made upstream and arrives by moving the pin, never by editing the copy (ADR-0009).
+_Avoid_: fork, local copy (both imply it may be edited here)
+
 **Mode-gated reference**:
 A reference file only one mode of a skill loads, via an explicit Read instruction in the
 body — e.g. the to-tickets+route handoff that route-only `/route` runs never see. Disclosure
