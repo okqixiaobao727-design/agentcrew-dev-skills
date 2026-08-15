@@ -559,6 +559,7 @@ def build_rows(waves, records, moment, sources):
                 else:
                     state, anomaly, status = live_state(launch, sources)
                     end = moment
+            escalation_count = sum(record.get("event") == ESCALATION_EVENT for record in events)
             rows.append({
                 "wave": number,
                 "ticket": ticket,
@@ -573,7 +574,7 @@ def build_rows(waves, records, moment, sources):
                 "started": started,
                 "launched": launch is not None,
                 "settled": settling is not None,
-                "escalated": any(record.get("event") == ESCALATION_EVENT for record in events),
+                "escalation_count": escalation_count,
                 "annotations": annotations(events, state, anomaly, moment),
             })
     return rows
@@ -738,8 +739,11 @@ def toasts(rows):
                 ))
             elif row["state"] == VANISHED:
                 said.append((f"vanished:{ticket}", f"crew {ticket} vanished"))
-        if row["escalated"]:
-            said.append((f"escalated:{ticket}", f"crew {ticket} escalated"))
+        for occurrence in range(row["escalation_count"]):
+            # Keep the original key for the first occurrence so an existing run's toast state
+            # remains valid; later occurrences extend it with their ordinal in the append-only log.
+            suffix = "" if occurrence == 0 else f":{occurrence}"
+            said.append((f"escalated:{ticket}{suffix}", f"crew {ticket} escalated"))
         waves.setdefault(row["wave"], []).append(row)
     for wave, members in waves.items():
         # A wave nobody has launched into is not a wave that finished.

@@ -243,6 +243,19 @@ class EventTests(MachineLogTestCase):
         # A decision is about a wave, so it carries no ticket at all.
         self.assertNotIn("ticket", entry)
 
+    def test_a_monitor_error_records_the_monitor_and_its_reason(self):
+        result = run_cli(
+            "monitor-error", "--monitor", "monitor-wave.sh",
+            "--reason", "claude agents --json failed", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "monitor-error")
+        self.assertEqual(entry["monitor"], "monitor-wave.sh")
+        self.assertEqual(entry["reason"], "claude agents --json failed")
+
     def test_a_session_cost_records_the_usage_one_child_spent(self):
         result = run_cli(
             "session-cost",
