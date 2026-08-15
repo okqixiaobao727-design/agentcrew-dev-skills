@@ -38,24 +38,47 @@ cell whose executor, model, or effort disagrees, plus the hook command when it i
 two outcomes: keep the file as it stands, or replace it wholesale with the shipped defaults. Keep
 it unless the user explicitly chooses replacement.
 
-**Done when** `agentcrew.toml` exists at the target repo root, holding either a fresh copy of the
-shipped defaults or the content the user chose to keep.
+**A missing section is not a declined override.** Every cell here is inheritable — a project that
+leaves one out gets the shipped default, which is why a trimmed file is sound. Two keys are
+**uninheritable**: `[repair] model` and `[tracker] kind`, which the driver reads from the project's
+own file and nowhere else. A config written before they existed carries neither, so keeping it as
+it stands is what stops that repo's next run in preflight. Name each absent one as a hole rather
+than a difference, and append it from the shipped defaults, leaving every edit above it as it was.
 
-## 3. Validate what you wrote
+**Done when** `agentcrew.toml` exists at the target repo root, holding either a fresh copy of the
+shipped defaults or the content the user chose to keep, and carrying both uninheritable keys.
+
+## 3. Settle `[tracker] kind`
+
+The one value the shipped defaults cannot ship correct: it is this repo's own convention, and what
+you copied carries a placeholder. A wrong tracker does not fail — the run closes its merged tickets
+in the wrong place, quietly.
+
+Read what step 1 settled, `docs/agents/issue-tracker.md`, and name the kind it describes:
+`"github"` where a ticket is a GitHub issue reached through the `gh` CLI, `"local"` where a ticket
+is a markdown file whose `Status:` line carries what a label carries on github. State the
+document's answer and the value it makes, ask the user to confirm, and write what they confirm.
+Where the document is missing — declined in step 1 — ask them outright which of the two their
+tickets live in, saying that `/crew` closes every merged ticket through their answer.
+
+**Done when** `[tracker] kind` names the tracker the user confirmed.
+
+## 4. Validate what you wrote
 
 ```bash
 python3 <plugin-dir>/scripts/validate_plugin_tree.py --config agentcrew.toml
 ```
 
 It prints one line per problem and exits non-zero. Fix each line in `agentcrew.toml`, then run it
-again. A case the file leaves out is sound, not a problem: the shipped defaults answer every case,
-so a project file only has to carry the cells it overrides.
+again. A *cell* the file leaves out is sound, not a problem: the shipped defaults answer every
+case, so a project file only has to carry the cells it overrides. A missing uninheritable key is a
+problem, and this command reports it in the words the run's preflight would use.
 
 **Done when** the command exits 0.
 
 Then tell the user the config's path and that every cell in it is theirs to edit per repo.
 
-## 4. Offer the pin
+## 5. Offer the pin
 
 **The pin** draws a run's frame into the operator's own Claude Code statusline, so the run and the
 coordinator's prompt are on screen at once —

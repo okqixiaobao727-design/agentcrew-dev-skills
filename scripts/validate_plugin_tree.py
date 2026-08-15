@@ -3,6 +3,8 @@
 
 With `--config PATH`, validate one project config file instead of a tree: the same table shape,
 with every cell optional, because a project file overrides the cells it names and inherits the rest.
+Two keys are not optional there — `[repair] model` and `[tracker] kind`, which the driver reads
+from the project file alone — so this agrees with what a run's preflight will say.
 
 Exits 0 when what was checked is sound, 1 when it is not, printing one line per problem.
 """
@@ -293,7 +295,8 @@ def check_config_text(text, label, complete, aliases, problems):
     """The config in `text`: every cell answered when `complete`, else only the cells it overrides.
 
     The shipped defaults answer every case, which is what lets a project file inherit the cells it
-    leaves out.
+    leaves out. `[repair]` and `[tracker]` are outside that bargain — nothing inherits them — so
+    they are required either way.
     """
     try:
         config = tomllib.loads(text)
@@ -321,24 +324,32 @@ def check_config_text(text, label, complete, aliases, problems):
 
     check_hook(config, label, complete, problems)
     check_dashboard(config, label, complete, problems)
-    check_repair(config, label, complete, aliases, problems)
-    check_tracker(config, label, complete, problems)
+    # Not governed by `complete`: neither of these is inheritable, so both are required of every
+    # config this validates, the shipped defaults and a project file alike.
+    check_repair(config, label, aliases, problems)
+    check_tracker(config, label, problems)
 
 
-def check_repair(config, label, complete, aliases, problems):
-    """The repair rung's model, which is a full model ID on the same rule every cell above is."""
+def check_repair(config, label, aliases, problems):
+    """The repair rung's model, which is a full model ID on the same rule every cell above is.
+
+    Required of a project file too. A model cell left out is inherited from the shipped defaults,
+    but the driver reads this key from the project's own `agentcrew.toml` and nowhere else — no
+    default is exactly the point (ADR-0010) — so a file that omits it is a file the run stops on.
+    """
     repair = config.get(REPAIR)
     if repair is None:
-        if complete:
-            problems.append(f"{label}: missing [{REPAIR}]")
+        problems.append(
+            f"{label}: missing [{REPAIR}] — the merge ladder's repair rung has no model to run on,"
+            f" and this key is never inherited from the shipped defaults"
+        )
         return
     if not isinstance(repair, dict):
         problems.append(f"{label}: [{REPAIR}] must be a table with a {REPAIR_MODEL}")
         return
     model = repair.get(REPAIR_MODEL)
     if model is None:
-        if complete:
-            problems.append(f"{label}: [{REPAIR}] needs a {REPAIR_MODEL}, a full model ID")
+        problems.append(f"{label}: [{REPAIR}] needs a {REPAIR_MODEL}, a full model ID")
     elif not isinstance(model, str) or not model.strip():
         problems.append(f"{label}: [{REPAIR}] needs a non-empty {REPAIR_MODEL}")
     elif is_alias(model, aliases):
@@ -349,20 +360,25 @@ def check_repair(config, label, complete, aliases, problems):
         problems.append(f"{label}: [{REPAIR}] carries an unknown field {field!r}")
 
 
-def check_tracker(config, label, complete, problems):
-    """The tracker a merged ticket is closed in, which is one of the two that are exercised."""
+def check_tracker(config, label, problems):
+    """The tracker a merged ticket is closed in, which is one of the two that are exercised.
+
+    Required of a project file for the same reason `[repair]` is: the driver reads it from the
+    project's own `agentcrew.toml` alone, so a file that omits it stops the run in preflight.
+    """
     tracker = config.get(TRACKER)
     if tracker is None:
-        if complete:
-            problems.append(f"{label}: missing [{TRACKER}]")
+        problems.append(
+            f"{label}: missing [{TRACKER}] — a merged ticket has nowhere to be closed, and this"
+            f" key is never inherited from the shipped defaults"
+        )
         return
     if not isinstance(tracker, dict):
         problems.append(f"{label}: [{TRACKER}] must be a table with a {TRACKER_KIND}")
         return
     kind = tracker.get(TRACKER_KIND)
     if kind is None:
-        if complete:
-            problems.append(f"{label}: [{TRACKER}] needs a {TRACKER_KIND}, one of {TRACKERS}")
+        problems.append(f"{label}: [{TRACKER}] needs a {TRACKER_KIND}, one of {TRACKERS}")
     elif kind not in TRACKERS:
         problems.append(
             f"{label}: [{TRACKER}] {TRACKER_KIND} {kind!r} is not one of {TRACKERS}"
@@ -418,7 +434,8 @@ def check_hook(config, label, complete, problems):
 
 
 def validate_project_config(path):
-    """Every problem in one project config file, whose cells are all optional overrides."""
+    """Every problem in one project config file: its cells are optional overrides, its two
+    uninheritable keys — `[repair] model` and `[tracker] kind` — are not."""
     problems = []
     label = path.name
     try:

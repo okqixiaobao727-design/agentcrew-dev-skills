@@ -147,8 +147,12 @@ surface = "window"
 # this model under a hard budget cap before anything reaches the coordinator
 # (`docs/adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md`). Pick a cheap model:
 # the rung exists to keep mechanical work off the expensive one. A full model ID, never an alias,
-# on the same rule every other model value here follows, and no default — a run whose config names
-# no repair model stops in preflight rather than repairing on a model nobody chose.
+# on the same rule every other model value here follows.
+#
+# Unlike every cell above it, this key is not inherited. A project file that leaves out a model
+# cell gets this file's answer; a project file that leaves out this key gets nothing, and its run
+# stops in preflight rather than repairing on a model nobody chose. The value below is what the
+# setup wizard copies into your `agentcrew.toml`, not a fallback your run reads from here.
 
 [repair]
 model = "claude-sonnet-5"
@@ -159,6 +163,12 @@ model = "claude-sonnet-5"
 # is an issue reached through the `gh` CLI, and `local`, where a ticket is a markdown file in the
 # repo whose `Status:` line carries what a label carries on github. Anything else stops the run in
 # preflight rather than guessing a CLI.
+#
+# Not inherited either, and the one value in this file that cannot be shipped correct: it is your
+# repo's convention, the one `docs/agents/issue-tracker.md` states, and no file here can know it.
+# The value below is a placeholder the setup wizard settles against that document and confirms with
+# you. If you copied this file by hand, this is the line to check before your first run — a wrong
+# tracker does not fail, it closes your tickets in the wrong place.
 
 [tracker]
 kind = "local"

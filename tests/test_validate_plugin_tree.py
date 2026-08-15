@@ -568,6 +568,10 @@ class ValidatePluginTreeTests(unittest.TestCase):
 class ProjectConfigTests(unittest.TestCase):
     """`--config`: the file the setup wizard writes at a project root."""
 
+    # The two keys nothing inherits, so every project file has to carry them. Each case below adds
+    # them to the fragment it is really about, which is what leaves the fragment as its own cause.
+    REQUIRED = '[repair]\nmodel = "claude-sonnet-5"\n[tracker]\nkind = "local"\n'
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -590,71 +594,98 @@ class ProjectConfigTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(mentioning, result.stdout + result.stderr)
 
+    def assert_accepts_with_required(self, text):
+        self.assert_accepts(text + self.REQUIRED)
+
+    def assert_rejects_with_required(self, text, mentioning):
+        self.assert_rejects(text + self.REQUIRED, mentioning)
+
     def test_the_shipped_defaults_are_accepted_verbatim(self):
         self.assert_accepts((PLUGIN_ROOT / CONFIG).read_text())
 
     def test_a_single_overridden_cell_is_accepted(self):
-        self.assert_accepts(
+        self.assert_accepts_with_required(
             '[implementer.direct.any]\nexecutor = "codex"\nmodel = "gpt-5.6-sol"\neffort = "high"\n'
         )
 
-    def test_an_empty_file_is_accepted(self):
-        self.assert_accepts("")
+    def test_a_file_carrying_only_the_uninheritable_keys_is_accepted(self):
+        """Overriding nothing is still a complete project file: every cell is inherited."""
+        self.assert_accepts(self.REQUIRED)
+
+    def test_an_empty_file_is_rejected(self):
+        """It inherits every cell, but there is no repair model and no tracker to inherit, so the
+        run it belongs to would stop in preflight. Saying so here is the whole point of `--config`.
+        """
+        self.assert_rejects("", "repair")
+
+    def test_a_file_without_a_repair_model_is_rejected(self):
+        self.assert_rejects('[tracker]\nkind = "local"\n', "repair")
+
+    def test_a_file_without_a_tracker_is_rejected(self):
+        self.assert_rejects('[repair]\nmodel = "claude-sonnet-5"\n', "tracker")
+
+    def test_the_missing_key_verdicts_say_that_nothing_inherits_them(self):
+        """The line has to answer the question it raises: why the shipped defaults do not cover it."""
+        result = self.check("")
+        self.assertIn("never inherited", result.stdout + result.stderr)
 
     def test_an_overridden_cell_missing_a_field_is_rejected(self):
-        self.assert_rejects(
+        self.assert_rejects_with_required(
             '[implementer.direct.any]\nexecutor = "claude"\nmodel = "claude-opus-5"\n', "effort"
         )
 
     def test_an_overridden_cell_with_an_alias_model_is_rejected(self):
-        self.assert_rejects(
+        self.assert_rejects_with_required(
             '[implementer.direct.any]\nexecutor = "claude"\nmodel = "opus"\neffort = "medium"\n',
             "alias",
         )
 
     def test_an_overridden_cell_with_a_versioned_alias_is_rejected(self):
         """Not every alias is a bare word: a versioned name the vendor routes onward is one too."""
-        self.assert_rejects(
+        self.assert_rejects_with_required(
             '[implementer.direct.any]\nexecutor = "codex"\nmodel = "gpt-5.6"\neffort = "max"\n',
             "alias",
         )
 
     def test_an_overridden_cell_with_a_context_suffixed_full_id_is_accepted(self):
         """The suffix on a full ID is part of the ID, and the launch chain carries it."""
-        self.assert_accepts(
+        self.assert_accepts_with_required(
             '[implementer.direct.any]\nexecutor = "claude"\nmodel = "claude-opus-5[1m]"\n'
             'effort = "medium"\n'
         )
 
     def test_an_unknown_executor_is_rejected(self):
-        self.assert_rejects('[reviewer.core-complex]\nexecutor = "gemini"\n', "gemini")
+        self.assert_rejects_with_required('[reviewer.core-complex]\nexecutor = "gemini"\n', "gemini")
 
     def test_an_unknown_case_is_rejected(self):
-        self.assert_rejects("[reviewer.core-tricky]\n", "core-tricky")
+        self.assert_rejects_with_required("[reviewer.core-tricky]\n", "core-tricky")
 
     def test_a_project_choosing_another_surface_is_accepted(self):
-        self.assert_accepts('[dashboard]\nsurface = "both"\n')
+        self.assert_accepts_with_required('[dashboard]\nsurface = "both"\n')
 
     def test_a_project_choosing_a_surface_that_is_not_one_is_rejected(self):
-        self.assert_rejects('[dashboard]\nsurface = "popup"\n', "popup")
+        self.assert_rejects_with_required('[dashboard]\nsurface = "popup"\n', "popup")
 
     def test_an_unknown_dashboard_field_is_rejected(self):
-        self.assert_rejects('[dashboard]\nposition = "top"\n', "position")
+        self.assert_rejects_with_required('[dashboard]\nposition = "top"\n', "position")
 
     def test_a_project_naming_its_own_repair_model_is_accepted(self):
-        self.assert_accepts('[repair]\nmodel = "claude-haiku-5"\n')
+        self.assert_accepts('[repair]\nmodel = "claude-haiku-5"\n[tracker]\nkind = "github"\n')
 
     def test_a_project_naming_an_aliased_repair_model_is_rejected(self):
-        self.assert_rejects('[repair]\nmodel = "haiku"\n', "alias")
+        self.assert_rejects('[repair]\nmodel = "haiku"\n[tracker]\nkind = "local"\n', "alias")
 
     def test_a_project_naming_a_tracker_that_is_not_exercised_is_rejected(self):
-        self.assert_rejects('[tracker]\nkind = "jira"\n', "jira")
+        self.assert_rejects('[repair]\nmodel = "claude-sonnet-5"\n[tracker]\nkind = "jira"\n', "jira")
 
     def test_an_unknown_tracker_field_is_rejected(self):
-        self.assert_rejects('[tracker]\nrepo = "owner/name"\n', "repo")
+        self.assert_rejects(
+            '[repair]\nmodel = "claude-sonnet-5"\n[tracker]\nkind = "local"\nrepo = "owner/name"\n',
+            "repo",
+        )
 
     def test_a_hook_env_holding_a_non_string_value_is_rejected(self):
-        self.assert_rejects("[hooks.on-child-launch.env]\nPORT = 123\n", "PORT")
+        self.assert_rejects_with_required("[hooks.on-child-launch.env]\nPORT = 123\n", "PORT")
 
     def test_unparsable_toml_is_rejected(self):
         self.assert_rejects("[implementer.direct.any\n", "unparsable")
