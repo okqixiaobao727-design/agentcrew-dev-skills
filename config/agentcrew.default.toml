@@ -140,3 +140,25 @@ command = ""
 
 [dashboard]
 surface = "window"
+
+# --- Merge repair -----------------------------------------------------------
+# The model the merge ladder's repair rung runs on. A mechanical merge conflict — two children
+# editing the same region, neither rewriting the other's work — is handed to a headless session on
+# this model under a hard budget cap before anything reaches the coordinator
+# (`docs/adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md`). Pick a cheap model:
+# the rung exists to keep mechanical work off the expensive one. A full model ID, never an alias,
+# on the same rule every other model value here follows, and no default — a run whose config names
+# no repair model stops in preflight rather than repairing on a model nobody chose.
+
+[repair]
+model = "claude-sonnet-5"
+
+# --- Issue tracker ----------------------------------------------------------
+# Which tracker a run closes its merged tickets in, and so which close operation and which undo it
+# records (`references/trackers.md`). Two values are exercised end to end: `github`, where a ticket
+# is an issue reached through the `gh` CLI, and `local`, where a ticket is a markdown file in the
+# repo whose `Status:` line carries what a label carries on github. Anything else stops the run in
+# preflight rather than guessing a CLI.
+
+[tracker]
+kind = "local"

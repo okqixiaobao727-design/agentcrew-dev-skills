@@ -2,13 +2,14 @@
 """The crew driver: the one command a run is started by, and the state machine it runs on.
 
     start   preflight the run, build and validate its wave table, prepare the branch and the run
-            directory, dispatch wave 1, start the dashboard, and arm the wake monitors
+            directory, dispatch wave 1, start the dashboard, and run the wave loop to its end
     clear   inventory one recorded run, ask the operator, and remove its recorded artefacts
+    resume  put that loop back where a ruling stopped it
 
 The driver runs as a background task of the coordinator's own session, so it costs that session no
 turn while it works and its exit is what wakes it (ADR-0001). Two contracts follow from that and
-are the whole of what a woken coordinator reads; the tickets that build the wave loop and the
-wind-down on top of this module couple to them rather than to anything inside it.
+are the whole of what a woken coordinator reads; the tickets that build the wind-down on top of
+this module couple to them rather than to anything inside it.
 
 **Stdout is at most one line per lifecycle event.** A successful launch prints one line naming the
 run directory. Every exit that wakes the coordinator prints its **wake snapshot** instead: one JSON
@@ -22,22 +23,43 @@ object, the last thing on stdout, carrying
 A snapshot on stdout is the one channel that reaches the woken coordinator without it opening a
 run file, which is what keeps the oracle boundary intact; `monitor-wave.sh` and the Codex bridge's
 `watch` already exit this way. A launched wave is not a wake reason: the driver prints its one
-launch line and exits 0, and the loop that ends in one of the four reasons belongs to the wave
-loop built on this module.
+launch line and goes on working, and only one of the four reasons ends it.
 
 The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle event:
 it prints a multi-line inventory, asks for confirmation, and reports errors directly instead of
 emitting a wake snapshot.
 
-**A preflight failure never reaches the coordinator as diagnosis.** Preflight is exactly four
-read-only checks — a clean working tree, a base branch that resolves and fast-forwards, a valid
-routing on every ticket (the renderer's own validation, which is the authority on the case list),
-and a complete acyclic dependency graph. On any failure the driver launches nothing, prints the
-`preflight-failed` snapshot naming the problem count and the display surface, and shows the full
-problem list to the operator in a detached tmux window named `crew-preflight` in the run's own
-session, ending with the reminder that fixes must be committed. That notice is the run's only
-diagnosis surface: it is killed by name, in that session alone, at the start of the next run, so a
-stale notice can never outlive its fix.
+**A preflight failure never reaches the coordinator as diagnosis.** Preflight is the four read-only
+checks — a clean working tree, a base branch that resolves and fast-forwards, a valid routing on
+every ticket (the renderer's own validation, which is the authority on the case list), and a
+complete acyclic dependency graph — plus the run's two configured decisions, the repair rung's
+model and the tracker its merged tickets are closed in, neither of which has a default. On any
+failure the driver launches nothing, prints the `preflight-failed` snapshot naming the problem
+count and the display surface, and shows the full problem list to the operator in a detached tmux
+window named `crew-preflight` in the run's own session, ending with the reminder that fixes must be
+committed. That notice is the run's only diagnosis surface: it is killed by name, in that session
+alone, at the start of the next run, so a stale notice can never outlive its fix.
+
+**The wave loop is a rule table, and the rule table is exhaustive.** Between the launch and the
+report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
+and, where it holds, settled in silence; an invalid receipt earns one re-ask and settles failed on
+the second; parked and failed receipts are recorded by the driver rather than by hand; an idle
+child earns one nudge and settles failed on the second silence; a vanished child settles failed; a
+settled wave is advanced, which lands its branches, hands a mechanical conflict to the
+budget-capped repair rung and launches the next wave; a semantic conflict is answered first by a
+templated instruction to the child that has to resolve it; a merged ticket is closed in the run's
+tracker with its exact undo written into the log; and each wave's monitors are re-armed without a
+coordinator turn.
+
+**Exactly three things end the loop at judgment.** A `CREW ASK` of any kind — an assumption
+confirmation included, deliberately not auto-approved; a semantic conflict a child has bounced back
+a second time; and any state the table has no row for, a child at a permission prompt and a monitor
+that failed among them, so the unexpected reaches judgment instead of hanging. Each exits with the
+wake snapshot, which carries the one command that resumes the loop where it left off.
+
+The loop keeps no state of its own. Every count it acts on is read back out of the machine log each
+time it is needed, which is what makes `resume` the same code path as carrying on and what lets a
+driver that died mid-wave be replaced by another.
 
 Everything the driver does to the repository, the children and the log it does through the existing
 scripts — the dispatch renderer, the machine log, the monitor and its wake monitors, the Codex
@@ -50,6 +72,7 @@ import argparse
 import contextlib
 from dataclasses import dataclass
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -57,6 +80,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 CREW_SKILL_DIR = pathlib.Path(__file__).resolve().parents[2]
@@ -66,6 +90,12 @@ MACHINE_LOG = ASSETS / "machine_log.py"
 MONITOR = ASSETS / "monitor" / "monitor.py"
 MONITOR_WAVE = ASSETS / "monitor-wave.sh"
 CODEX_BRIDGE = ASSETS / "codex" / "codex_bridge.py"
+ADVANCE = ASSETS / "advance.py"
+
+# The renderer owns two rules this module asks rather than restates: what counts as an alias, and
+# what a ticket's branch is called. Advance imports it the same way, from the same place.
+sys.path.insert(0, str(DISPATCH.parent))
+import dispatch  # noqa: E402
 
 # The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
 RUN_DIR_NAME = ".crew"
@@ -85,12 +115,34 @@ NOTICE_REMINDER = (
 
 # The settings file a session's hooks are registered in, relative to the directory it runs in.
 SETTINGS_PATH = pathlib.Path(".claude") / "settings.local.json"
-# The project config the dashboard's surface and the launch hook are read from.
+# The project config the dashboard's surface, the launch hook, and the run's two configured
+# routing decisions are read from.
 CONFIG_NAME = "agentcrew.toml"
 LAUNCH_HOOK_SECTION = ("hooks", "on-child-launch")
+# The repair rung's model and the tracker a merged ticket is closed in. Both are routing decisions
+# and both live in the project's committed config rather than in a launch flag: the only caller
+# left to pass a flag is the coordinator, and a routing decision composed in a model turn is the
+# thing this design deletes. Neither has a default here — a missing one is a preflight failure,
+# which committing the config permanently clears.
+REPAIR_MODEL_KEYS = ("repair", "model")
+TRACKER_KIND_KEYS = ("tracker", "kind")
 
-# The wake reasons. `preflight-failed` and `driver-error` are this module's; the other two belong
-# to the wave loop and the wind-down, and are named here because the snapshot's shape is one.
+# The two trackers `references/trackers.md` declares exercised end to end, and the whole of what a
+# close operation may be asked for: anything else stops the run rather than guessing a CLI.
+TRACKER_GITHUB = "github"
+TRACKER_LOCAL = "local"
+TRACKERS = (TRACKER_GITHUB, TRACKER_LOCAL)
+# A local ticket's status is a `Status:` line in its own file, and the value a finished one carries
+# where the repo's convention document names none.
+STATUS_LINE = re.compile(r"^(\s*(?:[-*]\s+)?)(?:\*\*)?Status(?:\*\*)?\s*:\s*(.*?)\s*$")
+STATUS_FINISHED = "done"
+# The labels a github ticket carries to say who may pick it up; a close takes the one it has off,
+# and the undo puts it back (`references/trackers.md`).
+PICKUP_LABELS = ("ready-for-agent", "ready-for-human")
+GH = "gh"
+
+# The wake reasons, exhaustively: nothing else ends this driver. `run-complete` stays the
+# wind-down's to fill out, and is named here because the snapshot's shape is one.
 PREFLIGHT_FAILED = "preflight-failed"
 JUDGMENT_NEEDED = "judgment-needed"
 DRIVER_ERROR = "driver-error"
@@ -119,6 +171,80 @@ REVIEW_KEY = "review"
 REVIEW_FIELDS = ("vendor", "model", "effort")
 
 CODEX = "codex"
+CLAUDE = "claude"
+
+# --- the rule table's own vocabulary ------------------------------------------------------------
+
+# What a child says, in the grammar its first turn gave it. Only the three settling verbs are read
+# here; `CREW ASK` is read by the log's own writer, which is why an escalation arrives as its own
+# event rather than as a message this has to recognise.
+CHILD_ROLE = "child"
+COORDINATOR_ROLE = "coordinator"
+
+COMPLETE_VERB = "CREW COMPLETE"
+PARKED_VERB = "CREW PARKED"
+FAILED_VERB = "CREW FAILED"
+
+# What the driver says back. Each opens with its own marker, because the marker is how the loop
+# reads its own history out of the log: a rung that has already fired for a ticket is a ruling of
+# that shape standing in the log, which is what makes every count survive a resume.
+RECHECK_MARKER = "CREW RECHECK"
+NUDGE_MARKER = "CREW NUDGE"
+MERGE_MARKER = "CREW MERGE"
+HANDED_OVER_MARKER = "CREW RULED"
+
+HANDED_OVER = (
+    "{marker} {ticket} — this escalation was handed to the coordinator, which is where it is"
+    " answered. An answer sent as tmux keys passes no hook and so reaches no log; this line is"
+    " what the run's report has of it."
+)
+
+RECHECK_TEMPLATE = (
+    "{marker} {ticket} — the receipt you sent did not verify: {problem}. Finish the work in your"
+    " worktree, commit it, and send a new CREW COMPLETE <sha>; if it cannot be finished, send"
+    " CREW FAILED <reason>. This is the one re-ask — a second receipt that does not verify settles"
+    " this ticket failed."
+)
+NUDGE_TEMPLATE = (
+    "{marker} {ticket} — your session is idle and this run holds no receipt from you. Send"
+    " CREW COMPLETE <sha> if the work is committed, CREW PARKED <checklist path> if finishing it"
+    " needs a human, or CREW FAILED <reason>. This is the one nudge — a second idle silence"
+    " settles this ticket failed."
+)
+MERGE_TEMPLATE = (
+    "{marker} {ticket} — your branch {branch} conflicts with {integration} in a way no script can"
+    " resolve: {reason}. Merge {integration} into {branch}, resolve the conflict, re-run the checks"
+    " your workflow asked of you, commit, and send a new CREW COMPLETE <sha>. If this is a design"
+    " disagreement you cannot settle alone, send CREW ASK instead."
+)
+
+# The verdicts and events the loop reads back out of the log. The writer owns their spelling.
+LANDABLE = "landable"
+PARKED = "parked"
+FAILED = "failed"
+COMPLETED = "completed"
+LAUNCHED = "launched"
+COMPLETE = "complete"
+LANDED_RESULTS = ("clean", "repaired")
+ESCALATED = "escalated"
+SEMANTIC_PREFIX = "semantic: "
+
+# What a wake monitor says a child is doing. `busy` is the only one the loop lets stand.
+STATUS_BUSY = "busy"
+STATUS_IDLE = "idle"
+STATUS_WAITING = "waiting"
+STATUS_VANISHED = "vanished"
+STATUS_PARKED = "parked"
+
+# How often the loop asks the log what has happened, and how long it waits for anything at all
+# before a run that is going nowhere becomes a wake rather than a hang.
+DEFAULT_POLL_SECONDS = 5.0
+DEFAULT_TIMEOUT_SECONDS = 7200.0
+# How long a monitor asked to stop is given before it is killed.
+MONITOR_STOP_SECONDS = 5.0
+
+ADVANCE_ESCALATED_EXIT = 1
+ADVANCE_INTERRUPTED_EXIT = 130
 
 
 class DriverError(Exception):
@@ -143,14 +269,34 @@ class ClearPlan:
     dashboard_window: str | None
 
 
+class Wake(Exception):
+    """A state the rule table settles by handing it to judgment; the loop exits on it.
+
+    Exactly three raise it: a CREW ASK of any kind, a semantic conflict a child has bounced back a
+    second time, and a state the table has no row for. Everything else the loop settles itself.
+    """
+
+    def __init__(self, reason, ticket=None, pointer=None, **fields):
+        super().__init__(reason)
+        self.reason = reason
+        self.ticket = ticket
+        self.pointer = pointer
+        self.fields = fields
+
+
 # --- the wake snapshot ----------------------------------------------------------------------
 
 
 def snapshot(reason, ticket=None, pointer=None, **fields):
-    """Print the run's wake snapshot: the one JSON object a woken coordinator reads."""
+    """Print the run's wake snapshot: the one JSON object a woken coordinator reads.
+
+    Flushed as it is written, like every other line this driver puts on that channel: stdout is a
+    pipe here, and a lifecycle line held in a buffer until the process ends is not one line per
+    lifecycle event.
+    """
     record = {"reason": reason, "ticket": ticket, "pointer": pointer}
     record.update(fields)
-    print(json.dumps(record, ensure_ascii=False))
+    print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
 # --- git ----------------------------------------------------------------------------------
@@ -381,6 +527,50 @@ def routing_problems(tickets, run, launch_dir):
     return [line for line in result.stderr.splitlines() if line.strip()]
 
 
+def config_problems(repo, run):
+    """Whether the run's two configured decisions are there and are values a run can act on.
+
+    Neither carries a default. A repair model compiled into this script would be a routing decision
+    nobody chose, and a tracker guessed from a name would reach a CLI nobody named; both are
+    exactly the failure a single committed config line clears for good.
+    """
+    problems = []
+    config = repo / CONFIG_NAME
+    model = run.get("repair_model")
+    if not isinstance(model, str) or not model.strip():
+        problems.append(
+            f"repair model: {config} names no [repair] model — the merge ladder's repair rung has"
+            " no model to run on, and it takes a full model ID, never an alias"
+        )
+    else:
+        fault = alias_problem(model)
+        if fault:
+            problems.append(f"repair model: {fault}")
+    kind = run.get("tracker")
+    if not isinstance(kind, str) or not kind.strip():
+        problems.append(
+            f"tracker: {config} names no [tracker] kind — a merged ticket has nowhere to be"
+            f" closed; it is one of {', '.join(TRACKERS)}"
+        )
+    elif kind not in TRACKERS:
+        problems.append(
+            f"tracker: `{kind}` is not a tracker this run closes tickets in — it is one of"
+            f" {', '.join(TRACKERS)}, the two `references/trackers.md` declares exercised"
+        )
+    return problems
+
+
+def alias_problem(model):
+    """Why that model value is an alias rather than a full ID, asked of the renderer's own rule.
+
+    The repair rung's model is refused on the same rule as every routed model, from the same code:
+    an alias was measured to resolve to a different model than the one named (ADR-0003), and a
+    ladder that repairs on a model nobody chose is the routing this run exists to enforce, missed.
+    """
+    aliases = {alias.lower() for alias in dispatch.load_templates()["models"]["aliases"]}
+    return dispatch.alias_problem("`[repair] model`", model, aliases)
+
+
 def graph_problems(tickets):
     """Whether every blocker exists in the feature and whether the graph is acyclic."""
     problems = []
@@ -519,22 +709,33 @@ def repository_root(feature_dir, given):
     return pathlib.Path(root).resolve()
 
 
-def launch_hook(repo):
-    """The project's `[hooks.on-child-launch]`, or nothing where it declares none."""
+def project_config(repo):
+    """The project's `agentcrew.toml`, or an empty document where the repo carries none."""
     config = repo / CONFIG_NAME
     if not config.exists():
-        return None
+        return {}
     try:
-        parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+        return tomllib.loads(config.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise DriverError(f"{config} is unreadable: {error}") from error
-    section = parsed
-    for key in LAUNCH_HOOK_SECTION:
+
+
+def config_value(config, keys):
+    """The value that path of keys reaches in the config, or None where it reaches nothing."""
+    section = config
+    for key in keys:
         section = section.get(key) if isinstance(section, dict) else None
+    return section
+
+
+def launch_hook(config):
+    """The project's `[hooks.on-child-launch]`, or nothing where it declares none."""
+    section = config_value(config, LAUNCH_HOOK_SECTION)
     return section if isinstance(section, dict) and section else None
 
 
-def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit):
+def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit,
+                config):
     """The table's `run` section: everything about this run that is not a ticket."""
     run = {
         "repo_root": str(repo),
@@ -550,12 +751,17 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
         "base_branch": base_branch,
         "return_branch": return_branch,
         "feature_dir": str(feature_dir),
+        # The two configured decisions, recorded as this start resolved them. The loop and every
+        # resume of it read the run's own record rather than the config file, so editing
+        # `agentcrew.toml` mid-run cannot silently retarget a run already under way.
+        "repair_model": config_value(config, REPAIR_MODEL_KEYS),
+        "tracker": config_value(config, TRACKER_KIND_KEYS),
         "codex": {
             "bridge": str(args.codex_bridge or CODEX_BRIDGE),
             "state_dir": str(run_dir / CODEX_DIR_NAME),
         },
     }
-    hook = launch_hook(repo)
+    hook = launch_hook(config)
     if hook:
         run["launch_hook"] = hook
     return run
@@ -647,8 +853,13 @@ def launched_children(log):
 def arm_monitors(run_dir, log, children, bridge):
     """Arm the wake monitors over this wave's live children, Claude and Codex each under theirs.
 
-    Each is a one-shot wake-up that outlives this process: armed while every child under it is
-    busy, exiting with its snapshot as soon as one needs attention.
+    Each is a one-shot wake-up: armed while every child under it is busy, exiting with its snapshot
+    as soon as one needs attention. They are this process's own children now rather than detached
+    watchers — the driver is the loop their exit reports to, so a monitor outliving the driver would
+    be a wake-up nobody is left to read.
+
+    Returns one armed monitor per lane, each carrying the process and the worktree paths it stands
+    over, so the lane a snapshot came from is never guessed from its shape.
     """
     parked_paths = run_dir / PARKED_PATHS_NAME
     parked_paths.touch()
@@ -656,24 +867,37 @@ def arm_monitors(run_dir, log, children, bridge):
         child["worktree"] for child in children
         if child.get("executor") != CODEX and child.get("worktree")
     ]
-    codex_states = [
-        str(run_dir / CODEX_DIR_NAME / f"{child['ticket']}.json")
+    codex_states = {
+        str(run_dir / CODEX_DIR_NAME / f"{child['ticket']}.json"): str(child["ticket"])
         for child in children if child.get("executor") == CODEX
-    ]
+    }
+    armed = []
     if claude_worktrees:
-        spawn([str(MONITOR_WAVE), "--log", str(log), str(parked_paths), *claude_worktrees])
+        armed.append({
+            "lane": CLAUDE,
+            "process": spawn(
+                [str(MONITOR_WAVE), "--log", str(log), str(parked_paths), *claude_worktrees]
+            ),
+        })
     if codex_states:
-        spawn([sys.executable, str(bridge), "watch", *codex_states])
+        armed.append({
+            "lane": CODEX,
+            "tickets": codex_states,
+            "process": spawn([sys.executable, str(bridge), "watch", *codex_states]),
+        })
+    return armed
+
+
+def lane_of(child):
+    """The wake monitor lane a child is watched under, which is the executor it runs on."""
+    return CODEX if child.get("executor") == CODEX else CLAUDE
 
 
 def spawn(arguments):
-    """Start a wake monitor and leave it running; returns nothing.
-
-    Its exit is a wake, not this process's business: the monitor outlives the driver.
-    """
-    subprocess.Popen(
-        arguments,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    """Start a wake monitor with its snapshot on a pipe; returns the process."""
+    return subprocess.Popen(
+        [str(argument) for argument in arguments],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True,
     )
 
@@ -1052,6 +1276,26 @@ def run_clear(args):
     return 0
 
 
+def disarm(monitors):
+    """Take down every armed monitor; returns nothing.
+
+    Called on every way out of the loop. A monitor left polling after the driver has exited holds
+    the run's log open, re-reads an agents list nobody is waiting on, and would report the next
+    driver's children to a pipe that has gone.
+    """
+    for monitor in monitors:
+        process = monitor["process"]
+        if process.poll() is not None:
+            continue
+        with contextlib.suppress(OSError):
+            process.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=MONITOR_STOP_SECONDS)
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.kill()
+
+
 # --- start ------------------------------------------------------------------------------------
 
 
@@ -1071,12 +1315,13 @@ def scratch():
 
 
 def preflight(repo, tickets, base_branch, upstream, run):
-    """The four read-only checks, every problem of every one of them."""
+    """The four read-only checks and the run's two configured values, every problem of every one."""
     problems = dirty_tree_problems(repo)
     problems += base_branch_problems(repo, base_branch, upstream)
     with scratch() as directory:
         problems += routing_problems(tickets, run, directory)
     problems += graph_problems(tickets)
+    problems += config_problems(repo, run)
     return problems
 
 
@@ -1103,7 +1348,8 @@ def run_start(args):
     # The table preflight validates: everything the run section carries but the commit the run has
     # not cut yet, which no routing rule reads.
     head = git_output(repo, "rev-parse", "HEAD")
-    candidate = run_section(args, repo, feature_dir, run_dir, base_branch, head, head)
+    config = project_config(repo)
+    candidate = run_section(args, repo, feature_dir, run_dir, base_branch, head, head, config)
     upstream = upstream_state(repo, base_branch) if base_branch else (UPSTREAM_ABSENT, "")
     problems = preflight(repo, tickets, base_branch, upstream, candidate)
 
@@ -1130,7 +1376,7 @@ def run_start(args):
     launch_dir = run_dir / LAUNCH_DIR_NAME
     log = run_dir / LOG_NAME
     run = run_section(
-        args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit
+        args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit, config
     )
     table = run_dir / TABLE_NAME
     table.write_text(
@@ -1146,9 +1392,8 @@ def run_start(args):
             log, pathlib.Path(child["worktree"]) / SETTINGS_PATH, "child", child["ticket"]
         )
     start_dashboard(args, repo, run_dir)
-    arm_monitors(run_dir, log, children, run["codex"]["bridge"])
-    print(f"crew wave 1 launched, run directory {run_dir}")
-    return 0
+    print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
+    return wave_loop(args, repo, run_dir, table)
 
 
 def dispatch_wave(table, log, launch_dir, run_dir):
@@ -1187,6 +1432,871 @@ def start_dashboard(args, repo, run_dir):
     run_command(arguments, "the dashboard could not be started", pointer=str(run_dir))
 
 
+# --- what the run's log says ---------------------------------------------------------------
+
+# The loop keeps no state of its own between polls, and none at all between runs of this process:
+# every count it acts on — how many times a ticket has been re-asked, whether a nudge has gone out,
+# how often a conflict has been bounced back — is read out of the machine log each time it is
+# needed. That is what makes resuming after a ruling the same code path as carrying on, and what
+# makes a driver that died mid-wave recoverable by starting another one.
+
+
+def read_records(log):
+    """Every record in the run's log, oldest first; a half-written line is skipped.
+
+    A line is skipped rather than raised on because the log is appended to by one hook per child,
+    the monitor and the merge driver at once, and a reader that met a torn line by stopping would
+    turn another writer's timing into this run's failure.
+    """
+    path = pathlib.Path(log)
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def launch_records(records):
+    """{ticket: the last launch the log recorded for it} — its child, worktree, window, executor."""
+    launches = {}
+    for record in records:
+        if record.get("event") == "launch" and record.get("ticket") is not None:
+            launches[str(record["ticket"])] = record
+    return launches
+
+
+def settled_states(records):
+    """{ticket: the word its last settling event settled it into}.
+
+    A receipt's verdict or an outcome, whichever came last; a ticket the log holds neither for is
+    still live and is absent here. The same rule advance settles a wave by, read from the same
+    events, so the loop and the advance it calls can never disagree about what has settled.
+    """
+    states = {}
+    for record in records:
+        if record.get("event") not in ("receipt", "outcome"):
+            continue
+        for key in ("verdict", "outcome"):
+            if record.get(key):
+                states[str(record.get("ticket"))] = str(record[key])
+                break
+    return states
+
+
+def record_ticket(record, launches):
+    """The ticket a record belongs to, through the child it was addressed to where it names none.
+
+    The coordinator's ruling hook is installed for a session rather than for a ticket, so the
+    rulings it copies in carry the child's name and no ticket number. Reading the number back off
+    that name is what lets an answered escalation be told from an unanswered one.
+    """
+    if record.get("ticket") is not None:
+        return str(record["ticket"])
+    recipient = record.get("to")
+    if not isinstance(recipient, str):
+        return None
+    for ticket, launch in launches.items():
+        if launch.get("child") == recipient:
+            return ticket
+    return None
+
+
+def instructions_sent(records, launches, ticket, marker):
+    """How many times the loop has already sent that ticket that rung's instruction.
+
+    Counted off the log, so a rung fires exactly once however many times the driver is restarted.
+    """
+    sent = 0
+    for record in records:
+        if record.get("event") != "ruling":
+            continue
+        message = record.get("message")
+        if not isinstance(message, str) or not message.lstrip().startswith(marker):
+            continue
+        if record_ticket(record, launches) == ticket:
+            sent += 1
+    return sent
+
+
+def unanswered(records, launches):
+    """{ticket: (where it sits in the log, the last thing its child said that nothing answered)}.
+
+    Answered means the log carries something the run wrote for that ticket after the message: a
+    receipt, a ruling, or an outcome. Anything else would have the loop act twice on one message —
+    re-verify a receipt it has already settled, or wake the coordinator a second time for an
+    escalation it has already ruled on. The position comes back with the record because that is
+    what identifies one message rather than a ticket: a ticket that escalates twice does so at two
+    positions, and a resume must carry on past the first without swallowing the second.
+    """
+    latest = {}
+    answered = {}
+    for index, record in enumerate(records):
+        ticket = record_ticket(record, launches)
+        if ticket is None:
+            continue
+        event = record.get("event")
+        if event in ("message", "escalation") and record.get("role") == CHILD_ROLE:
+            latest[ticket] = (index, record)
+        elif event in ("receipt", "ruling", "outcome"):
+            answered[ticket] = index
+    return {
+        ticket: (index, record) for ticket, (index, record) in latest.items()
+        if answered.get(ticket, -1) < index
+    }
+
+
+def awaiting_receipt(records, launches):
+    """Every ticket the loop has sent an instruction to and had no receipt back from since.
+
+    A ticket whose branch would not merge carries a `landable` receipt already, so nothing in the
+    wave's settled states says the run is still waiting on it. This does: the instruction stands in
+    the log with no receipt after it, and until one arrives the ticket is live whatever its last
+    verdict was.
+    """
+    waiting = set()
+    for index, record in enumerate(records):
+        ticket = record_ticket(record, launches)
+        if ticket is None:
+            continue
+        message = record.get("message")
+        if record.get("event") == "ruling" and isinstance(message, str) and any(
+            message.lstrip().startswith(marker)
+            for marker in (RECHECK_MARKER, NUDGE_MARKER, MERGE_MARKER)
+        ):
+            waiting.add(ticket)
+        elif record.get("event") == "receipt":
+            waiting.discard(ticket)
+    return waiting
+
+
+def current_wave(records):
+    """The wave the run is working, as the log's own advance decisions leave it."""
+    wave = 1
+    for record in records:
+        if record.get("event") == "advance" and record.get("decision") == LAUNCHED:
+            with contextlib.suppress(TypeError, ValueError):
+                wave = int(record.get("wave"))
+    return wave
+
+
+def merge_results(records):
+    """{ticket: how its branch's last trip into the integration branch ended}."""
+    results = {}
+    for record in records:
+        if record.get("event") == "merge" and record.get("result"):
+            results[str(record.get("ticket"))] = str(record["result"])
+    return results
+
+
+def merged_tickets(records):
+    """Every ticket whose branch the log says reached the integration branch."""
+    return sorted(
+        ticket for ticket, result in merge_results(records).items()
+        if result in LANDED_RESULTS
+    )
+
+
+def semantic_conflicts(records):
+    """Every ticket whose last merge ended in a semantic conflict rather than a mechanical one.
+
+    The merge driver classifies before it does anything else and records the classification on the
+    `conflict` event; the `escalated` event after it says the ladder was exhausted. Only the pair
+    means the rung below the coordinator had nothing to offer because the two sides disagree.
+    """
+    classified = {}
+    for record in records:
+        if record.get("event") != "merge":
+            continue
+        detail = record.get("detail")
+        if record.get("result") == "conflict" and isinstance(detail, str):
+            classified[str(record.get("ticket"))] = detail
+    latest = merge_results(records)
+    # The last trip is the only one that counts: a ticket that escalated once and landed on the
+    # instruction it was sent has no conflict standing, and re-answering it would be the loop
+    # arguing with a merge that is already in the integration branch.
+    return {
+        ticket: classified[ticket][len(SEMANTIC_PREFIX):]
+        for ticket, result in latest.items()
+        if result == ESCALATED and classified.get(ticket, "").startswith(SEMANTIC_PREFIX)
+    }
+
+
+# --- the loop's own context --------------------------------------------------------------------
+
+
+class Loop:
+    """One run's wave loop: the rule table, the run it applies to, and the monitors it waits on."""
+
+    def __init__(self, args, repo, run_dir, table_path):
+        self.args = args
+        self.repo = repo
+        self.run_dir = run_dir
+        self.log = run_dir / LOG_NAME
+        self.table_path = table_path
+        self.table = json.loads(pathlib.Path(table_path).read_text(encoding="utf-8"))
+        self.run = self.table["run"]
+        self.monitors = []
+
+    # --- what it reads --------------------------------------------------------------------
+
+    def records(self):
+        return read_records(self.log)
+
+    def tickets_of(self, wave):
+        for entry in self.table.get("waves") or []:
+            if isinstance(entry, dict) and entry.get("wave") == wave:
+                return [dict(ticket) for ticket in entry.get("tickets") or []]
+        raise DriverError(f"the wave table holds no wave {wave}", pointer=str(self.table_path))
+
+    def live(self, wave, records):
+        """The tickets of that wave the run is still waiting on."""
+        launches = launch_records(records)
+        states = settled_states(records)
+        waiting = awaiting_receipt(records, launches)
+        return [
+            str(ticket["id"]) for ticket in self.tickets_of(wave)
+            if str(ticket["id"]) not in states or str(ticket["id"]) in waiting
+        ]
+
+    # --- what it says ---------------------------------------------------------------------
+
+    def settle(self, ticket, verdict, detail):
+        """Record a ticket's verdict through the log's own writer; returns nothing.
+
+        The driver writes every parked and failed receipt the run earns. They used to be the
+        coordinator's to type, and a wave settles on what the log holds.
+        """
+        run_command(
+            [
+                sys.executable, MACHINE_LOG, "--log", self.log, "receipt",
+                "--ticket", ticket, "--verdict", verdict, "--detail", detail,
+            ],
+            f"the {verdict} receipt for {ticket} could not be recorded",
+            ticket=ticket, pointer=str(self.log),
+        )
+
+    def deliver(self, ticket, launch, text):
+        """Say one thing to a child on its own channel, and record it; returns nothing.
+
+        A Codex child is reached through the bridge, which logs the prompt as it sends it. A Claude
+        child is reached through its tmux pane, which is the only channel a script has to it — the
+        cross-session message tool belongs to a model — and keys pass no hook, so the instruction
+        is written into the log here rather than by being sent.
+        """
+        if launch.get("executor") == CODEX:
+            run_command(
+                [
+                    sys.executable, self.run["codex"]["bridge"], "send",
+                    "--state-file", self.run_dir / CODEX_DIR_NAME / f"{ticket}.json",
+                    "--machine-log", self.log, "--ticket", ticket, "--prompt", text,
+                ],
+                f"the instruction for {ticket} could not be sent through the bridge",
+                ticket=ticket, pointer=str(self.log),
+            )
+            return
+        window = launch.get("window")
+        if not window:
+            raise DriverError(
+                f"{ticket} has no window to reach its child through, so nothing can be asked of it",
+                ticket=ticket, pointer=str(self.log),
+            )
+        tmux(["send-keys", "-t", window, "-l", text], f"{ticket} could not be reached at {window}")
+        tmux(["send-keys", "-t", window, "Enter"], f"{ticket} could not be reached at {window}")
+        self.record_ruling(ticket, launch, text)
+
+    def record_ruling(self, ticket, launch, text):
+        """Put one thing the run said to a child into the log; returns nothing."""
+        run_command(
+            [
+                sys.executable, MACHINE_LOG, "--log", self.log, "message",
+                "--role", COORDINATOR_ROLE, "--ticket", ticket,
+                "--to", launch.get("child") or ticket, "--message", text,
+            ],
+            f"what was said to {ticket} could not be recorded",
+            ticket=ticket, pointer=str(self.log),
+        )
+
+    # --- the rule table, row by row ---------------------------------------------------------
+
+    def hand_over(self, ticket, launch, message):
+        """Record that this escalation is the coordinator's now, and wake it; never returns.
+
+        Written as the escalation is handed over rather than when the run comes back, because the
+        one thing the driver knows for certain is which escalation it is exiting on. Acknowledging
+        at resume instead would take in every escalation standing at that moment: two children
+        asking at once means one snapshot and two acknowledgements, and the ASK nobody was shown
+        would be settled unread.
+
+        The line is what the log has of the answer, too. A ruling sent through a child's tmux pane
+        — the channel a permission prompt answers on — passes no hook and reaches no log, so
+        without this the escalation would still be standing on the next poll and the run could
+        never go on.
+        """
+        self.record_ruling(ticket, launch, HANDED_OVER.format(
+            marker=HANDED_OVER_MARKER, ticket=ticket
+        ))
+        raise Wake(
+            JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
+            detail=message, child=launch.get("child"), window=launch.get("window"),
+        )
+
+    def rule_on_messages(self, records):
+        """Settle everything the wave's children have said and nothing has answered.
+
+        Returns whether anything was settled, so a poll that changed the run is followed by another
+        read rather than by a wait.
+        """
+        launches = launch_records(records)
+        acted = False
+        for ticket, (index, record) in sorted(unanswered(records, launches).items()):
+            launch = launches.get(ticket)
+            if launch is None:
+                continue
+            message = record.get("message") or ""
+            if record.get("event") == "escalation":
+                self.hand_over(ticket, launch, message)
+            acted = self.rule_on_receipt(ticket, launch, message, records) or acted
+        return acted
+
+    def rule_on_receipt(self, ticket, launch, message, records):
+        """Settle one child's final word; returns whether it settled anything."""
+        body = message.lstrip()
+        if body.startswith(PARKED_VERB):
+            self.park(ticket, launch, body)
+            return True
+        if body.startswith(FAILED_VERB):
+            self.settle(ticket, FAILED, body)
+            return True
+        if body.startswith(COMPLETE_VERB):
+            self.rule_on_completion(ticket, launch, body, records)
+            return True
+        # Anything else a child says is conversation, not a verdict: the run reads the grammar its
+        # first turn gave it and leaves everything outside it alone.
+        return False
+
+    def park(self, ticket, launch, message):
+        """Record a parked receipt and put the child's worktree where the monitor reads it."""
+        worktree = launch.get("worktree")
+        if worktree:
+            with (self.run_dir / PARKED_PATHS_NAME).open("a", encoding="utf-8") as parked:
+                parked.write(f"{worktree}\n")
+        self.settle(ticket, PARKED, message)
+
+    def rule_on_completion(self, ticket, launch, message, records):
+        """Verify a claimed receipt, and settle what a second failure of it means."""
+        words = message.split()
+        sha = words[2] if len(words) > 2 else ""
+        result = subprocess.run(
+            [
+                sys.executable, str(MONITOR), "verify",
+                "--ticket", ticket, "--worktree", str(launch.get("worktree") or ""),
+                "--sha", sha, "--base", self.base_commit(launch), "--log", str(self.log),
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            # Silent success: the verifying script appended the landable receipt itself, and a
+            # receipt that held is not something judgment is spent on.
+            return
+        problem = (result.stdout or result.stderr).strip().replace("\n", " ")
+        launches = launch_records(records)
+        if instructions_sent(records, launches, ticket, RECHECK_MARKER):
+            self.settle(ticket, FAILED, f"a second receipt did not verify: {problem}")
+            return
+        self.deliver(ticket, launch, RECHECK_TEMPLATE.format(
+            marker=RECHECK_MARKER, ticket=ticket, problem=problem
+        ))
+
+    def base_commit(self, launch):
+        """The commit that worktree was cut from, which is what a receipt is measured against.
+
+        Recovered from the worktree itself rather than from the wave it belongs to: a later wave is
+        cut from what the wave before it landed, and the fork point of the child's branch and the
+        integration branch is that commit whichever wave the ticket sits in.
+        """
+        worktree = launch.get("worktree")
+        forked = git_output(
+            worktree, "merge-base", "HEAD", self.run["integration_branch"]
+        ) if worktree else None
+        return forked or self.run["integration_base_commit"]
+
+    def rule_on_statuses(self, statuses, records):
+        """Settle every non-busy child a wake monitor reported; returns whether anything changed."""
+        launches = launch_records(records)
+        states = settled_states(records)
+        pending = unanswered(records, launches)
+        waiting = awaiting_receipt(records, launches)
+        acted = False
+        for ticket, status in sorted(statuses.items()):
+            launch = launches.get(ticket)
+            if launch is None or status in (STATUS_BUSY, STATUS_PARKED):
+                continue
+            if ticket in states and ticket not in waiting:
+                continue
+            if ticket in pending:
+                # Its own last word is still to be settled, and that word decides the ticket; a
+                # status is only ever read about a child that has said nothing.
+                continue
+            if status == STATUS_VANISHED:
+                self.settle(ticket, FAILED, "the child's session vanished with no receipt sent")
+                acted = True
+            elif status == STATUS_IDLE:
+                acted = self.rule_on_idle(ticket, launch, records) or acted
+            else:
+                raise Wake(
+                    JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
+                    detail=f"the child is {status}, which the rule table does not settle",
+                    child=launch.get("child"), window=launch.get("window"),
+                )
+        return acted
+
+    def rule_on_idle(self, ticket, launch, records):
+        """One nudge for an idle child with no receipt; a second silence settles it failed."""
+        launches = launch_records(records)
+        if instructions_sent(records, launches, ticket, NUDGE_MARKER):
+            self.settle(ticket, FAILED, "a nudged child went idle again with no receipt sent")
+            return True
+        self.deliver(ticket, launch, NUDGE_TEMPLATE.format(marker=NUDGE_MARKER, ticket=ticket))
+        return True
+
+    # --- the wave boundary ------------------------------------------------------------------
+
+    def advance(self, wave):
+        """Land the settled wave and launch the next; returns the wave to work, or None when done.
+
+        Every rung below the coordinator lives inside this one call — the merge driver classifies a
+        conflict and hands a mechanical one to the budget-capped repair rung, and advance launches
+        the next wave and blocks what a stopped ticket stopped. What comes back is a decision, and
+        only two of them are this loop's to act on.
+        """
+        result = subprocess.run(
+            [
+                sys.executable, str(ADVANCE), "advance",
+                "--table", str(self.table_path), "--wave", str(wave),
+                "--log", str(self.log), "--out-dir", str(self.run_dir / LAUNCH_DIR_NAME),
+                "--repair-model", str(self.run["repair_model"]),
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode == ADVANCE_ESCALATED_EXIT:
+            return self.rule_on_halt(wave, result)
+        if result.returncode == ADVANCE_INTERRUPTED_EXIT:
+            raise DriverError(
+                f"wave {wave} was interrupted before it advanced", pointer=str(self.log)
+            )
+        if result.returncode != 0:
+            raise DriverError(
+                f"wave {wave} could not be advanced past:"
+                f" {(result.stderr or result.stdout).strip()}",
+                pointer=str(self.log),
+            )
+        self.close_merged()
+        records = self.records()
+        following = current_wave(records)
+        if following == wave:
+            return None
+        self.open_wave(records)
+        return following
+
+    def rule_on_halt(self, wave, result):
+        """The chain stopped: answer a semantic conflict once, and read what the rest of it means.
+
+        Three things a wave can stop on, and only one of them is judgment. A conflict the merge
+        driver called semantic is two children's designs disagreeing, and the child that lost the
+        race is the one who can settle it — so it gets the instruction first, and only a second
+        bounce is worth a coordinator's turn. A ticket the table already settled failed, or parked
+        with descendants below it, stopped the chain by a rule that has run its course: its
+        descendants are blocked, nothing downstream can start, and the run is over — which is a
+        report, not a ruling. Anything else — a repair rung that failed twice, a branch that moved
+        off its receipt — is the ladder exhausted (ADR-0004), and that reaches judgment.
+        """
+        self.close_merged()
+        records = self.records()
+        launches = launch_records(records)
+        conflicts = semantic_conflicts(records)
+        halted = [
+            str(ticket["id"]) for ticket in self.tickets_of(wave)
+            if str(ticket["id"]) in conflicts and str(ticket["id"]) in launches
+        ]
+        for ticket in halted:
+            launch = launches[ticket]
+            if instructions_sent(records, launches, ticket, MERGE_MARKER):
+                raise Wake(
+                    JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
+                    detail=f"the semantic conflict on {ticket} came back a second time:"
+                           f" {conflicts[ticket]}",
+                    child=launch.get("child"), window=launch.get("window"),
+                )
+            self.deliver(ticket, launch, MERGE_TEMPLATE.format(
+                marker=MERGE_MARKER, ticket=ticket, branch=self.branch_of(ticket, launch),
+                integration=self.run["integration_branch"], reason=conflicts[ticket],
+            ))
+        if halted:
+            return wave
+        unsettled = self.unsettled_halt(wave, records)
+        if unsettled:
+            raise Wake(
+                JUDGMENT_NEEDED, ticket=unsettled[0], pointer=str(self.log),
+                detail=self.halt_detail(records, result),
+            )
+        # Every reason the chain stopped on is one the rule table already settled, so there is
+        # nothing left for this run to launch and nothing for anyone to rule on.
+        return None
+
+    def unsettled_halt(self, wave, records):
+        """The wave's tickets whose halt no rule of the table has already accounted for.
+
+        A ticket settled `failed` or `parked` stopped the chain by its own recorded verdict. One
+        the log says is `landable` and never landed is a merge the ladder could not finish, and
+        that is nobody's but the coordinator's.
+        """
+        states = settled_states(records)
+        merges = merge_results(records)
+        return [
+            str(ticket["id"]) for ticket in self.tickets_of(wave)
+            if states.get(str(ticket["id"])) not in (FAILED, PARKED)
+            and merges.get(str(ticket["id"])) not in LANDED_RESULTS
+        ]
+
+    def halt_detail(self, records, result):
+        """Why the chain stopped, as the advance decision the log holds recorded it."""
+        for record in reversed(records):
+            if record.get("event") == "advance" and record.get("decision") == ESCALATED:
+                return str(record.get("detail") or "")
+        return (result.stdout or result.stderr).strip().replace("\n", "; ")
+
+    def branch_of(self, ticket, launch):
+        """The branch that ticket's child stands on, as its launch or the renderer's naming says."""
+        if launch.get("branch"):
+            return launch["branch"]
+        for entry in dispatch.walk_tickets(self.table):
+            if str(entry.get("id")) == ticket:
+                return dispatch.branch_name(entry)
+        return ticket
+
+    def open_wave(self, records):
+        """Give the wave advance just launched everything a launched wave has; returns nothing.
+
+        Its children get this run's escalation hook and the dashboard is pointed at the run again,
+        exactly as the first wave's launch did — the command owns the run's one window, so calling
+        it every wave is what brings a window the operator closed back.
+        """
+        for ticket, launch in sorted(launch_records(records).items()):
+            worktree = launch.get("worktree")
+            if worktree:
+                install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
+        start_dashboard(self.args, self.repo, self.run_dir)
+
+    def close_merged(self):
+        """Close every merged ticket in the run's tracker, recording each undo; returns nothing."""
+        records = self.records()
+        already = {
+            str(record.get("ticket")) for record in records
+            if record.get("event") == "outcome" and record.get("outcome") == COMPLETED
+        }
+        tickets = {str(ticket["id"]): ticket for ticket in dispatch.walk_tickets(self.table)}
+        for number in merged_tickets(records):
+            if number in already or number not in tickets:
+                continue
+            undo = close_ticket(self.run, tickets[number], number)
+            run_command(
+                [
+                    sys.executable, MACHINE_LOG, "--log", self.log, "outcome",
+                    "--ticket", number, "--outcome", COMPLETED,
+                    "--detail", f"closed in the {self.run['tracker']} tracker; undo: {undo}",
+                ],
+                f"the close of {number} could not be recorded",
+                ticket=number, pointer=str(self.log),
+            )
+
+    # --- the loop itself ----------------------------------------------------------------------
+
+    def arm(self, wave, records):
+        """Arm a monitor over the wave's live children in every lane that has none; returns nothing.
+
+        Lane by lane, because the two exit independently: a Claude monitor that has fired and been
+        settled must be re-armed while the Codex watch beside it is still standing, and re-arming
+        both would leave two watching the same session.
+        """
+        armed = {monitor["lane"] for monitor in self.monitors}
+        launches = launch_records(records)
+        children = [
+            launches[ticket] for ticket in self.live(wave, records)
+            if ticket in launches and launches[ticket].get("worktree")
+            and lane_of(launches[ticket]) not in armed
+        ]
+        if children:
+            self.monitors += arm_monitors(
+                self.run_dir, self.log, children, self.run["codex"]["bridge"]
+            )
+
+    def harvest(self):
+        """What every monitor that has exited since the last poll reports the children doing.
+
+        Returns `{ticket: status}`. A monitor that exited nonzero is a wake-up that failed rather
+        than one that fired, and nothing about a ticket may be concluded from it.
+        """
+        statuses = {}
+        still_armed = []
+        for monitor in self.monitors:
+            process = monitor["process"]
+            if process.poll() is None:
+                still_armed.append(monitor)
+                continue
+            output, errors = process.communicate()
+            if process.returncode != 0:
+                raise DriverError(
+                    f"the {monitor['lane']} wake monitor exited {process.returncode}:"
+                    f" {(errors or output).strip()}",
+                    pointer=str(self.log),
+                )
+            statuses.update(
+                codex_statuses(output, monitor["tickets"]) if monitor["lane"] == CODEX
+                else claude_statuses(output, self.records())
+            )
+        self.monitors = still_armed
+        return statuses
+
+    def poll(self, wave):
+        """One turn of the loop over one wave; returns the wave to work next, or None when done."""
+        records = self.records()
+        if self.rule_on_messages(records):
+            return wave
+        statuses = self.harvest()
+        if statuses and self.rule_on_statuses(statuses, self.records()):
+            return wave
+        records = self.records()
+        if not self.live(wave, records):
+            disarm(self.monitors)
+            self.monitors = []
+            return self.advance(wave)
+        self.arm(wave, records)
+        return wave
+
+    def run_until_woken(self):
+        """Apply the rule table until it is done or something outside it needs judgment."""
+        records = self.records()
+        wave = current_wave(records)
+        deadline = time.monotonic() + self.args.timeout
+        seen = None
+        while True:
+            following = self.poll(wave)
+            if following is None:
+                return self.finish()
+            here = (following, len(self.records()), len(self.monitors))
+            if here != seen:
+                seen, deadline = here, time.monotonic() + self.args.timeout
+            elif time.monotonic() >= deadline:
+                raise DriverError(
+                    f"wave {wave} has done nothing for {self.args.timeout:g} seconds, which the"
+                    " rule table has no row for",
+                    pointer=str(self.log),
+                )
+            wave = following
+            time.sleep(self.args.poll_seconds)
+
+    def finish(self):
+        """Every wave has landed: the run is over and its exit is the last wake."""
+        snapshot(RUN_COMPLETE, pointer=str(self.run_dir))
+        return 0
+
+
+def claude_statuses(output, records):
+    """{ticket: status} from a wake monitor's TSV lines, joined to tickets by worktree path.
+
+    The monitor prints a line per status *change*, so the picture is the last word about each
+    worktree across everything it printed rather than its final block alone. Paths are compared
+    resolved, because the same directory is reached by two spellings on macOS (ADR-0007).
+    """
+    by_worktree = {}
+    for ticket, launch in launch_records(records).items():
+        worktree = launch.get("worktree")
+        if worktree:
+            by_worktree[os.path.realpath(worktree)] = ticket
+    statuses = {}
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        ticket = by_worktree.get(os.path.realpath(parts[0]))
+        if ticket is not None:
+            statuses[ticket] = parts[1].strip()
+    return statuses
+
+
+def codex_statuses(output, tickets):
+    """{ticket: status} from the Codex bridge's watch snapshot, by the state file it watched."""
+    statuses = {}
+    for line in output.splitlines():
+        try:
+            snapshot_object = json.loads(line)
+        except ValueError:
+            continue
+        for session in (snapshot_object or {}).get("sessions") or []:
+            ticket = tickets.get(str(session.get("stateFile")))
+            if ticket is not None:
+                statuses[ticket] = str(session.get("status"))
+    return statuses
+
+
+# --- closing a merged ticket in the run's tracker ------------------------------------------
+
+
+def close_ticket(run, ticket, number):
+    """Close that ticket where this repo keeps its tickets; returns the exact undo.
+
+    Only the two trackers `references/trackers.md` declares exercised are reachable here — anything
+    else stopped the run in preflight rather than arriving at a CLI nobody named.
+    """
+    if run.get("tracker") == TRACKER_GITHUB:
+        return close_github_issue(run, number)
+    return close_local_ticket(run, ticket, number)
+
+
+def close_local_ticket(run, ticket, number):
+    """Set a local ticket's `Status:` to the finished value; returns how to put it back.
+
+    A local tracker's close is a write inside the repository, so the edit is committed on the
+    integration branch as it is made: the merge driver refuses to land a wave into a working tree
+    that carries uncommitted changes, and a close left loose would stop the run's next wave on
+    bookkeeping the run itself wrote.
+    """
+    path = pathlib.Path(ticket["path"])
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as error:
+        raise DriverError(f"{number} could not be closed: {error}", ticket=number) from error
+    for index, line in enumerate(lines):
+        match = STATUS_LINE.match(line.rstrip("\n"))
+        if not match:
+            continue
+        held = match.group(2)
+        lines[index] = f"{match.group(1)}Status: {STATUS_FINISHED}\n"
+        path.write_text("".join(lines), encoding="utf-8")
+        undo = f"set `Status:` in {path} back to `{held}`"
+        break
+    else:
+        # A ticket with no status line had none to finish; adding one and saying so keeps the undo
+        # exact, which is the whole point of recording it.
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\nStatus: {STATUS_FINISHED}\n")
+        undo = f"take the `Status: {STATUS_FINISHED}` line off the end of {path}"
+    commit_close(run["repo_root"], path, number)
+    return undo
+
+
+def commit_close(repo, path, number):
+    """Commit that close on the integration branch, and nothing else with it."""
+    result = git(
+        repo, "commit", "-m", f"chore: close {number} in the local tracker", "--", str(path)
+    )
+    if result.returncode != 0 and git_output(repo, "status", "--porcelain", "--", str(path)):
+        detail = (result.stderr or result.stdout).strip()
+        raise DriverError(
+            f"the close of {number} could not be committed: {detail}", ticket=number
+        )
+
+
+def close_github_issue(run, number):
+    """Close that issue with its pickup label off; returns how to reopen and re-label it.
+
+    Every call is made from the run's own checkout and names no repository: `gh` takes an
+    `OWNER/REPO` slug there, not a path, and the checkout it is run in is what it resolves the
+    slug from — which is also the one repository this run is allowed to touch.
+    """
+    repo = run["repo_root"]
+    listed = gh(repo, "issue", "view", number, "--json", "labels")
+    labels = []
+    if listed.returncode == 0:
+        with contextlib.suppress(ValueError):
+            labels = [
+                label.get("name") for label in (json.loads(listed.stdout) or {}).get("labels") or []
+                if label.get("name") in PICKUP_LABELS
+            ]
+    for label in labels:
+        gh_or_raise(
+            repo, number, f"the pickup label {label} could not be taken off {number}",
+            "issue", "edit", number, "--remove-label", label,
+        )
+    gh_or_raise(repo, number, f"{number} could not be closed", "issue", "close", number)
+    undo = f"gh issue reopen {number}"
+    if labels:
+        undo += f", then gh issue edit {number} --add-label {','.join(labels)}"
+    return f"{undo} (in {repo})"
+
+
+def gh(repo, *arguments):
+    """One `gh` call, made in the run's own checkout so it resolves that repository."""
+    return subprocess.run([GH, *arguments], cwd=str(repo), capture_output=True, text=True)
+
+
+def gh_or_raise(repo, number, message, *arguments):
+    """The same call, where anything but success stops the close; returns nothing."""
+    result = gh(repo, *arguments)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        raise DriverError(f"{message}: {detail}", ticket=number)
+
+
+# --- the loop's two entry points ---------------------------------------------------------------
+
+
+def wave_loop(args, repo, run_dir, table_path):
+    """Run the wave loop over a prepared run; returns the exit code its ending earns.
+
+    Every way out of the loop carries the command that puts it back: a run stopped by a driver
+    error is one the operator fixes and the coordinator carries on, exactly as a run stopped by a
+    ruling is, so the snapshot that says it stopped has to say how it goes on.
+    """
+    loop = Loop(args, repo, run_dir, table_path)
+    resume = resume_command(args)
+    try:
+        return loop.run_until_woken()
+    except Wake as wake:
+        snapshot(
+            wake.reason, ticket=wake.ticket, pointer=wake.pointer, resume=resume, **wake.fields
+        )
+        return 0
+    except DriverError as error:
+        snapshot(
+            DRIVER_ERROR, ticket=error.ticket, pointer=error.pointer,
+            detail=str(error), resume=resume,
+        )
+        return DRIVER_ERROR_EXIT
+    finally:
+        disarm(loop.monitors)
+
+
+def resume_command(args):
+    """The one command that puts the loop back where it left off, for the snapshot to carry."""
+    return shlex.join([
+        sys.executable, str(pathlib.Path(__file__).resolve()), "resume",
+        "--feature-dir", str(args.feature_dir), "--tmux-session", str(args.tmux_session),
+        "--coordinator-pid", str(args.coordinator_pid),
+    ])
+
+
+def run_resume(args):
+    """Carry on the loop of a run already under way, once the coordinator has ruled."""
+    feature_dir = pathlib.Path(args.feature_dir).resolve()
+    run_dir = feature_dir / RUN_DIR_NAME
+    table = run_dir / TABLE_NAME
+    if not table.exists():
+        raise DriverError(
+            f"{feature_dir} holds no run to resume: {table} is not there", pointer=str(feature_dir)
+        )
+    repo = repository_root(feature_dir, args.repo_root)
+    args.tmux_session = tmux_session(args.tmux_session)
+    print(f"crew resumed, run directory {run_dir}", flush=True)
+    return wave_loop(args, repo, run_dir, table)
+
+
 # --- entry point ------------------------------------------------------------------------------
 
 
@@ -1220,13 +2330,44 @@ def build_parser():
         "--codex-bridge", help=f"the bridge Codex children are launched and watched through"
                                f" (default: {CODEX_BRIDGE})",
     )
-
     clear = commands.add_parser(
         "clear", help="inventory a run, confirm in the terminal, and remove its artefacts"
     )
     clear.set_defaults(handler=run_clear)
     clear.add_argument("--run-dir", required=True, help="the recorded run directory to clear")
+    add_loop_arguments(start)
+
+    resume = commands.add_parser(
+        "resume", help="carry a run's wave loop on from where a ruling stopped it"
+    )
+    resume.set_defaults(handler=run_resume)
+    resume.add_argument("--feature-dir", required=True, help="the feature whose run this resumes")
+    resume.add_argument(
+        "--coordinator-pid", required=True, type=int,
+        help="the pid of the session this run is driven from, which the dashboard is checked"
+             " against",
+    )
+    resume.add_argument("--repo-root", help="the repository (default: the feature's own checkout)")
+    resume.add_argument(
+        "--tmux-session", help="the session this run's windows live in (default: the driver's own)"
+    )
+    add_loop_arguments(resume)
     return parser
+
+
+def add_loop_arguments(command):
+    """The two dials the wave loop turns on, which every entry point into it carries."""
+    command.add_argument(
+        "--poll-seconds", type=float, default=float(
+            os.environ.get("CREW_POLL_SECONDS") or DEFAULT_POLL_SECONDS
+        ),
+        help="how often the loop asks the log what has happened (default: %(default)s)",
+    )
+    command.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
+        help="how long a run may do nothing at all before that becomes a wake (default:"
+             " %(default)s)",
+    )
 
 
 def main(argv=None):
