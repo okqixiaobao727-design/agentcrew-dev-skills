@@ -7,6 +7,20 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-15
+
+The coordinator stops running the run and starts only ruling on it. A scripted
+driver now does every mechanical thing the coordinator used to narrate —
+preflight, the wave table, dispatch, receipts, settlement, merges, tracker
+closes, advancement and the report — as a background task of the coordinator's
+own session, and wakes it for exactly three things: a `CREW ASK`, a semantic
+merge conflict a child has bounced back twice, and any state the rule table has
+no row for. Typing `/crew <feature-dir>` is the whole sign-off, and typing it
+again is how an interrupted run resumes.
+
+Upgrading needs one edit: name a `[repair] model` and a `[tracker] kind` in
+your `agentcrew.toml`, or the run stops in preflight.
+
 ### Added
 - **The crew driver** (`skills/crew/assets/driver/driver.py`): one script that
   runs a whole run as a state machine — preflight, the wave table, dispatch,
@@ -413,7 +427,8 @@ Initial public release.
   produce permanent false positives; shipped-file enumeration now skips any
   path with a `.git` component (#1, #2).
 
-[Unreleased]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.3.8...v0.4.0
 [0.3.5]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.3.0...v0.3.5
 [0.3.0]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.2.0...v0.2.1
