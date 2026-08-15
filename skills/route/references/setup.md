@@ -63,10 +63,13 @@ coordinator's prompt are on screen at once —
 and the link to give the user. Wiring it edits the user's Claude Code settings, which is theirs and
 not this repo's, so the wizard shows the exact edit and asks before anything is written.
 
+The pin ships with the crew skill, so it is reached through that skill's own directory — the `crew`
+slot of `<plugin-dir>`'s skills — recorded here as `<crew-skill-dir>`, absolute.
+
 Print what the install would do. It is a dry run: it writes nothing.
 
 ```bash
-python3 <plugin-dir>/skills/crew/assets/monitor/monitor.py pin-install
+python3 <crew-skill-dir>/assets/monitor/monitor.py pin-install
 ```
 
 That output is the whole of what you ask about. Read which case it shows and say so:
