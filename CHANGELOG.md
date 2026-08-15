@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-16
+
+The two config keys 0.4.0 made required were settled nowhere the operator
+passes through: the wizard left them out of an upgraded config, the validator
+the wizard runs called that config sound, and a fresh install got a tracker
+nobody chose. Upgrading from 0.4.0 is worth it for the third alone — a run
+could close its merged tickets in the wrong place without failing.
+
 ### Fixed
 - `validate_plugin_tree.py --config` accepted a project `agentcrew.toml` that
   named no `[repair] model` and no `[tracker] kind` — the exact file a run then
@@ -449,7 +457,8 @@ Initial public release.
   produce permanent false positives; shipped-file enumeration now skips any
   path with a `.git` component (#1, #2).
 
-[Unreleased]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.3.8...v0.4.0
 [0.3.5]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.3.0...v0.3.5
 [0.3.0]: https://github.com/okqixiaobao727-design/agentcrew-dev-skills/compare/v0.2.1...v0.3.0
