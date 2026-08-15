@@ -3,6 +3,7 @@
 
     start   preflight the run, build and validate its wave table, prepare the branch and the run
             directory, dispatch wave 1, start the dashboard, and arm the wake monitors
+    clear   inventory one recorded run, ask the operator, and remove its recorded artefacts
 
 The driver runs as a background task of the coordinator's own session, so it costs that session no
 turn while it works and its exit is what wakes it (ADR-0001). Two contracts follow from that and
@@ -24,6 +25,10 @@ run file, which is what keeps the oracle boundary intact; `monitor-wave.sh` and 
 launch line and exits 0, and the loop that ends in one of the four reasons belongs to the wave
 loop built on this module.
 
+The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle event:
+it prints a multi-line inventory, asks for confirmation, and reports errors directly instead of
+emitting a wake snapshot.
+
 **A preflight failure never reaches the coordinator as diagnosis.** Preflight is exactly four
 read-only checks — a clean working tree, a base branch that resolves and fast-forwards, a valid
 routing on every ticket (the renderer's own validation, which is the authority on the case list),
@@ -43,6 +48,7 @@ launch directory, the Codex state, and the parked paths.
 
 import argparse
 import contextlib
+from dataclasses import dataclass
 import json
 import pathlib
 import re
@@ -122,6 +128,19 @@ class DriverError(Exception):
         super().__init__(message)
         self.ticket = ticket
         self.pointer = pointer
+
+
+class ClearError(Exception):
+    """The recorded run cannot be inventoried or cleared safely."""
+
+
+@dataclass(frozen=True)
+class ClearPlan:
+    """The destructive inputs prepared by the confirmed terminal inventory."""
+
+    rows: list
+    launches: list
+    dashboard_window: str | None
 
 
 # --- the wake snapshot ----------------------------------------------------------------------
@@ -659,6 +678,380 @@ def spawn(arguments):
     )
 
 
+# --- clear ------------------------------------------------------------------------------------
+
+
+def clear_json(path, label):
+    """Read one recorded JSON document, refusing malformed run state before any action."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise ClearError(f"{label} {path} is unreadable: {error}") from error
+
+
+def clear_records(log):
+    """Read the append-only log as the source of every child path and window id."""
+    try:
+        lines = pathlib.Path(log).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ClearError(f"the machine log {log} is unreadable: {error}") from error
+    records = []
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError as error:
+            raise ClearError(
+                f"the machine log {log} line {line_number} is not JSON: {error}"
+            ) from error
+        if not isinstance(record, dict):
+            raise ClearError(f"the machine log {log} line {line_number} is not an object")
+        records.append(record)
+    return records
+
+
+def clear_run_data(run_dir):
+    """Load the run table and log, keeping all paths at the recorded boundary."""
+    table_path = run_dir / TABLE_NAME
+    log_path = run_dir / LOG_NAME
+    table = clear_json(table_path, "the wave table")
+    if not isinstance(table, dict) or not isinstance(table.get("run"), dict):
+        raise ClearError(f"the wave table {table_path} carries no run section")
+    run = table["run"]
+    for key in ("repo_root", "integration_branch", "return_branch"):
+        if not run.get(key):
+            raise ClearError(f"the wave table {table_path} carries no run.{key}")
+    return table, run, clear_records(log_path), log_path
+
+
+def clear_table_tickets(table):
+    """Yield ticket records from the recorded wave table in table order."""
+    for wave in table.get("waves") or []:
+        if not isinstance(wave, dict):
+            continue
+        for ticket in wave.get("tickets") or []:
+            if isinstance(ticket, dict):
+                yield ticket
+
+
+def clear_tickets(table, records):
+    """Return ticket ids in table order, followed by any recorded launch-only ids."""
+    identifiers = []
+    for ticket in clear_table_tickets(table):
+        identifier = ticket.get("id")
+        if identifier is not None and str(identifier) not in identifiers:
+            identifiers.append(str(identifier))
+    for record in records:
+        if record.get("event") != "launch" or record.get("ticket") is None:
+            continue
+        identifier = str(record["ticket"])
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+    return identifiers
+
+
+def clear_launches(records):
+    """The launch records whose paths and ids are authorized for this clear."""
+    launches = []
+    for record in records:
+        if record.get("event") != "launch":
+            continue
+        missing = [key for key in ("ticket", "branch", "worktree") if not record.get(key)]
+        if missing:
+            raise ClearError(
+                "a launch record lacks " + ", ".join(missing) + "; refusing to guess an artefact"
+            )
+        launches.append(record)
+    return launches
+
+
+def clear_codex_state_files(run, launches):
+    """The state files named by recorded Codex ticket ids, never a directory glob."""
+    codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
+    state_dir = pathlib.Path(codex["state_dir"]) if codex.get("state_dir") else None
+    if state_dir is None:
+        return []
+    state_files = []
+    for launch in launches:
+        if launch.get("executor") != CODEX:
+            continue
+        state_file = state_dir / f"{launch['ticket']}.json"
+        if state_file not in state_files:
+            state_files.append(state_file)
+    return state_files
+
+
+def clear_git(repo, *arguments):
+    """Run one git operation and return stdout, or stop before the next destructive operation."""
+    result = git(repo, *arguments)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ClearError(f"git {' '.join(arguments)} failed: {detail}")
+    return result.stdout.strip()
+
+
+def clear_command(arguments, label):
+    """Run an existing cleanup interface without exposing its output to the operator's inventory."""
+    result = subprocess.run(arguments, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ClearError(f"{label} failed: {detail}")
+    return result.stdout
+
+
+def clear_status(worktree):
+    if not worktree.exists():
+        return None
+    result = git(worktree, "status", "--short")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ClearError(f"the worktree {worktree} could not be inventoried: {detail}")
+    return result.stdout.splitlines()
+
+
+def clear_unmerged(repo, integration_branch, branch):
+    branch_ref = f"refs/heads/{branch}"
+    if git(repo, "show-ref", "--verify", "--quiet", branch_ref).returncode != 0:
+        return None
+    integration_ref = f"refs/heads/{integration_branch}"
+    if git(repo, "show-ref", "--verify", "--quiet", integration_ref).returncode != 0:
+        raise ClearError(
+            f"the integration branch {integration_branch} could not be inventoried: it is gone"
+        )
+    result = git(repo, "rev-list", "--oneline", f"{integration_branch}..{branch}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ClearError(f"the branch {branch} could not be inventoried: {detail}")
+    return result.stdout.splitlines()
+
+
+def clear_dashboard_window(path):
+    """Read the recorded dashboard id once, treating an absent record as already clear."""
+    if not path.exists():
+        return None
+    try:
+        window = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ClearError(f"the dashboard window record is unreadable: {error}") from error
+    return window or None
+
+
+def clear_inventory(run_dir, table, run, records, log_path):
+    """Render every recorded ticket artefact and the exact uncommitted/unmerged work."""
+    repo = pathlib.Path(run["repo_root"])
+    launches = clear_launches(records)
+    by_ticket = {}
+    ticket_paths = {}
+    for ticket in clear_table_tickets(table):
+        if ticket.get("id") is not None:
+            ticket_paths[str(ticket["id"])] = ticket.get("path")
+    for launch in launches:
+        by_ticket.setdefault(str(launch["ticket"]), []).append(launch)
+    rows = []
+    lines = [
+        f"run: {run_dir}",
+        f"integration branch: {run['integration_branch']}",
+        f"return branch: {run['return_branch']}",
+        f"machine log: {log_path}",
+    ]
+    for ticket in clear_tickets(table, records):
+        path = ticket_paths.get(ticket)
+        lines.append(f"ticket {ticket}" + (f" ({path})" if path else "") + ":")
+        ticket_launches = by_ticket.get(ticket, [])
+        if not ticket_launches:
+            lines.append("  no recorded launch artefacts")
+            continue
+        for launch in ticket_launches:
+            worktree = pathlib.Path(launch["worktree"])
+            branch = str(launch["branch"])
+            status = clear_status(worktree)
+            unmerged = clear_unmerged(repo, run["integration_branch"], branch)
+            row = {
+                "ticket": ticket,
+                "executor": launch.get("executor"),
+                "worktree": worktree,
+                "branch": branch,
+                "window": launch.get("window"),
+                "status": status,
+                "unmerged": unmerged,
+            }
+            rows.append(row)
+            lines.append(f"  window: {launch.get('window') or 'none'}")
+            lines.append(
+                f"  worktree: {worktree}" + (" (already gone)" if status is None else "")
+            )
+            if unmerged is None:
+                lines.append(f"  branch: {branch} (already gone)")
+            else:
+                disposition = (
+                    "unmerged; force-delete with -D"
+                    if unmerged else "merged; delete with -d"
+                )
+                lines.append(f"  branch: {branch} ({disposition})")
+            if status is None:
+                lines.append("  uncommitted files: already gone")
+            elif status:
+                lines.append("  uncommitted files:")
+                lines.extend(f"    {item}" for item in status)
+            else:
+                lines.append("  uncommitted files: none")
+            if unmerged is None:
+                lines.append("  unmerged commits: already gone")
+            elif unmerged:
+                lines.append("  unmerged commits:")
+                lines.extend(f"    {item}" for item in unmerged)
+            else:
+                lines.append("  unmerged commits: none")
+
+    for state_file in clear_codex_state_files(run, launches):
+        lines.append(
+            f"Codex state: {state_file}"
+            + (" (already gone)" if not state_file.exists() else "")
+        )
+    dashboard_path = run_dir / "dashboard-window"
+    dashboard_window = clear_dashboard_window(dashboard_path)
+    if dashboard_window:
+        lines.append(f"dashboard window: {dashboard_window}")
+    report = pathlib.Path(run.get("feature_dir") or run_dir.parent) / "report.md"
+    lines.append(f"report: {report} (kept)")
+    return lines, ClearPlan(rows, launches, dashboard_window)
+
+
+def clear_kill_window(window):
+    """Kill one recorded tmux id; an already-stopped recorded window is already clear."""
+    result = subprocess.run(
+        ["tmux", "kill-window", "-t", str(window)], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        lower_detail = detail.lower()
+        already_gone = (
+            "can't find window" in lower_detail
+            or "no server running" in lower_detail
+            or "error connecting to" in lower_detail
+            or "failed to connect" in lower_detail
+        )
+        if not already_gone:
+            raise ClearError(f"tmux window {window} could not be killed: {detail}")
+
+
+def clear_unlock_worktree(repo, worktree):
+    """Unlock one recorded worktree, tolerating the normal already-unlocked state."""
+    if not worktree.exists():
+        return
+    result = git(repo, "worktree", "unlock", "--", str(worktree))
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        if "not locked" not in detail.lower():
+            raise ClearError(f"the worktree {worktree} could not be unlocked: {detail}")
+
+
+def clear_remove_worktree(repo, worktree):
+    """Remove one recorded worktree, tolerating an artefact already removed by an earlier try."""
+    result = git(repo, "worktree", "remove", "--force", "--", str(worktree))
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        lower_detail = detail.lower()
+        already_gone = (
+            "is not a working tree" in lower_detail
+            or "no such file or directory" in lower_detail
+        )
+        if not already_gone:
+            raise ClearError(f"the worktree {worktree} could not be removed: {detail}")
+
+
+def clear_actions(run_dir, run, log_path, plan):
+    """Apply the clearing steps using only the paths and ids in the inventory."""
+    repo = pathlib.Path(run["repo_root"])
+    integration_branch = str(run["integration_branch"])
+    if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
+        clear_git(repo, "switch", "--", integration_branch)
+
+    codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
+    state_dir = pathlib.Path(codex["state_dir"]) if codex.get("state_dir") else None
+    bridge = codex.get("bridge")
+    for state_file in clear_codex_state_files(run, plan.launches):
+        if not state_file.exists():
+            continue
+        if not bridge:
+            raise ClearError(f"the Codex launch for {state_file} carries no bridge")
+        clear_command(
+            [sys.executable, str(bridge), "stop", "--state-file", str(state_file)],
+            f"Codex session {state_file}",
+        )
+
+    windows = []
+    for launch in plan.launches:
+        window = launch.get("window")
+        if window and str(window) not in windows:
+            windows.append(str(window))
+    if plan.dashboard_window and plan.dashboard_window not in windows:
+        windows.append(plan.dashboard_window)
+    for window in windows:
+        clear_kill_window(window)
+
+    unique_rows = []
+    seen_rows = set()
+    for row in plan.rows:
+        identity = (str(row["worktree"]), row["branch"])
+        if identity not in seen_rows:
+            seen_rows.add(identity)
+            unique_rows.append(row)
+    for row in unique_rows:
+        clear_unlock_worktree(repo, row["worktree"])
+        clear_remove_worktree(repo, row["worktree"])
+
+    for row in unique_rows:
+        if row["unmerged"] is None:
+            continue
+        flag = "-D" if row["unmerged"] else "-d"
+        clear_git(repo, "branch", flag, "--", row["branch"])
+
+    return_branch = str(run["return_branch"])
+    if git(repo, "show-ref", "--verify", f"refs/heads/{return_branch}").returncode == 0:
+        clear_git(repo, "switch", "--", return_branch)
+    else:
+        clear_git(repo, "switch", "--detach", "--", return_branch)
+    if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
+        clear_git(repo, "branch", "-D", "--", integration_branch)
+
+    if state_dir is not None and state_dir.exists():
+        if state_dir.is_symlink():
+            state_dir.unlink()
+        else:
+            shutil.rmtree(state_dir)
+
+    machine_log = run_dir / MACHINE_LOG.name
+    if not machine_log.exists():
+        raise ClearError(f"the run carries no durable machine log at {machine_log}")
+    clear_command(
+        [
+            sys.executable, str(machine_log), "--log", str(log_path), "uninstall",
+            "--settings", str(repo / SETTINGS_PATH),
+        ],
+        "machine-log uninstall",
+    )
+
+
+def run_clear(args):
+    """Inventory a run, ask in the terminal, and clear only after an affirmative answer."""
+    run_dir = pathlib.Path(args.run_dir).resolve()
+    table, run, records, log_path = clear_run_data(run_dir)
+    lines, plan = clear_inventory(run_dir, table, run, records, log_path)
+    print("\n".join(lines))
+    try:
+        answer = input("Clear this run? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("clear cancelled")
+        return 0
+    clear_actions(run_dir, run, log_path, plan)
+    print(f"run cleared; durable record kept at {run_dir}")
+    return 0
+
+
 # --- start ------------------------------------------------------------------------------------
 
 
@@ -827,6 +1220,12 @@ def build_parser():
         "--codex-bridge", help=f"the bridge Codex children are launched and watched through"
                                f" (default: {CODEX_BRIDGE})",
     )
+
+    clear = commands.add_parser(
+        "clear", help="inventory a run, confirm in the terminal, and remove its artefacts"
+    )
+    clear.set_defaults(handler=run_clear)
+    clear.add_argument("--run-dir", required=True, help="the recorded run directory to clear")
     return parser
 
 
@@ -834,6 +1233,9 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         return args.handler(args)
+    except ClearError as error:
+        print(f"clear: {error}", file=sys.stderr)
+        return 1
     except DriverError as error:
         snapshot(DRIVER_ERROR, ticket=error.ticket, pointer=error.pointer, detail=str(error))
         return DRIVER_ERROR_EXIT

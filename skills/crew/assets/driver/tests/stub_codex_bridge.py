@@ -27,6 +27,10 @@ def main():
         print(json.dumps({"sessions": []}))
         return 0
 
+    if argv[:1] == ["stop"]:
+        print(json.dumps({"ok": True, "stateFile": flag(argv, "--state-file")}))
+        return 0
+
     if argv[:1] != ["launch"]:
         print(json.dumps({"ok": False, "error": f"unexpected command: {argv[:1]}"}))
         return 1
