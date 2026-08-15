@@ -16,10 +16,17 @@ costs a model token or reaches the coordinator's context
 [wake]: ../skills/crew/assets/monitor-wave.sh
 [monitor]: ../skills/crew/assets/monitor/monitor.py
 
-The wake-up is unchanged and keeps its contract: armed while every supplied child is `busy`, exit 0
-the moment any child is `waiting`, `idle`, `parked` or `vanished`, nonzero on a monitor error. The
-dashboard is a display, so a failure it meets is drawn rather than raised — it does not compete
-with the wake-up for the job of stopping a run.
+The wake-up is started with the run's machine log:
+
+```sh
+monitor-wave.sh --log <run-dir>/log.jsonl <run-dir>/parked-paths <worktree-path>...
+```
+
+It remains armed while every supplied child is `busy`, exits 0 the moment any child is `waiting`,
+`idle`, `parked` or `vanished`, and exits nonzero on a monitor error. Before a nonzero exit it
+appends a `monitor-error` event naming the script and reason. The dashboard is a display, so a
+failure it meets is drawn rather than raised — it does not compete with the wake-up for the job of
+stopping a run.
 
 ## The dashboard
 
@@ -133,15 +140,16 @@ written where a model would be handed it.
 | `crew <NN> stuck at a permission prompt` | its lane's source says `waiting` |
 | `crew <NN> stopped without finishing` | its lane's source says `idle` |
 | `crew <NN> vanished` | a launched, unsettled row has no live entry at all |
-| `crew <NN> escalated` | the log carries an `escalation` for that ticket |
+| `crew <NN> escalated` | the log carries an escalation occurrence for that ticket |
 
 Both rows a `waiting` state can come from are announced in their own words: a child at a
 permission prompt and a child that finished a turn without settling anything need different things
 from the operator. A wave nobody has launched into has not completed, so a run's later waves never
-toast on the first frame. Each of these fires once per run: what has already been said is
+toast on the first frame. Each toast occurrence fires once per run: what has already been said is
 remembered in the toast-state file — `--toast-state`, by default `<run-dir>/toasts.json` — so a
 restarted window does not replay a run's exceptions, and a `--refresh` loop does not repeat itself
-every few seconds.
+every few seconds. Escalations use one key per occurrence in log order, so a later escalation gets
+a fresh toast while re-observing the same one does not.
 
 ## The receipt check
 

@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -63,17 +64,32 @@ def run_hook(payload, log=None, role="child", ticket=None):
     )
 
 
-def send_message_event(message, to="crew-coordinator"):
-    """A PostToolUse payload for a SendMessage call that has just been made."""
+def send_message_event(message, to="crew-coordinator", cwd="/tmp/worktree"):
+    """A PostToolUse payload for a SendMessage call that has just been made.
+
+    `cwd` is the directory the sending session runs in — the coordinator's checkout or a child's
+    worktree — which is what tells one side of the channel's hooks from the other's.
+    """
     return {
         "session_id": "9d1f4c2a-0000-4000-8000-000000000001",
         "transcript_path": "/tmp/transcript.jsonl",
-        "cwd": "/tmp/worktree",
+        "cwd": cwd,
         "hook_event_name": "PostToolUse",
         "tool_name": "SendMessage",
         "tool_input": {"to": to, "message": message},
         "tool_response": {"status": "delivered"},
     }
+
+
+def registered_commands(settings):
+    """Every SendMessage hook command a settings file registers, in the order it lists them."""
+    document = json.loads(pathlib.Path(settings).read_text(encoding="utf-8"))
+    return [
+        hook["command"]
+        for block in document.get("hooks", {}).get("PostToolUse", [])
+        if block["matcher"] == "SendMessage"
+        for hook in block["hooks"]
+    ]
 
 
 class MachineLogTestCase(unittest.TestCase):
@@ -243,6 +259,19 @@ class EventTests(MachineLogTestCase):
         # A decision is about a wave, so it carries no ticket at all.
         self.assertNotIn("ticket", entry)
 
+    def test_a_monitor_error_records_the_monitor_and_its_reason(self):
+        result = run_cli(
+            "monitor-error", "--monitor", "monitor-wave.sh",
+            "--reason", "claude agents --json failed", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "monitor-error")
+        self.assertEqual(entry["monitor"], "monitor-wave.sh")
+        self.assertEqual(entry["reason"], "claude agents --json failed")
+
     def test_a_session_cost_records_the_usage_one_child_spent(self):
         result = run_cli(
             "session-cost",
@@ -387,6 +416,34 @@ class EventTests(MachineLogTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.lines()), 1)
+
+    def test_a_direct_message_uses_the_hook_classification_for_both_roles(self):
+        cases = (
+            ("child", ESCALATION, "escalation"),
+            ("coordinator", RULING, "ruling"),
+        )
+
+        for role, message, event in cases:
+            result = run_cli(
+                "message",
+                "--role", role,
+                "--ticket", "07",
+                "--message", message,
+                log=self.log,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        recorded = self.lines()
+        self.assertEqual(
+            [entry["event"] for entry in recorded],
+            [event for _role, _message, event in cases],
+        )
+        for entry, (role, message, _event) in zip(recorded, cases):
+            self.assertUniformTimestamp(entry)
+            self.assertEqual(entry["role"], role)
+            self.assertEqual(entry["ticket"], "07")
+            self.assertEqual(entry["message"], message)
 
 
 class AppendOnlyTests(MachineLogTestCase):
@@ -612,8 +669,9 @@ class InstallTests(MachineLogTestCase):
         self.install(role="child", ticket="07")
 
         command = self.installed_hooks()[0]["command"]
+        sent_here = send_message_event(ESCALATION, cwd=str(self.settings.parent.parent))
         result = subprocess.run(
-            command, shell=True, input=json.dumps(send_message_event(ESCALATION)),
+            command, shell=True, input=json.dumps(sent_here),
             capture_output=True, text=True,
         )
 
@@ -709,6 +767,277 @@ class InstallTests(MachineLogTestCase):
         self.settings.write_text('{"hooks": ', encoding="utf-8")
 
         result = self.install(role="child", ticket="07")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.settings.read_text(encoding="utf-8"), '{"hooks": ')
+
+
+class InheritedSettingsTests(MachineLogTestCase):
+    """Both sides' hooks fire on a child's send, because the worktree inherits the repo's settings.
+
+    A child's worktree sits under the repository the coordinator runs in, so the coordinator's
+    hook is loaded in the child's session too and every hook the two files register runs on one
+    send. What decides which of them writes is the directory each was installed for: a message is
+    logged by the side whose session sent it, once, under that side's own role.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo = pathlib.Path(self.work.name) / "repo"
+        self.worktree = self.repo / ".claude" / "worktrees" / "07"
+        self.log = self.repo / "features" / "crew-v3" / ".crew" / "log.jsonl"
+        self.coordinator_settings = self.repo / ".claude" / "settings.local.json"
+        self.child_settings = self.worktree / ".claude" / "settings.local.json"
+        self.child_settings.parent.mkdir(parents=True)
+        self.assertEqual(
+            run_cli("install", "--settings", str(self.coordinator_settings),
+                    "--role", "coordinator", log=self.log).returncode,
+            0,
+        )
+        self.assertEqual(
+            run_cli("install", "--settings", str(self.child_settings),
+                    "--role", "child", "--ticket", "07", log=self.log).returncode,
+            0,
+        )
+
+    def send_from(self, cwd, message):
+        """Fire every hook an inheriting session sees: the repo root's and the worktree's."""
+        payload = json.dumps(send_message_event(message, cwd=str(cwd)))
+        for settings in (self.coordinator_settings, self.child_settings):
+            for command in registered_commands(settings):
+                result = subprocess.run(
+                    command, shell=True, input=payload, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_childs_message_is_logged_once_as_the_childs(self):
+        self.send_from(self.worktree, ESCALATION)
+
+        entry = self.only_line()
+
+        self.assertEqual(entry["event"], "escalation")
+        self.assertEqual(entry["role"], "child")
+        self.assertEqual(entry["ticket"], "07")
+        self.assertEqual(entry["message"], ESCALATION)
+
+    def test_a_childs_message_is_never_logged_as_a_coordinator_ruling(self):
+        self.send_from(self.worktree, "CREW COMPLETE b614ec84712aa8c351fe30ec69000e2e12518aeb")
+
+        self.assertEqual([entry["role"] for entry in self.lines()], ["child"])
+
+    def test_the_coordinators_own_message_is_logged_once_as_a_ruling(self):
+        self.send_from(self.repo, RULING)
+
+        entry = self.only_line()
+
+        self.assertEqual(entry["event"], "ruling")
+        self.assertEqual(entry["role"], "coordinator")
+        self.assertNotIn("ticket", entry)
+
+
+class VersionIndependentPathTests(MachineLogTestCase):
+    """The registered command outlives the plugin version that installed it (#37)."""
+
+    VERSION = "0.3.8"
+
+    def setUp(self):
+        super().setUp()
+        self.project = pathlib.Path(self.work.name) / "repo"
+        self.settings = self.project / ".claude" / "settings.local.json"
+        self.settings.parent.mkdir(parents=True)
+        self.log = self.project / "features" / "crew-v3" / ".crew" / "log.jsonl"
+        # The plugin as it is installed on a machine: one directory per released version.
+        self.plugin = (
+            pathlib.Path(self.work.name) / "plugins" / self.VERSION
+            / "skills" / "crew" / "assets" / "machine_log.py"
+        )
+        self.plugin.parent.mkdir(parents=True)
+        self.plugin.write_bytes(SCRIPT.read_bytes())
+
+    def install_from_the_plugin(self):
+        """Install the way a run does: the plugin's own copy, naming no script but itself."""
+        return subprocess.run(
+            [sys.executable, str(self.plugin), "--log", str(self.log),
+             "install", "--settings", str(self.settings), "--role", "coordinator"],
+            capture_output=True, text=True,
+        )
+
+    def test_the_installed_command_carries_no_plugin_version_in_its_path(self):
+        result = self.install_from_the_plugin()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command, = registered_commands(self.settings)
+        self.assertNotIn(self.VERSION, command)
+
+    def test_the_hook_still_writes_the_log_after_the_installing_version_is_gone(self):
+        self.install_from_the_plugin()
+        command, = registered_commands(self.settings)
+        # The upgrade: the version that installed the hook is no longer on this machine.
+        shutil.rmtree(pathlib.Path(self.work.name) / "plugins" / self.VERSION)
+
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            input=json.dumps(send_message_event(RULING, cwd=str(self.project))),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.only_line()["event"], "ruling")
+
+
+class UninstallTests(MachineLogTestCase):
+    """Taking the hook back out: what the matching install wrote, and nothing else."""
+
+    GUARD_COMMAND = "/worktree/.claude/red-line.sh"
+    FOREIGN_COMMAND = "/notify/machine_log.py-watcher --tag sent"
+    # An entry from a finished run, pinned to a plugin version that is no longer on the machine.
+    STALE_SCRIPT = "/cache/agentcrew-dev-skills/0.3.0/skills/crew/assets/machine_log.py"
+    STALE_LOG = "/repo/features/crew-first-run-defects/.crew/log.jsonl"
+
+    def setUp(self):
+        super().setUp()
+        self.project = pathlib.Path(self.work.name) / "repo"
+        self.settings = self.project / ".claude" / "settings.local.json"
+        self.settings.parent.mkdir(parents=True)
+        self.log = self.project / "features" / "crew-v3" / ".crew" / "log.jsonl"
+
+    def install(self, log=None):
+        return run_cli(
+            "install", "--settings", str(self.settings), "--role", "child", "--ticket", "07",
+            log=log if log is not None else self.log,
+        )
+
+    def uninstall(self, log=None):
+        return run_cli(
+            "uninstall", "--settings", str(self.settings),
+            log=log if log is not None else self.log,
+        )
+
+    def stale_entry(self, log):
+        """An entry a previous plugin version wrote for `log`, at its own versioned path."""
+        return {"type": "command", "command":
+                f"python3 {self.STALE_SCRIPT} --log {log} hook --role coordinator"}
+
+    def test_uninstalling_removes_the_entry_the_matching_install_wrote(self):
+        self.install()
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_commands(self.settings), [])
+
+    def test_uninstalling_twice_changes_nothing_the_second_time(self):
+        self.install()
+        self.uninstall()
+        settled = self.settings.read_text(encoding="utf-8")
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.settings.read_text(encoding="utf-8"), settled)
+
+    def test_uninstalling_from_a_file_that_never_carried_the_hook_leaves_it_untouched(self):
+        body = json.dumps({"permissions": {"allow": ["SendMessage"]}})
+        self.settings.write_text(body, encoding="utf-8")
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.settings.read_text(encoding="utf-8"), body)
+
+    def test_every_other_hook_in_the_file_is_left_where_it_is(self):
+        self.settings.write_text(json.dumps({
+            "permissions": {"allow": ["SendMessage", "ListAgents"]},
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": self.GUARD_COMMAND},
+                ]}],
+                "PostToolUse": [{"matcher": "SendMessage", "hooks": [
+                    {"type": "command", "command": self.FOREIGN_COMMAND},
+                ]}],
+            },
+        }), encoding="utf-8")
+        self.install()
+
+        self.uninstall()
+
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        self.assertEqual(settings["permissions"]["allow"], ["SendMessage", "ListAgents"])
+        self.assertEqual(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], self.GUARD_COMMAND
+        )
+        self.assertEqual(registered_commands(self.settings), [self.FOREIGN_COMMAND])
+
+    def test_another_runs_entry_in_the_same_file_survives(self):
+        other_log = self.project / "features" / "dashboard-pin" / ".crew" / "log.jsonl"
+        self.install()
+        self.install(log=other_log)
+
+        self.uninstall()
+
+        remaining, = registered_commands(self.settings)
+        self.assertIn(str(other_log), remaining)
+        self.assertNotIn(str(self.log), remaining)
+
+    def test_a_stale_version_pinned_entry_is_removed_by_the_log_it_was_writing(self):
+        self.settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "SendMessage", "hooks": [
+                self.stale_entry(self.STALE_LOG),
+                {"type": "command", "command": self.FOREIGN_COMMAND},
+            ]},
+        ]}}), encoding="utf-8")
+
+        result = self.uninstall(log=self.STALE_LOG)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_commands(self.settings), [self.FOREIGN_COMMAND])
+
+    def test_an_entry_a_previous_plugin_version_wrote_for_this_run_is_replaced_not_doubled(self):
+        """The upgrade case: the installed path changes with the version, the run does not."""
+        self.settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "SendMessage", "hooks": [self.stale_entry(self.log)]},
+        ]}}), encoding="utf-8")
+
+        self.install()
+
+        command, = registered_commands(self.settings)
+        self.assertNotIn(self.STALE_SCRIPT, command)
+        self.assertIn(str(self.log), command)
+
+    def test_an_entry_a_previous_plugin_version_wrote_for_this_run_is_uninstalled_too(self):
+        self.settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "SendMessage", "hooks": [self.stale_entry(self.log)]},
+        ]}}), encoding="utf-8")
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_commands(self.settings), [])
+
+    def test_a_hook_whose_log_merely_begins_with_ours_is_left_alone(self):
+        """One run directory's path is a prefix of another's the moment it is named after it."""
+        neighbour = (
+            f"python3 /elsewhere/watcher.py --log {self.log}-other hook --role coordinator"
+        )
+        self.settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "SendMessage", "hooks": [{"type": "command", "command": neighbour}]},
+        ]}}), encoding="utf-8")
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_commands(self.settings), [neighbour])
+
+    def test_a_missing_settings_file_is_nothing_to_uninstall(self):
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.settings.exists())
+
+    def test_a_settings_file_that_cannot_be_parsed_is_refused_never_overwritten(self):
+        self.settings.write_text('{"hooks": ', encoding="utf-8")
+
+        result = self.uninstall()
 
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.settings.read_text(encoding="utf-8"), '{"hooks": ')

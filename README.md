@@ -192,6 +192,30 @@ surface = "window"
 What the pinned dashboard is and how it is wired into Claude Code is in
 [`docs/monitor-dashboard.md`](docs/monitor-dashboard.md).
 
+### `[repair]` — the model the merge ladder repairs on
+
+A mechanical merge conflict — two children inserting at the same point, neither rewriting the
+other's work — goes to a headless session under a hard budget cap before anything reaches the
+coordinator. Pick a cheap model: the rung exists to keep mechanical work off the expensive one. A
+full model ID, never an alias, and no default — a run whose config names none stops in preflight.
+
+```toml
+[repair]
+model = "claude-sonnet-5"
+```
+
+### `[tracker]` — where a run closes its merged tickets
+
+Which of the two exercised trackers a run's close operation and its recorded undo are those of:
+`github`, where a ticket is an issue reached through `gh`, or `local`, where a ticket is a markdown
+file whose `Status:` line carries what a label carries on github. No default, and any other value
+stops the run in preflight rather than reaching a CLI nobody named.
+
+```toml
+[tracker]
+kind = "local"
+```
+
 ## Tracker support
 
 Both skills read your repo's `docs/agents/issue-tracker.md` and hard-code no tracker.

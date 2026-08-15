@@ -7,6 +7,120 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **The crew driver** (`skills/crew/assets/driver/driver.py`): one script that
+  runs a whole run as a state machine — preflight, the wave table, dispatch,
+  receipt verification, settlement, the merge ladder, tracker closes, wave
+  advancement and the rendered report — launched as a background task of the
+  coordinator's own session, costing it nothing while it works. Typing `/crew
+  <feature-dir>` is now the run's whole sign-off: the interactive approval step
+  is gone, because across three measured runs it raised no objection while
+  costing the most expensive model a table-construction pass and a round-trip.
+  Why a script rather than a second resident agent, a crew-state MCP server or
+  the Agent SDK, and the three measurements that decided it, is
+  [ADR-0010](docs/adr/0010-the-driver-runs-the-run-the-coordinator-rules.md)
+  (#41, #47).
+- **The rule table**, which settles in the driver everything a written rule
+  already decided: a verified receipt settles in silence, an invalid one earns
+  exactly one re-ask, an idle child exactly one nudge, a vanished child settles
+  failed, parked and failed receipts are recorded by the driver, a settled wave
+  advances, a merged ticket is closed in the run's tracker with its exact undo,
+  and each wave's monitors are re-armed without anyone being asked. It is a
+  transcription of the skill document's own settlement prose, not a new policy.
+  The loop keeps no state of its own — every count it acts on is read out of
+  the machine log when it is needed, which is what makes resuming the same code
+  path as carrying on (#48).
+- **A wake surface of exactly three items.** A `CREW ASK` of any kind, a
+  semantic merge conflict a child has bounced back a second time, and any state
+  the rule table has no row for — a driver crash, a timeout, an unknown status,
+  a child at a permission prompt, a monitor that failed. The driver's last line
+  before every exit is one JSON wake snapshot, and that object is the whole of
+  what a woken coordinator reads: it never opens a run file, so its rulings
+  rest only on what a message shows it. Each wake carries the one command that
+  puts the loop back, so a driver error is recovered exactly as a ruling is.
+  Of 31 in-run wakes across the three audited runs, 26 needed no judgment; a
+  clean run now costs the coordinator one turn to launch, one per ASK, and one
+  to point at the report (#48, #49).
+- **Starting and resuming are one action.** `start` over a feature that already
+  carries a run directory adopts that run instead of cutting a second one
+  beside it: nothing settled is dispatched again, children keep their worktrees
+  and windows, hooks are put back where those worktrees still stand, the
+  dashboard is drawn again, and the loop picks the run up from its log. A
+  coordinator that restarted re-anchors the run it adopts, so every later
+  ticket carries the live identity and every live Claude child is sent the new
+  socket. An interruption, a driver crash or a coordinator restart therefore
+  costs exactly one re-typed command (#50).
+- **`driver.py clear`**, a standalone terminal command that inventories a
+  finished run, asks for confirmation, and removes its worktrees, branches,
+  windows and hooks. Cleanup is the operator's, so the coordinator never holds
+  cleanup context (#51).
+- Two `agentcrew.toml` keys the loop needs and no document named, both with no
+  default and both validated in preflight: `[repair] model`, the cheap model
+  the merge ladder's repair rung runs on, and `[tracker] kind`, `github` or
+  `local`, which decides the close operation and the undo a merged ticket
+  records. Both are recorded into the run at start, so a mid-run config edit
+  cannot retarget a run already under way, and neither decision is ever
+  composed in a model turn (#48).
+- `machine_log.py uninstall --settings <file>` removes every SendMessage hook
+  entry installed for its `--log` and nothing else. The log an entry writes is
+  what identifies it as that run's — whichever plugin version registered it —
+  so another live run's entry, the guard hooks, and a third party's watcher all
+  stay where they are. It is idempotent: a settings file carrying none of ours
+  is left byte for byte as it was found. The crew skill calls it when the run
+  ends, for the coordinator's settings file and each launched child's, and
+  again when the run is cleared, so a finished run leaves no hook behind (#37).
+
+### Changed
+- **Upgrading needs one config edit.** A run whose `agentcrew.toml` names no
+  `[repair] model` or no `[tracker] kind` stops in preflight rather than
+  guessing a model or a CLI. Copy both blocks from
+  [`config/agentcrew.default.toml`](config/agentcrew.default.toml) and set them
+  for your repo before the first run on this version (#48).
+- The crew `SKILL.md` is 60 lines where it was 400: the reversibility contract,
+  the pure-oracle boundary, the one start command, the triage pointer and the
+  resume line. It is the oracle's resident prefix and nothing else — every
+  procedural step it used to carry now lives in the driver. ADR-0003 gains the
+  amendment that the driver, not the coordinator, builds and validates the wave
+  table, and the glossary gains the driver and the wake surface (#52).
+- The interactive wave-table approval round-trip is removed. A routing
+  validation failure is now a preflight failure, fixed by re-running `/route`
+  and never interpreted by a model; the full problem list reaches the operator
+  through a detached `crew-preflight` window that the next start kills by name,
+  so a stale notice cannot outlive its fix (#47).
+
+### Removed
+- `skills/crew/references/resume.md`. Resuming is no longer a procedure anyone
+  reads: it is `start` adopting the unfinished run (#50).
+
+### Fixed
+- An advance treated a parked ticket as unsettled, so a parked ticket with no
+  descendants held its wave open and the run stopped moving on work nobody was
+  waiting for. A parked leaf now settles its wave (#44).
+- The monitor dropped its own failures silently and toasted an escalation once
+  per run rather than once per occurrence, so a second ASK from the same child
+  raised nothing on screen. Errors are recorded as events and escalations toast
+  per occurrence (#45).
+- The test suite could not pass inside a linked git worktree — which is exactly
+  where every crew child runs it — because the plugin-tree fixture borrowed the
+  enclosing repository. The fixture now has a git repository of its own (#46).
+- Every message a child sent was copied into the machine log twice: once as the
+  child's, once more as a coordinator `ruling`. A child's worktree sits inside
+  the repository the coordinator runs in, so the coordinator's hook loads in
+  the child's session too and both hooks fired on the one send — which put the
+  child's words in the log under the coordinator's role and doubled every
+  message count a later auditor would take from the file. Each installed entry
+  now carries the directory it was installed for and copies only what was sent
+  from exactly that directory, so a message is logged once, by the side that
+  sent it (#37).
+- Installed hook commands named the plugin's own copy of `machine_log.py`,
+  whose path carries the plugin version, so upgrading the plugin left every
+  registered hook pointing at a file that was no longer there — a failing hook
+  on every `SendMessage` of a run in progress. The install now registers the
+  run's own copy beside the log, refreshed on each install, which carries no
+  version and outlives every upgrade (#37).
+- Codex child turn messages and coordinator rulings now enter the machine log through the bridge,
+  with the same event classification and timestamp format as Claude child messages (#43).
+
 ## [0.3.8] - 2026-08-15
 
 Watching a run stops meaning leaving it. The dashboard can now be drawn into

@@ -107,6 +107,15 @@ HOOK = "hooks.on-child-launch"
 DASHBOARD = "dashboard"
 SURFACE = "surface"
 SURFACES = ("window", "pin", "both")
+# The model the merge ladder's repair rung runs on: a routing decision like every other model here,
+# so it is refused on the same alias rule.
+REPAIR = "repair"
+REPAIR_MODEL = "model"
+# The tracker a run closes its merged tickets in. Two are exercised end to end
+# (`references/trackers.md`), and a run on any other would reach a CLI nobody named.
+TRACKER = "tracker"
+TRACKER_KIND = "kind"
+TRACKERS = ("github", "local")
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 # The alias list the dispatch renderer refuses to launch on, so a cell this accepts is a cell that
@@ -292,7 +301,7 @@ def check_config_text(text, label, complete, aliases, problems):
         problems.append(f"{label}: unparsable: {error}")
         return
 
-    expected = {"implementer", "reviewer", "hooks", DASHBOARD}
+    expected = {"implementer", "reviewer", "hooks", DASHBOARD, REPAIR, TRACKER}
     for section in sorted(set(config) - expected):
         problems.append(f"{label}: unknown section [{section}]")
 
@@ -312,6 +321,54 @@ def check_config_text(text, label, complete, aliases, problems):
 
     check_hook(config, label, complete, problems)
     check_dashboard(config, label, complete, problems)
+    check_repair(config, label, complete, aliases, problems)
+    check_tracker(config, label, complete, problems)
+
+
+def check_repair(config, label, complete, aliases, problems):
+    """The repair rung's model, which is a full model ID on the same rule every cell above is."""
+    repair = config.get(REPAIR)
+    if repair is None:
+        if complete:
+            problems.append(f"{label}: missing [{REPAIR}]")
+        return
+    if not isinstance(repair, dict):
+        problems.append(f"{label}: [{REPAIR}] must be a table with a {REPAIR_MODEL}")
+        return
+    model = repair.get(REPAIR_MODEL)
+    if model is None:
+        if complete:
+            problems.append(f"{label}: [{REPAIR}] needs a {REPAIR_MODEL}, a full model ID")
+    elif not isinstance(model, str) or not model.strip():
+        problems.append(f"{label}: [{REPAIR}] needs a non-empty {REPAIR_MODEL}")
+    elif is_alias(model, aliases):
+        problems.append(
+            f"{label}: [{REPAIR}] {REPAIR_MODEL} {model!r} is an alias, not a full model ID"
+        )
+    for field in sorted(set(repair) - {REPAIR_MODEL}):
+        problems.append(f"{label}: [{REPAIR}] carries an unknown field {field!r}")
+
+
+def check_tracker(config, label, complete, problems):
+    """The tracker a merged ticket is closed in, which is one of the two that are exercised."""
+    tracker = config.get(TRACKER)
+    if tracker is None:
+        if complete:
+            problems.append(f"{label}: missing [{TRACKER}]")
+        return
+    if not isinstance(tracker, dict):
+        problems.append(f"{label}: [{TRACKER}] must be a table with a {TRACKER_KIND}")
+        return
+    kind = tracker.get(TRACKER_KIND)
+    if kind is None:
+        if complete:
+            problems.append(f"{label}: [{TRACKER}] needs a {TRACKER_KIND}, one of {TRACKERS}")
+    elif kind not in TRACKERS:
+        problems.append(
+            f"{label}: [{TRACKER}] {TRACKER_KIND} {kind!r} is not one of {TRACKERS}"
+        )
+    for field in sorted(set(tracker) - {TRACKER_KIND}):
+        problems.append(f"{label}: [{TRACKER}] carries an unknown field {field!r}")
 
 
 def check_dashboard(config, label, complete, problems):

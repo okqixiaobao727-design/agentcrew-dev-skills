@@ -1140,6 +1140,29 @@ class ToastTests(MonitorTestCase):
 
         self.assertEqual(self.fixture.toasts(), ["crew 06 stuck at a permission prompt"])
 
+    def test_each_escalation_occurrence_toasts_once(self):
+        self.launch_wave_one()
+        self.fixture.append(
+            NOW_TS, "escalation", ticket="06", role="child",
+            message="CREW ASK 06 first escalation — ts=1755060042",
+        )
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        self.fixture.dashboard()
+        self.fixture.dashboard()
+
+        self.fixture.append(
+            NOW_TS, "escalation", ticket="06", role="child",
+            message="CREW ASK 06 second escalation — ts=1755060043",
+        )
+        self.fixture.dashboard()
+        self.fixture.dashboard()
+
+        self.assertEqual(
+            self.fixture.toasts(),
+            ["crew 06 escalated", "crew 06 escalated"],
+        )
+
     def test_pin_toasts_on_the_first_tick_and_not_on_the_second(self):
         self.launch_wave_one()
         self.fixture.live({"06": "waiting", "07": "busy"})

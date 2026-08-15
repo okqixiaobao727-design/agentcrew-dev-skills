@@ -5,17 +5,17 @@
                        --out-dir <launch artifacts> --repair-model <full model ID>
 
 One settled wave in, one decision out. The wave is landed through the merge driver; when every
-one of its tickets came back `landable` and every one of them merged, the next wave is launched
-through the dispatch renderer and the operator is toasted. Nobody is consulted on the way: the
-plan the user approved up front is the whole authority this needs (ADR-0001).
+ticket either came back `landable` and merged or is `parked` with no descendants, the next wave
+is launched through the dispatch renderer and the operator is toasted. Nobody is consulted on
+the way: the plan the user approved up front is the whole authority this needs (ADR-0001).
 
 The four decisions, each recorded once in the machine log as an `advance` event:
 
     launched     the next wave is running, and the toast says so
     complete     that was the last wave; the run has nothing left to advance to
-    escalated    a ticket failed, parked, or did not merge — the chain stops here and the
-                 coordinator rules, woken by the child's own message rather than by this script,
-                 which writes nothing into anybody's context
+    escalated    a ticket failed, a parked ticket has descendants, or did not merge — the chain
+                 stops here; the coordinator rules, woken by the child's own message rather than
+                 by this script, which writes nothing into anybody's context
     interrupted  the operator stopped the run
 
 A halt also marks every unlaunched descendant of a failed or parked ticket `blocked`, following
@@ -60,8 +60,9 @@ DISPATCH = ASSETS / "dispatch" / "dispatch.py"
 TMUX_BIN = "tmux"
 
 LANDABLE = "landable"
-# The two verdicts that stop a ticket's descendants: neither leaves anything for them to build on.
-HALTING_VERDICTS = ("failed", "parked")
+FAILED = "failed"
+PARKED = "parked"
+# A failed ticket always stops the chain; a parked ticket only halts it when it has descendants.
 BLOCKED = "blocked"
 # The merge results that mean the branch is on the integration branch (`docs/merge-driver.md`).
 LANDED_RESULTS = ("clean", "repaired")
@@ -311,17 +312,25 @@ def block_descendants(table, records, roots, options):
     return lines
 
 
-def halt(table, wave, records, reasons, roots, options):
+def decision_detail(detail, passed_over=()):
+    """Add parked tickets passed over as settled without presenting them as halt reasons."""
+    if not passed_over:
+        return detail
+    return f"{detail}; passed over as settled: " + "; ".join(passed_over)
+
+
+def halt(table, wave, records, reasons, roots, options, passed_over=()):
     """Stop the chain: block what can no longer start, and record the one escalation."""
     lines = block_descendants(table, records, roots, options)
-    detail = "; ".join(reasons)
+    detail = decision_detail("; ".join(reasons), passed_over)
     record(options, wave, ESCALATED, detail)
     return lines + [f"wave {wave} {ESCALATED} {detail}"]
 
 
-def stop_short(wave, options):
-    record(options, wave, INTERRUPTED, "the operator interrupted the run")
-    return [f"wave {wave} {INTERRUPTED}"]
+def stop_short(wave, options, passed_over=()):
+    detail = decision_detail("the operator interrupted the run", passed_over)
+    record(options, wave, INTERRUPTED, detail)
+    return list(passed_over) + [f"wave {wave} {INTERRUPTED}"]
 
 
 def advance_wave(table, table_path, wave, options, interrupt):
@@ -355,12 +364,22 @@ def advance_wave(table, table_path, wave, options, interrupt):
     records = read_log(options["log"])
     states = settled_states(records)
     merges = merge_results(records)
+    all_tickets = None
     reasons = []
     roots = {}
+    passed_over = []
     for ticket in tickets:
         number = str(ticket["id"])
         state = states.get(number)
-        if state in HALTING_VERDICTS:
+        if state == PARKED:
+            if all_tickets is None:
+                all_tickets = every_ticket(table)
+            if not descendants(all_tickets, [number]):
+                passed_over.append(f"{number} parked passed over as settled; no descendants")
+                continue
+            roots[number] = state
+            reasons.append(f"{number} {state}; {pointers(ticket)}")
+        elif state == FAILED:
             roots[number] = state
             reasons.append(f"{number} {state}; {pointers(ticket)}")
         elif state != LANDABLE:
@@ -368,25 +387,35 @@ def advance_wave(table, table_path, wave, options, interrupt):
         elif merges.get(number) not in LANDED_RESULTS:
             reasons.append(f"{number} did not land; {pointers(ticket)}")
     if reasons:
-        return lines + halt(table, wave, records, reasons, roots, options), ESCALATED_EXIT
+        return (
+            lines + halt(table, wave, records, reasons, roots, options, passed_over),
+            ESCALATED_EXIT,
+        )
 
     if interrupt.raised:
-        return lines + stop_short(wave, options), INTERRUPT_EXIT
+        return lines + stop_short(wave, options, passed_over), INTERRUPT_EXIT
 
     if following is None:
-        record(options, wave, COMPLETE, "every wave of the run has landed")
-        return lines + [f"wave {wave} {COMPLETE}"], 0
+        detail = decision_detail("every wave of the run has landed", passed_over)
+        record(options, wave, COMPLETE, detail)
+        return lines + list(passed_over) + [f"wave {wave} {COMPLETE}"], 0
 
     launched, launch_lines = launch(table_path, following, landed_head(run), options)
     if not launched:
-        detail = f"wave {following} did not launch: " + "; ".join(launch_lines)
+        detail = decision_detail(
+            f"wave {following} did not launch: " + "; ".join(launch_lines), passed_over
+        )
         record(options, following, ESCALATED, detail)
-        return lines + launch_lines + [f"wave {following} {ESCALATED} {detail}"], ESCALATED_EXIT
+        return (
+            lines + launch_lines + list(passed_over)
+            + [f"wave {following} {ESCALATED} {detail}"], ESCALATED_EXIT
+        )
 
     children = ", ".join(str(ticket["id"]) for ticket in wave_tickets(table, following))
-    record(options, following, LAUNCHED, f"advanced from wave {wave}: {children}")
+    detail = decision_detail(f"advanced from wave {wave}: {children}", passed_over)
+    record(options, following, LAUNCHED, detail)
     toast(f"crew wave {following} {LAUNCHED}")
-    return lines + launch_lines + [f"wave {following} {LAUNCHED} {children}"], 0
+    return lines + launch_lines + list(passed_over) + [f"wave {following} {LAUNCHED} {children}"], 0
 
 
 def parse_args(argv):

@@ -20,6 +20,7 @@ DISPATCH = "skills/crew/assets/dispatch/dispatch.py"
 
 IDENTIFIERS_FILE = ".agentcrew-local-identifiers"
 IDENTIFIERS_ENV = "AGENTCREW_LOCAL_IDENTIFIERS"
+GIT_DIR = ".git"
 
 
 def run_validator(root, env=None):
@@ -37,7 +38,13 @@ class TreeFixture:
     def __init__(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._tmp.name) / "plugin"
-        shutil.copytree(PLUGIN_ROOT, self.root)
+        # The checkout's own `.git` is never copied: in a linked worktree it is a *file* naming a
+        # directory elsewhere, so copying it would leave the fixture pointing at this repository
+        # instead of owning one. The fixture gets its own repository below, so that the residue
+        # lint's ignore lookup, the `.git/` internals these tests seed, and the unpacked-release
+        # case that deletes it all behave the same in a clone and in a worktree.
+        shutil.copytree(PLUGIN_ROOT, self.root, ignore=shutil.ignore_patterns(GIT_DIR))
+        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
         # A maintainer's own identifier list must not decide what these tests reject.
         self.path(IDENTIFIERS_FILE).unlink(missing_ok=True)
 
@@ -79,7 +86,7 @@ class TreeFixture:
 
     def write_git_internal(self, relative, text):
         """Seed a file under this tree's `.git/`, which no release ever ships."""
-        path = self.path(pathlib.Path(".git") / relative)
+        path = self.path(pathlib.Path(GIT_DIR) / relative)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
@@ -106,6 +113,27 @@ class ValidatePluginTreeTests(unittest.TestCase):
     def test_copy_of_the_skeleton_passes(self):
         result = run_validator(self.tree.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_fixture_is_its_own_git_repository(self):
+        # The fixture must be the same tree whether this checkout is a plain clone or a linked
+        # git worktree — where `.git` is a *file* naming a directory elsewhere, so a copy of it
+        # neither holds internals to seed nor owns the repository it points at. Tests below write
+        # under `.git/` and delete it outright, and the residue lint asks git what this tree
+        # ignores; all three need a repository that is a directory rooted inside the fixture.
+        git_dir = subprocess.run(
+            ["git", "-C", str(self.tree.root), "rev-parse", "--absolute-git-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertTrue(
+            self.tree.path(GIT_DIR).is_dir(),
+            f"{self.tree.path(GIT_DIR)} is not a directory",
+        )
+        self.assertEqual(
+            pathlib.Path(git_dir).resolve(),
+            self.tree.path(GIT_DIR).resolve(),
+        )
 
     # --- broken tree ---------------------------------------------------
 
@@ -341,7 +369,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
     def test_residue_outside_a_git_repo_is_rejected(self):
         # An unpacked release has no `.git/` to ask what is ignored. Nothing is ignored there —
         # the tree as it stands is exactly what shipped — so every file is scanned.
-        shutil.rmtree(self.tree.path(".git"))
+        shutil.rmtree(self.tree.path(GIT_DIR))
         self.tree.set_local_identifiers("example-host")
         self.tree.write("docs/scratch.md", "Landed from example-host.\n")
         self.assert_rejects("docs/scratch.md")
@@ -523,6 +551,19 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.edit_config('surface = "window"', 'surface = "popup"')
         self.assert_rejects("popup")
 
+    def test_shipped_defaults_without_a_repair_model_are_rejected(self):
+        """The repair rung has no default: the file every project inherits has to answer it."""
+        self.tree.edit_config('[repair]\nmodel = "claude-sonnet-5"\n', "")
+        self.assert_rejects("repair")
+
+    def test_an_aliased_repair_model_is_rejected(self):
+        self.tree.edit_config('model = "claude-sonnet-5"', 'model = "sonnet"')
+        self.assert_rejects("alias")
+
+    def test_shipped_defaults_without_a_tracker_are_rejected(self):
+        self.tree.edit_config('[tracker]\nkind = "local"\n', "")
+        self.assert_rejects("tracker")
+
 
 class ProjectConfigTests(unittest.TestCase):
     """`--config`: the file the setup wizard writes at a project root."""
@@ -599,6 +640,18 @@ class ProjectConfigTests(unittest.TestCase):
 
     def test_an_unknown_dashboard_field_is_rejected(self):
         self.assert_rejects('[dashboard]\nposition = "top"\n', "position")
+
+    def test_a_project_naming_its_own_repair_model_is_accepted(self):
+        self.assert_accepts('[repair]\nmodel = "claude-haiku-5"\n')
+
+    def test_a_project_naming_an_aliased_repair_model_is_rejected(self):
+        self.assert_rejects('[repair]\nmodel = "haiku"\n', "alias")
+
+    def test_a_project_naming_a_tracker_that_is_not_exercised_is_rejected(self):
+        self.assert_rejects('[tracker]\nkind = "jira"\n', "jira")
+
+    def test_an_unknown_tracker_field_is_rejected(self):
+        self.assert_rejects('[tracker]\nrepo = "owner/name"\n', "repo")
 
     def test_a_hook_env_holding_a_non_string_value_is_rejected(self):
         self.assert_rejects("[hooks.on-child-launch.env]\nPORT = 123\n", "PORT")
