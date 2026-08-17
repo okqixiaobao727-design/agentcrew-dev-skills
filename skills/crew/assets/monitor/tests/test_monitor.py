@@ -47,6 +47,20 @@ AWAITING_RULING = "⚠ awaiting your ruling"
 # halted frame is read rather than measured.
 HALTED_COLUMNS = 120
 
+# The refresh the tests that watch the dashboard's loop run it at, and how they wait on it. One
+# frame of this fixture costs a quarter of a second or more — every draw spawns the stub `claude`
+# and the stub `tmux` — so a fixed nap is no way to count frames: half a second is never long
+# enough for a second frame, and on a loaded machine not long enough for the first. These tests
+# wait for the frame they are waiting for instead; the deadline is only how long they wait before
+# calling the loop broken, and the poll is how often they look.
+LOOP_REFRESH_SECONDS = 0.05
+FRAME_DEADLINE_SECONDS = 30
+FRAME_POLL_SECONDS = 0.05
+# How long a frame that must be the run's last is watched for the redraw that would prove it is
+# not. At the refresh above a live loop draws several frames a second, so this window is many
+# redraws wide — long enough that its silence means the loop really has stopped.
+HELD_FRAME_SECONDS = 2.0
+
 CHILDREN = {"06": "crew-06-dispatch", "07": "crew-07-log", "08": "crew-08-skill"}
 MODEL = "claude-opus-4-5-20251101"
 CODEX_MODEL = "gpt-5.6-luna"
@@ -202,6 +216,14 @@ class Fixture:
         self.bin_dir.mkdir()
         self._link_stub("claude", "stub_claude.py")
         self._link_stub("tmux", "stub_tmux.py")
+
+        # Where a refreshing dashboard's frames and complaints land. Files rather than pipes: the
+        # way a test collects a pipe is `communicate()`, which returns at EOF and so not until the
+        # loop exits, leaving a test watching it redraw nothing to do but nap and then read. A
+        # file is readable while the loop that writes it is still running, so a test can wait for
+        # the frame it is waiting for.
+        self.frames_path = self.root / "dashboard-frames.txt"
+        self.frames_errors = self.root / "dashboard-errors.txt"
 
         self.worktrees = {}
         self.columns = 100
@@ -572,6 +594,21 @@ class Fixture:
         """One statusline tick, at the fixed moment the elapsed times are measured to."""
         return self.run_monitor("pin", "--now", NOW_TS, *extra)
 
+    def refreshing_dashboard(self, *extra):
+        """Start the dashboard in its refresh loop; returns the `Popen` still drawing.
+
+        Its frames go to `frames_path` and anything it complains about to `frames_errors`, both
+        readable while it runs. Nothing here waits for it or ends it: the caller owns both.
+        """
+        with self.frames_path.open("wb") as frames, self.frames_errors.open("wb") as errors:
+            return subprocess.Popen(
+                [sys.executable, str(MONITOR), "dashboard",
+                 "--run-dir", str(self.run_dir), "--now", NOW_TS,
+                 "--refresh", str(LOOP_REFRESH_SECONDS),
+                 *[str(argument) for argument in extra]],
+                stdout=frames, stderr=errors, env=self.environment(),
+            )
+
     def pin_frame_over(self, stdin, *extra):
         """One tick with Claude Code's own JSON on its stdin, as the statusline runs it."""
         with pathlib.Path(stdin).open() as handle:
@@ -830,6 +867,47 @@ class DashboardTests(MonitorTestCase):
         self.fixture.worktree("07")
         self.fixture.launch("06")
         self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+
+    def start_loop(self):
+        """Start the dashboard's refresh loop; returns the `Popen`, killed and reaped at cleanup.
+
+        Nothing ever ends this loop on its own — a finished run holds its frame rather than
+        exiting — so the kill is the only way out, and the wait after it is what keeps a loop the
+        suite abandoned from being left a zombie.
+        """
+        process = self.fixture.refreshing_dashboard()
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        return process
+
+    def drawn(self):
+        """Everything the loop has drawn so far."""
+        return self.fixture.frames_path.read_text(errors="replace")
+
+    def frames(self):
+        """How many whole frames the loop has drawn so far, counted by their one summary line."""
+        return self.drawn().count(f"crew {RUN_ID} —")
+
+    def await_frames(self, count):
+        """Wait for the loop to draw `count` frames; returns everything it has drawn by then."""
+        return self.await_loop(lambda: self.frames() >= count, f"{count} frames")
+
+    def await_text(self, text):
+        """Wait for the loop to draw `text`; returns everything it has drawn by then."""
+        return self.await_loop(lambda: text in self.drawn(), repr(text))
+
+    def await_loop(self, drawn, wanted):
+        """Wait for the loop to satisfy `drawn`, or fail naming what it drew instead."""
+        deadline = time.monotonic() + FRAME_DEADLINE_SECONDS
+        while not drawn():
+            if time.monotonic() >= deadline:
+                self.fail(
+                    f"the dashboard never drew {wanted} in {FRAME_DEADLINE_SECONDS}s; "
+                    f"{self.frames()} frames drawn\n{self.drawn()}"
+                    f"{self.fixture.frames_errors.read_text(errors='replace')}"
+                )
+            time.sleep(FRAME_POLL_SECONDS)
+        return self.drawn()
 
     def test_the_frame_carries_a_summary_line_a_row_per_ticket_and_pending_for_the_unlaunched(self):
         self.launch_wave_one()
@@ -1128,20 +1206,13 @@ class DashboardTests(MonitorTestCase):
     def test_the_frame_redraws_as_the_log_changes(self):
         self.launch_wave_one()
         self.fixture.live({"06": "busy", "07": "busy"})
-        process = self.fixture.start_monitor(
-            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
-        )
-        self.addCleanup(process.kill)
+        self.start_loop()
 
-        time.sleep(0.5)
+        self.assertIn("running", self.await_frames(1))
         self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
                             sha=self.fixture.head("06"))
-        time.sleep(0.5)
-        process.terminate()
-        output = process.communicate(timeout=10)[0]
+        output = self.await_text("landable")
 
-        self.assertIn("running", output)
-        self.assertIn("landable", output)
         self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
 
     def test_a_finished_run_stops_refreshing_and_keeps_its_last_frame(self):
@@ -1151,17 +1222,13 @@ class DashboardTests(MonitorTestCase):
         self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed")
         self.fixture.append(SETTLED_TS, "advance", wave=2, decision="complete")
         self.fixture.live({})
-        process = self.fixture.start_monitor(
-            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
-        )
-        self.addCleanup(process.kill)
+        process = self.start_loop()
 
-        time.sleep(0.5)
+        output = self.await_frames(1)
+        time.sleep(HELD_FRAME_SECONDS)
+
         self.assertIsNone(process.poll(), "the renderer left the window without a frame in it")
-        process.terminate()
-        output = process.communicate(timeout=10)[0]
-
-        self.assertEqual(output.count(f"crew {RUN_ID} —"), 1)
+        self.assertEqual(self.frames(), 1, self.drawn())
         self.assertIn("landable", output)
 
     def test_a_run_the_driver_stopped_keeps_its_last_frame_and_claims_no_ruling(self):
@@ -1178,17 +1245,13 @@ class DashboardTests(MonitorTestCase):
         self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
         self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="stopped")
         self.fixture.live({})
-        process = self.fixture.start_monitor(
-            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
-        )
-        self.addCleanup(process.kill)
+        process = self.start_loop()
 
-        time.sleep(0.5)
+        output = self.await_frames(1)
+        time.sleep(HELD_FRAME_SECONDS)
+
         self.assertIsNone(process.poll(), "the renderer left the window without a frame in it")
-        process.terminate()
-        output = process.communicate(timeout=10)[0]
-
-        self.assertEqual(output.count(f"crew {RUN_ID} —"), 1)
+        self.assertEqual(self.frames(), 1, self.drawn())
         self.assertNotIn(AWAITING_RULING, output)
 
     def test_a_wave_that_escalated_keeps_redrawing_because_the_run_is_not_over(self):
@@ -1196,14 +1259,9 @@ class DashboardTests(MonitorTestCase):
         self.launch_wave_one()
         self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
         self.fixture.live({"06": "busy", "07": "busy"})
-        process = self.fixture.start_monitor(
-            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
-        )
-        self.addCleanup(process.kill)
+        self.start_loop()
 
-        time.sleep(0.5)
-        process.terminate()
-        output = process.communicate(timeout=10)[0]
+        output = self.await_frames(2)
 
         self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
 
@@ -1211,14 +1269,9 @@ class DashboardTests(MonitorTestCase):
         self.launch_wave_one()
         self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="interrupted")
         self.fixture.live({"06": "busy", "07": "busy"})
-        process = self.fixture.start_monitor(
-            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
-        )
-        self.addCleanup(process.kill)
+        self.start_loop()
 
-        time.sleep(0.5)
-        process.terminate()
-        output = process.communicate(timeout=10)[0]
+        output = self.await_frames(2)
 
         self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
 
