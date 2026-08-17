@@ -14,3 +14,6 @@ features/
 # A staged crew run directory, written by the route skill's staging script: a snapshot of tracker
 # tickets for one run, refreshed by re-staging. Scaffolding, never part of the plugin.
 crewtask/
+# The maintainer's own measurements of the merge and review lanes: working notes taken against
+# runs on one machine, kept local rather than shipped as documentation of the plugin.
+docs/merge-and-review-research.md
