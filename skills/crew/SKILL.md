@@ -6,8 +6,8 @@ disable-model-invocation: true
 
 # Crew
 
-`/crew <path-to-feature-dir>` runs the tickets `/to-spec` and `/to-tickets` produced, unattended,
-and hands back an integration branch to review. Typing it is the run's whole sign-off: the wave
+`/crew <run-dir>` runs the tickets of the run directory `/route` staged, unattended, and hands back
+an integration branch to review. Typing it is the run's whole sign-off: the wave
 table the driver validates from each ticket's `## Routing` section is the sole routing authority
 ([ADR-0003](../../docs/adr/0003-script-composed-first-turns-wave-table-authority.md)).
 
@@ -35,14 +35,15 @@ direction or pseudocode, and the child writes the edit.
 Launch the driver as a background task — this session's one proactive turn:
 
 ```bash
-python3 <crew-skill-dir>/assets/driver/driver.py start \
-  --feature-dir <feature-dir> --coordinator-name <this session's own name> \
-  --coordinator-pid "$PPID" --permission-mode <this session's own permission mode>
+python3 <crew-skill-dir>/assets/launch/launch.py <run-dir>
 ```
 
-`<crew-skill-dir>` is the absolute directory this `SKILL.md` loaded from. `$PPID` is this session's
-own process, the anchor a child authenticates your rulings against, and children launch in your
-permission mode because a message crosses only between sessions of one mode.
+`<crew-skill-dir>` is the absolute directory this `SKILL.md` loaded from. The launch script reads
+your pid, your session name, and your permission mode off the harness's own records and starts the
+driver with them, so this step costs one tool call. Where it cannot read one of the three it stops
+and names the flag that supplies the value by hand: get that value from the user, because a wrong
+pid or name strands every ruling you make, and a wrong mode launches every child of the run outside
+the mode a message can cross.
 
 ## Rule when it wakes you
 
@@ -57,4 +58,4 @@ The driver exits with one JSON wake snapshot, and that object is the whole of wh
   the operator's own terminal command.
 
 An interrupted run — a crash, a killed driver, a restarted session — resumes by re-typing `/crew
-<feature-dir>`: start adopts a run already under way rather than beginning a second one.
+<run-dir>`: start adopts a run already under way rather than beginning a second one.
