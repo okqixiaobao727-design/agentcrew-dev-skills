@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-17
+
 ### Added
 - Two words in the dashboard's state vocabulary, for the two intervals it used to
   draw as frozen rows. A ticket whose merge escalated and whose child was then
