@@ -21,6 +21,7 @@ from hook_fixtures import marker_lines, write_hook_config  # noqa: E402
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 BRIDGE_PATH = TESTS_DIR.parent / "scripts" / "claude_review_bridge.py"
 STUB_PATH = TESTS_DIR / "stub_claude.py"
+GRAPH_STUB_PATH = TESTS_DIR / "stub_code_review_graph.py"
 
 
 class BridgeRun:
@@ -491,6 +492,342 @@ class MachineLogTests(BridgeTestCase):
             ["running", "returned", "running", "returned"],
         )
         self.assertEqual({record["ticket"] for record in records}, {self.TICKET})
+
+
+class ScopedRoundOneTestCase(BridgeTestCase):
+    """A real repository, a real worktree on a branch, and a PATH the graph CLI can be kept off.
+
+    The bridge is told only `--cwd` and `--base`: the main checkout and the branch under review
+    are its own to derive, because a worktree shares the object database with the checkout that
+    holds the graph.
+    """
+
+    BRANCH = "ticket-71"
+    TOUCHED_FILE = "app.py"
+    ADDED_FILE = "notes.md"
+    GRAPH_CLI = "code-review-graph"
+
+    def setUp(self):
+        super().setUp()
+        self.checkout = pathlib.Path(self.work.name) / "checkout"
+        self.checkout.mkdir()
+        self.git("init", "-b", "main")
+        self.git("config", "user.email", "crew@example.com")
+        self.git("config", "user.name", "Crew Test")
+        (self.checkout / self.TOUCHED_FILE).write_text("def one():\n    return 1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+
+        # BridgeTestCase made `self.cwd` a bare directory; the worktree takes its place.
+        self.cwd.rmdir()
+        self.git("worktree", "add", "-b", self.BRANCH, str(self.cwd))
+        (self.cwd / self.TOUCHED_FILE).write_text("def one():\n    return 2\n")
+        (self.cwd / self.ADDED_FILE).write_text("what changed and why\n")
+        self.git("add", ".", cwd=self.cwd)
+        self.git("commit", "-m", "the change under review", cwd=self.cwd)
+
+        self.graph_bin = pathlib.Path(self.work.name) / "graph-bin"
+        self.graph_bin.mkdir()
+        self.graph_argv_log = pathlib.Path(self.work.name) / "crg-argv.jsonl"
+
+    def git(self, *arguments, cwd=None):
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=str(cwd or self.checkout),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return completed.stdout
+
+    def install_graph_stub(self):
+        installed = self.graph_bin / self.GRAPH_CLI
+        if not installed.exists():
+            installed.symlink_to(GRAPH_STUB_PATH)
+
+    def graphless_path(self):
+        """PATH with every directory that already carries a real graph CLI removed."""
+        kept = [
+            entry
+            for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry and not (pathlib.Path(entry) / self.GRAPH_CLI).exists()
+        ]
+        return os.pathsep.join(kept)
+
+    def run_scoped(
+        self,
+        *arguments,
+        scenario="ok",
+        graph_scenario="risk",
+        with_graph=True,
+        env_redirection=None,
+    ):
+        if with_graph:
+            self.install_graph_stub()
+        environment = {
+            "PATH": (
+                f"{self.graph_bin}{os.pathsep}{self.graphless_path()}"
+                if with_graph
+                else self.graphless_path()
+            ),
+            "CRG_STUB_SCENARIO": graph_scenario,
+            "CRG_STUB_ARGV_LOG": str(self.graph_argv_log),
+        }
+        environment.update(env_redirection or {})
+        return self.run_bridge(
+            "the changes in this worktree since the base",
+            "--base",
+            self.base,
+            *arguments,
+            scenario=scenario,
+            env=environment,
+        )
+
+    def graph_calls(self):
+        if not self.graph_argv_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.graph_argv_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def prompt_from(self, run):
+        return run.invocations[-1]["argv"][-1]
+
+
+class ScopedContextTests(ScopedRoundOneTestCase):
+    """Round one opens with an analysis of exactly the range under review.
+
+    The graph CLI answers when it can; when it cannot — missing, failing, or reporting no changed
+    functions against a diff that plainly has some — a git summary fills the same slot, and
+    nothing else about the review changes.
+    """
+
+    def test_the_graph_is_queried_for_the_range_against_the_main_checkout(self):
+        run = self.run_scoped()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = self.graph_calls()
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual(argv[0], "detect-changes")
+        self.assertIn("--brief", argv)
+        self.assertEqual(argv[argv.index("--base") + 1], f"{self.base}...{self.BRANCH}")
+        self.assertEqual(
+            pathlib.Path(argv[argv.index("--repo") + 1]).resolve(),
+            self.checkout.resolve(),
+        )
+
+    def test_the_graph_is_never_pointed_by_environment_variable(self):
+        # Measured unreliable: a redirected graph answers with a silent zero-risk score, so even
+        # an inherited redirection must not reach the call.
+        self.run_scoped(
+            env_redirection={
+                "CRG_DATA_DIR": str(self.cwd / "private-graph"),
+                "CRG_REPO_ROOT": str(self.cwd),
+            }
+        )
+
+        call = self.graph_calls()[0]
+        self.assertIsNone(call["dataDirEnv"])
+        self.assertIsNone(call["repoRootEnv"])
+
+    def test_the_risk_analysis_reaches_the_round_one_prompt(self):
+        run = self.run_scoped()
+
+        prompt = self.prompt_from(run)
+        self.assertIn(f"{self.base}...{self.BRANCH}", prompt)
+        self.assertIn("3 changed function(s)/class(es)", prompt)
+        self.assertIn("2 test gap(s)", prompt)
+        self.assertIn("Overall risk score: 0.62", prompt)
+
+    def test_a_missing_graph_cli_fills_the_slot_with_the_git_summary(self):
+        run = self.run_scoped(with_graph=False)
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        prompt = self.prompt_from(run)
+        self.assertIn(self.base, prompt)
+        self.assertIn("2 files changed", prompt)
+        self.assertIn(self.TOUCHED_FILE, prompt)
+        self.assertIn(self.ADDED_FILE, prompt)
+
+    def test_a_failing_graph_cli_falls_back_to_the_git_summary(self):
+        run = self.run_scoped(graph_scenario="fail")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        prompt = self.prompt_from(run)
+        self.assertIn("2 files changed", prompt)
+        self.assertIn(self.ADDED_FILE, prompt)
+
+    def test_a_silent_graph_cli_falls_back_to_the_git_summary(self):
+        run = self.run_scoped(graph_scenario="empty")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        prompt = self.prompt_from(run)
+        self.assertIn("2 files changed", prompt)
+
+    def test_zero_changed_functions_on_a_non_empty_diff_is_treated_as_no_graph(self):
+        run = self.run_scoped(graph_scenario="zero")
+
+        prompt = self.prompt_from(run)
+        self.assertNotIn("Overall risk score", prompt)
+        self.assertIn("2 files changed", prompt)
+        self.assertIn(self.TOUCHED_FILE, prompt)
+
+    def test_uncommitted_work_is_summarised_rather_than_left_out(self):
+        """The review runs before the child commits, so the range must end at the working tree."""
+        (self.cwd / "pending.py").write_text("def two():\n    return 2\n")
+        (self.cwd / self.TOUCHED_FILE).write_text("def one():\n    return 3\n")
+
+        run = self.run_scoped()
+
+        prompt = self.prompt_from(run)
+        self.assertIn("pending.py", prompt)
+        self.assertIn(self.TOUCHED_FILE, prompt)
+        self.assertIn(self.base, prompt)
+
+    def test_a_dirty_worktree_is_never_answered_by_a_graph_that_cannot_see_it(self):
+        (self.cwd / "pending.py").write_text("def two():\n    return 2\n")
+
+        run = self.run_scoped()
+
+        self.assertEqual(self.graph_calls(), [])
+        self.assertNotIn("Overall risk score", self.prompt_from(run))
+
+    def test_the_review_behaves_identically_whichever_slot_filler_ran(self):
+        with_graph = self.run_scoped()
+        self.argv_log.unlink()
+        self.graph_argv_log.unlink()
+        without_graph = self.run_scoped(with_graph=False)
+
+        self.assertEqual(without_graph.returncode, with_graph.returncode)
+        for key in ("status", "sessionId", "round", "findings", "permissionDenials"):
+            self.assertEqual(without_graph.output[key], with_graph.output[key], key)
+
+    def test_a_call_without_a_base_reviews_exactly_as_before(self):
+        scoped = self.run_scoped()
+        self.argv_log.unlink()
+
+        plain = self.run_bridge("the changes in this worktree since the base")
+
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(plain.output["status"], scoped.output["status"])
+        self.assertNotIn("Change analysis", self.prompt_from(plain))
+
+    def test_the_follow_up_prompt_does_not_repeat_the_scoped_block(self):
+        first = self.run_scoped()
+
+        second = self.run_scoped("--resume-session", first.output["lineageId"])
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("Change analysis", self.prompt_from(second))
+
+
+class VerificationReuseTests(ScopedRoundOneTestCase):
+    """The reviewer is handed what the author already ran, and told not to run it again."""
+
+    VERIFICATION = "python3 -m unittest discover -s tests — passed; validator — passed"
+
+    def test_the_recorded_verification_reaches_the_round_one_prompt(self):
+        run = self.run_scoped("--verification", self.VERIFICATION)
+
+        prompt = self.prompt_from(run)
+        self.assertIn(self.VERIFICATION, prompt)
+
+    def test_the_prompt_asks_for_the_touched_tests_only(self):
+        run = self.run_scoped("--verification", self.VERIFICATION)
+
+        prompt = self.prompt_from(run)
+        self.assertIn("only the tests the diff touches", prompt)
+        self.assertIn("full suite", prompt)
+
+    def test_an_unrecorded_verification_says_so_rather_than_claiming_one(self):
+        run = self.run_scoped()
+
+        prompt = self.prompt_from(run)
+        self.assertIn("recorded no verification", prompt)
+        self.assertIn("only the tests the diff touches", prompt)
+
+
+class ReReviewGateTests(ScopedRoundOneTestCase):
+    """The cap is code now: a second pass needs a spec finding from the first.
+
+    The round-one prompt asks for a machine-readable verdict line, and the gate reads it. A round
+    one that never printed one is not evidence of a clean review, so the gate lets that through
+    rather than refusing a review the caller may genuinely need.
+    """
+
+    def resume(self, first, **kwargs):
+        return self.run_scoped("--resume-session", first.output["lineageId"], **kwargs)
+
+    def test_the_round_one_prompt_asks_for_the_verdict_line(self):
+        run = self.run_scoped()
+
+        prompt = self.prompt_from(run)
+        self.assertIn("REVIEW VERDICT: spec-findings-requiring-fix=", prompt)
+
+    def test_a_spec_finding_that_required_a_fix_earns_the_second_pass(self):
+        first = self.run_scoped()
+
+        second = self.resume(first)
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.output["status"], "completed")
+        self.assertEqual(second.output["round"], 2)
+        self.assertEqual(len(second.invocations), 2)
+
+    def test_a_standards_only_round_one_is_refused_a_second_pass(self):
+        first = self.run_scoped(scenario="verdict-clean")
+
+        second = self.resume(first, scenario="verdict-clean")
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.output["status"], "refused")
+        self.assertEqual(second.output["specFindingsRequiringFix"], 0)
+        self.assertEqual(len(second.invocations), 1)
+        self.assertEqual(second.state(first.output["lineageId"])["rounds"], 1)
+
+    def test_a_refusal_says_why_without_pretending_to_be_a_review(self):
+        first = self.run_scoped(scenario="verdict-clean")
+
+        second = self.resume(first, scenario="verdict-clean")
+
+        self.assertIn("spec finding", second.output["reason"])
+        self.assertEqual(second.output["findings"], "")
+        self.assertEqual(second.output["lineageId"], first.output["lineageId"])
+
+    def test_a_round_one_without_a_verdict_line_earns_no_second_pass(self):
+        first = self.run_scoped(scenario="no-verdict")
+
+        second = self.resume(first, scenario="no-verdict")
+
+        self.assertEqual(second.output["status"], "refused")
+        self.assertIsNone(second.output["specFindingsRequiringFix"])
+        self.assertIn("REVIEW VERDICT", second.output["reason"])
+        self.assertEqual(len(second.invocations), 1)
+
+    def test_half_a_verdict_line_is_not_a_verdict(self):
+        """A fragment of the line, or the phrase inside prose, is not the report saying so."""
+        first = self.run_scoped(scenario="part-verdict")
+
+        second = self.resume(first, scenario="part-verdict")
+
+        self.assertEqual(second.output["status"], "refused")
+        self.assertIsNone(second.output["specFindingsRequiringFix"])
+        self.assertEqual(len(second.invocations), 1)
+
+    def test_the_one_re_review_is_a_cap_so_a_third_pass_is_refused(self):
+        first = self.run_scoped()
+        second = self.resume(first)
+
+        third = self.resume(first)
+
+        self.assertEqual(second.output["round"], 2)
+        self.assertEqual(third.output["status"], "refused")
+        self.assertIn("one re-review", third.output["reason"])
+        self.assertEqual(len(third.invocations), 2)
 
 
 if __name__ == "__main__":

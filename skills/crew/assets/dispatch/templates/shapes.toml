@@ -48,13 +48,31 @@ line last and stop; its reply arrives as your next turn. Keep the `ts=<unix time
 the run's record of when you sent.
 '''
 
-# The receipt paragraph every workflow but `acceptance` closes with.
+# The receipt paragraph every workflow but `acceptance` closes with. A Codex child has no channel
+# of its own — its bridge reads the final message of the turn and writes the log from there — so
+# this variant asks it to send, and it is also what a run dispatched without a machine log renders
+# for either lane: there is no log path to name, so the sendable receipt is all a child can do.
 completion = '''
 When <completion condition> are complete, run `git rev-parse HEAD` and send all 40 characters of
 its output:
 CREW COMPLETE <sha> ts=<unix time>
 If you cannot complete the ticket, send:
 CREW FAILED <reason> ts=<unix time>
+'''
+
+# The Claude lane's receipt: written straight to the run's machine log, which is where the driver
+# verifies receipts from, so it never lands in the coordinator's conversation. The coordinator is
+# woken by `CREW ASK` alone, which keeps SendMessage — it is the one message that needs an answer.
+completion_claude = '''
+When <completion condition> are complete, run `git rev-parse HEAD` and record the receipt in the
+run's machine log yourself — this receipt is not a message to your coordinator:
+
+python3 <machine log script> --log <machine log path> message \
+  --role child --ticket <NN> --message 'CREW COMPLETE <sha> ts=<unix time>'
+
+If you cannot complete the ticket, record the same way with:
+CREW FAILED <reason> ts=<unix time>
+Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is woken for.
 '''
 
 [workflows.tdd]
@@ -144,15 +162,30 @@ and stop — the checklist is the human's to run.
 If you cannot reach that point, send:
 CREW FAILED <reason> ts=<unix time>
 '''
+# The same park, recorded rather than sent, for a Claude child on a run with a machine log.
+completion_claude = '''
+Commit your preparation and the checklist, then park: record the receipt in the run's machine log
+yourself — this receipt is not a message to your coordinator:
+
+python3 <machine log script> --log <machine log path> message \
+  --role child --ticket <NN> --message 'CREW PARKED <absolute checklist path> ts=<unix time>'
+
+and stop — the checklist is the human's to run.
+If you cannot reach that point, record the same way with:
+CREW FAILED <reason> ts=<unix time>
+Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is woken for.
+'''
 
 [review]
 # Both variants close with the same contract; the reviewed child is the party that reads it.
 rounds = '''
 Rounds. Classify each finding on two axes: standards — style, naming, convention, anything that
 leaves behaviour intact — and spec — correctness, security, deviation from the spec or ticket.
-Fix the standards findings you accept in one pass; they are done without re-review. Spec findings
-that required fixes get one re-review, scoped to exactly those fixes. Most reviews end clean after
-the first pass — the re-review is a cap, not a stage to fill.
+Fix the standards findings you accept in one pass; they are done without re-review. A second review
+pass is permitted only when the first pass produced a spec finding that required a fix, and it
+is scoped to exactly those fixes; a clean first pass, or one carrying only standards findings,
+ends the review there. Most reviews end clean after the first pass — the re-review is a cap, not
+a stage to fill.
 A spec finding still open after that re-review, or a finding the reviewer reopens after you ruled
 on it, ends the review: send your coordinator a CREW ASK carrying both positions, rather
 than opening another round.
@@ -207,6 +240,8 @@ own, so a headless one reviews for you. Once the work is in place and before you
 
 python3 <crew-skill-dir>/assets/review/scripts/claude_review_bridge.py \
   --cwd <worktree-abs-path> --model <review model> --effort <review effort><review log> \
+  --base <ticket base commit> \
+  --verification '<the commands you ran to verify this work, and that they passed>' \
   'the changes in this worktree since <ticket base commit>'
 
 This command is the ticket's only review; it satisfies every review step any skill you invoke

@@ -58,8 +58,10 @@ anyone, so nobody has to translate.
 | `pending` | is in the table and has not been launched yet |
 | `running` | has a live child working on it |
 | `waiting` | has a child or a merge needing a human: a prompt, an idle turn, a blocked merge |
+| `reworking` | has a live child resolving the semantic merge conflict the run sent it back to |
 | `parked` | needs an irreversible action, so it is waiting for a human |
 | `landable` | has a verified completion receipt and has not been merged yet |
+| `settling` | is landable in a wave whose last receipt is in, so its merge is what happens next |
 | `merged` | is in the integration branch |
 | `failed` | did not produce work that could land |
 | `vanished` | was launched and its child is no longer there |
@@ -153,10 +155,12 @@ when the round budget runs out escalates too. Escalation is not an ending: once 
 keeps running.
 
 **Receipt** — A child's final word on a ticket: complete (with the full commit sha, which the
-coordinator verifies independently) or failed (with the reason).
+coordinator verifies independently) or failed (with the reason). A child records it in the run's
+machine log rather than sending it, so a receipt reaches the run's record without waking the
+coordinator for an event it has nothing to decide.
 
 **Message channel** — Point-to-point cross-session messaging between Claude Code sessions on one
-machine. Escalations, answers and receipts travel this way. tmux is reserved for three jobs:
+machine. Escalations and answers travel this way; receipts do not. tmux is reserved for three jobs:
 launching children, answering permission confirmations (a message cannot approve permissions on the
 receiver's behalf), and human takeover.
 

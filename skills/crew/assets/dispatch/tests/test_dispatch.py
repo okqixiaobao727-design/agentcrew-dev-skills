@@ -475,9 +475,12 @@ class ReviewEventRenderTests(DispatchTestCase):
         self.assertIn(
             "python3 %s/assets/review/scripts/claude_review_bridge.py \\\n"
             "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
+            "  --base %s \\\n"
+            "  --verification '<the commands you ran to verify this work, and that they"
+            " passed>' \\\n"
             "  'the changes in this worktree since %s'"
             % (CREW_SKILL_DIR, self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT,
-               self.machine_log, self.fixture.base_commit),
+               self.machine_log, self.fixture.base_commit, self.fixture.base_commit),
             prompt,
         )
 
@@ -508,6 +511,140 @@ class ReviewEventRenderTests(DispatchTestCase):
                self.fixture.base_commit),
             prompt,
         )
+
+
+class ReceiptChannelTests(DispatchTestCase):
+    """Where a child's receipts go: a Claude child writes them, only CREW ASK is sent.
+
+    A receipt carries no decision, so waking the coordinator with one buys nothing. The Claude
+    lane records `CREW COMPLETE` / `CREW FAILED` / `CREW PARKED` through the machine log's own
+    CLI — the same log the Codex bridge already writes — and keeps the cross-session channel for
+    the one line the coordinator must answer.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = self.fixture.root / "run" / "log.jsonl"
+        # The run's own copy of the log's writer: installed beside the log, so a plugin upgrade
+        # mid-run cannot leave the receipt command naming a file that is no longer there (#37).
+        self.log_script = self.machine_log.parent / "machine_log.py"
+
+    def prompt_for(self, *extra, **overrides):
+        table = self.fixture.table([self.fixture.ticket("06", "receipted", **overrides)])
+        result = self.fixture.run_dispatch("render", table, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.fixture.turn("06")
+
+    def logged_prompt(self):
+        return self.prompt_for("--log", str(self.machine_log))
+
+    def test_a_claude_child_records_its_completion_in_the_runs_machine_log(self):
+        self.assertIn(
+            "When implementation, tests, the review, and commit are complete, run"
+            " `git rev-parse HEAD` and record the receipt in the\nrun's machine log yourself —"
+            " this receipt is not a message to your coordinator:\n"
+            "\n"
+            "python3 %s --log %s message \\\n"
+            "  --role child --ticket 06 --message 'CREW COMPLETE <sha> ts=<unix time>'"
+            % (self.log_script, self.machine_log),
+            self.logged_prompt(),
+        )
+
+    def test_a_claude_child_records_its_failure_the_same_way(self):
+        self.assertIn(
+            "If you cannot complete the ticket, record the same way with:\n"
+            "CREW FAILED <reason> ts=<unix time>",
+            self.logged_prompt(),
+        )
+
+    def test_a_claude_child_is_told_not_to_send_its_receipts(self):
+        self.assertIn(
+            "Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is"
+            " woken for.",
+            self.logged_prompt(),
+        )
+
+    def test_a_claude_child_records_a_parked_receipt_too(self):
+        prompt = self.prompt_for(
+            "--log", str(self.machine_log), workflow="acceptance", review=None,
+        )
+        self.assertIn(
+            "Commit your preparation and the checklist, then park: record the receipt in the run's"
+            " machine log\nyourself — this receipt is not a message to your coordinator:\n"
+            "\n"
+            "python3 %s --log %s message \\\n"
+            "  --role child --ticket 06 --message"
+            " 'CREW PARKED <absolute checklist path> ts=<unix time>'\n"
+            "\n"
+            "and stop — the checklist is the human's to run."
+            % (self.log_script, self.machine_log),
+            prompt,
+        )
+
+    def test_a_claude_child_keeps_the_coordinator_channel_for_crew_ask(self):
+        prompt = self.logged_prompt()
+        self.assertIn(
+            f"Reply with SendMessage to\n`{COORDINATOR_NAME}`; ListAgents shows the ref to attach"
+            " on first send.",
+            prompt,
+        )
+        self.assertIn("CREW ASK 06 <doc-conflict|stuck|scope>", prompt)
+
+    def test_a_codex_child_keeps_the_receipt_its_bridge_reads(self):
+        """The Codex lane's bridge already writes the log; its turn shape does not change."""
+        prompt = self.prompt_for(
+            "--log", str(self.machine_log),
+            workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
+        self.assertIn(
+            "When characterization tests, refactor, the review, and commit are complete, run"
+            " `git rev-parse HEAD` and send all 40 characters of\nits output:\n"
+            "CREW COMPLETE <sha> ts=<unix time>\n"
+            "If you cannot complete the ticket, send:\n"
+            "CREW FAILED <reason> ts=<unix time>",
+            prompt,
+        )
+        self.assertNotIn("machine_log.py", prompt)
+        self.assertIn("CREW ASK 06 <doc-conflict|stuck|scope>", prompt)
+
+    def test_a_run_with_no_machine_log_leaves_the_receipt_a_message(self):
+        """There is no log to name, so the sendable receipt is what a child can still do."""
+        prompt = self.prompt_for()
+        self.assertNotIn("machine_log.py", prompt)
+        self.assertIn(
+            "When implementation, tests, the review, and commit are complete, run"
+            " `git rev-parse HEAD` and send all 40 characters of\nits output:\n"
+            "CREW COMPLETE <sha> ts=<unix time>",
+            prompt,
+        )
+
+
+class ReReviewConditionTests(DispatchTestCase):
+    """The re-review cap, stated as a condition on both review lanes."""
+
+    CONDITION = (
+        "A second review\npass is permitted only when the first pass produced a spec finding that"
+        " required a fix, and it\nis scoped to exactly those fixes; a clean first pass, or one"
+        " carrying only standards findings,\nends the review there."
+    )
+
+    def prompt_for(self, **overrides):
+        table = self.fixture.table([self.fixture.ticket("06", "reviewed", **overrides)])
+        result = self.fixture.run_dispatch("render", table)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.fixture.turn("06")
+
+    def test_the_codex_review_lane_states_the_condition(self):
+        self.assertIn(self.CONDITION, self.prompt_for())
+
+    def test_the_claude_review_lane_states_the_condition(self):
+        prompt = self.prompt_for(
+            workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
+        self.assertIn("claude_review_bridge.py", prompt)
+        self.assertIn(self.CONDITION, prompt)
 
 
 class WorkflowShapeTests(DispatchTestCase):
