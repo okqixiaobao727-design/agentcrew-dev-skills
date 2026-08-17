@@ -71,7 +71,16 @@ WAVE  TICKET  TITLE                       EXECUTOR                         STATE
 
 The summary line above the table is the run at a glance: the run id (the run directory's own
 name), how many of its waves have been launched, a count per state, and the run's total elapsed
-time from its first launch.
+time from its first launch. While the run is halted on a ruling it carries one more field
+between the counts and the clock — `⚠ awaiting your ruling` — so a run waiting on the operator
+is never read as a frozen frame:
+
+```
+crew crew-run-3 — wave 2/5 · pending=6 merged=4 · ⚠ awaiting your ruling · elapsed 01:12:44
+```
+
+The log's newest `advance` decides it: `escalated` or `interrupted` puts the marker up, and the
+next `advance` — the wave carrying on once the coordinator has ruled — takes it away.
 
 ### States
 
@@ -82,7 +91,7 @@ never reads an internal word:
 | --- | --- |
 | `pending` | the log carries no `launch` for that ticket, or an `outcome` of `blocked` |
 | `running` | its lane's source says `busy` |
-| `waiting` | its lane's source says `waiting` or `idle`: a child that stopped short |
+| `waiting` | its lane says `waiting` or `idle`, or a `merge` result of `conflict` or `escalated` |
 | `parked` | a `receipt` verdict or an `outcome` of `parked`, or the agents list says so |
 | `landable` | a `receipt` verdict of `landable` |
 | `merged` | a `merge` result of `clean` or `repaired`, or an `outcome` of `completed` |
@@ -123,10 +132,13 @@ tests read. The title column absorbs whatever width the window has left after th
 titles are as readable as the terminal allows.
 
 `--refresh` turns the single render into the window's loop: the same frame, redrawn over itself
-every so many seconds. Once the log carries an `advance` decision of `complete`, `escalated` or
-`interrupted`, the run is over: the renderer draws its last frame, stops refreshing, and stays
-alive holding it — nothing here ever closes the window. `--now` fixes the moment elapsed times are
-measured to, which is what makes a render reproducible.
+every so many seconds. Once the log carries an `advance` decision of `complete` or `stopped`, the
+run is over: the renderer draws its last frame, stops refreshing, and stays alive holding it —
+nothing here ever closes the window. Those two are the only decisions that end a run, here and in
+the driver, which imports this predicate rather than keeping one of its own: a wave that escalated
+or was interrupted is carried on by the ruling or by the run that adopts it, so every surface
+keeps drawing it and says `⚠ awaiting your ruling` while it waits. `--now` fixes the moment
+elapsed times are measured to, which is what makes a render reproducible.
 
 ## Toasts
 
@@ -328,7 +340,8 @@ One pin is selected per tick, in this order:
 ### When nothing is drawn
 
 Nothing is drawn, and the exit status is still 0, when there is no pin, when the run directory is
-gone or unreadable, when the coordinator's pid is not alive, or when the machine log carries a
-final `advance` decision. The last two are the whole liveness story: a dead pid is a crashed or
-killed run, a final `advance` is a run that is over, and there is no watchdog, no heartbeat and no
-separate liveness file behind either.
+gone or unreadable, when the coordinator's pid is not alive, or when the machine log carries an
+`advance` decision of `complete` or `stopped`. The last two are the whole liveness story: a dead
+pid is a crashed or killed run, either of those decisions is a run that is over, and there is no
+watchdog, no heartbeat and no separate liveness file behind either. A halted wave is none of these
+— the pin keeps drawing it, with the `⚠ awaiting your ruling` marker on its summary line.

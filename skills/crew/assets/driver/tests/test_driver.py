@@ -1216,6 +1216,24 @@ class LoopTests(DriverTestCase):
         self.assertEqual(self.verdict("02"), "blocked")
         self.assertIsNone(self.fixture.launch_record("02"))
 
+    def test_a_chain_that_stopped_for_good_records_that_the_run_stopped(self):
+        """The ending the `escalated` decision cannot describe on its own.
+
+        A wave that escalated is halted awaiting a ruling — until the reasons are all ones the
+        rule table has already settled, and then the same word means the run has ended. The driver
+        appends `stopped` at that point so the operator's surfaces can tell the two apart: nothing
+        else in the log distinguishes a run that is over from one waiting on the coordinator.
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW FAILED the approach does not work")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(
+            [record["decision"] for record in self.events("advance")], ["escalated", "stopped"]
+        )
+        self.assertEqual(self.events("advance", decision="stopped")[0]["wave"], "1")
+
     def test_a_failure_receipt_is_recorded_by_the_driver(self):
         process = self.start(("01", ()))
 
@@ -1513,6 +1531,15 @@ class AdoptionTests(DriverTestCase):
         process.kill()
         process.communicate()
 
+    def append_advance(self, wave, decision):
+        """The advance line the run's own driver wrote before it stopped, in the log's schema."""
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "advance", "wave": wave, "decision": decision,
+        }
+        with (self.fixture.run_dir / "log.jsonl").open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+
     def test_re_invoking_the_driver_over_an_unfinished_run_adopts_it(self):
         self.interrupted(("01", ()), ("02", ("01",)))
         run = self.fixture.table()["run"]
@@ -1546,6 +1573,38 @@ class AdoptionTests(DriverTestCase):
         self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
         self.assertEqual(len(self.events("launch", ticket="02")), 1, "02 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    def test_a_run_whose_wave_escalated_is_unfinished_and_is_adopted(self):
+        """`escalated` is not final: the wave the coordinator ruled on is the run's to carry on.
+
+        The predicate the driver asks here is the monitor's own, so this is also what keeps the
+        operator's surfaces drawing such a run rather than freezing at its first escalation.
+        """
+        self.interrupted(("01", ()))
+        self.append_advance("1", "escalated")
+
+        adopted = self.fixture.launch()
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
+        self.assertEqual(self.verdict("01"), "completed")
+        self.assertEqual(
+            [record["decision"] for record in self.events("advance")], ["escalated", "complete"]
+        )
+
+    def test_a_run_the_driver_stopped_is_not_adopted(self):
+        """`stopped` is final too: the chain ended on reasons no ruling of the run can undo."""
+        self.interrupted(("01", ()))
+        self.append_advance("1", "escalated")
+        self.append_advance("1", "stopped")
+        launches = len(self.fixture.launches())
+
+        result = self.fixture.start()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(result)["reason"], "run-complete")
+        self.assertEqual(len(self.fixture.launches()), launches, "a stopped run was re-dispatched")
 
     def test_a_run_whose_log_holds_a_final_advance_decision_is_not_adopted(self):
         finished = self.running(("01", ()))

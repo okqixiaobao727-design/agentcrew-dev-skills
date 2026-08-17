@@ -32,6 +32,20 @@ NOW_TS = "2026-08-13T09:12:31Z"
 LIVE_ELAPSED = "00:12:31"
 SETTLED_TS = "2026-08-13T09:41:07Z"
 SETTLED_ELAPSED = "00:41:07"
+# The moment a merge blew up on a ticket that already had its receipt, and the moment the wave
+# re-ran once the coordinator had ruled: both later than the receipt, so a row that keeps
+# following its stale receipt is visible in its clock alone.
+BLOCKED_TS = "2026-08-13T09:44:19Z"
+BLOCKED_ELAPSED = "00:44:19"
+RULED_TS = "2026-08-13T09:47:53Z"
+RULED_ELAPSED = "00:47:53"
+# Why one merge stopped, as the merge driver words it, and what the row says about it underneath.
+BLOCKED_DETAIL = "semantic: both sides rewrote the same lines of driver.py"
+# The marker the summary line carries while a wave is halted on the coordinator's ruling.
+AWAITING_RULING = "⚠ awaiting your ruling"
+# A window wide enough to hold that summary line and the blocked row's annotation whole, so a
+# halted frame is read rather than measured.
+HALTED_COLUMNS = 120
 
 CHILDREN = {"06": "crew-06-dispatch", "07": "crew-07-log", "08": "crew-08-skill"}
 MODEL = "claude-opus-4-5-20251101"
@@ -887,6 +901,70 @@ class DashboardTests(MonitorTestCase):
             row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
         ]))
 
+    def blocked_merge(self):
+        """A wave halted on a ruling: 06's receipt landed, its merge did not, and the wave stopped.
+
+        This is the shape the real run took — a receipt, then a `merge` the driver could not
+        finish, then the `advance` that handed the wave to the coordinator.
+        """
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="escalated",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+
+    def test_a_wave_halted_on_a_ruling_says_so_in_the_summary_and_under_the_blocked_row(self):
+        self.blocked_merge()
+        # Wide enough for the marker and the merge driver's own words: what a narrower window does
+        # to either is the cutting the frame already has its own tests for.
+        self.fixture.columns = HALTED_COLUMNS
+        self.fixture.live({"07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(frame(result.stdout), "\n".join([
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=1 waiting=1 · "
+            f"{AWAITING_RULING} · elapsed {LIVE_ELAPSED}",
+            header(),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", BLOCKED_ELAPSED),
+            f"  ↳ last event: merge escalated — {BLOCKED_DETAIL} · {BLOCKED_TS}",
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
+        ]))
+
+    def test_a_merge_that_hit_a_conflict_is_not_drawn_landable(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="conflict",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.live({"07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", BLOCKED_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn("landable", result.stdout)
+
+    def test_the_ruling_lands_the_wave_re_runs_and_both_marks_go(self):
+        self.blocked_merge()
+        self.fixture.append(RULED_TS, "merge", ticket="06", result="clean",
+                            branch="worktree-06", into="crew/feature")
+        self.fixture.append(RULED_TS, "advance", wave=2, decision="launched")
+        self.fixture.live({"07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "merged", RULED_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn(AWAITING_RULING, result.stdout)
+        self.assertNotIn("↳ last event:", result.stdout)
+
     def test_a_settled_ticket_stops_following_its_lanes_live_source(self):
         self.launch_wave_one()
         self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="landable",
@@ -1040,7 +1118,7 @@ class DashboardTests(MonitorTestCase):
         self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
                             sha=self.fixture.head("06"))
         self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed")
-        self.fixture.append(SETTLED_TS, "advance", wave=2, decision="escalated")
+        self.fixture.append(SETTLED_TS, "advance", wave=2, decision="complete")
         self.fixture.live({})
         process = self.fixture.start_monitor(
             "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
@@ -1054,6 +1132,64 @@ class DashboardTests(MonitorTestCase):
 
         self.assertEqual(output.count(f"crew {RUN_ID} —"), 1)
         self.assertIn("landable", output)
+
+    def test_a_run_the_driver_stopped_keeps_its_last_frame_and_claims_no_ruling(self):
+        """The other ending: the chain stopped on an escalation nobody can rule away.
+
+        The driver writes `stopped` when it ends such a run, and that line is what tells the frame
+        the run is over — the `escalated` decision above it never could, because the same word is
+        written when a wave is halted and a ruling would carry it on.
+        """
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed")
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="stopped")
+        self.fixture.live({})
+        process = self.fixture.start_monitor(
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
+        )
+        self.addCleanup(process.kill)
+
+        time.sleep(0.5)
+        self.assertIsNone(process.poll(), "the renderer left the window without a frame in it")
+        process.terminate()
+        output = process.communicate(timeout=10)[0]
+
+        self.assertEqual(output.count(f"crew {RUN_ID} —"), 1)
+        self.assertNotIn(AWAITING_RULING, output)
+
+    def test_a_wave_that_escalated_keeps_redrawing_because_the_run_is_not_over(self):
+        """The defect this ticket exists for: only `complete` ends a run, and the frame with it."""
+        self.launch_wave_one()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.live({"06": "busy", "07": "busy"})
+        process = self.fixture.start_monitor(
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
+        )
+        self.addCleanup(process.kill)
+
+        time.sleep(0.5)
+        process.terminate()
+        output = process.communicate(timeout=10)[0]
+
+        self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
+
+    def test_a_wave_an_interruption_halted_keeps_redrawing_too(self):
+        self.launch_wave_one()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="interrupted")
+        self.fixture.live({"06": "busy", "07": "busy"})
+        process = self.fixture.start_monitor(
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
+        )
+        self.addCleanup(process.kill)
+
+        time.sleep(0.5)
+        process.terminate()
+        output = process.communicate(timeout=10)[0]
+
+        self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
 
     def test_a_run_dir_with_no_wave_table_is_a_monitor_error_rather_than_an_empty_frame(self):
         result = self.fixture.dashboard()
@@ -1330,6 +1466,57 @@ class PinTests(MonitorTestCase):
         self.fixture.pin()
 
         self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_run_the_driver_stopped_draws_nothing(self):
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="stopped")
+        self.fixture.pin()
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_run_an_escalated_advance_halted_is_still_drawn(self):
+        """An escalation is not the end of a run, so the statusline keeps naming it."""
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_a_run_an_interruption_halted_is_still_drawn(self):
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="interrupted")
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_the_pin_says_a_halted_wave_is_awaiting_a_ruling(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="escalated",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.columns = HALTED_COLUMNS
+        self.fixture.live({"07": "busy"})
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(
+            frame(result.stdout).splitlines()[0],
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=1 waiting=1 · "
+            f"{AWAITING_RULING} · elapsed {LIVE_ELAPSED}",
+        )
+        self.assertIn(
+            f"  ↳ last event: merge escalated — {BLOCKED_DETAIL} · {BLOCKED_TS}", result.stdout
+        )
 
     def test_a_malformed_wave_table_draws_nothing(self):
         self.live_run()

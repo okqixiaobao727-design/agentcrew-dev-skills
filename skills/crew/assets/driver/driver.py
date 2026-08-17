@@ -47,9 +47,10 @@ a second time, the children keep the worktrees and windows they have, their hook
 where their worktrees still stand, a coordinator that restarted re-anchors the run and the live
 children it answers, the dashboard is drawn again, and the loop picks the run up from its log —
 which is where every count it acts on lives, so an adopted run and an uninterrupted one are the
-same code path. What ends adoption is the log's own final advance decision: a run that has
-completed is not adopted, and the driver says so and points at the run's report. So re-typing the
-crew command is the whole of what an interruption, a driver crash or a coordinator restart costs.
+same code path. What ends adoption is the log's own final advance decision, which is the monitor's
+predicate asked rather than restated: a run that has completed is not adopted, and the driver says
+so and points at the run's report. So re-typing the crew command is the whole of what an
+interruption, a driver crash or a coordinator restart costs.
 
 **The wave loop is a rule table, and the rule table is exhaustive.** Between the launch and the
 report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
@@ -110,6 +111,11 @@ sys.path.insert(0, str(DISPATCH.parent))
 import dispatch  # noqa: E402
 sys.path.insert(0, str(ASSETS))
 import machine_log  # noqa: E402
+# The monitor owns one more: whether a log says the run is over. The operator's surfaces and this
+# loop have to agree on that word — a second implementation here is how they came to disagree —
+# so it is asked for, in the same way and from the same place.
+sys.path.insert(0, str(MONITOR.parent))
+import monitor  # noqa: E402
 
 # The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
 RUN_DIR_NAME = ".crew"
@@ -250,7 +256,9 @@ FAILED = "failed"
 COMPLETED = "completed"
 BLOCKED = "blocked"
 LAUNCHED = "launched"
-COMPLETE = "complete"
+# The advance decision this loop writes itself: the run ended because the chain stopped on reasons
+# the rule table had already settled, which no other decision in the log's vocabulary says.
+STOPPED = "stopped"
 LANDED_RESULTS = ("clean", "repaired")
 ESCALATED = "escalated"
 SEMANTIC_PREFIX = "semantic: "
@@ -1443,15 +1451,19 @@ def adopt(args, repo, run_dir, table_path):
     worktrees, branches and windows the interrupted run left them, and what they lost — the process
     watching them — is what this puts back.
 
-    One thing stands between the log and the loop: a run whose log holds the final advance decision
-    has nothing to adopt. It is finished, and saying so and pointing at its report is the whole of
-    what a re-typed command may do to it. Everything an unfinished one needs is the loop's own —
-    what it puts back before it starts polling is `Loop.adopt`, and what it reads from the log is
-    what it would have read had it never stopped.
+    One thing stands between the log and the loop: a run the monitor's `over` calls finished has
+    nothing to adopt — an `advance` decision of `complete`, or the `stopped` this loop appends
+    when a chain halted for good. A wave that escalated or was interrupted is neither: it is
+    re-run by the run that adopts it, which is how such a run carries on at all. The question is
+    asked of the monitor so the loop and the operator's surfaces can never disagree about it. A
+    finished run earns saying so and pointing at its report, and nothing else a re-typed command
+    may do to it. Everything an unfinished one needs is the loop's own — what it puts back before
+    it starts polling is `Loop.adopt`, and what it reads from the log is what it would have read
+    had it never stopped.
     """
     log = run_dir / LOG_NAME
     records = read_records(log)
-    if run_is_complete(records):
+    if monitor.over(records):
         table = json.loads(table_path.read_text(encoding="utf-8"))
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
@@ -1460,18 +1472,6 @@ def adopt(args, repo, run_dir, table_path):
         return 0
     print(f"crew adopted wave {current_wave(records)}, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table_path, adopting=True)
-
-
-def run_is_complete(records):
-    """Whether the log holds the advance decision that ends a run.
-
-    The one decision that is final: a wave that escalated or was interrupted is re-run by the run
-    that adopts it, which is how such a run carries on at all.
-    """
-    return any(
-        record.get("event") == "advance" and record.get("decision") == COMPLETE
-        for record in records
-    )
 
 
 def dispatch_wave(table, log, launch_dir, run_dir):
@@ -2311,7 +2311,26 @@ class Loop:
             )
         # Every reason the chain stopped on is one the rule table already settled, so there is
         # nothing left for this run to launch and nothing for anyone to rule on.
+        self.record_stopped(wave)
         return None
+
+    def record_stopped(self, wave):
+        """Put this run's ending into the log, where every surface reads it from; returns nothing.
+
+        The `escalated` decision above it cannot carry that meaning: the same word is written when
+        a wave is halted awaiting a ruling that will carry it on, and a run left with only that
+        line reads as still going — a dashboard redrawing it forever, saying a ruling is owed that
+        nobody is waiting for.
+        """
+        run_command(
+            [
+                sys.executable, MACHINE_LOG, "--log", self.log, "advance",
+                "--wave", str(wave), "--decision", STOPPED,
+                "--detail", "the chain stopped on reasons the rule table had already settled",
+            ],
+            f"the end of the run at wave {wave} could not be recorded",
+            pointer=str(self.log),
+        )
 
     def unsettled_halt(self, wave, records):
         """The wave's tickets whose halt no rule of the table has already accounted for.
