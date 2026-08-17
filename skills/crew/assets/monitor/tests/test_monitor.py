@@ -32,6 +32,20 @@ NOW_TS = "2026-08-13T09:12:31Z"
 LIVE_ELAPSED = "00:12:31"
 SETTLED_TS = "2026-08-13T09:41:07Z"
 SETTLED_ELAPSED = "00:41:07"
+# The moment a merge blew up on a ticket that already had its receipt, and the moment the wave
+# re-ran once the coordinator had ruled: both later than the receipt, so a row that keeps
+# following its stale receipt is visible in its clock alone.
+BLOCKED_TS = "2026-08-13T09:44:19Z"
+BLOCKED_ELAPSED = "00:44:19"
+RULED_TS = "2026-08-13T09:47:53Z"
+RULED_ELAPSED = "00:47:53"
+# Why one merge stopped, as the merge driver words it, and what the row says about it underneath.
+BLOCKED_DETAIL = "semantic: both sides rewrote the same lines of driver.py"
+# The marker the summary line carries while a wave is halted on the coordinator's ruling.
+AWAITING_RULING = "⚠ awaiting your ruling"
+# A window wide enough to hold that summary line and the blocked row's annotation whole, so a
+# halted frame is read rather than measured.
+HALTED_COLUMNS = 120
 
 CHILDREN = {"06": "crew-06-dispatch", "07": "crew-07-log", "08": "crew-08-skill"}
 MODEL = "claude-opus-4-5-20251101"
@@ -449,20 +463,43 @@ class Fixture:
         """The pin registry's default location, under the Claude config this fixture points at."""
         return self.claude_home.joinpath(*PIN_REGISTRY)
 
-    def pin(self, run_dir=None, pid=None, session=CALLER_SESSION, directory=None):
-        """A pin naming a live run: its run directory, the coordinator's pid, its tmux session."""
+    def pin(self, run_dir=None, pid=None, session=CALLER_SESSION, directory=None,
+            renderer=MONITOR, interpreter=sys.executable):
+        """A pin naming a live run: its run directory, the coordinator's pid, its tmux session,
+        and the renderer and interpreter that draw it.
+
+        `None` for either of the last two leaves that key out, which is how a release older than
+        those fields wrote its pins.
+        """
         run_dir = self.run_dir if run_dir is None else run_dir
         directory = self.pin_dir() if directory is None else pathlib.Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         # The run names its pin file after the run directory it points at, as dispatch does.
         name = hashlib.sha256(os.path.realpath(str(run_dir)).encode()).hexdigest()[:16]
         path = directory / f"{name}.json"
-        path.write_text(json.dumps({
+        pin = {
             "run_dir": str(run_dir),
             "coordinator_pid": os.getpid() if pid is None else pid,
             "tmux_session": session,
-        }))
+        }
+        if renderer is not None:
+            pin["renderer"] = str(renderer)
+        if interpreter is not None:
+            pin["interpreter"] = str(interpreter)
+        path.write_text(json.dumps(pin))
         return path
+
+    def release_copy(self, name):
+        """A second copy of this release's monitor under `name` — the upgrade simulation's X.
+
+        An install run from it records nothing about where it is, so the copy can be taken away
+        afterwards and the pin a later release writes still draws.
+        """
+        directory = self.root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        copy = directory / MONITOR.name
+        shutil.copy2(str(MONITOR), str(copy))
+        return copy
 
     def dead_pid(self):
         """A pid that has certainly gone: a process this fixture started and then reaped."""
@@ -506,8 +543,13 @@ class Fixture:
         return environment
 
     def run_monitor(self, *args):
+        return self.run_release(MONITOR, *args)
+
+    def run_release(self, monitor, *args):
+        """The same call against one particular copy of the release, so an install made by the
+        copy and a run dispatched by another are two different releases."""
         return subprocess.run(
-            [sys.executable, str(MONITOR), *[str(argument) for argument in args]],
+            [sys.executable, str(monitor), *[str(argument) for argument in args]],
             capture_output=True, text=True, env=self.environment(),
         )
 
@@ -579,9 +621,10 @@ class Fixture:
     def settings_json(self):
         return json.loads(self.settings_path.read_text())
 
-    def pin_install(self, *extra):
+    def pin_install(self, *extra, monitor=MONITOR):
         """Wire the pin in, against this fixture's settings file and wrapper path."""
-        return self.run_monitor(
+        return self.run_release(
+            monitor,
             "pin-install", "--settings", self.settings_path, "--statusline", self.wrapper_path,
             *extra,
         )
@@ -887,6 +930,70 @@ class DashboardTests(MonitorTestCase):
             row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
         ]))
 
+    def blocked_merge(self):
+        """A wave halted on a ruling: 06's receipt landed, its merge did not, and the wave stopped.
+
+        This is the shape the real run took — a receipt, then a `merge` the driver could not
+        finish, then the `advance` that handed the wave to the coordinator.
+        """
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="escalated",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+
+    def test_a_wave_halted_on_a_ruling_says_so_in_the_summary_and_under_the_blocked_row(self):
+        self.blocked_merge()
+        # Wide enough for the marker and the merge driver's own words: what a narrower window does
+        # to either is the cutting the frame already has its own tests for.
+        self.fixture.columns = HALTED_COLUMNS
+        self.fixture.live({"07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(frame(result.stdout), "\n".join([
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=1 waiting=1 · "
+            f"{AWAITING_RULING} · elapsed {LIVE_ELAPSED}",
+            header(),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", BLOCKED_ELAPSED),
+            f"  ↳ last event: merge escalated — {BLOCKED_DETAIL} · {BLOCKED_TS}",
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
+        ]))
+
+    def test_a_merge_that_hit_a_conflict_is_not_drawn_landable(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="conflict",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.live({"07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", BLOCKED_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn("landable", result.stdout)
+
+    def test_the_ruling_lands_the_wave_re_runs_and_both_marks_go(self):
+        self.blocked_merge()
+        self.fixture.append(RULED_TS, "merge", ticket="06", result="clean",
+                            branch="worktree-06", into="crew/feature")
+        self.fixture.append(RULED_TS, "advance", wave=2, decision="launched")
+        self.fixture.live({"07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "merged", RULED_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn(AWAITING_RULING, result.stdout)
+        self.assertNotIn("↳ last event:", result.stdout)
+
     def test_a_settled_ticket_stops_following_its_lanes_live_source(self):
         self.launch_wave_one()
         self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="landable",
@@ -1040,7 +1147,7 @@ class DashboardTests(MonitorTestCase):
         self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
                             sha=self.fixture.head("06"))
         self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed")
-        self.fixture.append(SETTLED_TS, "advance", wave=2, decision="escalated")
+        self.fixture.append(SETTLED_TS, "advance", wave=2, decision="complete")
         self.fixture.live({})
         process = self.fixture.start_monitor(
             "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
@@ -1054,6 +1161,64 @@ class DashboardTests(MonitorTestCase):
 
         self.assertEqual(output.count(f"crew {RUN_ID} —"), 1)
         self.assertIn("landable", output)
+
+    def test_a_run_the_driver_stopped_keeps_its_last_frame_and_claims_no_ruling(self):
+        """The other ending: the chain stopped on an escalation nobody can rule away.
+
+        The driver writes `stopped` when it ends such a run, and that line is what tells the frame
+        the run is over — the `escalated` decision above it never could, because the same word is
+        written when a wave is halted and a ruling would carry it on.
+        """
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="failed")
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="stopped")
+        self.fixture.live({})
+        process = self.fixture.start_monitor(
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
+        )
+        self.addCleanup(process.kill)
+
+        time.sleep(0.5)
+        self.assertIsNone(process.poll(), "the renderer left the window without a frame in it")
+        process.terminate()
+        output = process.communicate(timeout=10)[0]
+
+        self.assertEqual(output.count(f"crew {RUN_ID} —"), 1)
+        self.assertNotIn(AWAITING_RULING, output)
+
+    def test_a_wave_that_escalated_keeps_redrawing_because_the_run_is_not_over(self):
+        """The defect this ticket exists for: only `complete` ends a run, and the frame with it."""
+        self.launch_wave_one()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.live({"06": "busy", "07": "busy"})
+        process = self.fixture.start_monitor(
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
+        )
+        self.addCleanup(process.kill)
+
+        time.sleep(0.5)
+        process.terminate()
+        output = process.communicate(timeout=10)[0]
+
+        self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
+
+    def test_a_wave_an_interruption_halted_keeps_redrawing_too(self):
+        self.launch_wave_one()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="interrupted")
+        self.fixture.live({"06": "busy", "07": "busy"})
+        process = self.fixture.start_monitor(
+            "dashboard", "--run-dir", self.fixture.run_dir, "--now", NOW_TS, "--refresh", "0.05",
+        )
+        self.addCleanup(process.kill)
+
+        time.sleep(0.5)
+        process.terminate()
+        output = process.communicate(timeout=10)[0]
+
+        self.assertGreater(output.count(f"crew {RUN_ID} —"), 1)
 
     def test_a_run_dir_with_no_wave_table_is_a_monitor_error_rather_than_an_empty_frame(self):
         result = self.fixture.dashboard()
@@ -1331,6 +1496,57 @@ class PinTests(MonitorTestCase):
 
         self.assertNothingDrawn(self.fixture.pin_frame())
 
+    def test_a_run_the_driver_stopped_draws_nothing(self):
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="stopped")
+        self.fixture.pin()
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_run_an_escalated_advance_halted_is_still_drawn(self):
+        """An escalation is not the end of a run, so the statusline keeps naming it."""
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_a_run_an_interruption_halted_is_still_drawn(self):
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="interrupted")
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_the_pin_says_a_halted_wave_is_awaiting_a_ruling(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="escalated",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.columns = HALTED_COLUMNS
+        self.fixture.live({"07": "busy"})
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(
+            frame(result.stdout).splitlines()[0],
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=1 waiting=1 · "
+            f"{AWAITING_RULING} · elapsed {LIVE_ELAPSED}",
+        )
+        self.assertIn(
+            f"  ↳ last event: merge escalated — {BLOCKED_DETAIL} · {BLOCKED_TS}", result.stdout
+        )
+
     def test_a_malformed_wave_table_draws_nothing(self):
         self.live_run()
         self.fixture.table_path.write_text("{ this is not the wave table")
@@ -1344,6 +1560,39 @@ class PinTests(MonitorTestCase):
         (self.fixture.pin_dir() / "broken.json").write_text("{ half a pin")
 
         self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_the_wrapper_is_told_in_one_line_that_a_pin_cannot_be_read(self):
+        """ADR-0011's exception, asked for by the one caller that cannot judge it: the wrapper
+        reads the registry with `sed`, so whether a file is a pin at all is decided here."""
+        self.live_run()
+        self.fixture.pin_dir().mkdir(parents=True, exist_ok=True)
+        (self.fixture.pin_dir() / "broken.json").write_text("{ half a pin")
+
+        result = self.fixture.pin_frame("--from-wrapper")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1, result.stdout)
+        self.assertIn(str(self.fixture.pin_dir()), result.stdout)
+
+    def test_a_live_run_beside_an_unreadable_pin_is_drawn_and_says_nothing_else(self):
+        """The notice never displaces a frame: it is what is printed when nothing was drawn."""
+        self.live_run()
+        self.fixture.pin()
+        (self.fixture.pin_dir() / "broken.json").write_text("{ half a pin")
+
+        result = self.fixture.pin_frame("--from-wrapper", "--no-color")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
+        self.assertNotIn(str(self.fixture.pin_dir()), result.stdout)
+
+    def test_a_registry_of_readable_pins_is_silent_for_the_wrapper_too(self):
+        """A run that is simply over is not a wiring fault, so the exception does not fire."""
+        self.live_run()
+        self.fixture.append(SETTLED_TS, "advance", wave=2, decision="complete")
+        self.fixture.pin()
+
+        self.assertNothingDrawn(self.fixture.pin_frame("--from-wrapper"))
 
     def test_the_pin_matching_the_callers_session_is_the_run_drawn(self):
         self.live_run()
@@ -1731,6 +1980,8 @@ class SurfaceTests(MonitorTestCase):
         )
 
     def test_dispatch_writes_a_pin_naming_the_run_the_coordinator_pid_and_its_session(self):
+        """And the renderer and interpreter that draw it: the running release's own monitor and
+        the interpreter running it, both necessarily alive at the moment the pin is written."""
         result = self.surfaced("pin")
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1738,6 +1989,8 @@ class SurfaceTests(MonitorTestCase):
             "run_dir": str(self.fixture.run_dir.resolve()),
             "coordinator_pid": COORDINATOR_PID,
             "tmux_session": SESSION_TARGET,
+            "renderer": str(MONITOR.resolve()),
+            "interpreter": sys.executable,
         }])
 
     def test_the_pin_names_the_runs_realpath_however_the_run_dir_is_spelled(self):
@@ -2445,15 +2698,20 @@ class PinInstallTests(MonitorTestCase):
         backups = self.fixture.backups(self.fixture.settings_path)
         self.assertEqual([backup.read_text() for backup in backups], [before])
 
-    def test_the_pins_own_command_runs_beneath_the_previous_one(self):
+    def test_the_wrapper_carries_no_path_that_a_release_can_expire(self):
+        """What the installer writes is a permanent stub: neither the release that wrote it nor
+        the interpreter that ran it is recorded, so no upgrade can strand it."""
         self.wired()
 
         self.fixture.pin_install("--apply")
 
         wrapper = self.fixture.wrapper_path.read_text()
-        self.assertIn(str(MONITOR), wrapper)
-        self.assertIn("pin", wrapper.split(str(MONITOR))[1].splitlines()[0])
-        self.assertLess(wrapper.index(str(self.statusline)), wrapper.index(str(MONITOR)))
+        self.assertNotIn(str(MONITOR), wrapper)
+        self.assertNotIn(sys.executable, wrapper)
+        self.assertLess(
+            wrapper.index(str(self.statusline)), wrapper.index("/".join(PIN_REGISTRY)),
+            "the operator's own statusline still runs before the pin's frame",
+        )
 
     def test_a_second_apply_changes_nothing(self):
         self.wired()
@@ -2476,14 +2734,13 @@ class PinInstallTests(MonitorTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.status_line()["command"], self.spelled(self.fixture.wrapper_path))
-        # The pin is the whole of what the statusline runs: no other command is in the wrapper,
-        # and the operator's script — which this settings file never named — is not summoned.
+        # The pin is the whole of what the statusline runs: the operator's script — which this
+        # settings file never named — is not summoned, and with no run pinned nothing is printed.
         wrapper = self.fixture.wrapper_path.read_text()
         self.assertNotIn(str(self.statusline), wrapper)
-        self.assertEqual(
-            [line for line in wrapper.splitlines() if line and not line.startswith("#")],
-            [f"exec {sys.executable} {MONITOR} pin </dev/null"],
-        )
+        drawn = self.fixture.run_statusline()
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(drawn.stdout, "")
 
     def test_an_install_onto_a_fresh_machine_sets_the_pins_refresh_interval(self):
         self.fixture.settings(**{UNRELATED_SETTING[0]: UNRELATED_SETTING[1]})
@@ -2566,6 +2823,26 @@ class PinInstallTests(MonitorTestCase):
         self.assertEqual(self.fixture.settings_path.read_text(), installed)
         self.assertTrue(self.fixture.wrapper_path.exists())
 
+    def test_an_installed_wrapper_that_differs_is_reported_and_rewritten(self):
+        """A wrapper an older release wrote is not what this one would write, so the difference is
+        the whole point of re-running the install: it is reported, and `--apply` puts it right."""
+        self.wired()
+        self.fixture.pin_install("--apply")
+        wanted = self.fixture.wrapper_path.read_text()
+        self.fixture.wrapper_path.write_text(wanted + "# a wrapper an older release wrote\n")
+
+        reported = self.fixture.pin_install()
+
+        self.assertEqual(reported.returncode, 0, reported.stderr)
+        self.assertIn(f"rewrite {self.spelled(self.fixture.wrapper_path)}", reported.stdout)
+        self.assertNotIn("nothing to change", reported.stdout)
+        self.assertNotEqual(self.fixture.wrapper_path.read_text(), wanted)
+
+        applied = self.fixture.pin_install("--apply")
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(self.fixture.wrapper_path.read_text(), wanted)
+
     def test_the_install_costs_the_coordinator_nothing(self):
         self.wired()
 
@@ -2573,6 +2850,145 @@ class PinInstallTests(MonitorTestCase):
 
         self.assertEqual(self.fixture.calls("claude"), [])
         self.assertEqual(self.fixture.calls("tmux"), [])
+
+
+class PinWrapperTests(MonitorTestCase):
+    """The wrapper the install leaves behind: a permanent stub that runs whatever the live pin
+    names.
+
+    Nothing in it expires, so a release that replaces the one that installed it draws the frame
+    with no re-install. Every path through it exits 0, because Claude Code blanks the operator's
+    whole statusline when the statusline command does not.
+    """
+
+    def live_run(self):
+        """A run of two launched, busy children and one wave nobody has reached yet."""
+        self.fixture.table()
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+    def install(self, previous=True, monitor=MONITOR):
+        """The wrapper in place, over the operator's own statusline or over nothing at all."""
+        if previous:
+            statusline = self.fixture.statusline()
+            self.fixture.settings(**{
+                "statusLine": {"type": "command", "command": str(statusline)},
+            })
+        else:
+            self.fixture.settings(**{UNRELATED_SETTING[0]: UNRELATED_SETTING[1]})
+        result = self.fixture.pin_install("--apply", monitor=monitor)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def assertOneLine(self, drawn):
+        """The one exception to the silence contract: a single line, and still exit 0."""
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(len(drawn.stdout.splitlines()), 1, drawn.stdout)
+
+    def test_a_release_that_replaced_the_installer_draws_the_frame(self):
+        """The upgrade: release X installs the wrapper and is then gone; release Y dispatches the
+        run and its pin is what the same wrapper draws, with no second install."""
+        self.live_run()
+        release_x = self.fixture.release_copy("release-x")
+        self.install(monitor=release_x)
+        shutil.rmtree(release_x.parent)
+        self.fixture.window(
+            "--config", self.fixture.config("pin"), "--coordinator-pid", os.getpid(),
+        )
+
+        drawn = self.fixture.run_statusline()
+
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(drawn.stdout.splitlines()[0], PREVIOUS_STATUSLINE)
+        self.assertIn(f"crew {RUN_ID} —", ANSI.sub("", drawn.stdout))
+
+    def test_no_live_pin_leaves_the_operators_own_statusline_alone(self):
+        self.live_run()
+        self.install()
+
+        drawn = self.fixture.run_statusline()
+
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(drawn.stdout.splitlines(), [PREVIOUS_STATUSLINE])
+
+    def test_a_live_pin_is_drawn_beneath_the_operators_own_statusline(self):
+        self.live_run()
+        self.install()
+        self.fixture.pin()
+
+        drawn = self.fixture.run_statusline()
+
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(drawn.stdout.splitlines()[0], PREVIOUS_STATUSLINE)
+        self.assertIn(f"crew {RUN_ID} —", ANSI.sub("", drawn.stdout))
+
+    def test_a_pin_whose_renderer_is_gone_prints_one_line_and_exits_zero(self):
+        self.live_run()
+        self.install(previous=False)
+        self.fixture.pin(renderer=self.fixture.root / "release-gone" / MONITOR.name)
+
+        self.assertOneLine(self.fixture.run_statusline())
+
+    def test_a_pin_whose_interpreter_is_gone_prints_one_line_and_exits_zero(self):
+        self.live_run()
+        self.install(previous=False)
+        self.fixture.pin(interpreter=self.fixture.root / "python-gone")
+
+        self.assertOneLine(self.fixture.run_statusline())
+
+    def test_a_pin_that_cannot_be_read_prints_one_line_and_exits_zero(self):
+        self.live_run()
+        self.install(previous=False)
+        self.fixture.pin_dir().mkdir(parents=True, exist_ok=True)
+        (self.fixture.pin_dir() / "broken.json").write_text("{ half a pin")
+
+        self.assertOneLine(self.fixture.run_statusline())
+
+    def test_a_pin_that_cannot_be_read_but_spells_a_renderer_prints_one_line(self):
+        """The wrapper reads the two paths out with `sed`, which is not a JSON parser: a file that
+        is not a pin at all can still spell them. What the wrapper reaches judges the registry
+        properly, so this is still one line rather than the silence a bad read would leave."""
+        self.live_run()
+        self.install(previous=False)
+        self.fixture.pin_dir().mkdir(parents=True, exist_ok=True)
+        (self.fixture.pin_dir() / "broken.json").write_text(
+            f'{{"renderer": "{MONITOR}", "interpreter": "{sys.executable}", half a pin'
+        )
+
+        self.assertOneLine(self.fixture.run_statusline())
+
+    def test_a_renderer_path_the_wrapper_cannot_read_back_prints_one_line(self):
+        """A path carrying a quote is escaped in the pin's JSON and `sed` reads it back short, so
+        the wrapper reaches no renderer. The bound on that is the point: it is the one actionable
+        line and exit 0, never a blank statusline."""
+        self.live_run()
+        self.install(previous=False)
+        self.fixture.pin(renderer=self.fixture.release_copy('rel"ease'))
+
+        self.assertOneLine(self.fixture.run_statusline())
+
+    def test_a_pin_written_before_the_fields_existed_prints_one_line_and_exits_zero(self):
+        """A run launched by a release older than this fix: its pin names no renderer, so the
+        wrapper says so rather than drawing nothing the operator cannot explain."""
+        self.live_run()
+        self.install(previous=False)
+        self.fixture.pin(renderer=None, interpreter=None)
+
+        self.assertOneLine(self.fixture.run_statusline())
+
+    def test_a_dead_reference_leaves_the_operators_own_statusline_standing(self):
+        """The exit code is the whole point: a non-zero one blanks the operator's lines too."""
+        self.live_run()
+        self.install()
+        self.fixture.pin(renderer=self.fixture.root / "release-gone" / MONITOR.name)
+
+        drawn = self.fixture.run_statusline()
+
+        self.assertEqual(drawn.returncode, 0, drawn.stderr)
+        self.assertEqual(drawn.stdout.splitlines()[0], PREVIOUS_STATUSLINE)
+        self.assertEqual(len(drawn.stdout.splitlines()), 2, drawn.stdout)
 
 
 if __name__ == "__main__":

@@ -71,7 +71,16 @@ WAVE  TICKET  TITLE                       EXECUTOR                         STATE
 
 The summary line above the table is the run at a glance: the run id (the run directory's own
 name), how many of its waves have been launched, a count per state, and the run's total elapsed
-time from its first launch.
+time from its first launch. While the run is halted on a ruling it carries one more field
+between the counts and the clock — `⚠ awaiting your ruling` — so a run waiting on the operator
+is never read as a frozen frame:
+
+```
+crew crew-run-3 — wave 2/5 · pending=6 merged=4 · ⚠ awaiting your ruling · elapsed 01:12:44
+```
+
+The log's newest `advance` decides it: `escalated` or `interrupted` puts the marker up, and the
+next `advance` — the wave carrying on once the coordinator has ruled — takes it away.
 
 ### States
 
@@ -82,7 +91,7 @@ never reads an internal word:
 | --- | --- |
 | `pending` | the log carries no `launch` for that ticket, or an `outcome` of `blocked` |
 | `running` | its lane's source says `busy` |
-| `waiting` | its lane's source says `waiting` or `idle`: a child that stopped short |
+| `waiting` | its lane says `waiting` or `idle`, or a `merge` result of `conflict` or `escalated` |
 | `parked` | a `receipt` verdict or an `outcome` of `parked`, or the agents list says so |
 | `landable` | a `receipt` verdict of `landable` |
 | `merged` | a `merge` result of `clean` or `repaired`, or an `outcome` of `completed` |
@@ -123,10 +132,13 @@ tests read. The title column absorbs whatever width the window has left after th
 titles are as readable as the terminal allows.
 
 `--refresh` turns the single render into the window's loop: the same frame, redrawn over itself
-every so many seconds. Once the log carries an `advance` decision of `complete`, `escalated` or
-`interrupted`, the run is over: the renderer draws its last frame, stops refreshing, and stays
-alive holding it — nothing here ever closes the window. `--now` fixes the moment elapsed times are
-measured to, which is what makes a render reproducible.
+every so many seconds. Once the log carries an `advance` decision of `complete` or `stopped`, the
+run is over: the renderer draws its last frame, stops refreshing, and stays alive holding it —
+nothing here ever closes the window. Those two are the only decisions that end a run, here and in
+the driver, which imports this predicate rather than keeping one of its own: a wave that escalated
+or was interrupted is carried on by the ruling or by the run that adopts it, so every surface
+keeps drawing it and says `⚠ awaiting your ruling` while it waits. `--now` fixes the moment
+elapsed times are measured to, which is what makes a render reproducible.
 
 ## Toasts
 
@@ -300,11 +312,18 @@ is not replaced, deprecated or changed by any of this, and it stays the default 
 files at `$CLAUDE_CONFIG_DIR/agentcrew/pins/`, falling back to `~/.claude/agentcrew/pins/`,
 overridable with `--pin-dir`. A pin file is JSON naming the run — the run directory as an absolute
 realpath ([ADR-0007](adr/0007-paths-are-absolute-at-the-boundary-and-compared-by-realpath.md)), the
-coordinator's pid, and the coordinator's tmux session, under those three keys:
+coordinator's pid, and the coordinator's tmux session — and naming what draws it: the `monitor.py`
+of the release that wrote the pin, and the interpreter running it. Five keys:
 
 ```json
-{"run_dir": "/abs/realpath/of/the/run", "coordinator_pid": 4242, "tmux_session": "$7"}
+{"run_dir": "/abs/realpath/of/the/run", "coordinator_pid": 4242, "tmux_session": "$7",
+ "renderer": "/abs/path/of/the/running/release/monitor.py", "interpreter": "/abs/path/of/python3"}
 ```
+
+The last two are why an upgrade never strands the pin. They are recorded at dispatch, by a release
+that is by definition alive at that moment, rather than at install time by a release that will not
+outlive the wiring it writes
+([ADR-0011](adr/0011-the-pin-names-its-renderer-the-wrapper-is-a-permanent-stub.md)).
 
 The run writes its pin at dispatch — `monitor.py window`, on a `pin` or `both` surface — and
 removes it when the run ends, after the report is written:
@@ -325,10 +344,47 @@ One pin is selected per tick, in this order:
 3. if several pins exist and none matches, nothing is drawn, because two crews at once must never
    cross frames.
 
+### The wrapper the install writes
+
+```sh
+monitor.py pin-install [--apply] [--uninstall] [--settings <file>] [--statusline <file>]
+```
+
+`pin-install` wires the pin into the operator's own Claude Code statusline: it writes a wrapper
+script beside their settings and points `statusLine.command` at it. The wrapper runs whatever the
+statusline ran before, prints that first, and draws the pin's frame beneath it. Nothing is written
+without `--apply`, every file is copied aside first, and `--uninstall` reads the record the wrapper
+carries to put the statusline back exactly.
+
+That wrapper names no release. It reads the registry above, and runs the renderer and interpreter
+the live pin names — so the release that draws the frame is the release that dispatched the run,
+and an upgrade needs no re-install. It ends in `exit 0` on every path, including the one where the
+renderer fails, because Claude Code blanks the whole statusline — the operator's own lines with it
+— when the statusline command exits non-zero.
+
+The install is idempotent, and "idempotent" is measured against the wrapper this release would
+write: a wrapper that is there but differs is reported as a `rewrite` line and rewritten under
+`--apply`. Existing installs are never rewritten behind the operator's back; an operator carrying
+one from an older release re-runs `pin-install --apply` once.
+
+There is one exception to the silence contract, and this is it: when pins are present but none of
+them names a renderer and interpreter this machine has — the paths are gone, the pin cannot be read,
+or it was written by a release older than those fields — a single line says so, instead of nothing.
+The wrapper prints it when it can reach no renderer at all; the renderer it does reach is told so
+(`pin --from-wrapper`) and prints the same line for the registry files only a JSON parser can
+judge. `monitor.py pin` on its own is silent as it has always been.
+
+A statusline that has quietly stopped working is indistinguishable from a machine with no run on
+it, and this case is one the operator can act on
+([ADR-0011](adr/0011-the-pin-names-its-renderer-the-wrapper-is-a-permanent-stub.md)). Failures
+*inside* the renderer stay silent, as
+[ADR-0008](adr/0008-the-pinned-dashboard-lives-in-claude-codes-statusline.md) decided.
+
 ### When nothing is drawn
 
 Nothing is drawn, and the exit status is still 0, when there is no pin, when the run directory is
-gone or unreadable, when the coordinator's pid is not alive, or when the machine log carries a
-final `advance` decision. The last two are the whole liveness story: a dead pid is a crashed or
-killed run, a final `advance` is a run that is over, and there is no watchdog, no heartbeat and no
-separate liveness file behind either.
+gone or unreadable, when the coordinator's pid is not alive, or when the machine log carries an
+`advance` decision of `complete` or `stopped`. The last two are the whole liveness story: a dead
+pid is a crashed or killed run, either of those decisions is a run that is over, and there is no
+watchdog, no heartbeat and no separate liveness file behind either. A halted wave is none of these
+— the pin keeps drawing it, with the `⚠ awaiting your ruling` marker on its summary line.

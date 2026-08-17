@@ -368,7 +368,7 @@ class EventTests(MachineLogTestCase):
         self.assertFalse(self.log.exists())
 
     def test_every_advance_decision_is_accepted_and_an_unknown_one_is_refused(self):
-        for decision in ("launched", "escalated", "complete", "interrupted"):
+        for decision in ("launched", "escalated", "complete", "interrupted", "stopped"):
             self.assertEqual(
                 run_cli("advance", "--wave", "1", "--decision", decision, log=self.log).returncode,
                 0,
@@ -377,7 +377,7 @@ class EventTests(MachineLogTestCase):
         refused = run_cli("advance", "--wave", "1", "--decision", "advanced", log=self.log)
 
         self.assertEqual(refused.returncode, 2)
-        self.assertEqual(len(self.lines()), 4)
+        self.assertEqual(len(self.lines()), 5)
 
     def test_every_verdict_outcome_and_merge_result_is_accepted(self):
         for verdict in ("landable", "parked", "failed"):

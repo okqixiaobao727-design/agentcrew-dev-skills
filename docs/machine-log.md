@@ -86,7 +86,7 @@ reads. Each round of a review is a review, so round two writes its own pair.
 
 `wave`, `decision`, `detail`. The one event that carries no `ticket`: a decision is about a wave.
 `decision` is one of the four the advance driver reaches
-([`docs/wave-advance.md`](wave-advance.md)):
+([`docs/wave-advance.md`](wave-advance.md)), or the fifth the wave loop appends itself:
 
 | `decision` | Meaning |
 | --- | --- |
@@ -94,6 +94,15 @@ reads. Each round of a review is a review, so round two writes its own pair.
 | `complete` | that was the last wave of the run |
 | `escalated` | a ticket failed, parked or did not land, and the chain stopped |
 | `interrupted` | the operator stopped the run |
+| `stopped` | the run ended on an escalation the rule table had already settled |
+
+Two of them end a run: `complete` and `stopped`. `escalated` does not — a wave that escalated is
+halted until the coordinator rules on it, and the run carries on or is adopted — so the driver
+appends `stopped` when the escalation it read leaves nothing to launch and nothing to rule on.
+That word is what every surface reads the end of a run from ([`monitor.py`][monitor] `over`), and
+the driver asks it there rather than keeping a rule of its own.
+
+[monitor]: ../skills/crew/assets/monitor/monitor.py
 
 ### `monitor-error` — a monitor that exited with an error
 
@@ -141,7 +150,7 @@ machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parke
 machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state running|returned \
                                     [--detail TEXT]
 machine_log.py --log <path> advance --wave N \
-                                    --decision launched|complete|escalated|interrupted \
+                                    --decision launched|complete|escalated|interrupted|stopped \
                                     [--detail TEXT]
 machine_log.py --log <path> monitor-error --monitor NAME --reason TEXT
 machine_log.py --log <path> message --role coordinator|child [--ticket NN] [--to NAME] \
