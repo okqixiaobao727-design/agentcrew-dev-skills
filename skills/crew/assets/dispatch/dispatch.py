@@ -287,6 +287,34 @@ def review_log_flags(ticket, log):
     return f" --machine-log {log} --ticket {ticket['id']}"
 
 
+def run_log_script(log):
+    """The machine log's own writer, as the run keeps it: the copy beside the log itself.
+
+    The plugin is installed one directory per version, so a command naming this script inside the
+    plugin tree stops working at the next upgrade, while the run directory carries no version and
+    outlives every one of them (#37). The copy is written there when the run installs its hooks,
+    which happens before any child is launched.
+    """
+    if not log:
+        return ""
+    return str(pathlib.Path(log).parent / MACHINE_LOG.name)
+
+
+def completion_template(shape, turn, ticket, log):
+    """The receipt paragraph this child closes with: recorded by a Claude child, sent otherwise.
+
+    A receipt carries no decision, so a Claude child writes it straight to the run's machine log —
+    the transport-agnostic surface the driver already verifies receipts from — instead of waking
+    the coordinator with a cross-session message. `CREW ASK` is untouched: it is the one message
+    that genuinely needs the coordinator. A Codex child keeps sending, because its bridge is what
+    reads the final message of a turn and writes the log from it, and so does either lane on a run
+    dispatched without a machine log: there is no log path to name.
+    """
+    if ticket["executor"] == "claude" and log:
+        return shape.get("completion_claude") or turn["completion_claude"]
+    return shape.get("completion") or turn["completion"]
+
+
 def render_turn(run, ticket, templates, log=None):
     shape = templates["workflows"][ticket["workflow"]]
     turn = templates["turn"]
@@ -299,6 +327,8 @@ def render_turn(run, ticket, templates, log=None):
         "<NN>": ticket["id"],
         "<coordinator name>": run["coordinator_name"],
         "<coordinator pid>": run["coordinator_pid"],
+        "<machine log path>": log or "",
+        "<machine log script>": run_log_script(log),
     }
 
     workflow_block = block(shape["block"])
@@ -315,7 +345,7 @@ def render_turn(run, ticket, templates, log=None):
         )
         workflow_block = workflow_block.replace("<review block>", review_block)
 
-    completion = block(shape.get("completion") or turn["completion"])
+    completion = block(completion_template(shape, turn, ticket, log))
     completion = completion.replace(
         "<completion condition>", shape.get("completion_condition", "")
     )
