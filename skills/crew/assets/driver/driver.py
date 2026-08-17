@@ -63,6 +63,16 @@ templated instruction to the child that has to resolve it; a merged ticket is cl
 tracker with its exact undo written into the log; and each wave's monitors are re-armed without a
 coordinator turn.
 
+**A completed run clears its own site.** After the report is written the driver runs a scripted
+epilogue over the tickets the log says landed: their worktrees removed, their branches deleted,
+their windows and the dashboard's killed, their Codex sessions stopped. Parked and failed tickets
+keep worktree, branch and window, and the report lists those paths. The coordinator's window, the
+integration branch the run hands over and the durable run directory are never touched. An artefact
+that would not go does not withhold the run's ending: the `run-complete` snapshot carries a
+`cleanup` field, null where the site was cleared and the failure where it was not. The `clear`
+subcommand keeps its confirmation, because it is aimed at a run in any state rather than at one
+whose log says what landed.
+
 **Exactly three things end the loop at judgment.** A `CREW ASK` of any kind — an assumption
 confirmation included, deliberately not auto-approved; a semantic conflict a child has bounced back
 a second time; and any state the table has no row for, a child at a permission prompt and a monitor
@@ -242,11 +252,15 @@ ANCHOR_TEMPLATE = (
     " `{name}` now, and its messages arrive from `{socket}` — that socket is the identity. Reply"
     " with SendMessage to `{name}`; nothing else about your ticket has changed."
 )
+# The rework instruction is scoped to the conflict rather than to the whole workflow: the work it
+# asks for is a resolution, and re-running everything the ticket already ran green buys nothing the
+# conflict put in doubt.
 MERGE_TEMPLATE = (
     "{marker} {ticket} — your branch {branch} conflicts with {integration} in a way no script can"
-    " resolve: {reason}. Merge {integration} into {branch}, resolve the conflict, re-run the checks"
-    " your workflow asked of you, commit, and send a new CREW COMPLETE <sha>. If this is a design"
-    " disagreement you cannot settle alone, send CREW ASK instead."
+    " resolve: {reason}. Merge {integration} into {branch}, resolve the conflict, re-run the tests"
+    " the conflict touched, re-review scoped to the conflict-resolution diff, commit, and send a"
+    " new CREW COMPLETE <sha>. If this is a design disagreement you cannot settle alone, send"
+    " CREW ASK instead."
 )
 
 # The verdicts and events the loop reads back out of the log. The writer owns their spelling.
@@ -1251,17 +1265,11 @@ def clear_remove_worktree(repo, worktree):
             raise ClearError(f"the worktree {worktree} could not be removed: {detail}")
 
 
-def clear_actions(run_dir, run, log_path, plan):
-    """Apply the clearing steps using only the paths and ids in the inventory."""
-    repo = pathlib.Path(run["repo_root"])
-    integration_branch = str(run["integration_branch"])
-    if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
-        clear_git(repo, "switch", "--", integration_branch)
-
+def clear_stop_codex_sessions(run, launches):
+    """Stop the Codex session behind each recorded launch through the bridge that started it."""
     codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
-    state_dir = pathlib.Path(codex["state_dir"]) if codex.get("state_dir") else None
     bridge = codex.get("bridge")
-    for state_file in clear_codex_state_files(run, plan.launches):
+    for state_file in clear_codex_state_files(run, launches):
         if not state_file.exists():
             continue
         if not bridge:
@@ -1271,6 +1279,9 @@ def clear_actions(run_dir, run, log_path, plan):
             f"Codex session {state_file}",
         )
 
+
+def clear_kill_windows(plan):
+    """Kill each window the plan holds once, the dashboard's among them."""
     windows = []
     for launch in plan.launches:
         window = launch.get("window")
@@ -1281,9 +1292,12 @@ def clear_actions(run_dir, run, log_path, plan):
     for window in windows:
         clear_kill_window(window)
 
+
+def clear_worktrees_and_branches(repo, rows):
+    """Remove each planned worktree and delete its branch, once per recorded artefact."""
     unique_rows = []
     seen_rows = set()
-    for row in plan.rows:
+    for row in rows:
         identity = (str(row["worktree"]), row["branch"])
         if identity not in seen_rows:
             seen_rows.add(identity)
@@ -1297,6 +1311,20 @@ def clear_actions(run_dir, run, log_path, plan):
             continue
         flag = "-D" if row["unmerged"] else "-d"
         clear_git(repo, "branch", flag, "--", row["branch"])
+
+
+def clear_actions(run_dir, run, log_path, plan):
+    """Apply the clearing steps using only the paths and ids in the inventory."""
+    repo = pathlib.Path(run["repo_root"])
+    integration_branch = str(run["integration_branch"])
+    if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
+        clear_git(repo, "switch", "--", integration_branch)
+
+    codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
+    state_dir = pathlib.Path(codex["state_dir"]) if codex.get("state_dir") else None
+    clear_stop_codex_sessions(run, plan.launches)
+    clear_kill_windows(plan)
+    clear_worktrees_and_branches(repo, plan.rows)
 
     return_branch = str(run["return_branch"])
     if git(repo, "show-ref", "--verify", f"refs/heads/{return_branch}").returncode == 0:
@@ -1340,6 +1368,39 @@ def run_clear(args):
     clear_actions(run_dir, run, log_path, plan)
     print(f"run cleared; durable record kept at {run_dir}")
     return 0
+
+
+# --- the run-end epilogue ----------------------------------------------------------------------
+
+
+def epilogue_plan(plan, landed):
+    """The clear plan narrowed to the tickets whose branches reached the integration branch.
+
+    Everything else a run recorded — a parked child's worktree, a failed child's branch, the window
+    either is still sitting in — is work nobody has merged, and the epilogue is not the place a run
+    destroys work. The dashboard belongs to the run rather than to a ticket, so it is carried
+    through whether or not anything landed.
+    """
+    return ClearPlan(
+        [row for row in plan.rows if str(row["ticket"]) in landed],
+        [launch for launch in plan.launches if str(launch["ticket"]) in landed],
+        plan.dashboard_window,
+    )
+
+
+def epilogue(run_dir, run, table, records, log_path):
+    """Clear a completed run's landed artefacts, without a question and without a token.
+
+    The operator's `clear` asks first because it is aimed at a run in any state; this path runs
+    itself, over exactly the tickets the log says landed. The coordinator's own window, the
+    integration branch the run exists to hand over, and the durable run directory are not the
+    plan's to touch, so none of them is in it.
+    """
+    _, plan = clear_inventory(run_dir, table, run, records, log_path)
+    plan = epilogue_plan(plan, set(merged_tickets(records)))
+    clear_stop_codex_sessions(run, plan.launches)
+    clear_kill_windows(plan)
+    clear_worktrees_and_branches(pathlib.Path(run["repo_root"]), plan.rows)
 
 
 def disarm(monitors):
@@ -1884,6 +1945,17 @@ def render_report(run, tickets, records, cost_output):
         )
     else:
         lines.append("- none recorded")
+
+    lines += ["", "## Preserved work", ""]
+    preserved = [ticket for ticket in ticket_ids if outcomes[ticket] in (PARKED, FAILED)]
+    preserved_lines = [
+        f"- {ticket}: worktree `{launches[ticket]['worktree']}`,"
+        f" branch `{launches[ticket]['branch']}`"
+        for ticket in preserved
+        if ticket in launches and launches[ticket].get("worktree")
+        and launches[ticket].get("branch")
+    ]
+    lines.extend(preserved_lines or ["- none recorded"])
 
     lines += ["", "## Rulings", ""]
     rulings = report_rulings(records)
@@ -2562,7 +2634,7 @@ class Loop:
             time.sleep(self.args.poll_seconds)
 
     def finish(self):
-        """Render and close the run, then emit its final wake snapshot."""
+        """Render and close the run, clear what landed, then emit its final wake snapshot."""
         try:
             cost_output = run_cost_pass(self.log, self.run)
             records = self.records()
@@ -2572,7 +2644,15 @@ class Loop:
                 remove_run_pin(self.run_dir)
             finally:
                 uninstall_run_hooks(self.run_dir, self.run, self.records())
-        snapshot(RUN_COMPLETE, pointer=str(report), report=str(report))
+        # The run is over and its report is written, so an artefact that would not go cannot
+        # withhold the ending the run has earned — but the snapshot is the only channel a woken
+        # coordinator reads, so a half-cleared site says so there rather than nowhere.
+        cleanup = None
+        try:
+            epilogue(self.run_dir, self.run, self.table, records, self.log)
+        except ClearError as error:
+            cleanup = str(error)
+        snapshot(RUN_COMPLETE, pointer=str(report), report=str(report), cleanup=cleanup)
         return 0
 
 

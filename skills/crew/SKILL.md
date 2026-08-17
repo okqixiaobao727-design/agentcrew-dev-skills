@@ -54,8 +54,10 @@ The driver exits with one JSON wake snapshot, and that object is the whole of wh
   `resume` command, in the background as above.
 - `preflight-failed` — tell the operator the count and the surface the snapshot names, and stop;
   they fix and commit in their own session, then type `/crew` again.
-- `run-complete` — one sentence pointing at the `report` path. The run is over, and clearing it is
-  the operator's own terminal command.
+- `run-complete` — one sentence pointing at the `report` path. The run is over: the driver has
+  already cleared what landed, and the parked and failed work it left standing is listed in the
+  report for the operator's own terminal command to clear. Where the snapshot's `cleanup` field is
+  not null, say what it names too: that much of the site is still standing.
 
 An interrupted run — a crash, a killed driver, a restarted session — resumes by re-typing `/crew
 <run-dir>`: start adopts a run already under way rather than beginning a second one.

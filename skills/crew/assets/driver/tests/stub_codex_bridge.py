@@ -28,6 +28,9 @@ def main():
         return 0
 
     if argv[:1] == ["stop"]:
+        if (state_dir / "codex-stop-fails").exists():
+            print("stop refused: the session would not go", file=sys.stderr)
+            return 1
         print(json.dumps({"ok": True, "stateFile": flag(argv, "--state-file")}))
         return 0
 

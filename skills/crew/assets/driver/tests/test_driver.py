@@ -372,6 +372,14 @@ class Fixture:
         path = self.stub_dir / "tmux-windows.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
+    def add_window(self, window_id, name):
+        """Put a window nobody in the run recorded on the stub server, as a session's own is."""
+        path = self.stub_dir / "tmux-windows.json"
+        table = self.windows()
+        table[window_id] = {"name": name, "target": TMUX_SESSION}
+        path.write_text(json.dumps(table))
+        return window_id
+
     def windows_named(self, name):
         return {
             window_id: window for window_id, window in self.windows().items()
@@ -964,18 +972,18 @@ class LoopTests(DriverTestCase):
     writer its hook uses, and the agents list is rewritten to make a session idle or vanish.
     """
 
-    def feature(self, *tickets, shared=None):
+    def feature(self, *tickets, shared=None, routing=ROUTING):
         """A feature of tickets, and a file in the base commit two children can collide over."""
         for number, blockers in tickets:
-            self.fixture.ticket(number, f"thing {number}", blocked_by=blockers)
+            self.fixture.ticket(number, f"thing {number}", routing=routing, blocked_by=blockers)
         if shared is not None:
             (self.fixture.repo / "shared.txt").write_text(shared)
             git(self.fixture.repo, "add", "shared.txt")
         self.fixture.commit_feature()
 
-    def start(self, *tickets, shared=None, env_overrides=None):
+    def start(self, *tickets, shared=None, env_overrides=None, routing=ROUTING):
         """A run with its first wave up and its loop running."""
-        self.feature(*tickets, shared=shared)
+        self.feature(*tickets, shared=shared, routing=routing)
         process = self.fixture.launch(env_overrides=env_overrides)
         for number, _ in tickets:
             if not _:
@@ -1416,6 +1424,23 @@ class LoopTests(DriverTestCase):
             "semantic", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
         )
 
+    def test_the_merge_rework_instruction_scopes_re_verification_to_the_conflict(self):
+        """The rework instruction has never fired in a run, so its text is pinned before it does.
+
+        The words are the ticket's: merge the integration branch, resolve, re-run the tests the
+        conflict touched, re-review scoped to the conflict-resolution diff, commit, send a new
+        receipt. The full-workflow re-run language it replaces is asserted gone.
+        """
+        process = self.start(("01", ()), ("02", ()), shared="one\n")
+
+        self.fixture.completes("01", "01 rewrote\n", name="shared.txt")
+        self.fixture.completes("02", "02 rewrote\n", name="shared.txt")
+        instruction = self.wait_for_instruction("02", "CREW MERGE")
+
+        self.assertIn("re-run the tests the conflict touched", instruction)
+        self.assertIn("re-review scoped to the conflict-resolution diff", instruction)
+        self.assertNotIn("the checks your workflow asked of you", instruction)
+
     def test_a_semantic_conflict_bounced_back_a_second_time_wakes_the_coordinator(self):
         process = self.start(("01", ()), ("02", ()), shared="one\n")
 
@@ -1447,6 +1472,97 @@ class LoopTests(DriverTestCase):
             "mechanical", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
         )
         self.assertEqual(self.instructions("02", "CREW MERGE"), [])
+
+    # --- the run-end epilogue ------------------------------------------------------------------
+
+    def artefacts(self, ticket):
+        """The worktree, branch and window the run recorded for that ticket's child."""
+        record = self.fixture.launch_record(ticket)
+        return pathlib.Path(record["worktree"]), record["branch"], record["window"]
+
+    def dashboard_window(self):
+        """The window id the dashboard recorded, once the surface has drawn itself."""
+        path = self.fixture.run_dir / "dashboard-window"
+        self.assertTrue(
+            self.fixture.wait_for(lambda: path.exists() and path.read_text().strip()),
+            "the dashboard never recorded its window",
+        )
+        return path.read_text().strip()
+
+    def test_the_epilogue_clears_landed_work_and_leaves_parked_work_standing(self):
+        process = self.start(("01", ()), ("02", ()))
+        landed_worktree, landed_branch, landed_window = self.artefacts("01")
+        parked_worktree, parked_branch, parked_window = self.artefacts("02")
+        coordinator_window = self.fixture.add_window("@coordinator", "coordinator")
+        dashboard_window = self.dashboard_window()
+
+        self.fixture.completes("01")
+        self.fixture.says("02", "CREW PARKED features/demo/checklist-02.md")
+        snapshot = self.woken(process, "run-complete")
+
+        self.assertIsNone(snapshot["cleanup"], "a cleared site reported a cleanup failure")
+        self.assertFalse(landed_worktree.exists(), "a landed worktree survived the epilogue")
+        self.assertNotIn(landed_branch, self.fixture.branches())
+        self.assertTrue(parked_worktree.exists(), "a parked worktree was destroyed")
+        self.assertIn(parked_branch, self.fixture.branches())
+        self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
+
+        windows = self.fixture.windows()
+        self.assertNotIn(landed_window, windows)
+        self.assertNotIn(dashboard_window, windows)
+        self.assertIn(parked_window, windows)
+        self.assertIn(coordinator_window, windows)
+
+    def test_the_report_lists_the_preserved_paths_of_parked_and_failed_tickets(self):
+        process = self.start(
+            ("01", ()), ("02", ()), ("03", ()),
+            env_overrides={"CLAUDE_CODE_SESSION_ID": ""},
+        )
+        landed_worktree, _, _ = self.artefacts("01")
+        parked_worktree, parked_branch, _ = self.artefacts("02")
+        failed_worktree, failed_branch, _ = self.artefacts("03")
+
+        self.fixture.completes("01")
+        self.fixture.says("02", "CREW PARKED features/demo/checklist-02.md")
+        self.fixture.says("03", "CREW COMPLETE " + "0" * 40)
+        self.wait_for_instruction("03", "CREW RECHECK")
+        self.fixture.says("03", "CREW COMPLETE " + "1" * 40)
+        self.woken(process, "run-complete")
+
+        self.assertTrue(failed_worktree.exists(), "a failed worktree was destroyed")
+        self.assertIn(failed_branch, self.fixture.branches())
+        # The cost rollup names every child's worktree, landed ones included, so what the report
+        # preserves is read from the report the run itself writes, ahead of that appended block.
+        report = (self.fixture.feature_dir / "report.md").read_text().split("## Cost", 1)[0]
+        for value in (str(parked_worktree), parked_branch, str(failed_worktree), failed_branch):
+            self.assertIn(value, report)
+        self.assertNotIn(str(landed_worktree), report)
+
+    def test_the_epilogue_stops_only_a_landed_ticket_s_codex_session(self):
+        process = self.start(("01", ()), ("02", ()), routing=CODEX_ROUTING)
+        landed_state = self.fixture.run_dir / "codex" / "01.json"
+        parked_state = self.fixture.run_dir / "codex" / "02.json"
+
+        self.fixture.completes("01")
+        self.fixture.says("02", "CREW PARKED features/demo/checklist-02.md")
+        self.woken(process, "run-complete")
+
+        stopped = [
+            call["argv"] for call in self.fixture.codex_calls() if call["argv"][:1] == ["stop"]
+        ]
+        self.assertEqual(len(stopped), 1, stopped)
+        self.assertIn(str(landed_state), stopped[0])
+        self.assertTrue(parked_state.exists(), "a parked ticket's Codex state was removed")
+
+    def test_an_epilogue_that_could_not_clear_says_so_in_the_run_complete_snapshot(self):
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+        (self.fixture.stub_dir / "codex-stop-fails").write_text("yes\n")
+
+        self.fixture.completes("01")
+        snapshot = self.woken(process, "run-complete")
+
+        self.assertIn(str(self.fixture.run_dir / "codex" / "01.json"), snapshot["cleanup"])
+        self.assertEqual(snapshot["report"], str(self.fixture.feature_dir / REPORT_NAME))
 
     # --- closing what landed -----------------------------------------------------------------
 
@@ -1797,17 +1913,24 @@ class AdoptionTests(DriverTestCase):
             self.kill_window(window)
 
         adopted = self.fixture.launch()
+        record = self.fixture.run_dir / "dashboard-window"
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.windows_named(DASHBOARD_WINDOW)),
+            self.fixture.wait_for(
+                lambda: self.fixture.windows_named(DASHBOARD_WINDOW)
+                and record.exists() and record.read_text().strip()
+            ),
             "the adopted run drew no dashboard",
         )
-        self.fixture.completes("01")
-        self.woken(adopted, "run-complete")
 
         windows = self.fixture.windows_named(DASHBOARD_WINDOW)
         self.assertEqual(len(windows), 1, f"dashboard windows: {windows}")
-        recorded = (self.fixture.run_dir / "dashboard-window").read_text().strip()
-        self.assertEqual(recorded, next(iter(windows)))
+        self.assertEqual(record.read_text().strip(), next(iter(windows)))
+
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        # The window is the run's, not the operator's: the epilogue closes it with the run.
+        self.assertEqual(self.fixture.windows_named(DASHBOARD_WINDOW), {})
 
 
 if __name__ == "__main__":
