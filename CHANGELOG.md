@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Three dashboard tests failed on a clean checkout. The tests that watch the
+  monitor's refresh loop time-boxed it with a fixed half-second nap and then
+  counted the frames in the pipe, but one frame of their fixture costs a quarter
+  of a second or more — every draw spawns the stub `claude` and the stub `tmux` —
+  so "at least two frames" was unreachable and even "exactly one frame" raced the
+  first draw on a loaded machine. They wait for the frame they are waiting for
+  now, reading it from a file the loop writes as it runs rather than collecting a
+  pipe, which only returns once the loop has exited. The monitor's behaviour was
+  correct throughout; only the test expectations were wrong (#73).
+
 ## [0.5.0] - 2026-08-17
 
 ### Added
