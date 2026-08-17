@@ -134,7 +134,10 @@ caller buckets the findings.
 
 ## 7. Message channel, and the monitor behind it
 
-Escalations, answers and receipts travel over cross-session messaging. tmux keeps three jobs:
+Escalations and answers travel over cross-session messaging. A receipt does not: a child records
+its own completion, failure or park in the run's machine log, which is where the driver verifies
+receipts from, so an event nobody has to decide about never wakes the coordinator. tmux keeps three
+jobs:
 launching children, answering permission confirmations (messaging cannot approve permissions for the
 receiver), and human takeover.
 

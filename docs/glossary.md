@@ -153,10 +153,12 @@ when the round budget runs out escalates too. Escalation is not an ending: once 
 keeps running.
 
 **Receipt** — A child's final word on a ticket: complete (with the full commit sha, which the
-coordinator verifies independently) or failed (with the reason).
+coordinator verifies independently) or failed (with the reason). A child records it in the run's
+machine log rather than sending it, so a receipt reaches the run's record without waking the
+coordinator for an event it has nothing to decide.
 
 **Message channel** — Point-to-point cross-session messaging between Claude Code sessions on one
-machine. Escalations, answers and receipts travel this way. tmux is reserved for three jobs:
+machine. Escalations and answers travel this way; receipts do not. tmux is reserved for three jobs:
 launching children, answering permission confirmations (a message cannot approve permissions on the
 receiver's behalf), and human takeover.
 
