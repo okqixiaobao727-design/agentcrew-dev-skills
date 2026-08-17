@@ -16,8 +16,58 @@ and this project uses [Semantic Versioning](https://semver.org/).
 - Two fields on the pin file, `renderer` and `interpreter`: the `monitor.py` and
   the interpreter of the release that wrote the pin, recorded at dispatch, which
   is what the installed statusline wrapper now runs (#56).
+- **The staging script** (`skills/route/assets/stage/stage.py`): `/route`'s exit.
+  It turns a set of tracker tickets into `crewtask/<n>/` — `spec.md` plus one
+  `<number>.md` per ticket at the root — resolves the dependency closure, where
+  an edge to a closed ticket outside the set is stripped and an open one is a
+  named blocking item, and self-checks the result by importing the driver's own
+  parsing, validation and wave-table build rather than restating them. Only a
+  fully green self-check prints the `/crew crewtask/<n>` command; any failure
+  exits non-zero with each blocking item beside its fix and the command
+  withheld. Re-staging the same parent refreshes its directory in place, and
+  `crewtask/` is gitignored, so staging never touches the tracked tree (#62).
+- The staging script's tracker side: `--parent <n>` expands a parent into its
+  open native sub-issues, so routing a triaged piece of work needs nothing but
+  one number; `--routing <file.json>` carries the table the user approved and is
+  the only thing that authorises a tracker write, putting each ticket's
+  `## Routing` section and role label back where the work state lives; and on a
+  green self-check the staged `/crew crewtask/<n>` command is commented on the
+  parent — or on every ticket of a parentless set — so the pickup point survives
+  a `/clear` (#64).
+- A **comment** operation in the tracker vocabulary
+  (`references/trackers.md`), the write the staged command needs:
+  `gh issue comment` under github, and an idempotent `Crew:` line in the ticket
+  file under local, rewritten rather than repeated (#64).
+- **The launch script** (`skills/crew/assets/launch/launch.py`): `/crew`'s whole
+  start-up in one command. Given a run directory it resolves the three values
+  the driver's start requires — the coordinator pid from the invoking shell's
+  parent process, the session name from the harness's per-pid session registry,
+  and the live permission mode from the newest entry of the session's
+  transcript, the one on-disk source that reflects a mid-session switch —
+  without a single agent exploration turn. These are harness-internal formats,
+  so a resolution it cannot make aborts loudly naming the flag that supplies the
+  value by hand; it never guesses a default, because a wrong mode launches every
+  child of the run outside the mode a message can cross. A run already in flight
+  is adopted rather than doubled (#63).
+
+### Changed
+- `/route` now has three entrances and one exit. A parent ticket number, an
+  explicit ticket list, or a spec whose tickets are not cut yet all end at the
+  staging script, and what the user is handed is the command that script printed
+  or the blocking items it named — never a `/crew` line composed by hand. The
+  `to-tickets+route` path gained the closing step that gets it there: link the
+  published tickets to the parent as native sub-issues, then stage. `/crew`'s
+  launch step is the single launch-script command now, and the
+  environment-exploration instructions it used to carry are gone (#65).
 
 ### Fixed
+- Preflight's "no tickets" error named neither what it had searched nor what it
+  wanted, and it is the error a hand-assembled run directory lands on most. It
+  names the directory searched and the `<number>.md` pattern wanted at that
+  directory's root now, and warns that a `tickets/` subdirectory there is the
+  layout a finished run is archived into, not where a run's input tickets go.
+  Both layouts are written down beside the driver's own code, so the next
+  hand-assembler — human or agent — has a contract to read (#61).
 - Every dashboard surface froze at the first wave that escalated. The monitor
   counted an `advance` decision of `escalated` or `interrupted` as the end of
   the run, so a multi-wave run held a stale frame in its tmux window and blanked
