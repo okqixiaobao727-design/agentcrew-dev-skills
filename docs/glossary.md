@@ -58,8 +58,10 @@ anyone, so nobody has to translate.
 | `pending` | is in the table and has not been launched yet |
 | `running` | has a live child working on it |
 | `waiting` | has a child or a merge needing a human: a prompt, an idle turn, a blocked merge |
+| `reworking` | has a live child resolving the semantic merge conflict the run sent it back to |
 | `parked` | needs an irreversible action, so it is waiting for a human |
 | `landable` | has a verified completion receipt and has not been merged yet |
+| `settling` | is landable in a wave whose last receipt is in, so its merge is what happens next |
 | `merged` | is in the integration branch |
 | `failed` | did not produce work that could land |
 | `vanished` | was launched and its child is no longer there |
