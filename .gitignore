@@ -11,3 +11,6 @@ __pycache__/
 # A crew run's own working directory — spec, tickets, decisions and rendered first turns for the
 # feature being built. Scaffolding for building this plugin, never part of it.
 features/
+# A staged crew run directory, written by the route skill's staging script: a snapshot of tracker
+# tickets for one run, refreshed by re-staging. Scaffolding, never part of the plugin.
+crewtask/
