@@ -150,8 +150,8 @@ surface = "pin"
 model = "claude-sonnet-5"
 
 # --- Issue tracker ----------------------------------------------------------
-# Which tracker this repo's runs close merged tickets in: `github` or `local`. This repo keeps its
-# tickets as markdown files under `features/<feature>/tickets/`, so its close is a `Status:` line.
+# Which tracker this repo's runs close merged tickets in: `github` or `local`. This repo's tickets
+# live as GitHub issues (docs/agents/issue-tracker.md), so runs read and close them via `gh`.
 
 [tracker]
-kind = "local"
+kind = "github"
