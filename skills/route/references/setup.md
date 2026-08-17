@@ -87,7 +87,9 @@ and the link to give the user. Wiring it edits the user's Claude Code settings, 
 not this repo's, so the wizard shows the exact edit and asks before anything is written.
 
 The pin ships with the crew skill, so it is reached through that skill's own directory — the `crew`
-slot of `<plugin-dir>`'s skills — recorded here as `<crew-skill-dir>`, absolute.
+slot of `<plugin-dir>`'s skills — recorded here as `<crew-skill-dir>`, absolute. Which copy of the
+release runs the command does not matter: what it writes names no release, and every run afterwards
+is drawn by whichever release dispatched it.
 
 Print what the install would do. It is a dry run: it writes nothing.
 
@@ -103,6 +105,8 @@ That output is the whole of what you ask about. Read which case it shows and say
   its output is printed first; the pin's frame is drawn beneath it.
 - `the pin is already installed here; nothing to change` — the wiring is in place. Say so and stop
   here; there is nothing to ask about.
+- `rewrite <path>` — a wrapper is there but it is not what this release writes, usually one from
+  before the wrapper became release-independent. Treat it as any other edit: show it and ask.
 
 Show the dry run's lines to the user as they were printed, and ask whether to make that change.
 

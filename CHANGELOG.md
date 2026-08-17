@@ -13,6 +13,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
   word a halted wave carries, so a run that ended on one was indistinguishable
   from a run waiting on the coordinator; `stopped` is what the surfaces read the
   end of such a run from (#57).
+- Two fields on the pin file, `renderer` and `interpreter`: the `monitor.py` and
+  the interpreter of the release that wrote the pin, recorded at dispatch, which
+  is what the installed statusline wrapper now runs (#56).
 
 ### Fixed
 - Every dashboard surface froze at the first wave that escalated. The monitor
@@ -30,6 +33,24 @@ and this project uses [Semantic Versioning](https://semver.org/).
   `landable`, indistinguishable from a branch waiting its turn. It is drawn
   `waiting` now, with the `last event:` line naming what blocked it and a clock
   that follows that event rather than the earlier receipt (#57).
+- `pin-install` baked the installing release's `monitor.py` path and its
+  interpreter into the statusline wrapper, so the first upgrade after an install
+  stranded the pin on a release that was no longer there — and, because the
+  wrapper ended in `exec`, a dead reference exited non-zero and Claude Code
+  blanked the operator's entire statusline, their own readout with it. The
+  wrapper is a permanent stub now: it reads the pin registry and runs the
+  renderer and interpreter the live pin names, so the release that dispatched a
+  run is the release that draws it, with no re-install. It exits 0 on every path
+  (#56).
+- A statusline that had quietly stopped working looked exactly like a machine
+  with no run on it. Where pins are present but none names a renderer this
+  machine still has — the paths are gone, the pin is unreadable, or it predates
+  those fields — one actionable line is printed instead of nothing: by the
+  wrapper when it can reach no renderer at all, and by the renderer it does
+  reach, under the new `pin --from-wrapper`, for the registry files only a JSON
+  parser can judge. This is the only exception to the silence contract; failures
+  inside the renderer stay silent, and `monitor.py pin` on its own is unchanged
+  (ADR-0011, #56).
 
 ## [0.4.1] - 2026-08-16
 
