@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-17
+
 ### Added
 - A fifth `advance` decision, `stopped`, written by the wave loop when a run ends
   on an escalation the rule table had already settled. `escalated` is the same
