@@ -20,6 +20,9 @@ The scenario is read from $CLAUDE_STUB_SCENARIO (default "ok"):
     bad-json    non-JSON output on stdout
     no-session  valid JSON without a session_id
     hang        never answers, so the bridge's timeout fires
+    verdict-clean  a report whose verdict line counts standards findings only
+    no-verdict     a report that never printed the verdict line the prompt asked for
+    part-verdict   a report whose verdict line is missing half of the required form
 """
 
 import json
@@ -29,8 +32,22 @@ import sys
 import time
 
 FIRST_SESSION_ID = "stub-session-0001"
-REVIEW_REPORT = "Standards: 1 finding (naming). Spec: no findings."
+REVIEW_REPORT = (
+    "Standards: 1 finding (naming). Spec: 1 finding (the base range is off by one).\n"
+    "REVIEW VERDICT: spec-findings-requiring-fix=1 standards-findings=1"
+)
 FOLLOWUP_REPORT = "Round two: the naming finding is resolved. No new findings."
+# The two other shapes the re-review gate has to tell apart from the default report above: a
+# standards-only verdict, and a report that never printed a verdict line at all.
+STANDARDS_ONLY_REPORT = (
+    "Standards: 1 finding (naming). Spec: no findings.\n"
+    "REVIEW VERDICT: spec-findings-requiring-fix=0 standards-findings=1"
+)
+UNVERDICTED_REPORT = "Standards: 1 finding (naming). Spec: no findings."
+PARTIAL_VERDICT_REPORT = (
+    "Standards: 1 finding (naming). Spec: 1 finding.\n"
+    "REVIEW VERDICT: spec-findings-requiring-fix=1"
+)
 
 
 def scenario():
@@ -101,6 +118,12 @@ def main():
         payload["result"] = ""
     elif active == "no-session":
         payload.pop("session_id")
+    elif active == "verdict-clean" and not resume_id:
+        payload["result"] = STANDARDS_ONLY_REPORT
+    elif active == "no-verdict" and not resume_id:
+        payload["result"] = UNVERDICTED_REPORT
+    elif active == "part-verdict" and not resume_id:
+        payload["result"] = PARTIAL_VERDICT_REPORT
 
     print(json.dumps(payload))
     return 0

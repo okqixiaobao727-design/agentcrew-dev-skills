@@ -50,6 +50,33 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 REVIEWER_CONFIG_ENV_VAR = "CODE_REVIEWER_FILE"
 BINARY_ENV_VAR = "CODE_REVIEW_CLAUDE_BINARY"
 STATE_DIR_ENV_VAR = "CODE_REVIEW_CLAUDE_STATE_DIR"
+# The optional knowledge-graph CLI that scores the range under review. It is an enhancement, never
+# a requirement: every way it can be absent or unhelpful ends in the git summary instead.
+GRAPH_CLI = "code-review-graph"
+# Measured at ~0.2s against this repository; a graph query that takes minutes is a broken graph,
+# and the review must not wait on one.
+GRAPH_TIMEOUT_SECONDS = 60
+GIT_TIMEOUT_SECONDS = 60
+# Redirecting the graph through the environment was measured to answer with a silent zero-risk
+# score, so an inherited redirection is dropped rather than obeyed: `--repo` is the only pointer.
+GRAPH_REDIRECT_ENV_VARS = ("CRG_DATA_DIR", "CRG_REPO_ROOT")
+# The brief report's changed-function count. Zero of them against a diff that plainly changed
+# something is the stale-or-empty-graph signature, not an answer.
+CHANGED_FUNCTIONS_PATTERN = re.compile(r"(\d+)\s+changed function", re.IGNORECASE)
+# The last line the round-one prompt asks the reviewer for. The re-review gate reads it, so it is
+# spelled once here and quoted into the prompt from there.
+VERDICT_LINE = (
+    "REVIEW VERDICT: spec-findings-requiring-fix=<count> standards-findings=<count>"
+)
+# The whole line or nothing: a fragment of it, or the phrase inside prose, is not the report
+# saying a fix is required, and the gate must not read one as if it were.
+VERDICT_PATTERN = re.compile(
+    r"^\s*REVIEW VERDICT:\s+spec-findings-requiring-fix=(\d+)\s+standards-findings=\d+\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# One re-review, and only for a spec finding: the contract's cap, enforced here rather than left
+# to the caller's self-restraint.
+MAX_ROUNDS = 2
 
 
 class BridgeError(RuntimeError):
@@ -225,6 +252,185 @@ class SessionStore:
         return path
 
 
+def run_command_capture(command, cwd, timeout_seconds, environment=None):
+    """`(exit code, stdout)` of a short read-only command, or `None` if it could not be run.
+
+    Every caller here is gathering context for a prompt, so a command that is missing, crashes, or
+    hangs is a slot to fill differently — never a failed review. Output that is not valid UTF-8
+    is decoded with replacements for the same reason: an optional tool's bad byte must not take
+    the review down with it.
+    """
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return completed.returncode, completed.stdout
+
+
+def resolve_main_checkout(cwd):
+    """Absolute path of the checkout whose graph and object database this worktree shares.
+
+    A child reviews from its own worktree, and a worktree's graph is empty; the common git
+    directory names the checkout that holds the real one.
+    """
+    answer = run_command_capture(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd,
+        GIT_TIMEOUT_SECONDS,
+    )
+    if not answer or answer[0] != 0 or not answer[1].strip():
+        return None
+    return str(pathlib.Path(answer[1].strip()).parent)
+
+
+def resolve_review_branch(cwd):
+    """The branch under review, or its commit when the worktree's HEAD is detached."""
+    answer = run_command_capture(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd, GIT_TIMEOUT_SECONDS
+    )
+    if not answer or answer[0] != 0 or not answer[1].strip():
+        return None
+    branch = answer[1].strip()
+    if branch != "HEAD":
+        return branch
+    detached = run_command_capture(["git", "rev-parse", "HEAD"], cwd, GIT_TIMEOUT_SECONDS)
+    if not detached or detached[0] != 0 or not detached[1].strip():
+        return None
+    return detached[1].strip()
+
+
+def graph_analysis(checkout, range_spec, environment=None):
+    """The graph CLI's brief risk report for the range, or `None` when it has no answer.
+
+    The `--repo` flag is the only supported way to point the CLI at a checkout: redirection
+    through `CRG_DATA_DIR` / `CRG_REPO_ROOT` was measured to answer with a silent zero-risk score,
+    so this call sets neither.
+    """
+    environment = os.environ if environment is None else environment
+    executable = shutil.which(GRAPH_CLI, path=environment.get("PATH"))
+    if not executable:
+        return None
+    environment = {
+        name: value
+        for name, value in environment.items()
+        if name not in GRAPH_REDIRECT_ENV_VARS
+    }
+    answer = run_command_capture(
+        [
+            executable, "detect-changes",
+            "--base", range_spec,
+            "--brief",
+            "--repo", checkout,
+        ],
+        checkout,
+        GRAPH_TIMEOUT_SECONDS,
+        environment,
+    )
+    if not answer or answer[0] != 0 or not answer[1].strip():
+        return None
+    return answer[1].strip()
+
+
+def git_change_summary(worktree, base):
+    """Diff stat, changed files, and untracked files since `base`, or `None` if git could not say.
+
+    The review runs before the child commits, so the range that matters ends at the working tree
+    rather than at the branch tip: `git diff <base>` spans both, and the untracked files it does
+    not list are appended in git's own porcelain spelling.
+    """
+    stat = run_command_capture(
+        ["git", "diff", "--stat", base], worktree, GIT_TIMEOUT_SECONDS
+    )
+    names = run_command_capture(
+        ["git", "diff", "--name-status", base], worktree, GIT_TIMEOUT_SECONDS
+    )
+    untracked = run_command_capture(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        worktree,
+        GIT_TIMEOUT_SECONDS,
+    )
+    if not stat or stat[0] != 0 or not names or names[0] != 0:
+        return None
+    listed = names[1].strip()
+    if untracked and untracked[0] == 0 and untracked[1].strip():
+        new_files = "\n".join(
+            f"??\t{path}" for path in untracked[1].strip().splitlines()
+        )
+        listed = "\n".join(part for part in (listed, new_files) if part)
+    return "\n\n".join(part for part in (stat[1].strip(), listed) if part)
+
+
+def has_pending_changes(worktree):
+    """True when the working tree carries changes no commit — and so no graph — has seen yet."""
+    status = run_command_capture(
+        ["git", "status", "--porcelain"], worktree, GIT_TIMEOUT_SECONDS
+    )
+    if not status or status[0] != 0:
+        return False
+    return bool(status[1].strip())
+
+
+def has_changed_functions(analysis):
+    """True when the brief report counts at least one changed function."""
+    match = CHANGED_FUNCTIONS_PATTERN.search(analysis or "")
+    return bool(match) and int(match.group(1)) > 0
+
+
+def build_scoped_context(checkout, worktree, base, branch, environment=None):
+    """The round-one prompt's change-analysis block, or `None` when the range is unknown.
+
+    A worktree shares the object database with its checkout, so committed work needs no checkout
+    of its own: the graph is queried where it lives. Work that is not committed yet is invisible
+    to any graph, so a dirty working tree is answered by git alone.
+    """
+    if not checkout or not worktree or not base or not branch:
+        return None
+    range_spec = f"{base}...{branch}"
+    summary = git_change_summary(worktree, base)
+    pending = has_pending_changes(worktree)
+    analysis = None if pending else graph_analysis(checkout, range_spec, environment)
+    # A zero changed-function count against a diff that plainly changed something is a stale or
+    # empty graph, and a silent zero-risk score is worse than no score at all.
+    if analysis and (has_changed_functions(analysis) or not summary):
+        return (
+            f"Change analysis for {range_spec}, computed before this review started:\n\n"
+            f"{analysis}"
+        )
+    if not summary:
+        return None
+    reason = (
+        "The working tree carries changes no commit holds yet, so no graph can have seen them"
+        if pending
+        else "The knowledge graph had no usable answer for this range"
+    )
+    return (
+        f"Change analysis for everything in this worktree since {base}, computed before this "
+        f"review started. {reason}, so this is git's own summary of it:\n\n{summary}"
+    )
+
+
+def build_verification_block(verification):
+    """What the author already ran, and the instruction not to run it all again."""
+    recorded = (verification or "").strip()
+    if recorded:
+        stated = f"The author recorded this verification of the change:\n\n{recorded}"
+    else:
+        stated = "The author recorded no verification of the change."
+    return (
+        f"{stated}\n\nRe-run only the tests the diff touches, rather than the full suite: "
+        "confirming the whole tree is green a second time is the caller's job, not this review's."
+    )
+
+
 # The whole review request, stated here rather than delegated to a skill name:
 # a headless reviewer that names a skill resolves that name a second time, in a
 # session nobody is watching. Same contract as the `rounds` block in
@@ -242,15 +448,29 @@ ROUNDS_CONTRACT = (
 )
 
 
-def build_review_prompt(target):
-    return (
+VERDICT_INSTRUCTION = (
+    "End your report with a final line in exactly this form, counting the findings you just "
+    "reported and, on the spec axis, only those that require a fix rather than a ruling:\n\n"
+    f"{VERDICT_LINE}\n\nThat line is read by machine to decide whether a re-review is permitted "
+    "at all, and a report without it earns none, so it must be present and it must be last."
+)
+
+
+def build_review_prompt(target, scoped_context=None, verification=None):
+    """The round-one prompt: the request, the scope, the author's verification, the contract."""
+    sections = [
         f"Review {target} and report your findings. You are a headless reviewer "
         "with full local access and no pane a human can watch, so ask no "
         "questions. If the originating issue or spec cannot be fetched, treat it "
         "as no spec available: run the standards axis and report the spec axis "
-        "as skipped. Report on the code as it stands; this is a review-only "
-        f"task.\n\n{ROUNDS_CONTRACT}"
-    )
+        "as skipped. Report on the code as it stands; this is a review-only task."
+    ]
+    if scoped_context:
+        sections.append(scoped_context)
+    sections.append(build_verification_block(verification))
+    sections.append(ROUNDS_CONTRACT)
+    sections.append(VERDICT_INSTRUCTION)
+    return "\n\n".join(sections)
 
 
 def build_followup_prompt(target):
@@ -373,6 +593,44 @@ def apply_session_model_choice(args, state):
         args.effort = state.get("effort")
 
 
+def read_spec_finding_count(report):
+    """The count of spec findings requiring a fix on the report's verdict line, or `None`.
+
+    `None` means the report carried no readable verdict line at all, which is a different thing
+    from a verdict that counted zero.
+    """
+    matches = VERDICT_PATTERN.findall(report or "")
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
+def refuse_second_pass(state):
+    """Why this lineage may not run another pass, or `None` when it may.
+
+    The permission is evidence, not the absence of a refusal: a second pass needs a round one
+    that said, in the line the prompt asked for, that a spec finding required a fix. A round one
+    that said nothing readable is not that evidence, so it does not earn one either.
+    """
+    if state.get("rounds", 0) >= MAX_ROUNDS:
+        return (
+            "The contract allows one re-review and this lineage has had it; a finding still open "
+            "after it ends the review and goes to the coordinator instead."
+        )
+    requiring_fix = state.get("specFindingsRequiringFix")
+    if requiring_fix is None:
+        return (
+            "Round one printed no readable REVIEW VERDICT line, so nothing on record says a spec "
+            "finding required a fix; the review ends on the round already in hand."
+        )
+    if requiring_fix == 0:
+        return (
+            "Round one reported no spec finding requiring a fix, and only such a finding earns a "
+            "second pass; standards findings are fixed without re-review."
+        )
+    return None
+
+
 def update_state_after_round(state, args, parsed, exit_code, duration_ms):
     state["sessionId"] = parsed.session_id
     state["target"] = args.target
@@ -381,6 +639,7 @@ def update_state_after_round(state, args, parsed, exit_code, duration_ms):
     state["lastSubtype"] = parsed.subtype
     state["lastIsError"] = parsed.is_error
     state["lastResult"] = parsed.result
+    state["specFindingsRequiringFix"] = read_spec_finding_count(parsed.result)
     state["lastDurationMs"] = duration_ms
     state["permissionDenials"] = parsed.permission_denials
     state["updatedAt"] = time.time()
@@ -394,6 +653,26 @@ def run_bridge(args):
 
     if args.resume_session:
         state = store.read(args.resume_session)
+        refusal = refuse_second_pass(state)
+        if refusal:
+            print(json.dumps(
+                {
+                    "status": "refused",
+                    "reason": refusal,
+                    "lineageId": state["lineageId"],
+                    "sessionId": state.get("sessionId"),
+                    "resumed": False,
+                    "round": state.get("rounds", 0),
+                    "specFindingsRequiringFix": state.get("specFindingsRequiringFix"),
+                    "stateFile": str(store.state_path(state["lineageId"])),
+                    "logFile": str(store.log_path(state["lineageId"])),
+                    "findings": "",
+                },
+                ensure_ascii=False,
+            ))
+            # A refusal is the gate working, not a review that failed: the caller acts on the
+            # round already in hand rather than retrying this call.
+            return 0
         apply_session_model_choice(args, state)
         lineage_id = state["lineageId"]
         resume_session_id = state.get("sessionId") or lineage_id
@@ -403,7 +682,15 @@ def run_bridge(args):
         state = None
         lineage_id = None
         resume_session_id = None
-        prompt = build_review_prompt(args.target)
+        scoped_context = None
+        if args.base:
+            scoped_context = build_scoped_context(
+                resolve_main_checkout(args.cwd),
+                args.cwd,
+                args.base,
+                resolve_review_branch(args.cwd),
+            )
+        prompt = build_review_prompt(args.target, scoped_context, args.verification)
         resumed = False
 
     command = build_command(
@@ -493,6 +780,16 @@ def build_parser():
     parser.add_argument(
         "--effort",
         help="Effort level for this review lineage (default: Claude config)",
+    )
+    parser.add_argument(
+        "--base",
+        help="the commit this review's range starts at; round one opens with an analysis of"
+             " <base>...<the worktree's branch>, and without it the prompt carries no scope",
+    )
+    parser.add_argument(
+        "--verification",
+        help="what the author ran to verify the change and how it came out; the reviewer is"
+             " handed this and asked to re-run only the tests the diff touches",
     )
     parser.add_argument(
         "--resume-session",

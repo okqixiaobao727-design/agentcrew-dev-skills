@@ -475,9 +475,12 @@ class ReviewEventRenderTests(DispatchTestCase):
         self.assertIn(
             "python3 %s/assets/review/scripts/claude_review_bridge.py \\\n"
             "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
+            "  --base %s \\\n"
+            "  --verification '<the commands you ran to verify this work, and that they"
+            " passed>' \\\n"
             "  'the changes in this worktree since %s'"
             % (CREW_SKILL_DIR, self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT,
-               self.machine_log, self.fixture.base_commit),
+               self.machine_log, self.fixture.base_commit, self.fixture.base_commit),
             prompt,
         )
 
