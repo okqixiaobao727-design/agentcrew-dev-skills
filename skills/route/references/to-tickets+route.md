@@ -55,3 +55,28 @@ operations ([`trackers.md`](../../../references/trackers.md)): each must carry e
 workflow. **Edit** or **mark** any ticket that misses, and touch nothing the user declined.
 
 **Done when** every published ticket is accounted for against the approved table.
+
+## 4. Link them, then stage
+
+Publication ends on the tracker, and a run starts from a directory: this step carries the published
+tickets across, so this entrance ends where the other two do.
+
+**Link** every published ticket to the run's parent ticket as a native sub-issue, where the tracker
+is github and the spec has a parent ticket, so that a later `/route #<parent>` expands to exactly
+this set:
+
+```bash
+gh api repos/<owner>/<repo>/issues/<parent>/sub_issues \
+  -F sub_issue_id="$(gh api repos/<owner>/<repo>/issues/<published-ticket> --jq .id)"
+```
+
+The sub-issues API takes the child's database `id`, which is why the inner call reads it rather
+than passing the issue number.
+
+Then run the staging script exactly as step 4 of [`../SKILL.md`](../SKILL.md) runs it, with the
+approved routing table as its JSON: `--parent <n>` where the tickets were just linked to one, the
+published ticket set itself otherwise. What the user is handed — the printed `/crew crewtask/<n>`
+command, or the blocking items and their fixes — is that step's rule too.
+
+**Done when** the staging script has run and the user holds its printed command, or its blocking
+items.
