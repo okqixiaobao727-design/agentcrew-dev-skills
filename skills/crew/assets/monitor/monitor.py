@@ -187,13 +187,27 @@ STATE_COLOURS = {
 COLOUR_RESET = "\x1b[0m"
 
 # The pin registry (`docs/monitor-dashboard.md`): the directory a live run leaves the file naming
-# itself in, under the operator's Claude config, and the three things that file carries.
+# itself in, under the operator's Claude config, and the five things that file carries.
 PIN_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "agentcrew/pins")
 PIN_SUFFIX = ".json"
 PIN_GLOB = f"*{PIN_SUFFIX}"
 PIN_RUN_DIR = "run_dir"
 PIN_PID = "coordinator_pid"
 PIN_SESSION = "tmux_session"
+# The renderer and interpreter that draw this run's frame, recorded by the release that wrote the
+# pin: paths that expire with a release belong to a file the run takes away with it, never to the
+# operator's statusline wrapper, which no upgrade rewrites (ADR-0011).
+PIN_RENDERER = "renderer"
+PIN_INTERPRETER = "interpreter"
+# ADR-0011's one exception to the silence contract, in one line: the registry holds something no
+# frame can be drawn from, which is a wiring fault the operator can act on rather than the ordinary
+# "nothing is running". The wrapper prints it when it can reach no renderer at all, and the
+# renderer the wrapper reached prints it for the pins only a JSON parser can judge, so both halves
+# of the statusline say the same sentence.
+PIN_NOTICE = (
+    "agentcrew: no pin in {registry} names a dashboard this machine still has — "
+    "re-dispatch the run to repin it, or clear that directory"
+)
 # What tmux exports into every session it runs — socket path, client pid, session id — which is
 # where the caller's own session is read from before tmux itself is asked.
 TMUX_ENVIRONMENT = "TMUX"
@@ -980,12 +994,14 @@ def pin_path(args, run_dir):
 
 
 def write_pin(args, run_dir):
-    """Name this live run in the pin registry: where it is, whose process it is, and where that
-    process runs.
+    """Name this live run in the pin registry: where it is, whose process it is, where that
+    process runs, and what draws its frame.
 
     The pid is the whole crash story — a statusline tick draws nothing once it is gone — so a pin
-    is never written without one. The file is put in place by rename, because a tick reading it
-    half-written would draw nothing for a run that is very much alive.
+    is never written without one. The renderer and interpreter are this release's own, recorded
+    here rather than at install time because both are necessarily alive at this moment, while an
+    install outlives every release that follows it. The file is put in place by rename, because a
+    tick reading it half-written would draw nothing for a run that is very much alive.
     """
     if args.coordinator_pid is None:
         raise MonitorError(
@@ -997,10 +1013,15 @@ def write_pin(args, run_dir):
         PIN_RUN_DIR: str(run_dir),
         PIN_PID: args.coordinator_pid,
         PIN_SESSION: args.session,
+        PIN_RENDERER: str(pathlib.Path(__file__).resolve()),
+        PIN_INTERPRETER: sys.executable,
     }
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(json.dumps(pin) + "\n", encoding="utf-8")
+        # Written as the characters themselves, not as escapes: the wrapper that reads these two
+        # paths back is a shell script, and a home directory spelled in any script but Latin would
+        # reach it as `\uXXXX` and name nothing.
+        temporary.write_text(json.dumps(pin, ensure_ascii=False) + "\n", encoding="utf-8")
         os.replace(temporary, path)
     except OSError as error:
         temporary.unlink(missing_ok=True)
@@ -1119,13 +1140,19 @@ def read_pin(path):
     }
 
 
-def read_pins(pin_dir):
-    """Every pin the registry carries, in a fixed order; a file that is not one is passed over."""
+def read_registry(pin_dir):
+    """Every pin the registry carries, in a fixed order, and how many of its files are not pins.
+
+    That second number is the wrapper's case and nobody else's: a file named like a pin that
+    cannot be read as one is invisible to a reader that collects only what it could parse, and it
+    is exactly what ADR-0011's notice is about.
+    """
     try:
         paths = sorted(pathlib.Path(pin_dir).glob(PIN_GLOB))
     except OSError:
-        return []
-    return [pin for pin in (read_pin(path) for path in paths) if pin is not None]
+        return [], 0
+    pins = [pin for pin in (read_pin(path) for path in paths) if pin is not None]
+    return pins, len(paths) - len(pins)
 
 
 def select_pin(pins, session):
@@ -1217,15 +1244,22 @@ def run_pin(args):
 
     Claude Code writes its own JSON to this command's stdin. Nothing here reads it, and no source
     this spawns inherits it, so a tick can neither block on that stream nor eat what is on it.
+
+    `--from-wrapper` adds ADR-0011's one exception, and only for the caller that cannot judge it
+    itself: the wrapper reads the registry with `sed`, so a file that is named like a pin and is
+    not one is a judgment only this JSON parser can make. Where nothing was drawn and the registry
+    holds such a file, the notice is printed here instead. Render failures stay silent (ADR-0008).
     """
     try:
-        pin = select_pin(
-            read_pins(pin_directory(args)), caller_session(args.tmux_bin, args.timeout)
-        )
-        if pin is None or not alive(pin["pid"]):
-            return 0
-        data = pin_frame_data(args, pin["run_dir"], args.now or now())
+        directory = pin_directory(args)
+        pins, unreadable = read_registry(directory)
+        pin = select_pin(pins, caller_session(args.tmux_bin, args.timeout))
+        data = None
+        if pin is not None and alive(pin["pid"]):
+            data = pin_frame_data(args, pin["run_dir"], args.now or now())
         if data is None:
+            if unreadable and args.from_wrapper:
+                print(PIN_NOTICE.format(registry=directory), flush=True)
             return 0
         frame, rows = data
         print(frame, flush=True)
@@ -1265,9 +1299,53 @@ def pin_wrapper_path(args, settings_file):
     return settings_file.parent / PIN_WRAPPER_NAME
 
 
+def pin_registry_expression():
+    """The pin registry, spelled for the shell: the same three parts `transcript_root` resolves."""
+    variable, home, subdirectory = PIN_REGISTRY
+    return f'"${{{variable}:-$HOME/{home}}}/{subdirectory}"'
+
+
 def pin_command():
-    """The command line the wrapper runs to draw one frame: this script's own pin."""
-    return shlex.join([sys.executable, str(pathlib.Path(__file__).resolve()), "pin"])
+    """The lines the wrapper runs to draw one frame: whatever the live run's pin names.
+
+    Nothing here names a release. The pin carries the renderer and interpreter that draw it,
+    recorded by the release that wrote it, so an upgrade that moves both leaves this stub correct
+    and no re-install is ever needed (ADR-0011).
+
+    Silence is still the rule — no pin, and this prints nothing — with the one exception ADR-0011
+    carves out: pins that are there but name nothing this machine has are a wiring fault the
+    operator can act on, so one line says so. Every path exits 0, because Claude Code blanks the
+    operator's whole statusline, their own lines included, when this command does not.
+
+    The two paths are read out with `sed` rather than parsed, because a shell has no JSON parser
+    and the interpreter that would is the very thing being looked up. That bootstrap is only ever
+    trusted forwards: what it finds is checked before it is run, the renderer it reaches is told
+    it was reached this way and judges the registry properly itself, and a path spelled in a way
+    `sed` cannot read back — an embedded quote or backslash — falls through to the notice rather
+    than to a blank statusline.
+    """
+    return [
+        f"registry={pin_registry_expression()}",
+        "pinned=",
+        f'for pin in "$registry"/{PIN_GLOB}; do',
+        '    [ -f "$pin" ] || continue',
+        "    pinned=$pin",
+        f'    interpreter=$(sed -n \'s/.*"{PIN_INTERPRETER}"[[:space:]]*:[[:space:]]*'
+        "\"\\([^\"]*\\)\".*/\\1/p' \"$pin\" 2>/dev/null)",
+        f'    renderer=$(sed -n \'s/.*"{PIN_RENDERER}"[[:space:]]*:[[:space:]]*'
+        "\"\\([^\"]*\\)\".*/\\1/p' \"$pin\" 2>/dev/null)",
+        '    if [ -x "$interpreter" ] && [ -f "$renderer" ]; then',
+        # Run rather than exec: a renderer that dies on a signal must not take the exit code, and
+        # the frame is the last thing this wrapper has to print anyway.
+        '        "$interpreter" "$renderer" pin --from-wrapper </dev/null',
+        "        exit 0",
+        "    fi",
+        "done",
+        'if [ -n "$pinned" ]; then',
+        "    printf '%s\\n' \"" + PIN_NOTICE.format(registry="$registry") + '"',
+        "fi",
+        "exit 0",
+    ]
 
 
 def wrapper_text(previous, added_interval):
@@ -1295,7 +1373,7 @@ def wrapper_text(previous, added_interval):
             'if [ -n "$previous" ]; then printf \'%s\\n\' "$previous"; fi',
             "",
         ]
-    lines += [f"exec {pin_command()} </dev/null", ""]
+    lines += [*pin_command(), ""]
     return "\n".join(lines)
 
 
@@ -2044,6 +2122,11 @@ def build_parser():
     pin.add_argument("--toast-state", help="where this run remembers what it has toasted")
     pin.add_argument(
         "--no-toast", action="store_true", help="draw the frame without displaying toasts"
+    )
+    pin.add_argument(
+        "--from-wrapper", action="store_true",
+        help="the statusline wrapper is the caller: say so in one line when the registry holds a"
+             " file that cannot be read as a pin (ADR-0011), rather than drawing nothing",
     )
     pin.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,

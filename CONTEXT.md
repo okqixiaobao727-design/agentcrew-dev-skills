@@ -64,6 +64,14 @@ _Avoid_: raw source states (busy, idle) in human-facing output
 The script-rendered human view of a run: a live table plus milestone and exception
 toasts, exactly one per run. The human watches this instead of coordinator prose.
 
+**Pin**:
+The small JSON file a live run leaves in the pin registry, written at dispatch and removed
+when the run ends. It names the run (directory, coordinator pid, tmux session) and what
+draws it — the writing release's own `monitor.py` and interpreter. Those last two are
+recorded here, by a release alive at that moment, and never at install time, which is what
+keeps the statusline wrapper a permanent stub no upgrade can strand (ADR-0011).
+_Avoid_: frame file, liveness file (there is no background process behind it)
+
 **Reference index**:
 The static list of file paths (one descriptive line each, no contents) placed in the
 coordinator's opening context so a ruling never starts with a hunt. Contents are read on

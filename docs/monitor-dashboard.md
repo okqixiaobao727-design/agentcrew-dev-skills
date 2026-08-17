@@ -312,11 +312,18 @@ is not replaced, deprecated or changed by any of this, and it stays the default 
 files at `$CLAUDE_CONFIG_DIR/agentcrew/pins/`, falling back to `~/.claude/agentcrew/pins/`,
 overridable with `--pin-dir`. A pin file is JSON naming the run — the run directory as an absolute
 realpath ([ADR-0007](adr/0007-paths-are-absolute-at-the-boundary-and-compared-by-realpath.md)), the
-coordinator's pid, and the coordinator's tmux session, under those three keys:
+coordinator's pid, and the coordinator's tmux session — and naming what draws it: the `monitor.py`
+of the release that wrote the pin, and the interpreter running it. Five keys:
 
 ```json
-{"run_dir": "/abs/realpath/of/the/run", "coordinator_pid": 4242, "tmux_session": "$7"}
+{"run_dir": "/abs/realpath/of/the/run", "coordinator_pid": 4242, "tmux_session": "$7",
+ "renderer": "/abs/path/of/the/running/release/monitor.py", "interpreter": "/abs/path/of/python3"}
 ```
+
+The last two are why an upgrade never strands the pin. They are recorded at dispatch, by a release
+that is by definition alive at that moment, rather than at install time by a release that will not
+outlive the wiring it writes
+([ADR-0011](adr/0011-the-pin-names-its-renderer-the-wrapper-is-a-permanent-stub.md)).
 
 The run writes its pin at dispatch — `monitor.py window`, on a `pin` or `both` surface — and
 removes it when the run ends, after the report is written:
@@ -336,6 +343,42 @@ One pin is selected per tick, in this order:
    configuration, including from a session the run does not know about;
 3. if several pins exist and none matches, nothing is drawn, because two crews at once must never
    cross frames.
+
+### The wrapper the install writes
+
+```sh
+monitor.py pin-install [--apply] [--uninstall] [--settings <file>] [--statusline <file>]
+```
+
+`pin-install` wires the pin into the operator's own Claude Code statusline: it writes a wrapper
+script beside their settings and points `statusLine.command` at it. The wrapper runs whatever the
+statusline ran before, prints that first, and draws the pin's frame beneath it. Nothing is written
+without `--apply`, every file is copied aside first, and `--uninstall` reads the record the wrapper
+carries to put the statusline back exactly.
+
+That wrapper names no release. It reads the registry above, and runs the renderer and interpreter
+the live pin names — so the release that draws the frame is the release that dispatched the run,
+and an upgrade needs no re-install. It ends in `exit 0` on every path, including the one where the
+renderer fails, because Claude Code blanks the whole statusline — the operator's own lines with it
+— when the statusline command exits non-zero.
+
+The install is idempotent, and "idempotent" is measured against the wrapper this release would
+write: a wrapper that is there but differs is reported as a `rewrite` line and rewritten under
+`--apply`. Existing installs are never rewritten behind the operator's back; an operator carrying
+one from an older release re-runs `pin-install --apply` once.
+
+There is one exception to the silence contract, and this is it: when pins are present but none of
+them names a renderer and interpreter this machine has — the paths are gone, the pin cannot be read,
+or it was written by a release older than those fields — a single line says so, instead of nothing.
+The wrapper prints it when it can reach no renderer at all; the renderer it does reach is told so
+(`pin --from-wrapper`) and prints the same line for the registry files only a JSON parser can
+judge. `monitor.py pin` on its own is silent as it has always been.
+
+A statusline that has quietly stopped working is indistinguishable from a machine with no run on
+it, and this case is one the operator can act on
+([ADR-0011](adr/0011-the-pin-names-its-renderer-the-wrapper-is-a-permanent-stub.md)). Failures
+*inside* the renderer stay silent, as
+[ADR-0008](adr/0008-the-pinned-dashboard-lives-in-claude-codes-statusline.md) decided.
 
 ### When nothing is drawn
 
