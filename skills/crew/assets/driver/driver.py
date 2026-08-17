@@ -374,6 +374,18 @@ def run_command(arguments, message, ticket=None, pointer=None):
 
 
 # --- the tickets ----------------------------------------------------------------------------
+#
+# A feature directory has two layouts, and only the first is one this driver reads.
+#
+# The **runtime layout** is what `start` is given: `spec.md`, and one `<number>.md` ticket file
+# per ticket at the directory's root — `01.md`, or `07-slug.md` where a slug follows the number
+# (`TICKET_FILE` is the whole rule). Nothing below the root is a ticket; `read_tickets` globs that
+# one level and no deeper. The run's own working directory, `.crew/`, is created beside them.
+#
+# The **archive layout** is what a finished run is filed into afterwards, by hand or by whatever
+# tidies up: the ticket files moved down into a `tickets/` subdirectory, next to the run's
+# `report.md`. It is a record, not an input. Handing `start` a directory in that shape is handing
+# it a feature with no tickets, which is why `routing_problems` says so in those words.
 
 
 def sections(text):
@@ -548,9 +560,19 @@ def routing_problems(tickets, run, launch_dir):
     candidate table
     is one wave of every ticket, because a table that cannot be routed is never dispatched and the
     wave a ticket would sit in has no bearing on whether its routing is valid.
+
+    A feature with no tickets at all is the one case the renderer never sees, and it is the case a
+    hand-assembled run directory lands in most: the message therefore carries the whole diagnosis —
+    the directory searched, the filename pattern wanted at its root, and the archive layout that
+    looks like the input layout and is not.
     """
     if not tickets:
-        return ["run: the feature carries no tickets to route"]
+        return [
+            f"run: {run['feature_dir']} carries no tickets to route — a ticket is a"
+            " `<number>.md` file at that directory's root (`01.md`, `07-slug.md`), and a"
+            " `tickets/` subdirectory there is the layout a finished run is archived into, not"
+            " where a run's input tickets go"
+        ]
     candidate = launch_dir / "candidate-table.json"
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_text(

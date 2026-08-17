@@ -620,6 +620,26 @@ class PreflightTests(DriverTestCase):
         notice = self.assert_preflight_failed(result, 1)
         self.assertIn("Review", notice)
 
+    def test_a_feature_carrying_no_tickets_names_the_path_the_pattern_and_the_archive_trap(self):
+        """The layout mistake is diagnosable from the error alone.
+
+        A run directory assembled by hand puts its tickets where a finished run puts its archive
+        often enough that the error names both: where the driver looked, the filename it wanted
+        there, and what `tickets/` actually is.
+        """
+        archived = self.fixture.feature_dir / "tickets"
+        archived.mkdir()
+        (archived / "01.md").write_text("# a ticket in the archive layout\n")
+        self.fixture.commit_feature()
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn(str(self.fixture.feature_dir), notice)
+        self.assertIn("<number>.md", notice)
+        self.assertIn("tickets/", notice)
+        self.assertIn("archive", notice)
+
     def test_a_blocker_no_ticket_carries_stops_the_run(self):
         self.fixture.ticket("01", "first thing", blocked_by=("09",))
         self.fixture.commit_feature()
