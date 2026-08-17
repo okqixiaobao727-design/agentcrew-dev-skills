@@ -1158,15 +1158,13 @@ def read_registry(pin_dir):
 def select_pin(pins, session):
     """The one run this tick draws, or None when the registry cannot name a single one.
 
-    The caller's own session decides, so two crews at once never cross frames. A registry holding
-    one pin is drawn whatever session that pin records — the single-run case must work from a
-    session the run was never told about. Two pins recording one session name a single run no
-    better than two unmatched pins do, so both draw nothing.
+    The caller's own session decides and nothing else does, so a run's frame is drawn in the tab
+    that launched it and in no other — however few pins the registry holds. A tick whose session
+    matches no pin, and a tick with no session to match at all, draw nothing. Two pins recording
+    one session name a single run no better than two unmatched pins do, so both draw nothing.
     """
     matching = [pin for pin in pins if session is not None and pin["session"] == session]
-    if matching:
-        return matching[0] if len(matching) == 1 else None
-    return pins[0] if len(pins) == 1 else None
+    return matching[0] if len(matching) == 1 else None
 
 
 def alive(pid):
