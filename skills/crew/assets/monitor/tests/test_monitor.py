@@ -123,6 +123,8 @@ PIN_REGISTRY = ("agentcrew", "pins")
 # The tmux session the caller of `pin` is sitting in, and one that belongs to another crew.
 CALLER_SESSION = "$7"
 OTHER_SESSION = "$9"
+# A third session, running no crew of its own: the tab a pin must never reach.
+BYSTANDER_SESSION = "$3"
 # That same session as tmux addresses it as a target, which is the spelling dispatch passes to
 # `window` and the pin therefore records.
 SESSION_TARGET = f"{CALLER_SESSION}:"
@@ -1647,15 +1649,42 @@ class PinTests(MonitorTestCase):
 
         self.assertNothingDrawn(self.fixture.pin_frame())
 
-    def test_the_sole_pin_is_drawn_even_though_it_names_another_session(self):
+    def test_a_session_running_neither_of_two_crews_draws_nothing(self):
+        """The third tab: two runs in two sessions, and a session that launched neither of them."""
         self.live_run()
-        self.fixture.pin(session=OTHER_SESSION)
+        self.fixture.pin(session=CALLER_SESSION)
+        self.fixture.pin(run_dir=self.fixture.second_run(), session=OTHER_SESSION)
+        self.fixture.tmux_session = BYSTANDER_SESSION
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_the_sole_pin_is_drawn_in_the_session_it_records(self):
+        self.live_run()
+        self.fixture.pin(session=CALLER_SESSION)
         self.fixture.tmux_session = CALLER_SESSION
 
         result = self.fixture.pin_frame("--no-color")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+    def test_the_sole_pin_is_not_drawn_where_it_names_another_session(self):
+        """A pin draws in the session that launched its run and nowhere else, however few pins the
+        registry holds: the lone pin used to be drawn everywhere, which is the defect."""
+        self.live_run()
+        self.fixture.pin(session=OTHER_SESSION)
+        self.fixture.tmux_session = CALLER_SESSION
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
+
+    def test_a_caller_without_a_tmux_session_draws_nothing(self):
+        """Outside tmux there is no session to match, so there is nothing to draw — the accepted
+        consequence of scoping the pin to the session that launched the run."""
+        self.live_run()
+        self.fixture.pin(session=CALLER_SESSION)
+        self.fixture.tmux_session = None
+
+        self.assertNothingDrawn(self.fixture.pin_frame())
 
     def test_a_pin_recording_an_aliased_run_directory_is_resolved_and_drawn(self):
         self.live_run()

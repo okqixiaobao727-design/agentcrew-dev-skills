@@ -336,13 +336,23 @@ The final frame lives in the report and the machine log, not on the screen. `unp
 ends whatever surface it ran on: a run that wrote no pin has nothing to remove, and that is a
 success rather than a complaint.
 
-One pin is selected per tick, in this order:
+One pin is selected per tick, by the caller's own tmux session and by nothing else:
 
-1. the pin whose recorded tmux session matches the caller's own;
-2. if no pin matches and exactly one pin exists, that one — the single-run case must work without
-   configuration, including from a session the run does not know about;
-3. if several pins exist and none matches, nothing is drawn, because two crews at once must never
-   cross frames.
+1. the pin whose recorded tmux session matches the caller's own is the run drawn;
+2. any other case draws nothing — no pin matches, several pins match, or the tick has no
+   resolvable session to match with — however many pins the registry holds.
+
+The pin is therefore scoped to the tmux session that launched the run: a run's frame is drawn in
+the tab that launched it and in no other, which is what keeps two crews at once from crossing
+frames. There is no fallback for the single-pin case; a lone pin used to be drawn whatever session
+the tick came from, which put one run's frame in every window on the machine. Two accepted
+consequences follow:
+
+- A Claude Code session outside tmux can see no pin, ever — there is no session to match. The
+  workflow this serves is tmux-resident.
+- Other tabs on the same project stay clean while a run is in flight. That is the chosen
+  behaviour, not a gap: the boundary is the tab, not the project, because one project may run
+  several crews at once in different tabs.
 
 ### The wrapper the install writes
 

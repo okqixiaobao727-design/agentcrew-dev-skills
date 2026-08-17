@@ -51,6 +51,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
   parser can judge. This is the only exception to the silence contract; failures
   inside the renderer stay silent, and `monitor.py pin` on its own is unchanged
   (ADR-0011, #56).
+- The pinned dashboard drew in every window. With one run in flight, every
+  Claude Code window — every tab, every project, including projects with no run
+  at all — showed that run's frame, because pin selection fell back to a lone
+  pin whatever session the tick came from. That fallback is gone: a pin draws
+  only in the tmux session it records, and a tick matching no pin draws nothing
+  however many pins the registry holds. Two accepted consequences: a session
+  outside tmux can see no pin at all, and a run's frame is visible only in the
+  tab that launched it (#67).
 
 ## [0.4.1] - 2026-08-16
 
