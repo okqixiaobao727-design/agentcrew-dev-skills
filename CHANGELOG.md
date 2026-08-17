@@ -7,6 +7,30 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A fifth `advance` decision, `stopped`, written by the wave loop when a run ends
+  on an escalation the rule table had already settled. `escalated` is the same
+  word a halted wave carries, so a run that ended on one was indistinguishable
+  from a run waiting on the coordinator; `stopped` is what the surfaces read the
+  end of such a run from (#57).
+
+### Fixed
+- Every dashboard surface froze at the first wave that escalated. The monitor
+  counted an `advance` decision of `escalated` or `interrupted` as the end of
+  the run, so a multi-wave run held a stale frame in its tmux window and blanked
+  its pinned statusline from its first escalation on, while the run itself
+  carried on. A run ends now on `complete` or on the `stopped` above, in the
+  one implementation the driver imports rather than restates — the two used to
+  disagree, which is how the defect survived (#57).
+- A wave halted awaiting a ruling read as a frozen frame. The summary line now
+  carries `⚠ awaiting your ruling` while the log's newest `advance` is
+  `escalated` or `interrupted`, and drops it when the next `advance` says the
+  wave has carried on (#57).
+- A `merge` result of `conflict` or `escalated` left its ticket drawn
+  `landable`, indistinguishable from a branch waiting its turn. It is drawn
+  `waiting` now, with the `last event:` line naming what blocked it and a clock
+  that follows that event rather than the earlier receipt (#57).
+
 ## [0.4.1] - 2026-08-16
 
 The two config keys 0.4.0 made required were settled nowhere the operator

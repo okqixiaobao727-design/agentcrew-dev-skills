@@ -57,7 +57,7 @@ anyone, so nobody has to translate.
 | --- | --- |
 | `pending` | is in the table and has not been launched yet |
 | `running` | has a live child working on it |
-| `waiting` | has a child that stopped without settling anything: a prompt, or an idle turn |
+| `waiting` | has a child or a merge needing a human: a prompt, an idle turn, a blocked merge |
 | `parked` | needs an irreversible action, so it is waiting for a human |
 | `landable` | has a verified completion receipt and has not been merged yet |
 | `merged` | is in the integration branch |

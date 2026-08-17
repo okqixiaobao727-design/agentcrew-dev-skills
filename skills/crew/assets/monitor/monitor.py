@@ -122,7 +122,12 @@ SETTLED_STATES = {
     "outcome": ("outcome", {
         "completed": MERGED, "failed": FAILED, "parked": PARKED, "blocked": PENDING,
     }),
-    "merge": ("result", {"clean": MERGED, "repaired": MERGED}),
+    # A merge that hit a conflict or went to the coordinator has not landed the branch and is not
+    # queued to land either, so it leaves `landable` for the abnormal state that owes the operator
+    # a line: "waiting its turn to merge" and "the merge blew up" are not the same row.
+    "merge": ("result", {
+        "clean": MERGED, "repaired": MERGED, "conflict": WAITING, "escalated": WAITING,
+    }),
 }
 # Where a live child of each lane says how it is doing, and what its words mean to the operator.
 # The two sources are disjoint: a Codex child has no entry in the agents list at all — the bridge
@@ -148,9 +153,18 @@ EVENT_QUALIFIERS = ("verdict", "outcome", "result", "decision", "state")
 ESCALATION_EVENT = "escalation"
 REVIEW_EVENT = "review"
 REVIEW_RUNNING = "running"
-# The advance decisions after which nothing more happens in this run.
+# The advance decisions after which nothing more happens in this run, and the two that stop a wave
+# without ending it. A wave that escalated or was interrupted is re-run once the coordinator rules
+# on it — or adopted by the next driver — so both keep every surface drawing; the driver appends
+# `stopped` when it ends a run whose chain halted for good, which is the only thing that tells
+# that ending from a wave awaiting a ruling. This is the run's single definition of "over": the
+# driver imports it rather than restating it.
 ADVANCE_EVENT = "advance"
-FINAL_DECISIONS = ("complete", "escalated", "interrupted")
+FINAL_DECISIONS = ("complete", "stopped")
+HALTED_DECISIONS = ("escalated", "interrupted")
+# What the summary line says while the run is waiting on the operator, so a halted wave is never
+# mistaken for a frozen frame.
+AWAITING_RULING = "⚠ awaiting your ruling"
 
 COLUMNS = ("WAVE", "TICKET", "TITLE", "EXECUTOR", "STATE", "ELAPSED")
 # The one column that has no natural width — it is given whatever the window has left over — and
@@ -581,11 +595,31 @@ def build_rows(waves, records, moment, sources):
 
 
 def over(records):
-    """Whether nothing more will happen in this run, which is when the frame stops moving."""
+    """Whether nothing more will happen in this run, which is when the frame stops moving.
+
+    The run's one answer to that question, and the one the driver asks too: a run ends on the
+    `complete` its last wave landed, or on the `stopped` the driver appends when the chain halted
+    on reasons no ruling will undo. A wave that escalated or was interrupted is carried on by the
+    ruling or by the run that adopts it, and a surface that stopped at either would go quiet on a
+    run that is still going.
+    """
     return any(
         record.get("event") == ADVANCE_EVENT and str(record.get("decision")) in FINAL_DECISIONS
         for record in records
     )
+
+
+def halted(records):
+    """Whether the run is stopped at a wave awaiting the coordinator's ruling.
+
+    The newest `advance` decides: it is the line the driver writes when it hands a wave over, and
+    the line it writes again when the wave carries on, so a ruling that lands and a wave that
+    re-runs take the marker away by themselves.
+    """
+    for record in reversed(records):
+        if record.get("event") == ADVANCE_EVENT:
+            return str(record.get("decision")) in HALTED_DECISIONS
+    return False
 
 
 def terminal_width():
@@ -607,8 +641,12 @@ def cut(text, width):
     return text[: width - 1].rstrip() + ELLIPSIS
 
 
-def summary(rows, run_id, waves, moment):
-    """The one line above the table: which run, how far through its waves, and how it stands."""
+def summary(rows, run_id, waves, moment, awaiting_ruling=False):
+    """The one line above the table: which run, how far through its waves, and how it stands.
+
+    A run halted on a ruling says so between its counts and its clock: the frame is still being
+    drawn, and what stopped moving is the run rather than the renderer.
+    """
     counts = {state: 0 for state in STATE_ORDER}
     for row in rows:
         counts[row["state"]] += 1
@@ -616,6 +654,7 @@ def summary(rows, run_id, waves, moment):
     parts = [
         f"wave {len({row['wave'] for row in rows if row['launched']})}/{waves}",
         " ".join(f"{state}={counts[state]}" for state in STATE_ORDER if counts[state]),
+        AWAITING_RULING if awaiting_ruling else "",
         f"elapsed {elapsed(min(started) if started else None, moment)}",
     ]
     return f"crew {run_id} — " + " · ".join(part for part in parts if part)
@@ -674,7 +713,9 @@ def fit_rows(rows, row_blocks, available, width):
     return lines
 
 
-def render(rows, run_id, waves, moment, width=None, colour=False, max_lines=None):
+def render(
+    rows, run_id, waves, moment, width=None, colour=False, max_lines=None, awaiting_ruling=False
+):
     """The whole frame: the summary line, the header, and each row with its annotations."""
     width = width or terminal_width()
     cells = [list(COLUMNS)] + [
@@ -699,7 +740,7 @@ def render(rows, run_id, waves, moment, width=None, colour=False, max_lines=None
             ]
         return block_lines
 
-    lines = [cut(summary(rows, run_id, waves, moment), width)]
+    lines = [cut(summary(rows, run_id, waves, moment, awaiting_ruling), width)]
     header_lines = block(0, cells[0])
     row_blocks = [block(index, values) for index, values in enumerate(cells[1:], 1)]
     if max_lines is None:
@@ -821,7 +862,10 @@ def draw(args, run_dir, moment):
     records = read_log(run_dir / MACHINE_LOG_NAME)
     rows = build_rows(waves, records, moment, live_sources(args.claude_bin, run_dir))
     print(
-        render(rows, run_dir.name, len(waves), moment, colour=colour_wanted(args)),
+        render(
+            rows, run_dir.name, len(waves), moment,
+            colour=colour_wanted(args), awaiting_ruling=halted(records),
+        ),
         flush=True,
     )
     emit_toasts(rows, toast_state_path(args, run_dir), args.tmux_bin)
@@ -1151,6 +1195,7 @@ def pin_frame_data(args, run_dir, moment):
     frame = render(
         rows, run_dir.name, len(waves), moment,
         colour=pin_colour(args), max_lines=pin_line_budget(args),
+        awaiting_ruling=halted(records),
     )
     return frame, rows
 

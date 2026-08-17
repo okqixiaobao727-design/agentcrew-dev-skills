@@ -51,6 +51,11 @@ Each is recorded once, as one `advance` event in the machine log
 | `escalated` | failed, parked with descendants, or did not land — chain stops | 1 |
 | `interrupted` | the operator stopped the run | 130 |
 
+A fifth decision, `stopped`, belongs to the log rather than to this script: the wave loop appends
+it against the wave that ended when the escalation it read leaves nothing to launch and nothing to
+rule on, because `escalated` alone cannot tell a run that ended from a wave awaiting a ruling
+([`docs/machine-log.md`](machine-log.md)).
+
 `launched` is recorded against the wave that started; the other three against the wave that ended.
 The toast goes to `tmux display-message`, the operator's terminal, in the family the monitor's
 toasts already speak ([`docs/monitor-dashboard.md`](monitor-dashboard.md)); a run watched from

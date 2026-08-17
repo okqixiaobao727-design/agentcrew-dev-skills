@@ -67,8 +67,11 @@ MERGE_RESULTS = ("clean", "conflict", "repaired", "escalated")
 # would leave standing, so the vocabulary is closed at "it is running" and "it is not".
 REVIEW_STATES = ("running", "returned")
 # What the run decided about carrying on after a wave. One of these per decision, and a decision
-# is about a wave rather than a ticket, so this is the one event that carries no ticket.
-DECISIONS = ("launched", "escalated", "complete", "interrupted")
+# is about a wave rather than a ticket, so this is the one event that carries no ticket. Two of
+# them end a run — `complete`, every wave landed, and `stopped`, the chain halted on reasons no
+# ruling will undo — and every surface that asks whether a run is over asks for exactly those two:
+# `escalated` alone cannot say, because it is also the word for a wave awaiting a ruling.
+DECISIONS = ("launched", "escalated", "complete", "interrupted", "stopped")
 # The two lanes a child runs in. A usage figure is only readable against the executor that wrote
 # it, so an executor this log does not know is an executor whose figures nobody can check.
 EXECUTORS = ("claude", "codex")
