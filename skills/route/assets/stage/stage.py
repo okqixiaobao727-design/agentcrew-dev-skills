@@ -27,9 +27,28 @@ graph check — which fails on a blocker no ticket of the run carries — passes
 decision the operator has to make, so it is a blocking item naming both tickets.
 
 **The directory is the handle.** `n` is the current maximum plus one. A re-run for the same ticket
-set finds its own directory again through the `Tracker:` provenance line in that directory's
-`spec.md` and overwrites the markdown files in place, leaving any `.crew` record a run already
-started there alone. `crewtask/` is gitignored, so none of this touches the tracked tree.
+set — or the same parent — finds its own directory again through the `Tracker:` provenance line in
+that directory's `spec.md` and overwrites the markdown files in place, leaving any `.crew` record a
+run already started there alone. `crewtask/` is gitignored, so none of this touches the tracked
+tree.
+
+**The tracker's side.** `--parent <n>` expands to that parent's native sub-issues, so routing a
+triaged piece of work needs nothing but one number; its closed sub-issues are finished work and stay
+out of the set, where the closure resolution below meets them as satisfied edges. `--routing` is the
+table the user approved: each entry is written back as that ticket's `## Routing` section and its
+role label, through the **edit** and **mark** operations `references/trackers.md` names, and the
+same text is what gets staged — the tracker and the run directory cannot disagree because they are
+written from one value. Without `--routing` nothing is written to the tracker at all. Finally, a
+green self-check **comments** the staged `/crew crewtask/<n>` on the parent, or on every ticket of a
+parentless set, so the pickup point lives where work state lives; a failed one comments nothing.
+Every write is skipped when the tracker already holds that exact value, so re-staging refreshes
+rather than duplicates.
+
+On the local tracker a ticket is a file in the repository, so every write above is a file write.
+Where those files are tracked, writing the approved routing into them dirties the tracked tree and
+the self-check reports it with the fix the operator has to apply anyway — commit the ticket edits,
+and stage again; the `Crew:` line a green staging then leaves is one more of the tracker's own files
+to commit before the command is typed.
 """
 
 import argparse
@@ -56,17 +75,31 @@ PROVENANCE_KEY = "Tracker:"
 # a name that could never be mistaken for a resolved one.
 LATER = "resolved-at-launch"
 
-# `--parent` is part of the invocation shape downstream couples to, so it exists here from the
-# first release; the sub-issue expansion behind it belongs to its own ticket.
-PARENT_TICKET = "#64"
-
 BLOCKED_EXIT = 1
 
 GH = "gh"
 GH_FIELDS = "number,title,body,state"
 GH_STATE_CLOSED = "CLOSED"
+GH_SUB_ISSUES = "repos/{owner}/{repo}/issues/%s/sub_issues"
 
 TICKET_NUMBER = re.compile(r"#(\d+)")
+
+# The `## Routing` section `skills/route/references/classify.md` templates: these keys, in this
+# order, one line each. `review` is the one a workflow may take none of, so it is the one key an
+# approved entry may leave out; every other line is required, because a ticket missing one is
+# unrouted and the renderer would refuse it at the self-check anyway.
+ROUTING_HEADING = "## Routing"
+ROUTING_ORDER = ("workflow", "executor", "model", "effort", "review", "reasons")
+ROUTING_OPTIONAL = ("review",)
+
+# The role strings classify.md names: an `acceptance` ticket is a human's to pick up, every other
+# ticket an agent's.
+HUMAN_WORKFLOW = "acceptance"
+AGENT_ROLE, HUMAN_ROLE = driver.PICKUP_LABELS
+
+# The local tracker's comment: the ticket file is the tracker, so the staged command goes on a line
+# of its own, the same file-is-the-tracker analogue `Status:` already is.
+CREW_KEY = "Crew:"
 
 
 class Blocked(Exception):
@@ -106,10 +139,21 @@ def gh_read(repo, reference, fields=GH_FIELDS):
 
 
 def local_read(repo, reference):
-    """That local ticket file as the repository holds it; raises Blocked where it is not one."""
+    """That local ticket file as the repository holds it; raises Blocked where it is not one.
+
+    A local ticket is a file **in the repository** — that is the whole of what the local tracker is
+    — and the write operations below rewrite the file they were given, so a reference resolving
+    outside the repository is refused before anything reads or writes it.
+    """
     path = pathlib.Path(reference)
     if not path.is_absolute():
         path = repo / path
+    path = path.resolve()
+    if not path.is_relative_to(repo):
+        raise Blocked([
+            f"ticket {reference}: resolves to {path}, outside {repo} — under the local tracker a"
+            " ticket is a file in the repository, so pass a path inside it"
+        ])
     match = driver.TICKET_FILE.match(path.name)
     if not match or not path.is_file():
         raise Blocked([
@@ -128,19 +172,30 @@ def local_status(text):
     return None
 
 
+def staged_text(kind, title, body):
+    """That ticket as the run directory holds it, from the body the tracker holds.
+
+    The github tracker keeps the title out of the body, and the staged file is what the driver reads
+    a title from, so the two are put back together as the run-directory layout wants them. The local
+    tracker's body is the whole file, title and all.
+    """
+    if kind == driver.TRACKER_GITHUB:
+        return f"# {title}\n\n{body.rstrip()}\n"
+    return body
+
+
 def read_ticket(kind, repo, reference):
-    """One ticket of the set: its number, its title, the text to stage, and whether it is closed."""
+    """One ticket: its number, title, the body the tracker holds, and whether it is closed."""
     if kind == driver.TRACKER_GITHUB:
         issue = gh_read(repo, reference)
         body = issue.get("body") or ""
         title = issue.get("title") or ""
-        # The tracker keeps the title out of the body; the staged file is what the driver reads a
-        # title from, so the two are put back together as the run-directory layout wants them.
-        text = f"# {title}\n\n{body.rstrip()}\n"
         return {
             "id": str(issue.get("number")),
             "title": title,
-            "text": text,
+            "body": body,
+            "text": staged_text(kind, title, body),
+            "path": None,
             "closed": (issue.get("state") or "").upper() == GH_STATE_CLOSED,
         }
     number, path = local_read(repo, reference)
@@ -148,9 +203,52 @@ def read_ticket(kind, repo, reference):
     return {
         "id": number,
         "title": driver.title_of(text, number),
+        "body": text,
         "text": text,
+        "path": path,
         "closed": local_status(text) == driver.STATUS_FINISHED,
     }
+
+
+def json_documents(text):
+    """Every entry of a paginated `gh api` answer, however it split the pages up.
+
+    A paginated array comes back as one merged array where `gh` merges the pages, and as one JSON
+    document per page where it does not; both are read here, so a parent with more sub-issues than
+    a page holds expands the same as one with fewer.
+    """
+    decoder = json.JSONDecoder()
+    entries = []
+    index = 0
+    text = text or ""
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            return entries
+        page, index = decoder.raw_decode(text, index)
+        entries += page if isinstance(page, list) else [page]
+
+
+def sub_issue_numbers(repo, parent):
+    """The parent's native sub-issues, in the tracker's own list; raises Blocked where it cannot."""
+    result = subprocess.run(
+        [GH, "api", "--paginate", GH_SUB_ISSUES % parent],
+        cwd=str(repo), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        raise Blocked([
+            f"parent {parent}: the tracker could not list its sub-issues — {detail}; check the"
+            " number, and that this checkout is the repository the issue belongs to"
+        ])
+    try:
+        listed = json_documents(result.stdout)
+    except ValueError as error:
+        raise Blocked([
+            f"parent {parent}: the tracker's sub-issue list was not readable — {error}"
+        ]) from error
+    return [str(entry["number"]) for entry in listed if entry.get("number") is not None]
 
 
 def outside_closed(kind, repo, number, sources):
@@ -236,22 +334,246 @@ def strip_edges(text, stripped):
     return "".join(written)
 
 
+# --- the tracker's edit, mark and comment operations ---------------------------------------------
+
+
+def gh_write(repo, arguments, reference, operation, body=None):
+    """One `gh` write against that issue; raises Blocked where the tracker refused it."""
+    result = subprocess.run(
+        [GH, "issue", *arguments], cwd=str(repo), input=body,
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        raise Blocked([
+            f"ticket {reference}: the tracker refused the {operation} — {detail}; check that this"
+            " checkout is the repository the issue belongs to, and that `gh` is authenticated"
+        ])
+
+
+def edit_body(kind, repo, ticket, body):
+    """**edit** — replace that ticket's body with the new text, as one atomic replacement.
+
+    A body the tracker already holds is not written again: on github that is a call saved, and on
+    the local tracker, where the ticket is a file in the repository, it is the difference between a
+    re-staging that leaves the tracked tree as it found it and one that dirties it for nothing.
+    """
+    if body == ticket["body"]:
+        return
+    if kind == driver.TRACKER_GITHUB:
+        gh_write(repo, ["edit", ticket["id"], "--body-file", "-"], ticket["id"], "edit", body=body)
+    else:
+        ticket["path"].write_text(body, encoding="utf-8")
+    ticket["body"] = body
+    ticket["text"] = staged_text(kind, ticket["title"], body)
+
+
+def local_marked(text, role):
+    """That ticket file with its `Status:` line carrying the role, added where it carried none."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        match = driver.STATUS_LINE.match(line.rstrip("\n"))
+        if match:
+            lines[index] = f"{match.group(1)}Status: {role}\n"
+            return "".join(lines)
+    return text.rstrip("\n") + f"\n\nStatus: {role}\n"
+
+
+def mark(kind, repo, ticket, role):
+    """**mark** — declare who may pick that ticket up, and take the other role off it."""
+    other = HUMAN_ROLE if role == AGENT_ROLE else AGENT_ROLE
+    if kind == driver.TRACKER_GITHUB:
+        carried = [
+            entry.get("name") for entry in gh_read(repo, ticket["id"], fields="labels")["labels"]
+        ]
+        arguments = []
+        if role not in carried:
+            arguments += ["--add-label", role]
+        if other in carried:
+            arguments += ["--remove-label", other]
+        if arguments:
+            gh_write(repo, ["edit", ticket["id"], *arguments], ticket["id"], "mark")
+        return
+    edit_body(kind, repo, ticket, local_marked(ticket["body"], role))
+
+
+def local_commented(text, command):
+    """That ticket file carrying exactly one `Crew:` line, whatever it carried before."""
+    kept = [
+        line for line in text.splitlines(keepends=True)
+        if not line.startswith(f"{CREW_KEY} ")
+    ]
+    return "".join(kept).rstrip("\n") + f"\n\n{CREW_KEY} {command}\n"
+
+
+def comment(kind, repo, ticket, command):
+    """**comment** — put the staged command where the ticket's own work state lives."""
+    if kind == driver.TRACKER_GITHUB:
+        held = gh_read(repo, ticket["id"], fields="comments")["comments"]
+        if command in [entry.get("body") for entry in held]:
+            return
+        gh_write(repo, ["comment", ticket["id"], "--body", command], ticket["id"], "comment")
+        return
+    edit_body(kind, repo, ticket, local_commented(ticket["body"], command))
+
+
+# --- the approved routing --------------------------------------------------------------------
+
+
+def read_routing(path):
+    """The approved routing table, keyed by ticket number; raises Blocked where it is not one."""
+    if not path:
+        return {}
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    except OSError as error:
+        raise Blocked([
+            f"approved routing: {path} could not be read — {error}; pass the file the approved"
+            " table was written to"
+        ]) from error
+    try:
+        table = json.loads(text)
+    except ValueError as error:
+        raise Blocked([
+            f"approved routing: {path} is not readable JSON — {error}; pass an object keyed by"
+            " ticket number, each entry carrying the approved routing's lines"
+        ]) from error
+    if not isinstance(table, dict) or not all(isinstance(entry, dict) for entry in table.values()):
+        raise Blocked([
+            f"approved routing: {path} is not an object keyed by ticket number, each entry an"
+            " object carrying the approved routing's lines"
+        ])
+    return {str(key): entry for key, entry in table.items()}
+
+
+def routing_faults(table, tickets):
+    """Everything the approved routing and the ticket set disagree on, one problem each."""
+    problems = []
+    inside = {ticket["id"] for ticket in tickets}
+    for key in sorted(table, key=lambda number: (not number.isdigit(), number)):
+        if key not in inside:
+            problems.append(
+                f"approved routing: it names ticket {key}, which is not in this ticket set — stage"
+                " that ticket too, or drop it from the approved routing"
+            )
+    for ticket in tickets:
+        entry = table.get(ticket["id"])
+        if entry is None:
+            problems.append(
+                f"ticket {ticket['id']}: the approved routing carries no entry for it — every"
+                " ticket of the set is routed, or none is"
+            )
+            continue
+        missing = [
+            key for key in ROUTING_ORDER
+            if key not in ROUTING_OPTIONAL and not str(entry.get(key, "")).strip()
+        ]
+        for key in missing:
+            problems.append(
+                f"ticket {ticket['id']}: the approved routing carries no {key} — the `## Routing`"
+                f" section takes a {key.capitalize()} line, so add it to the approved entry"
+            )
+    return problems
+
+
+def routing_section(entry):
+    """The `## Routing` section classify.md templates, rendered from that approved entry."""
+    lines = [
+        f"{key.capitalize()}: {str(entry[key]).strip()}"
+        for key in ROUTING_ORDER if str(entry.get(key, "")).strip()
+    ]
+    return ROUTING_HEADING + "\n\n" + "\n".join(lines) + "\n"
+
+
+def with_routing(body, section):
+    """That body carrying exactly this `## Routing` section, replacing the one it had.
+
+    The section ends the ticket, so what follows a replaced one is whatever the tracker keeps after
+    it — the next `##` heading, or the local tracker's `Status:` line — and that is kept.
+    """
+    lines = body.splitlines(keepends=True)
+    written = []
+    index = 0
+    replaced = False
+    while index < len(lines):
+        heading = driver.SECTION.match(lines[index].rstrip("\n"))
+        if heading and heading.group(1).lower() == driver.ROUTING_SECTION:
+            written.append(section.rstrip("\n") + "\n\n")
+            replaced = True
+            index += 1
+            while index < len(lines):
+                line = lines[index].rstrip("\n")
+                if driver.SECTION.match(line) or driver.STATUS_LINE.match(line):
+                    break
+                index += 1
+            continue
+        written.append(lines[index])
+        index += 1
+    if not replaced:
+        written.append("\n" + section)
+    return "".join(written).rstrip("\n") + "\n"
+
+
+def role_of(entry):
+    """Which role string that routing's workflow names."""
+    workflow = str(entry.get("workflow", "")).strip().lower()
+    return HUMAN_ROLE if workflow == HUMAN_WORKFLOW else AGENT_ROLE
+
+
+def write_routing(kind, repo, tickets, table):
+    """Write each approved `## Routing` section and role label back to the tracker.
+
+    The staged text is taken from the same value, so the run directory and the tracker say the same
+    thing about how a ticket is routed. What is checked here is only that the approved table and
+    the ticket set are about each other, and that every entry carries the lines the section takes:
+    whether `tdd` is a workflow and `medium` an effort is the renderer's verdict at the self-check,
+    which is this script's one authority on a valid routing everywhere else too.
+    """
+    if not table:
+        return
+    problems = routing_faults(table, tickets)
+    if problems:
+        raise Blocked(problems)
+    for ticket in tickets:
+        entry = table[ticket["id"]]
+        edit_body(kind, repo, ticket, with_routing(ticket["body"], routing_section(entry)))
+        mark(kind, repo, ticket, role_of(entry))
+
+
 # --- the run directory -----------------------------------------------------------------------
 
 
-def provenance(kind, tickets):
-    """The line that says where this directory came from, and so which re-run owns it."""
+def provenance(kind, parent, tickets):
+    """The line that says where this directory came from, and so which re-run owns it.
+
+    A parent names the run on its own: its sub-issues are the tracker's to change between two
+    routings, and a re-run for that parent has to find the directory the first one wrote whatever
+    the set has become. A parentless set is named by the tickets themselves, which are all it is.
+    """
+    if parent is not None:
+        return f"{kind} parent #{parent}"
     numbers = sorted(tickets, key=lambda ticket: int(ticket["id"]))
     return f"{kind} " + " ".join(f"#{ticket['id']}" for ticket in numbers)
 
 
-def cover_page(kind, tickets):
+def parent_page(line, parent):
+    """The `spec.md` of a run with a parent: that ticket's own body, and where it came from."""
+    return (
+        f"# {parent['title']}\n"
+        "\n"
+        f"{PROVENANCE_KEY} {line}\n"
+        "\n"
+        f"{parent['body'].strip()}\n"
+    )
+
+
+def cover_page(line, tickets):
     """The generated `spec.md` for a ticket set with no parent to take a spec from."""
     listed = "\n".join(f"- #{ticket['id']} — {ticket['title']}" for ticket in tickets)
     return (
         f"# Staged run of {len(tickets)} ticket{'s' if len(tickets) != 1 else ''}\n"
         "\n"
-        f"{PROVENANCE_KEY} {provenance(kind, tickets)}\n"
+        f"{PROVENANCE_KEY} {line}\n"
         "\n"
         "This page is written by the staging script, and there is no parent spec behind it. Each\n"
         "ticket in this run is self-contained: its own brief is the whole context, and nothing\n"
@@ -285,7 +607,7 @@ def allocate(run_root, line):
     return number, run_root / str(number)
 
 
-def materialise(directory, kind, tickets, stripped):
+def materialise(directory, spec, tickets, stripped):
     """Write the run directory's `spec.md` and one file per ticket; returns nothing.
 
     A directory being re-staged keeps its subdirectories: a run already started there holds its
@@ -295,7 +617,7 @@ def materialise(directory, kind, tickets, stripped):
     directory.mkdir(parents=True, exist_ok=True)
     for path in directory.glob("*.md"):
         path.unlink()
-    (directory / SPEC_NAME).write_text(cover_page(kind, tickets), encoding="utf-8")
+    (directory / SPEC_NAME).write_text(spec, encoding="utf-8")
     for ticket in tickets:
         (directory / f"{ticket['id']}.md").write_text(
             strip_edges(ticket["text"], stripped), encoding="utf-8"
@@ -404,8 +726,17 @@ def build_parser():
     parser.add_argument(
         "--parent", metavar="N",
         help=(
-            f"the parent ticket to expand into its sub-issues — accepted by {PARENT_TICKET}, which"
-            " owns the expansion; until it lands, pass the ticket set itself"
+            "the parent ticket to stage, expanded into its open native sub-issues; the run's"
+            " `spec.md` is then the parent's own body, and the staged command is commented there"
+        ),
+    )
+    parser.add_argument(
+        "--routing", metavar="FILE",
+        help=(
+            "the routing the user approved, as JSON keyed by ticket number, each entry carrying"
+            " the `## Routing` lines (workflow, executor, model, effort, reasons, and review where"
+            " the workflow takes one); it is written back to the tracker with each ticket's role"
+            " label, and nothing is written to the tracker without it"
         ),
     )
     parser.add_argument(
@@ -414,38 +745,80 @@ def build_parser():
     return parser
 
 
+def expand_parent(kind, repo, parent):
+    """The parent ticket and the open sub-issues that are this run's set.
+
+    A closed sub-issue is work already finished, so it stays out of the set; an edge to it is met
+    by the closure resolution, which reads it from the tracker as satisfied.
+    """
+    if kind != driver.TRACKER_GITHUB:
+        raise Blocked([
+            f"parent {parent}: the {kind} tracker has no sub-issues to expand — pass the ticket set"
+            " itself, which is what a ticket is on this tracker"
+        ])
+    ticket = read_ticket(kind, repo, parent)
+    numbers = sub_issue_numbers(repo, parent)
+    tickets = [read_ticket(kind, repo, number) for number in numbers]
+    open_tickets = [child for child in tickets if not child["closed"]]
+    if not open_tickets:
+        raise Blocked([
+            f"parent {parent}: it has no open sub-issues to stage — link the tickets to it as"
+            " sub-issues, or pass the ticket set itself"
+        ])
+    return ticket, open_tickets
+
+
 def stage(args):
-    """Stage that ticket set; returns the number of the run directory it wrote."""
+    """Stage that ticket set; returns the `/crew` command for the run directory it wrote."""
     repo = repository_root(args.repo_root)
     config = driver.project_config(repo)
     kind = tracker_kind(repo, config)
+    table = read_routing(args.routing)
 
-    # A reference repeated in the set names one ticket, not two: the directory holds one file per
-    # ticket, and the cover page and the provenance line have to say the same.
-    references = list(dict.fromkeys(args.tickets))
-    tickets = [read_ticket(kind, repo, reference) for reference in references]
+    if args.parent:
+        parent, tickets = expand_parent(kind, repo, args.parent)
+        references = [ticket["id"] for ticket in tickets]
+    else:
+        parent = None
+        # A reference repeated in the set names one ticket, not two: the directory holds one file
+        # per ticket, and the cover page and the provenance line have to say the same.
+        references = list(dict.fromkeys(args.tickets))
+        tickets = [read_ticket(kind, repo, reference) for reference in references]
+
+    write_routing(kind, repo, tickets, table)
     stripped = resolve_closure(kind, repo, tickets, ticket_sources(kind, repo, references))
-    number, directory = allocate(repo / RUN_ROOT, provenance(kind, tickets))
-    materialise(directory, kind, tickets, stripped)
+    line = provenance(kind, args.parent, tickets)
+    number, directory = allocate(repo / RUN_ROOT, line)
+    spec = parent_page(line, parent) if parent else cover_page(line, tickets)
+    materialise(directory, spec, tickets, stripped)
 
     problems = self_check(repo, directory, config)
     if problems:
         raise Blocked(problems)
-    return number
+
+    # Only now, with the self-check green, does the pickup point go on the tracker: a command that
+    # would not start is one nobody should be able to find later. A staging given no approved
+    # routing writes nothing to the tracker at all, and the comment is a tracker write like the
+    # others — that entrance stages a directory and says whether it starts, nothing more.
+    command = f"/crew {RUN_ROOT}/{number}"
+    if table:
+        for ticket in [parent] if parent else tickets:
+            comment(kind, repo, ticket, command)
+    return command
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.parent:
+    if args.parent and args.tickets:
         parser.error(
-            f"--parent expands to the parent's sub-issues in {PARENT_TICKET}, which is not landed"
-            " yet — pass the ticket set itself for now"
+            "--parent and a ticket set are two entrances, not one — pass the parent to stage its"
+            " sub-issues, or the tickets to stage exactly those"
         )
-    if not args.tickets:
-        parser.error("no tickets to stage — pass the ticket set this run is made of")
+    if not args.parent and not args.tickets:
+        parser.error("no tickets to stage — pass the ticket set this run is made of, or --parent")
     try:
-        number = stage(args)
+        command = stage(args)
     except Blocked as blocked:
         print(
             f"staging stopped on {len(blocked.problems)} blocking"
@@ -455,7 +828,7 @@ def main(argv=None):
         for problem in blocked.problems:
             print(f"- {problem}", file=sys.stderr)
         return BLOCKED_EXIT
-    print(f"/crew {RUN_ROOT}/{number}")
+    print(command)
     return 0
 
 
