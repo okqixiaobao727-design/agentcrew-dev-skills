@@ -7,6 +7,18 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Two words in the dashboard's state vocabulary, for the two intervals it used to
+  draw as frozen rows. A ticket whose merge escalated and whose child was then
+  sent the run's rework instruction is `reworking` rather than a bare abnormal
+  `waiting` — but only while its lane still sees that child busy, so a child that
+  stopped under its instruction is not drawn as though it were working — and a
+  ticket that is landable in a wave whose last receipt is in is
+  `settling` rather than `landable` while its merge — a sub-second operation —
+  happens. A conflict bounced back a second time keeps `waiting`, because that
+  one is the coordinator's to answer, and a run that is over keeps `landable`,
+  because no merge is coming for it (#76).
+
 ### Fixed
 - Three dashboard tests failed on a clean checkout. The tests that watch the
   monitor's refresh loop time-boxed it with a fixed half-second nap and then

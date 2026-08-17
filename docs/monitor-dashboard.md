@@ -92,16 +92,34 @@ never reads an internal word:
 | `pending` | the log carries no `launch` for that ticket, or an `outcome` of `blocked` |
 | `running` | its lane's source says `busy` |
 | `waiting` | its lane says `waiting` or `idle`, or a `merge` result of `conflict` or `escalated` |
+| `reworking` | an `escalated` merge, the rework instruction after it, and a `busy` lane |
 | `parked` | a `receipt` verdict or an `outcome` of `parked`, or the agents list says so |
 | `landable` | a `receipt` verdict of `landable` |
+| `settling` | `landable`, in a wave every ticket of which has settled, in a run that is not over |
 | `merged` | a `merge` result of `clean` or `repaired`, or an `outcome` of `completed` |
 | `failed` | a `receipt` verdict or an `outcome` of `failed` |
 | `vanished` | it was launched, nothing settled it, and its lane has no live entry for it |
 
+Two of those words are the intervals the run used to have no vocabulary for, and both exist
+because a frozen-looking row is read as a hung run. A child sent the merge driver's rework
+instruction — the `ruling` the log carries opening `CREW MERGE`, after the `merge` that escalated
+— is working on the conflict rather than stuck at anything, so its row says `reworking` and
+carries the abnormal row's annotation underneath. Order is the whole signal there: a conflict that
+bounced back a second time stands on an instruction older than the merge it is standing on, and
+that one is the coordinator's to answer, so it keeps `waiting`. `reworking` is also the one
+settled word that asks the lane whether its child is `busy`, because it is the one that claims
+something is happening now: a child that went idle, stopped at a prompt or vanished under its
+instruction keeps `waiting`, which is the row the operator has to go and look at. A wave whose
+last receipt is in is being merged next — seconds of work — so its unmerged rows say `settling`
+until each one's own merge takes it to `merged`. A run that is over is in no such interval:
+nothing is coming for a branch that never landed, and it stays `landable`.
+
 The last settling line the log carries wins, not the first: a landable branch is merged next, and
 where the ticket is *now* is what the operator is looking for. A settled row stops following its
-lane's live source and its elapsed time stops moving. Worktrees are compared by realpath, never as
-strings, so a `/tmp` spelling and a `/private/tmp` one are one worktree.
+lane's live source — `reworking` above is the one word that still asks it, because it is the one
+that claims a child is working — and its elapsed time stops moving in every case. Worktrees are
+compared by realpath, never as strings, so a `/tmp` spelling and a `/private/tmp` one are one
+worktree.
 
 ### Annotation rows
 
@@ -113,7 +131,10 @@ has to grow a column:
 | `↳ review: <lane> <state> · <elapsed>` | the log's last `review` line says a review is `running` |
 | `↳ anomaly: duplicate · more than one session in <worktree>` | one worktree, two sessions |
 | `↳ anomaly: unknown · <source> could not be read` | the lane's source failed or is unknown |
-| `↳ last event: <event> <word> — <detail> · <stamp>` | the row is `waiting`, `failed`, `vanished` |
+| `↳ last event: <event> <word> — <detail> · <stamp>` | the row's state is an abnormal one |
+
+The abnormal states are `waiting`, `reworking`, `failed` and `vanished`: a row in any of them owes
+the operator that last line, and every other row stays quiet.
 
 `duplicate` and `unknown` are annotations rather than states: both say what a reading did, not
 where the ticket got to, so the row keeps the state its own log lines justify.

@@ -43,6 +43,18 @@ RULED_ELAPSED = "00:47:53"
 BLOCKED_DETAIL = "semantic: both sides rewrote the same lines of driver.py"
 # The marker the summary line carries while a wave is halted on the coordinator's ruling.
 AWAITING_RULING = "⚠ awaiting your ruling"
+# The rework instruction the driver sends a child whose merge escalated on a semantic conflict,
+# opening with the marker the driver's merge rung is read back out of the log by. A child holding
+# this is working, not stuck, which is what the `reworking` state says.
+REWORK_INSTRUCTION = (
+    "CREW MERGE 06 — your branch worktree-06 conflicts with crew/feature in a way no script can"
+    f" resolve: {BLOCKED_DETAIL}. Merge crew/feature into worktree-06, resolve the conflict,"
+    " re-run the tests the conflict touched, re-review scoped to the conflict-resolution diff,"
+    " commit, and send a new CREW COMPLETE <sha>."
+)
+# The two widths a frame drawn with the new vocabulary aligns its state column to.
+REWORKING_WIDTH = len("reworking")
+SETTLING_WIDTH = len("settling")
 # A window wide enough to hold that summary line and the blocked row's annotation whole, so a
 # halted frame is read rather than measured.
 HALTED_COLUMNS = 120
@@ -1073,6 +1085,125 @@ class DashboardTests(MonitorTestCase):
         )
         self.assertNotIn(AWAITING_RULING, result.stdout)
         self.assertNotIn("↳ last event:", result.stdout)
+
+    def rework_sent(self):
+        """The rework path as the run walks it: a receipt, a semantic conflict, the instruction.
+
+        The merge driver escalates the conflict it cannot resolve, and the driver hands the child
+        that lost the race the instruction to resolve it — so the child is working again, on a
+        ticket whose last settling line is still that escalated merge.
+        """
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="escalated",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.append(RULED_TS, "ruling", ticket="06", role="coordinator",
+                            to=CHILDREN["06"], message=REWORK_INSTRUCTION)
+
+    def test_a_child_reworking_a_semantic_conflict_is_drawn_reworking_rather_than_waiting(self):
+        self.rework_sent()
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "reworking", BLOCKED_ELAPSED,
+                width=REWORKING_WIDTH),
+            frame(result.stdout),
+        )
+        self.assertNotIn("waiting", result.stdout)
+        self.assertIn(f"  ↳ last event: ruling · {RULED_TS}\n", result.stdout)
+
+    def test_a_child_that_stopped_under_its_rework_instruction_is_waiting_not_reworking(self):
+        """`reworking` says work is happening, so a child that is not working cannot wear it."""
+        self.rework_sent()
+        self.fixture.live({"06": "idle", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", BLOCKED_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn("reworking", result.stdout)
+
+    def test_a_child_gone_from_its_lane_under_its_rework_instruction_is_not_reworking(self):
+        self.rework_sent()
+        self.fixture.live({"07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", BLOCKED_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn("reworking", result.stdout)
+
+    def test_a_conflict_bounced_back_a_second_time_is_waiting_again(self):
+        """The rung above: the instruction fired once, and the same conflict came back anyway.
+
+        That escalation is the coordinator's, not the child's, so the row owes the operator the
+        abnormal word again — the instruction standing in the log is an older one.
+        """
+        self.rework_sent()
+        self.fixture.append(RULED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(RULED_TS, "merge", ticket="06", result="escalated",
+                            branch="worktree-06", into="crew/feature", detail=BLOCKED_DETAIL)
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", RULED_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn("reworking", result.stdout)
+
+    def test_a_wave_between_its_last_receipt_and_its_merges_is_settling(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="landable",
+                            sha=self.fixture.head("07"))
+        self.fixture.live({})
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(frame(result.stdout), "\n".join([
+            f"crew {RUN_ID} — wave 1/2 · pending=1 settling=2 · elapsed {LIVE_ELAPSED}",
+            header(width=SETTLING_WIDTH),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "settling", SETTLED_ELAPSED,
+                width=SETTLING_WIDTH),
+            row("1", "07", TITLES["07"], CODEX_LANE, "settling", SETTLED_ELAPSED,
+                width=SETTLING_WIDTH),
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED,
+                width=SETTLING_WIDTH),
+        ]))
+
+    def test_a_merge_takes_its_own_row_out_of_settling_and_leaves_the_rest_in_it(self):
+        self.launch_wave_one()
+        self.fixture.append(SETTLED_TS, "receipt", ticket="06", verdict="landable",
+                            sha=self.fixture.head("06"))
+        self.fixture.append(SETTLED_TS, "receipt", ticket="07", verdict="landable",
+                            sha=self.fixture.head("07"))
+        self.fixture.append(BLOCKED_TS, "merge", ticket="06", result="clean",
+                            branch="worktree-06", into="crew/feature")
+        self.fixture.live({})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "merged", BLOCKED_ELAPSED,
+                width=SETTLING_WIDTH),
+            frame(result.stdout),
+        )
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "settling", SETTLED_ELAPSED,
+                width=SETTLING_WIDTH),
+            frame(result.stdout),
+        )
 
     def test_a_settled_ticket_stops_following_its_lanes_live_source(self):
         self.launch_wave_one()

@@ -97,15 +97,25 @@ DEFAULT_SURFACE = SURFACE_WINDOW
 PENDING = "pending"
 RUNNING = "running"
 WAITING = "waiting"
+# The two intervals the run used to have no word for. A child sent the merge driver's rework
+# instruction is working on the conflict, not stuck at anything, so its row says so instead of
+# wearing the abnormal `waiting` a blocked merge leaves behind; a wave that has taken its last
+# receipt is being merged, so its unmerged rows say that rather than sitting `landable` while the
+# operator reads a run that lands in under a second as a hung one.
+REWORKING = "reworking"
+SETTLING = "settling"
 PARKED = "parked"
 LANDABLE = "landable"
 MERGED = "merged"
 FAILED = "failed"
 VANISHED = "vanished"
 # The order the summary line counts them in: the way a ticket travels, start to finish.
-STATE_ORDER = (PENDING, RUNNING, WAITING, PARKED, LANDABLE, MERGED, FAILED, VANISHED)
-# The states that owe the operator an explanation; every other row stays quiet.
-ABNORMAL_STATES = (WAITING, FAILED, VANISHED)
+STATE_ORDER = (
+    PENDING, RUNNING, WAITING, REWORKING, PARKED, LANDABLE, SETTLING, MERGED, FAILED, VANISHED,
+)
+# The states that owe the operator an explanation; every other row stays quiet. `reworking` is one
+# of them: the word says the child is busy, and the annotation says what it was sent to do.
+ABNORMAL_STATES = (WAITING, REWORKING, FAILED, VANISHED)
 # The existing Claude Code statusline occupies two rows before the pin's frame is appended.
 STATUSLINE_RESERVE_LINES = 2
 FINAL_STATES = (MERGED, FAILED)
@@ -151,6 +161,14 @@ ATTENTION_TOASTS = {
 # The qualifier each event carries, in the order an annotation looks for one.
 EVENT_QUALIFIERS = ("verdict", "outcome", "result", "decision", "state")
 ESCALATION_EVENT = "escalation"
+# What a row is drawn `reworking` from: the merge the ladder ran out of rungs on, and the
+# instruction the driver sends the child that lost the race, which the log carries as a ruling
+# opening with the driver's merge marker. The pair is the whole signal — an escalated merge with
+# no instruction after it is nobody's work yet, and it keeps the abnormal word it always had.
+MERGE_EVENT = "merge"
+MERGE_ESCALATED = "escalated"
+RULING_EVENT = "ruling"
+MERGE_INSTRUCTION_MARKER = "CREW MERGE"
 REVIEW_EVENT = "review"
 REVIEW_RUNNING = "running"
 # The advance decisions after which nothing more happens in this run, and the two that stop a wave
@@ -181,8 +199,8 @@ CLEAR_SCREEN = "\x1b[H\x1b[2J"
 # One SGR colour per state, and the reset that ends it. Applied to the state cell alone, and only
 # when a terminal is watching: `plain` is what a pipe, a redirect and every test sees.
 STATE_COLOURS = {
-    PENDING: "90", RUNNING: "36", WAITING: "33", PARKED: "35",
-    LANDABLE: "32", MERGED: "32", FAILED: "31", VANISHED: "31",
+    PENDING: "90", RUNNING: "36", WAITING: "33", REWORKING: "33", PARKED: "35",
+    LANDABLE: "32", SETTLING: "32", MERGED: "32", FAILED: "31", VANISHED: "31",
 }
 COLOUR_RESET = "\x1b[0m"
 
@@ -483,6 +501,72 @@ def settled(events):
     return None, None
 
 
+def reworking(events, settling, launch, sources):
+    """Whether this ticket's child is working on the conflict its escalated merge left behind.
+
+    Three things make it true, and the order between the first two is the whole point: the last
+    thing that settled the ticket is a merge the ladder escalated, and the run sent the rework
+    instruction *after* it. A conflict that came back a second time stands on an instruction older
+    than the merge it is standing on, and that one is the coordinator's to answer — so it keeps
+    the abnormal `waiting` the operator is meant to read as "this needs a human".
+
+    The third is the child itself. `reworking` is the one settled word that claims something is
+    happening right now, so it is the one that asks its lane: a child that has gone idle, stopped
+    at a prompt, or vanished under its instruction is not reworking anything, and drawing it as
+    though it were would hide exactly the row the operator has to go and look at.
+    """
+    if settling is None or settling.get("event") != MERGE_EVENT:
+        return False
+    if str(settling.get("result")) != MERGE_ESCALATED:
+        return False
+    if not working(launch, sources):
+        return False
+    for record in events[index_of(events, settling) + 1:]:
+        if record.get("event") != RULING_EVENT:
+            continue
+        message = record.get("message")
+        if isinstance(message, str) and message.lstrip().startswith(MERGE_INSTRUCTION_MARKER):
+            return True
+    return False
+
+
+def working(launch, sources):
+    """Whether this ticket's own lane can see a child of its own busy on it right now.
+
+    Stricter than "the lane did not say `idle`": a reading that produced an anomaly answered about
+    itself rather than about the child, and a state read off a source that could not be read is no
+    evidence that anyone is working.
+    """
+    state, anomaly, status = live_state(launch, sources)
+    return state == RUNNING and anomaly is None and status is not None
+
+
+def index_of(events, record):
+    """Where `record` sits among `events`, by identity — the one thing two events differ in.
+
+    Equality would not do: a run can write two lines carrying the same fields, and "the merge that
+    settled this ticket" is one of them rather than either.
+    """
+    for index, candidate in enumerate(events):
+        if candidate is record:
+            return index
+    return len(events)
+
+
+def settling_wave(settlements, records):
+    """Whether this wave is between its last receipt and its merges, which is what `settling` says.
+
+    Every ticket of the wave has settled, so the receipts are all in and the driver's per-wave
+    merging is what happens next — measured in seconds, which is exactly why a row idling at
+    `landable` through it reads as a merge that hung. A run that is over is not in that interval
+    at all: nothing is coming for a branch that never landed, and `landable` is the true word for
+    it.
+    """
+    if not settlements or any(record is None for record in settlements):
+        return False
+    return not over(records)
+
+
 def live_state(launch, sources):
     """What a launched, unsettled ticket is doing now: its state, its anomaly, and its raw status.
 
@@ -571,11 +655,26 @@ def build_rows(waves, records, moment, sources):
     rows = []
     for wave in waves:
         number = str(wave.get("wave", ""))
-        for entry in wave.get("tickets") or []:
+        entries = wave.get("tickets") or []
+        # Read once for the whole wave, because two of the words a row can be drawn need the wave
+        # rather than the ticket: `settling` is what the wave's last receipt puts its unmerged rows
+        # into, and no row can know that from its own events.
+        wave_events = {
+            str(entry.get("id", "")): [
+                record for record in records
+                if str(record.get("ticket")) == str(entry.get("id", ""))
+            ]
+            for entry in entries
+        }
+        wave_settled = {
+            ticket: settled(events) for ticket, events in wave_events.items()
+        }
+        merging = settling_wave([settling for settling, _ in wave_settled.values()], records)
+        for entry in entries:
             ticket = str(entry.get("id", ""))
-            events = [record for record in records if str(record.get("ticket")) == ticket]
+            events = wave_events[ticket]
             launch = launches.get(ticket)
-            settling, settled_into = settled(events)
+            settling, settled_into = wave_settled[ticket]
             anomaly = None
             status = None
             if launch is None:
@@ -584,6 +683,10 @@ def build_rows(waves, records, moment, sources):
                 started = parse_timestamp(launch.get("ts"))
                 if settling is not None:
                     state, end = settled_into, parse_timestamp(settling.get("ts"))
+                    if state == WAITING and reworking(events, settling, launch, sources):
+                        state = REWORKING
+                    elif state == LANDABLE and merging:
+                        state = SETTLING
                 else:
                     state, anomaly, status = live_state(launch, sources)
                     end = moment
