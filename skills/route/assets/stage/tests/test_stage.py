@@ -106,6 +106,11 @@ class Fixture:
     def __init__(self, tracker="github"):
         self.root = pathlib.Path(tempfile.mkdtemp()).resolve()
         self.tracker = tracker
+        self.origin = self.root / "origin.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", BASE_BRANCH, str(self.origin)],
+            check=True, capture_output=True,
+        )
         self.repo = self.root / "repo"
         self.repo.mkdir()
         git(self.repo, "init", "-b", BASE_BRANCH)
@@ -125,6 +130,9 @@ class Fixture:
         self._link_stub("gh", "stub_gh.py")
         (self.stub_dir / "gh-issues.json").write_text("{}")
         self.commit("base")
+        git(self.repo, "remote", "add", "origin", str(self.origin))
+        git(self.repo, "push", "-u", "origin", BASE_BRANCH)
+        git(self.repo, "remote", "set-head", "origin", "-a")
 
     def _link_stub(self, name, script):
         target = self.bin_dir / name
@@ -356,6 +364,17 @@ class StagingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("/crew ", result.stdout)
         self.assertIn("agentcrew.toml", result.stderr)
+
+    def test_a_missing_default_base_branch_withholds_the_command_and_names_the_fix(self):
+        self.two_tickets()
+        git(self.fixture.repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+
+        result = self.stage_two()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("/crew ", result.stdout)
+        self.assertIn("git remote set-head origin -a", result.stderr)
+        self.assertIn("--base-branch <branch>", result.stderr)
 
     # --- the dependency closure -----------------------------------------------------------
 

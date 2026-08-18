@@ -581,6 +581,17 @@ class PreflightTests(DriverTestCase):
         self.assertIn("origin", notice)
         self.assertIn(BASE_BRANCH, notice)
 
+    def test_a_missing_default_base_branch_names_the_repository_fix(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        git(self.fixture.repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("git remote set-head origin -a", notice)
+        self.assertIn("--base-branch <branch>", notice)
+
     def test_a_base_branch_origin_does_not_carry_has_nothing_to_fast_forward(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
