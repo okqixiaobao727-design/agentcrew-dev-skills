@@ -29,36 +29,48 @@ python3 <crew-skill-dir>/assets/codex/codex_bridge.py send \
 
 ## Answer a permission prompt
 
-A Claude child alone reaches this: Codex children run with approvals off. Only send keys while the
-session reports `waiting`.
+A Claude child alone reaches this: Codex children run with approvals off. Only answer while the
+session reports `waiting`; the command delivers the answer and records it in one action.
 
-- Numbered option: send its digit; it submits immediately.
-- Arrow option: send `Up`/`Down`, then `Enter`.
-- Free text: select its numbered row, type with `send-keys -l`, read the text back from the pane,
-  then send `Enter`.
-- Option plus caveat: use free text because a numbered option submits before a caveat can be added.
-- Multiple lines: use `S-Enter` between lines; a literal newline or plain `Enter` submits.
+- Numbered option:
 
-Example free-text sequence:
+  ```bash
+  python3 <crew-skill-dir>/assets/driver/driver.py answer \
+    --run-dir <run-dir> --ticket <NN> --key 4
+  ```
 
-```bash
-tmux send-keys -t <window-id> "4"
-tmux send-keys -t <window-id> -l "Use the existing retention_audit table"
-tmux capture-pane -p -t <window-id>
-tmux send-keys -t <window-id> Enter
-```
+- Arrow option:
+
+  ```bash
+  python3 <crew-skill-dir>/assets/driver/driver.py answer \
+    --run-dir <run-dir> --ticket <NN> --key Down --key Enter
+  ```
+
+- Free text: select its numbered row with `--key`, then pass the text with `--text`:
+
+  ```bash
+  python3 <crew-skill-dir>/assets/driver/driver.py answer \
+    --run-dir <run-dir> --ticket <NN> --key 4 \
+    --text "Use the existing retention_audit table"
+  ```
+
+- Option plus caveat: use `--key <row> --text <answer>` because a numbered option submits before a
+  caveat can be added.
+- Multiple lines: use shell's `$'line one\nline two'` form for `--text`; the command sends `S-Enter`
+  between lines and `Enter` to submit.
+
+The accepted `--key` names are single digits `0`–`9`, `Up`, `Down`, `Left`, `Right`, `Enter`, and
+`S-Enter`.
 
 ## Log
 
 The ruling hook copies every Claude message you send into the machine log verbatim as you send it,
-so an answer is logged by being sent. A Codex answer goes through `codex_bridge.py send`, which
-records the prompt in the same way from the state file's machine-log configuration. The driver
+so an ordinary ASK answer is logged by being sent. A Codex answer goes through `codex_bridge.py
+send`, which records the prompt in the same way from the state file's machine-log configuration.
+Permission answers go through `driver.py answer`: it delivers first, then reuses the coordinator
+message event shape for the ruling. A delivery failure is surfaced and writes no ruling. The driver
 builds the report from these lines, so name the effect and its exact reversal inside the ruling
 itself whenever you approve something outside the worktree.
-
-An answer sent as tmux keys passes no hook and so reaches no log. The driver has already written a
-`CREW RULED` line for the escalation it woke you on; where the ruling itself belongs in the record,
-send it to that child as a message too.
 
 ## Park
 

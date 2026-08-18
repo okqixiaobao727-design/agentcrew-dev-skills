@@ -20,6 +20,9 @@ import subprocess
 import sys
 
 
+ANSWER_KEYS = set("0123456789") | {"Up", "Down", "Left", "Right", "Enter", "S-Enter"}
+
+
 def state_dir():
     return pathlib.Path(os.environ["AGENTCREW_STUB_DIR"])
 
@@ -117,7 +120,8 @@ def send_keys(argv):
     either way, so a test reads what was typed out of `tmux-calls.jsonl`.
     """
     target = flag(argv, "-t")
-    keys = [value for value in argv[argv.index(target) + 1:] if value != "Enter"]
+    sent = argv[argv.index(target) + 1:]
+    keys = [value for value in sent if value != "Enter"]
     table = windows()
     if target not in table:
         # What a real tmux answers for a window that has gone, which is how a run learns that the
@@ -125,6 +129,15 @@ def send_keys(argv):
         print(f"can't find window: {target}", file=sys.stderr)
         return 1
     if "-l" in argv:
+        literal = argv[argv.index("-l") + 1:]
+        option_terminated = literal and literal[0] == "--"
+        if option_terminated:
+            literal = literal[1:]
+        if not option_terminated and literal and literal[0].startswith("-"):
+            print("command send-keys: invalid flag -", file=sys.stderr)
+            return 1
+        return 0
+    if all(key in ANSWER_KEYS for key in sent):
         return 0
     window = table.get(target, {})
     result = subprocess.run(
