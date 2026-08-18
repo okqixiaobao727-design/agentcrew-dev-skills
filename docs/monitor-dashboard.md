@@ -37,11 +37,11 @@ monitor.py dashboard --run-dir <run dir> [--refresh SECONDS] [--toast-state PATH
 
 One row per ticket of every wave, drawn from the run directory: the approved wave table
 (`<run-dir>/wave-table.json`), the machine log (`<run-dir>/log.jsonl`,
-[`docs/machine-log.md`](machine-log.md)), and one live-state source per lane — `claude agents
---json` for Claude children and the bridge state files `<run-dir>/codex/<NN>.json` for Codex
-ones. It takes the run directory and nothing else — no wave number, no worktree list — so the
-frame is the whole run from the first draw, and a ticket nothing has launched yet is drawn
-`pending` rather than missing.
+[`docs/machine-log.md`](machine-log.md)), and one live-state source per lane — the CLI's own
+per-session files for Claude children ([the live sources](#the-live-sources) below) and the bridge
+state files `<run-dir>/codex/<NN>.json` for Codex ones. It takes the run directory and nothing
+else — no wave number, no worktree list — so the frame is the whole run from the first draw, and a
+ticket nothing has launched yet is drawn `pending` rather than missing.
 
 The spec's source list for this dashboard names three sources and stops at the agents list. A
 Codex child never appears there — the bridge is the only thing that knows it is alive — so
@@ -91,9 +91,9 @@ never reads an internal word:
 | --- | --- |
 | `pending` | the log carries no `launch` for that ticket, or an `outcome` of `blocked` |
 | `running` | its lane's source says `busy` |
-| `waiting` | its lane says `waiting` or `idle`, or a `merge` result of `conflict` or `escalated` |
+| `waiting` | its lane says `waiting`, `idle` or `shell`; a `merge` of `conflict`/`escalated` |
 | `reworking` | an `escalated` merge, the rework instruction after it, and a `busy` lane |
-| `parked` | a `receipt` verdict or an `outcome` of `parked`, or the agents list says so |
+| `parked` | a `receipt` verdict or an `outcome` of `parked`, or its lane says so |
 | `landable` | a `receipt` verdict of `landable` |
 | `settling` | `landable`, in a wave every ticket of which has settled, in a run that is not over |
 | `merged` | a `merge` result of `clean` or `repaired`, or an `outcome` of `completed` |
@@ -339,6 +339,36 @@ than tmux's status lines is
 behind it are in [`docs/dashboard-pinning-research.md`](dashboard-pinning-research.md). The window
 is not replaced, deprecated or changed by any of this, and it stays the default surface.
 
+### The live sources
+
+Each lane is read from its own source, and the Claude lane has two of them
+([ADR-0012](adr/0012-the-statusline-tick-reads-the-sessions-files.md)):
+
+1. **The sessions files**, always tried first: one JSON object per live session at
+   `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, falling back to `~/.claude/sessions/`. Each carries
+   the session's `cwd` and its `status`, which is all a frame needs. A frame costs a few file
+   reads, so a pane's tick is affordable at any refresh interval and a tenth pane adds a tenth
+   read rather than a tenth CLI start.
+2. **`claude agents --json`**, only when that directory cannot be read at all. Each call is a
+   complete CLI start, so its parsed result is written to a machine-level cache at
+   `$CLAUDE_CONFIG_DIR/agentcrew/agents-cache.json` and every pane on the machine reads that one
+   file for a ten-second freshness window before any of them fetches again. A fetch that fails is
+   cached too, so a CLI that cannot answer is asked once a window rather than once a tick.
+
+Nothing is cached on the first path — reading the files is already as cheap as reading a cache
+would be, so there is nothing there to go stale. A tick whose sources have both failed draws the
+row `unknown` and says nothing at all, exactly as
+[ADR-0008](adr/0008-the-pinned-dashboard-lives-in-claude-codes-statusline.md) requires; the one
+record that it happened is a `live-source` line in the run's machine log, appended once per run.
+
+The two sources differ in one word. The files carry `shell` — a child sitting at a shell prompt —
+which the command folds into `busy`. The lane maps `shell` to `waiting` and toasts it in its own
+words (`sitting at a shell prompt`, not `stopped without finishing`); in fallback mode such a child
+is necessarily drawn `running`, and that asymmetry is accepted.
+
+The sessions directory is undocumented, which is exactly why the fallback exists: an upgrade that
+moves or removes it degrades what the dashboard costs, never what it draws.
+
 ### The pin registry
 
 `pin` takes no `--run-dir`. It discovers the live run from the **pin registry**: a directory of pin
@@ -357,6 +387,14 @@ The last two are why an upgrade never strands the pin. They are recorded at disp
 that is by definition alive at that moment, rather than at install time by a release that will not
 outlive the wiring it writes
 ([ADR-0011](adr/0011-the-pin-names-its-renderer-the-wrapper-is-a-permanent-stub.md)).
+
+A tick is also the registry's only housekeeper. Before any pin is matched, every pin whose
+recorded `coordinator_pid` is no longer alive has its file removed — because nothing but a normal
+finish ever unpins a run, and a coordinator abandoned after a judgment-needed or driver-error pause
+would otherwise leave a file that every pane reads for as long as the machine stays up. The sweep
+is safe because a pin is not state: every wave writes it again, so a run the operator resumes
+re-pins itself on its next dispatch. A pin whose coordinator is alive is never touched, which is
+what keeps the `⚠ awaiting your ruling` frame on screen through a pause.
 
 The run writes its pin at dispatch — `monitor.py window`, on a `pin` or `both` surface — and
 removes it when the run ends, after the report is written:

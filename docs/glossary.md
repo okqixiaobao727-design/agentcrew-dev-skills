@@ -65,7 +65,7 @@ _Avoid_: raw source states (busy, idle) in human-facing output
 | --- | --- |
 | `pending` | is in the table and has not been launched yet |
 | `running` | has a live child working on it |
-| `waiting` | has a child or a merge needing a human: a prompt, an idle turn, a blocked merge |
+| `waiting` | has a child or merge needing a human: a prompt, an idle/shell turn, a blocked merge |
 | `reworking` | has a live child resolving the semantic merge conflict the run sent it back to |
 | `parked` | needs an irreversible action, so it is waiting for a human |
 | `landable` | has a verified completion receipt and has not been merged yet |
