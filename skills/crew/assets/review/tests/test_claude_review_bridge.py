@@ -494,6 +494,138 @@ class MachineLogTests(BridgeTestCase):
         self.assertEqual({record["ticket"] for record in records}, {self.TICKET})
 
 
+class SessionCostTests(BridgeTestCase):
+    """The one `session-cost` line a review leaves beside its `review` pair.
+
+    A review runs in a session of its own, so nothing else in the run can account for what it
+    spent. The figures are the ones the headless result already reported, summed over the rounds
+    the lineage has had, and the model is the one the session resolved rather than the alias the
+    caller asked for.
+    """
+
+    TICKET = "26"
+    MODEL_ALIAS = "opus"
+    # The stub's four counters, which are the shape a real headless result reports.
+    FIRST_ROUND = {
+        "input_tokens": 44,
+        "output_tokens": 19475,
+        "cache_read_tokens": 1127733,
+        "cache_creation_tokens": 77334,
+        "total_tokens": 1224586,
+    }
+    BOTH_ROUNDS = {
+        "input_tokens": 68,
+        "output_tokens": 29779,
+        "cache_read_tokens": 2167659,
+        "cache_creation_tokens": 171497,
+        "total_tokens": 2369003,
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = pathlib.Path(self.work.name) / "run" / "log.jsonl"
+
+    def run_logged(self, *arguments, **kwargs):
+        return self.run_bridge(
+            "HEAD",
+            "--model", self.MODEL_ALIAS,
+            "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET,
+            *arguments,
+            **kwargs,
+        )
+
+    def costs(self):
+        if not self.machine_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.machine_log.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line).get("event") == "session-cost"
+        ]
+
+    def assertCounters(self, entry, expected):
+        for field, value in expected.items():
+            self.assertEqual(entry[field], value, field)
+
+    def test_a_review_records_what_its_session_spent(self):
+        run = self.run_logged()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        costs = self.costs()
+        self.assertEqual(len(costs), 1, costs)
+        entry = costs[0]
+        self.assertEqual(entry["ticket"], self.TICKET)
+        self.assertEqual(entry["executor"], "claude")
+        self.assertEqual(entry["lane"], f"claude {self.MODEL_ALIAS}")
+        self.assertEqual(entry["session"], run.output["sessionId"])
+        self.assertCounters(entry, self.FIRST_ROUND)
+        self.assertNotIn("detail", entry)
+
+    def test_the_model_recorded_is_the_one_the_session_resolved(self):
+        """The caller asked for an alias; what was billed is the model behind it."""
+        run = self.run_logged()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.costs()[0]["model"], "claude-opus-5")
+
+    def test_round_two_records_the_whole_review_rather_than_its_own_round(self):
+        """One review is one record, so the rounds are summed here and not downstream."""
+        first = self.run_logged()
+
+        second = self.run_logged("--resume-session", first.output["lineageId"])
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        costs = self.costs()
+        self.assertCounters(costs[0], self.FIRST_ROUND)
+        self.assertCounters(costs[-1], self.BOTH_ROUNDS)
+        self.assertEqual({entry["session"] for entry in costs}, {first.output["sessionId"]})
+
+    def test_a_result_without_usage_records_the_diagnosis_instead_of_figures(self):
+        run = self.run_logged(scenario="no-usage")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        entry = self.costs()[0]
+        self.assertIn("no usage", entry["detail"])
+        for field in self.FIRST_ROUND:
+            self.assertNotIn(field, entry)
+
+    def test_a_review_with_no_log_configured_records_no_cost(self):
+        run = self.run_bridge("HEAD", "--model", self.MODEL_ALIAS)
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.costs(), [])
+
+    def test_a_review_that_never_returned_a_result_records_the_diagnosis(self):
+        """Bookkeeping never fails a review, and never leaves one out of the log either."""
+        run = self.run_logged(scenario="bad-json")
+
+        self.assertEqual(run.returncode, 1)
+        entry = self.costs()[0]
+        self.assertEqual(entry["lane"], f"claude {self.MODEL_ALIAS}")
+        self.assertIsNotNone(entry["detail"])
+        for field in self.FIRST_ROUND:
+            self.assertNotIn(field, entry)
+
+    def test_a_failed_second_round_still_names_the_session_it_spent_in(self):
+        """Naming it is what keeps a same-vendor review out of the reviewed child's figures."""
+        first = self.run_logged()
+
+        second = self.run_logged(
+            "--resume-session", first.output["lineageId"], scenario="bad-json"
+        )
+
+        self.assertEqual(second.returncode, 1)
+        self.assertEqual(self.costs()[-1]["session"], first.output["lineageId"])
+
+    def test_a_result_that_names_no_model_records_no_model_rather_than_the_alias(self):
+        """The alias is already on the row, in the lane; the model field is a measurement."""
+        run = self.run_logged(scenario="no-usage")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.costs()[0]["model"], "")
+
+
 class ScopedRoundOneTestCase(BridgeTestCase):
     """A real repository, a real worktree on a branch, and a PATH the graph CLI can be kept off.
 

@@ -110,21 +110,45 @@ the driver asks it there rather than keeping a rule of its own.
 visible in the run's record as well as on stderr. `monitor` names the monitor script and `reason`
 is the same explanation printed after `MONITOR ERROR`.
 
-### `session-cost` — what one child's session spent, in tokens
+### `session-cost` — what one session spent, in tokens
 
-`ticket`, `executor`, `model`, `session`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
-`cache_creation_tokens`, `total_tokens`, `detail`. One line per launched child, appended by the
-cost pass at run completion ([`docs/monitor-dashboard.md`](monitor-dashboard.md)), so a run's
-usage is in its own artifacts rather than in transcripts a later agent would have to dig through.
+`ticket`, `executor`, `model`, `lane`, `session`, `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_creation_tokens`, `total_tokens`, `detail`. One line per launched
+child, appended by the cost pass at run completion
+([`docs/monitor-dashboard.md`](monitor-dashboard.md)), plus one per review, appended by the review
+bridge that ran it — so a run's usage is in its own artifacts rather than in transcripts a later
+agent would have to dig through, and the review lane can be graded from the run's own log.
+
+`lane` is what tells the two apart. A row with no `lane` is an implementing child's, which is
+what every row written before reviews were costed is. A row carrying one is a review's, spelled
+the way the `review` event spells it — the reviewing vendor and its model, `codex gpt-5.6-sol` —
+and its `executor` is the reviewing vendor rather than the child's. `model` is the model the
+session actually resolved to, read off the session's own record rather than the alias the caller
+asked for, so `opus` is recorded as the id behind it — and empty where that record named no single
+model, because the alias is already on the row, in `lane`, and the model field is a measurement.
+An empty `model` beside real figures is that measurement missing, not a corrupt row: the counters
+were read, the model the session resolved to was not.
 
 The four token counters are disjoint and `total_tokens` is their sum, in both lanes: Codex reports
 its cached tokens inside its input count and Claude reports them beside it, so the Codex figures
-are converted before they are written. `session` names every session that ran in the child's
-worktree, comma-separated — a resumed or replaced child spent the ticket's tokens too.
+are converted before they are written. Reasoning tokens stay inside the output count, where their
+vendor already counts them. `session` names every session the figures were read off,
+comma-separated — a resumed or replaced child spent the ticket's tokens too. A review names its
+own session, which is also what keeps it out of the child's row when the two share a vendor.
 
-A child whose transcript could not be read carries `detail` and no figures at all: the line says
+A review's figures are cumulative over the rounds it has had, so a second round writes a second
+line that supersedes the first rather than a share to be added to it. **A consumer MUST take the
+last line per review session id as what that review spent, and MUST NOT sum a session's lines** —
+summing them bills round one twice. The log is append-only and a bridge cannot know at the end of
+round one whether a round two is coming, so superseding is what "one figure per review" means
+here: withholding round one's line until the review is provably over would leave no figure at all
+for a review whose earned re-review never happened.
+
+A session whose usage could not be read carries `detail` and no figures at all: the line says
 what went wrong and where to look, which is what makes a missing measurement visible rather than
-a gap in the log.
+a gap in the log. That covers a transcript the cost pass could not read, a review whose rollout or
+result carried no counters — a rollout whose figures contradict each other counts as none — and a
+review that never returned a result to read one from at all.
 
 ### `escalation`, `ruling`, `message` — an outgoing message, copied verbatim
 
@@ -156,7 +180,8 @@ machine_log.py --log <path> monitor-error --monitor NAME --reason TEXT
 machine_log.py --log <path> message --role coordinator|child [--ticket NN] [--to NAME] \
                                     --message TEXT
 machine_log.py --log <path> session-cost --ticket NN --executor claude|codex --model ID \
-                                    [--session IDS] [--input-tokens N] [--output-tokens N] \
+                                    [--lane "VENDOR MODEL"] [--session IDS] \
+                                    [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \
                                     [--total-tokens N] [--detail TEXT]
 ```

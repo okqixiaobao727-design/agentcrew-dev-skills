@@ -23,6 +23,7 @@ The scenario is read from $CLAUDE_STUB_SCENARIO (default "ok"):
     verdict-clean  a report whose verdict line counts standards findings only
     no-verdict     a report that never printed the verdict line the prompt asked for
     part-verdict   a report whose verdict line is missing half of the required form
+    no-usage       a completed report whose result object carries no usage at all
 """
 
 import json
@@ -48,6 +49,33 @@ PARTIAL_VERDICT_REPORT = (
     "Standards: 1 finding (naming). Spec: 1 finding.\n"
     "REVIEW VERDICT: spec-findings-requiring-fix=1"
 )
+# The four disjoint counters a real headless result reports, and the resolved model id the run
+# actually billed — never the alias the caller asked for, which is the whole point of reading it.
+RESOLVED_MODEL = "claude-opus-5"
+FIRST_USAGE = {
+    "input_tokens": 44,
+    "cache_creation_input_tokens": 77334,
+    "cache_read_input_tokens": 1127733,
+    "output_tokens": 19475,
+}
+FOLLOWUP_USAGE = {
+    "input_tokens": 24,
+    "cache_creation_input_tokens": 94163,
+    "cache_read_input_tokens": 1039926,
+    "output_tokens": 10304,
+}
+
+
+def model_usage(usage):
+    """The per-model breakdown a real result carries beside `usage`, for the one model it ran on."""
+    return {
+        RESOLVED_MODEL: {
+            "inputTokens": usage["input_tokens"],
+            "outputTokens": usage["output_tokens"],
+            "cacheReadInputTokens": usage["cache_read_input_tokens"],
+            "cacheCreationInputTokens": usage["cache_creation_input_tokens"],
+        }
+    }
 
 
 def scenario():
@@ -106,6 +134,9 @@ def main():
         "permission_denials": [],
     }
     payload[cost_field] = 0.12
+    usage = FOLLOWUP_USAGE if resume_id else FIRST_USAGE
+    payload["usage"] = dict(usage)
+    payload["modelUsage"] = model_usage(usage)
 
     if active == "denials":
         payload["permission_denials"] = [
@@ -124,6 +155,9 @@ def main():
         payload["result"] = UNVERDICTED_REPORT
     elif active == "part-verdict" and not resume_id:
         payload["result"] = PARTIAL_VERDICT_REPORT
+    elif active == "no-usage":
+        payload.pop("usage")
+        payload.pop("modelUsage")
 
     print(json.dumps(payload))
     return 0
