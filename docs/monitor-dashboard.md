@@ -19,14 +19,22 @@ costs a model token or reaches the coordinator's context
 The wake-up is started with the run's machine log:
 
 ```sh
-monitor-wave.sh --log <run-dir>/log.jsonl <run-dir>/parked-paths <worktree-path>...
+monitor-wave.sh --log <run-dir>/log.jsonl [--driver-pid <pid>] \
+                <run-dir>/parked-paths <worktree-path>...
 ```
 
 It remains armed while every supplied child is `busy`, exits 0 the moment any child is `waiting`,
 `idle`, `parked` or `vanished`, and exits nonzero on a monitor error. Before a nonzero exit it
-appends a `monitor-error` event naming the script and reason. The dashboard is a display, so a
-failure it meets is drawn rather than raised — it does not compete with the wake-up for the job of
-stopping a run.
+appends a `monitor-error` event naming the script and reason.
+
+`--driver-pid` is the pid of the driver that armed it, and the driver passes its own. A wake-up is
+read by that process and no other, so each poll begins by asking `kill -0` whether it is still
+there and the loop ends quietly — exit 0, nothing printed — the first poll after it is gone. Every
+ordinary way out of a driver disarms its monitors; this covers the one that cannot, a driver killed
+outright, which otherwise left the monitor polling for a reader that would never come back.
+
+The dashboard is a display, so a failure it meets is drawn rather than raised — it does not compete
+with the wake-up for the job of stopping a run.
 
 ## The dashboard
 

@@ -964,9 +964,14 @@ def arm_monitors(run_dir, log, children, bridge):
     if claude_worktrees:
         armed.append({
             "lane": CLAUDE,
-            "process": spawn(
-                [str(MONITOR_WAVE), "--log", str(log), str(parked_paths), *claude_worktrees]
-            ),
+            "process": spawn([
+                str(MONITOR_WAVE), "--log", str(log),
+                # Its own pid, because the wake-up it holds is readable by this process and no
+                # other: a driver killed outright runs no `disarm`, and a monitor that outlived
+                # one polled for ever, spawning a CLI every poll for nobody.
+                "--driver-pid", str(os.getpid()),
+                str(parked_paths), *claude_worktrees,
+            ]),
         })
     if codex_states:
         armed.append({
@@ -1301,8 +1306,16 @@ def clear_kill_windows(plan):
         clear_kill_window(window)
 
 
-def clear_worktrees_and_branches(repo, rows):
-    """Remove each planned worktree and delete its branch, once per recorded artefact."""
+def clear_worktrees_and_branches(repo, rows, trust_inventory=False):
+    """Remove each planned worktree and delete its branch, once per recorded artefact.
+
+    `git branch -d` asks whether the branch is merged into HEAD, and every caller here has already
+    asked the better question: the inventory compared it against the run's own integration branch.
+    The two agree while HEAD is that branch, which is where a run's clear and its epilogue both
+    stand. A caller standing anywhere else — the start that sweeps a dead run, whose HEAD is its
+    own repo's — sets `trust_inventory`, and a row the inventory found merged is deleted on that
+    answer instead of on HEAD's, which is about somebody else's run entirely.
+    """
     unique_rows = []
     seen_rows = set()
     for row in rows:
@@ -1317,7 +1330,7 @@ def clear_worktrees_and_branches(repo, rows):
     for row in unique_rows:
         if row["unmerged"] is None:
             continue
-        flag = "-D" if row["unmerged"] else "-d"
+        flag = "-D" if row["unmerged"] or trust_inventory else "-d"
         clear_git(repo, "branch", flag, "--", row["branch"])
 
 
@@ -1431,6 +1444,175 @@ def disarm(monitors):
                 process.kill()
 
 
+# --- the residue an abandoned run leaves in its repo --------------------------------------------
+
+# A run that reaches `finish()` uninstalls its hooks, removes its pin and clears what landed. A run
+# that never gets there — an unresumed judgment-needed or driver-error pause, a driver killed
+# outright — leaves all three behind, and nothing in the design was left to notice. The pin is
+# swept by the statusline tick (#87); the hook and the landed worktrees are swept here, by the next
+# driver that comes to work in the same repo, because a hook lives in that repo's own settings and
+# only a driver about to work there has business touching it.
+
+
+def crew_hook_log(command):
+    """The run log this registered command writes for, or None where it is not a crew hook at all.
+
+    The log alone does not identify one. `machine_log` reads a command for the `--log` it carries
+    because every command it is ever asked about is one it installed itself; this sweep reads
+    commands nobody here installed, and an unrelated hook that happens to take a `--log` and a
+    `--role` would be uninstalled as a dead run's. So the script the interpreter runs — the word
+    after it, which is where every command `machine_log` writes carries it — must be the machine
+    log's own, and that is what makes the command this project's to remove. The position matters:
+    a foreign command whose `--log` merely points at a file called `machine_log.py` is somebody
+    else's hook, and reading the name anywhere in the words would have claimed it.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if len(words) < 2 or pathlib.PurePath(words[1]).name != machine_log.SCRIPT_NAME:
+        return None
+    return machine_log.command_log(command)
+
+
+def sweep_hook_logs(settings_path):
+    """Every run log this repo's settings registers a crew hook for, and what could not be read.
+
+    Returns the logs in registration order and the problems to warn about. A settings file this
+    driver cannot read as one is a file it must not rewrite, so nothing is swept out of it — but
+    that is said out loud rather than passed over in silence, because a dead run's hook living on
+    in an unreadable settings file is exactly what this sweep exists to catch.
+    """
+    try:
+        text = settings_path.read_text(encoding="utf-8") if settings_path.exists() else ""
+        settings = json.loads(text.strip() or "{}")
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return [], [f"{settings_path}: no hook could be read from it: {error}"]
+    if not machine_log.settings_shape_is_sound(settings):
+        return [], [
+            f"{settings_path}: no hook could be read from it: it is not a settings document"
+        ]
+    logs = []
+    for block in machine_log.message_blocks(settings):
+        for hook in block.get("hooks", []) or []:
+            if not isinstance(hook, dict):
+                continue
+            log = crew_hook_log(str(hook.get("command", "")))
+            if log and log not in logs:
+                logs.append(log)
+    return logs, []
+
+
+def run_section_of(run_dir):
+    """The run section the run at `run_dir` recorded, or None when nothing there can be read.
+
+    Every way a run cannot speak for itself reads the same: no table, a table this driver cannot
+    read, and a table carrying no run section. A run that cannot say whose process drove it or
+    which repository it worked in is a run this sweep judges on what it can see instead.
+    """
+    try:
+        table = json.loads((run_dir / TABLE_NAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    run = table.get("run") if isinstance(table, dict) else None
+    return run if isinstance(run, dict) else None
+
+
+def run_coordinator_pid(run_dir):
+    """The pid the run at `run_dir` recorded for the coordinator driving it, or None.
+
+    None is every way a run cannot name a live coordinator: no table, a table this driver cannot
+    read, and a table whose run section carries no pid. The caller reads all of them the same way,
+    because a hook whose run cannot say whose it is names no process that could still be running.
+    """
+    run = run_section_of(run_dir) or {}
+    pid = run.get("coordinator_pid")
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+
+
+def run_repo_root(run_dir):
+    """The repository the run at `run_dir` recorded working in, resolved, or None where it says
+    nothing this driver can read as a path."""
+    repo_root = (run_section_of(run_dir) or {}).get("repo_root")
+    return pathlib.Path(repo_root).resolve() if isinstance(repo_root, str) and repo_root else None
+
+
+def uninstall_hook(log, settings):
+    """Take every hook writing `log` out of that settings file, through the log's own operation."""
+    run_command(
+        [sys.executable, MACHINE_LOG, "--log", log, "uninstall", "--settings", settings],
+        f"the hook writing {log} could not be uninstalled from {settings}",
+    )
+
+
+def sweep_landed(run_dir):
+    """Clear the landed worktrees and branches of the run at `run_dir`; raises ClearError.
+
+    The dead run's own epilogue, run late by somebody else: the same inventory, narrowed by the
+    same `epilogue_plan` to the tickets its log says reached its integration branch. A parked or
+    failed child's worktree is work nobody merged, and no automatic path deletes that. Windows and
+    Codex sessions are the epilogue's and not this sweep's: both belong to a session that died with
+    the run, while a worktree is disk that outlives every session there ever was.
+    """
+    table, run, records, log_path = clear_run_data(run_dir)
+    _, plan = clear_inventory(run_dir, table, run, records, log_path)
+    plan = epilogue_plan(plan, set(merged_tickets(records)))
+    clear_worktrees_and_branches(pathlib.Path(run["repo_root"]), plan.rows, trust_inventory=True)
+
+
+def sweep_dead_runs(repo, keep_run_dir):
+    """Finish the cleanup every run abandoned in this repo never reached; returns its warnings.
+
+    A hook is dead when the run it writes for names no live coordinator — the same pid judgment
+    the pin registry's own sweep makes, asked of the pid that run recorded. Every problem either
+    step meets is returned as a warning rather than raised: the run about to start is not the place
+    to fail over a run that ended weeks ago.
+
+    The landed artefacts go first, and the hook goes whether or not they went: a hook nobody reads
+    costs a python interpreter on every message sent in this repo, which is the burn this sweep
+    exists to end, and the warning names the run directory so what is left can be cleared by hand.
+    Only a dead run that recorded this repository has its artefacts cleared — the settings file is
+    this repo's to edit, while another repository's worktrees and branches are not this driver's to
+    delete, however dead the run that made them.
+
+    The run this start is about is passed as `keep_run_dir` and is never swept. A driver adopting
+    an interrupted run meets its own hook here, recorded under the coordinator that abandoned it —
+    which is exactly the pid this judgment would call dead.
+
+    Both steps fail open on anything at all, and deliberately so: what they read is a settings file
+    and a machine log written by some earlier release of this project, and a shape neither the
+    clearing code nor this one anticipated has to come out as a warning about a run that is over
+    rather than as the exception that stopped the run being started now.
+    """
+    settings_path = repo / SETTINGS_PATH
+    keep = pathlib.Path(keep_run_dir).resolve()
+    repo_key = pathlib.Path(repo).resolve()
+    logs, warnings = sweep_hook_logs(settings_path)
+    for log in logs:
+        run_dir = pathlib.Path(log).parent
+        if run_dir.resolve() == keep:
+            continue
+        pid = run_coordinator_pid(run_dir)
+        if pid is not None and monitor.alive(pid):
+            continue
+        repo_root = run_repo_root(run_dir)
+        if repo_root is not None and repo_root != repo_key:
+            warnings.append(
+                f"{run_dir}: its landed artefacts were left alone: it records the repository"
+                f" {repo_root}, which is not the one being started in"
+            )
+        else:
+            try:
+                sweep_landed(run_dir)
+            except Exception as error:  # noqa: BLE001 - housekeeping never stops a run
+                warnings.append(f"{run_dir}: its landed artefacts were not cleared: {error}")
+        try:
+            uninstall_hook(log, settings_path)
+        except Exception as error:  # noqa: BLE001 - housekeeping never stops a run
+            warnings.append(f"{run_dir}: its hook was not uninstalled: {error}")
+    return warnings
+
+
 # --- start ------------------------------------------------------------------------------------
 
 
@@ -1478,6 +1660,10 @@ def run_start(args):
     clear_notice(args.tmux_session)
 
     run_dir = feature_dir / RUN_DIR_NAME
+    # Before anything else this driver does in this repo, and before it can matter whether the run
+    # is a fresh one or an adoption: what the runs abandoned here never cleaned up.
+    for warning in sweep_dead_runs(repo, run_dir):
+        print(f"crew sweep: {warning}", file=sys.stderr, flush=True)
     table_path = run_dir / TABLE_NAME
     if table_path.exists():
         return adopt(args, repo, run_dir, table_path)
@@ -1608,6 +1794,12 @@ def start_dashboard(args, repo, run_dir):
 # how often a conflict has been bounced back — is read out of the machine log each time it is
 # needed. That is what makes resuming after a ruling the same code path as carrying on, and what
 # makes a driver that died mid-wave recoverable by starting another one.
+#
+# Re-reading the whole log on every poll — here, in the dashboard and in the statusline tick — is
+# accepted rather than fixed (#89), so that it is not re-litigated on suspicion: a run's log
+# measured 122 KB at millisecond-scale parse times, and it is sealed the moment the run ends. The
+# revisit threshold is one number: a single run's log past ~5 MB, where the parse stops being free
+# and an incremental reader would start to earn its own complexity.
 
 
 def read_records(log):
