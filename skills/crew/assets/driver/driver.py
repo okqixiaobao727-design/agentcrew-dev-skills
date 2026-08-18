@@ -545,7 +545,8 @@ def base_branch_problems(repo, branch, upstream):
     if not branch:
         return [
             "base branch: this run has no base branch — the repository names no"
-            " refs/remotes/origin/HEAD, so give the run one with --base-branch"
+            " refs/remotes/origin/HEAD, so run `git remote set-head origin -a` or give the run"
+            " one with --base-branch <branch>"
         ]
     if git_output(repo, "rev-parse", "--verify", f"refs/heads/{branch}") is None:
         return [f"base branch: `{branch}` does not resolve to a branch in this repository"]

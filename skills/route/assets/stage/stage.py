@@ -11,10 +11,11 @@ the command, because a printed command that fails is the defect this script exis
 **The self-check is the driver's, not a copy of it.** Ticket parsing, `## Routing` validation, the
 dependency graph and the wave-table build are `driver.py`'s own functions, called here on the
 directory just written; the environment gates are the driver's `config_problems` and
-`dirty_tree_problems`. Two skills that both decide what a valid run directory is would drift; one
-that asks the other cannot. The driver's base-branch check is deliberately not repeated: the branch
-a run cuts from is an argument of the run's start (`--base-branch`), not a property of the staged
-directory, and staging does not know which branch the later session will name.
+`dirty_tree_problems`, plus its default base-branch check. Two skills that both decide what a valid
+run directory is would drift; one that asks the other cannot. The driver's base-branch check is
+included for the default case: a bare command must not be printed when the repository cannot
+resolve the default branch that a later run would use. A later run may still name an explicit
+`--base-branch` override at start time.
 
 **A ticket reference is whatever the configured tracker calls one.** Under `[tracker] kind =
 "github"` it is the issue number, read with `gh issue view`; under `local` it is the path to the
@@ -649,6 +650,10 @@ def self_check(repo, directory, config):
     tickets = driver.read_tickets(directory)
     run = candidate_run(repo, directory, config)
     problems = driver.dirty_tree_problems(repo)
+    base_branch = driver.default_base_branch(repo)
+    if base_branch is None:
+        # Fetch and fast-forward checks belong to run start; staging only checks default naming.
+        problems += driver.base_branch_problems(repo, base_branch, (driver.UPSTREAM_ABSENT, ""))
     with driver.scratch() as scratch:
         problems += driver.routing_problems(tickets, run, scratch)
     problems += driver.graph_problems(tickets)
