@@ -27,6 +27,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
   account, and a machine with no registry file runs its single-account waves
   with nothing to create (#97).
 
+### Changed
+- The cost pass now reads each Claude child's transcripts from the profile directory
+  named by its wave-table `account`, so a mixed-account run includes every child's
+  figures in its rollup. An unreadable wave table diagnoses Claude rows instead of
+  failing the pass or silently undercounting them; Codex remains on its own root
+  (#101).
+
 ## [0.8.1] - 2026-08-18
 
 ### Added
