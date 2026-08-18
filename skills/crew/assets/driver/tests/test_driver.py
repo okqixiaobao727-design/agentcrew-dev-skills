@@ -24,6 +24,8 @@ import unittest
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 DRIVER = TESTS_DIR.parent / "driver.py"
 MACHINE_LOG = DRIVER.parent.parent / "machine_log.py"
+TRIAGE = DRIVER.parent.parent.parent / "references" / "triage.md"
+MONITOR = DRIVER.parent.parent / "monitor" / "monitor.py"
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -194,6 +196,16 @@ class Fixture:
         environment.pop("AGENTCREW_STUB_TRANSCRIPT_MODEL", None)
         environment.update(overrides or {})
         return environment
+
+    def pin_install(self):
+        """Record the machine preference through the monitor's public installer command."""
+        return subprocess.run(
+            [
+                sys.executable, str(MONITOR), "pin-install",
+                "--settings", self.config_dir / "settings.json", "--apply",
+            ],
+            capture_output=True, text=True, env=self.environment(), cwd=str(self.repo),
+        )
 
     def start_argv(self, extra=()):
         return [
@@ -926,6 +938,16 @@ class LaunchTests(DriverTestCase):
         recorded = (self.fixture.run_dir / "dashboard-window").read_text().strip()
         self.assertEqual(recorded, next(iter(windows)))
 
+    def test_a_machine_pin_preference_starts_the_silent_project_without_a_dashboard_window(self):
+        installed = self.fixture.pin_install()
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        self.start_a_run()
+
+        self.assertEqual(self.fixture.windows_named(DASHBOARD_WINDOW), {})
+        pins = list((self.fixture.config_dir / "agentcrew" / "pins").glob("*.json"))
+        self.assertEqual(len(pins), 1)
+
     def test_the_wake_monitor_is_armed_over_the_wave_s_children(self):
         self.start_a_run()
 
@@ -1624,6 +1646,195 @@ class LoopTests(DriverTestCase):
         for call in calls:
             self.assertNotIn("--repo", call["argv"], f"gh was handed a repository: {call['argv']}")
             self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.repo))
+
+
+class AnswerTests(DriverTestCase):
+    def start(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        process = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("01") is not None),
+            "01 never launched",
+        )
+        return process
+
+    def answer(self, *arguments):
+        return subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer",
+                "--run-dir", str(self.fixture.run_dir), "--ticket", "01", *arguments,
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+    def kill_window(self, window):
+        subprocess.run(
+            [str(self.fixture.bin_dir / "tmux"), "kill-window", "-t", window],
+            check=True, capture_output=True, env=self.fixture.environment(),
+        )
+
+    def test_text_answer_sends_literal_text_then_enter_and_records_the_ruling(self):
+        self.start()
+        text = "Use the existing retention_audit table"
+        window = self.fixture.launch_record("01")["window"]
+
+        result = self.answer("--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-2:], [
+            ["send-keys", "-t", window, "-l", "--", text],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        ruling = self.events("ruling", ticket="01")[-1]
+        self.assertEqual(ruling["role"], "coordinator")
+        self.assertEqual(ruling["to"], "stub-child-1")
+        self.assertEqual(ruling["message"], text)
+
+    def test_key_answer_sends_named_keys_without_literal_mode_and_records_them(self):
+        self.start()
+        window = self.fixture.launch_record("01")["window"]
+
+        result = self.answer("--key", "Down", "--key", "Enter")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-2:], [
+            ["send-keys", "-t", window, "Down"],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        ruling = self.events("ruling", ticket="01")[-1]
+        self.assertEqual(ruling["message"], "Down Enter")
+
+    def test_digit_answer_sends_the_digit_and_records_it(self):
+        self.start()
+        window = self.fixture.launch_record("01")["window"]
+
+        result = self.answer("--key", "4")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-1], ["send-keys", "-t", window, "4"])
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], "4")
+
+    def test_delivery_failure_reports_unreachable_and_writes_no_ruling(self):
+        self.start()
+        window = self.fixture.launch_record("01")["window"]
+        self.kill_window(window)
+
+        result = self.answer("--text", "Use the existing retention_audit table")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not be reached", result.stdout)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_missing_recorded_window_reports_unreachable_and_writes_no_ruling(self):
+        self.start()
+        records = self.fixture.log_records()
+        launch = next(record for record in records if record.get("event") == "launch")
+        launch["window"] = None
+        (self.fixture.run_dir / "log.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+
+        result = self.answer("--text", "Use the existing retention_audit table")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no window", result.stdout)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_unsupported_key_is_rejected_without_delivery_or_ruling(self):
+        self.start()
+        before = len([
+            call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]
+        ])
+
+        result = self.answer("--key", "PageDown")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported answer key", result.stdout)
+        after = len([
+            call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]
+        ])
+        self.assertEqual(after, before)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_text_answer_can_select_a_free_text_option_before_typing(self):
+        self.start()
+        text = "Use the existing retention_audit table"
+        window = self.fixture.launch_record("01")["window"]
+
+        result = self.answer("--key", "4", "--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-3:], [
+            ["send-keys", "-t", window, "4"],
+            ["send-keys", "-t", window, "-l", "--", text],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], f"4 {text}")
+
+    def test_dash_prefixed_text_is_sent_as_literal_text(self):
+        self.start()
+        text = "- Use the existing retention_audit table"
+        window = self.fixture.launch_record("01")["window"]
+
+        result = self.answer("--key", "4", "--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-3:], [
+            ["send-keys", "-t", window, "4"],
+            ["send-keys", "-t", window, "-l", "--", text],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], f"4 {text}")
+
+    def test_triage_routes_permission_answers_through_the_driver_without_double_send(self):
+        triage = TRIAGE.read_text(encoding="utf-8")
+
+        self.assertIn("driver.py answer", triage)
+        self.assertNotIn("tmux send-keys", triage)
+        self.assertNotIn("send it to that child as a message too", triage)
+        self.assertIn("Reply to a Claude child by SendMessage", triage)
+
+    def test_multiline_text_uses_literal_lines_and_shift_enter_before_submit(self):
+        self.start()
+        text = "line one\nline two"
+        window = self.fixture.launch_record("01")["window"]
+
+        result = self.answer("--key", "4", "--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-5:], [
+            ["send-keys", "-t", window, "4"],
+            ["send-keys", "-t", window, "-l", "--", "line one"],
+            ["send-keys", "-t", window, "S-Enter"],
+            ["send-keys", "-t", window, "-l", "--", "line two"],
+            ["send-keys", "-t", window, "Enter"],
+        ])
 
 
 class AdoptionTests(DriverTestCase):

@@ -74,6 +74,17 @@ VERDICT_PATTERN = re.compile(
     r"^\s*REVIEW VERDICT:\s+spec-findings-requiring-fix=(\d+)\s+standards-findings=\d+\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+# The four disjoint counters a `session-cost` line carries, in the machine log's own spelling.
+COUNTERS = ("input", "output", "cache_read", "cache_creation")
+# What the headless result's `usage` object calls each of them. Claude reports its cached tokens
+# beside the input count rather than inside it, so the four arrive already disjoint.
+USAGE_FIELDS = {
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "cache_read": "cache_read_input_tokens",
+    "cache_creation": "cache_creation_input_tokens",
+}
+
 # One re-review, and only for a spec finding: the contract's cap, enforced here rather than left
 # to the caller's self-restraint.
 MAX_ROUNDS = 2
@@ -100,6 +111,9 @@ class ReviewEvent:
         # Vendor then model, separated by a space: the annotation row prints the field verbatim
         # after collapsing whitespace, so this is the spelling the dashboard shows.
         self.lane = " ".join(part for part in (vendor, model) if part)
+        # A review leaves exactly one cost line per call, whether it came back with figures or
+        # with the reason there are none.
+        self.costed = False
 
     def write(self, state):
         """Append one end of this review; returns nothing, and fails at nothing.
@@ -118,6 +132,37 @@ class ReviewEvent:
                 ],
                 capture_output=True, text=True, check=False,
             )
+        except OSError:
+            pass
+
+    def cost(self, session, model, counters, detail):
+        """Append this review's one `session-cost` line; returns nothing, and fails at nothing.
+
+        Lane-tagged, so a review's spend is told apart from the implementing child's, and written
+        through the log's own writer, which holds the figures-or-diagnosis rule: `counters` are
+        the four disjoint totals, or `None` with `detail` saying why nobody could tell.
+
+        Accounting must never fail a review, so every way this can go wrong is swallowed here,
+        exactly as the `review` pair's write is.
+        """
+        if not self.log or not self.ticket:
+            return
+        self.costed = True
+        command = [
+            sys.executable, str(MACHINE_LOG), "--log", str(self.log), "session-cost",
+            "--ticket", str(self.ticket), "--executor", REVIEW_VENDOR,
+            "--model", model or "", "--lane", self.lane,
+        ]
+        if session:
+            command += ["--session", str(session)]
+        if counters is None:
+            command += ["--detail", detail]
+        else:
+            for name in COUNTERS:
+                command += [f"--{name.replace('_', '-')}-tokens", str(counters[name])]
+            command += ["--total-tokens", str(sum(counters.values()))]
+        try:
+            subprocess.run(command, capture_output=True, text=True, check=False)
         except OSError:
             pass
 
@@ -631,6 +676,67 @@ def refuse_second_pass(state):
     return None
 
 
+def result_usage(payload):
+    """The four disjoint counters this round billed, or `None` when the result reported none.
+
+    All four or nothing: a `usage` object missing one of them is not a partial answer, it is a
+    shape this bridge does not recognise, and billing a review for three of its four counters
+    would understate it without saying so.
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    counters = {}
+    for name, field in USAGE_FIELDS.items():
+        value = usage.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        counters[name] = value
+    return counters
+
+
+def resolved_model(payload):
+    """The model id this round actually ran on, or `None` when the result named no single one.
+
+    The result's per-model breakdown is keyed by the model that was billed, so an alias like
+    `opus` is resolved to the id behind it. More than one key is a round that ran on more than
+    one model, which no single id describes. Either way the alias never stands in for the
+    answer: it is already on the row, in the lane, and writing it into the model field would
+    dress a guess up as a measurement.
+    """
+    billed = payload.get("modelUsage")
+    if isinstance(billed, dict) and len(billed) == 1:
+        return next(iter(billed))
+    return None
+
+
+def fold_usage(state, counters):
+    """Fold this round's counters into the review's running total, and answer with the total.
+
+    `None` means this review's total is not knowable: a round that reported no usage leaves the
+    sum short by whatever it spent, and a total that quietly drops a round is worse than none at
+    all. Cumulative by round so that a resumed review is one record rather than two to add up.
+    """
+    running = state.get("usage", {name: 0 for name in COUNTERS})
+    if counters is None or running is None:
+        state["usage"] = None
+    else:
+        state["usage"] = {name: running[name] + counters[name] for name in COUNTERS}
+    return state["usage"]
+
+
+def record_review_cost(review, state, parsed):
+    """Leave this review's `session-cost` line, cumulative over the rounds it has had."""
+    counters = fold_usage(state, result_usage(parsed.payload))
+    detail = None
+    if counters is None:
+        detail = (
+            f"round {state['rounds']} of this review reported no usage,"
+            " so what the review spent cannot be totalled"
+        )
+    review.cost(parsed.session_id, resolved_model(parsed.payload), counters, detail)
+
+
 def update_state_after_round(state, args, parsed, exit_code, duration_ms):
     state["sessionId"] = parsed.session_id
     state["target"] = args.target
@@ -645,7 +751,7 @@ def update_state_after_round(state, args, parsed, exit_code, duration_ms):
     state["updatedAt"] = time.time()
 
 
-def run_bridge(args):
+def run_bridge(args, review=None):
     if not pathlib.Path(args.cwd).is_dir():
         raise BridgeError(f"Working directory does not exist: {args.cwd}")
     binary = resolve_claude_binary(args.claude_binary)
@@ -731,6 +837,10 @@ def run_bridge(args):
         state = new_state(lineage_id, args, store.log_path(lineage_id))
     store.append_log(lineage_id, header, stdout, stderr)
     update_state_after_round(state, args, parsed, exit_code, duration_ms)
+    if review is not None:
+        # After the round is folded into the state and before the report is printed, so the
+        # figures cover every round this lineage has had.
+        record_review_cost(review, state, parsed)
     store.write(lineage_id, state)
 
     output = {
@@ -819,11 +929,22 @@ def main(argv=None):
     review = ReviewEvent(args.machine_log, args.ticket, args.model)
     review.write("running")
     try:
-        return run_bridge(args)
+        return run_bridge(args, review)
     except (BridgeError, OSError) as error:
         print(str(error), file=sys.stderr)
         return 1
     finally:
+        # A review that never returned a readable result read no counters, and one that is left
+        # out of the log entirely is the blind spot this event exists to close: the diagnosis
+        # goes in where the figures cannot.
+        if not review.costed:
+            # A resumed round names the session it was about to spend in, so even the failed
+            # round is attributable — and its transcript is kept out of the reviewed child's
+            # figures. A first round that never answered named none, and none is written.
+            review.cost(
+                args.resume_session, None, None,
+                "this review returned no result to read a cost from",
+            )
         review.write("returned")
 
 

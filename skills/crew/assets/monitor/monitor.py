@@ -81,8 +81,8 @@ DASHBOARD_WINDOW_NAME = "crew-dashboard"
 # A pin is named for the run it names, so a run re-pinning itself every wave still has one pin.
 PIN_NAME_LENGTH = 16
 
-# Which surface a run draws itself on, from `[dashboard] surface` in the project's config. The
-# window is the default, so upgrading agentcrew changes nobody's run.
+# Which surface a run draws itself on: an explicit project value, the machine preference recorded
+# by pin-install for a silent project, or the shipped window default.
 DASHBOARD_SECTION = "dashboard"
 SURFACE_KEY = "surface"
 SURFACE_WINDOW = "window"
@@ -207,6 +207,7 @@ COLOUR_RESET = "\x1b[0m"
 # The pin registry (`docs/monitor-dashboard.md`): the directory a live run leaves the file naming
 # itself in, under the operator's Claude config, and the five things that file carries.
 PIN_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "agentcrew/pins")
+SURFACE_PREFERENCE_NAME = "surface"
 PIN_SUFFIX = ".json"
 PIN_GLOB = f"*{PIN_SUFFIX}"
 PIN_RUN_DIR = "run_dir"
@@ -1055,28 +1056,41 @@ def window_lock(run_dir):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def machine_surface_preference():
+    """The installed machine preference, or None when it is absent or unusable."""
+    try:
+        value = surface_preference_path().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value if value in SURFACES else None
+
+
 def configured_surface(args):
     """Which surface this run draws itself on, read from the project's config file.
 
-    A run that names no config, or whose config has no `[dashboard]` section, gets the window it
-    has always got: the surface is a choice a repo makes, never one an upgrade makes for it.
+    A project's explicit surface wins. A silent project inherits the machine preference recorded by
+    pin-install, and a machine with no usable preference keeps the shipped window default.
     """
+    machine_surface = machine_surface_preference()
+    fallback = machine_surface or DEFAULT_SURFACE
     if not args.config:
-        return DEFAULT_SURFACE
+        return fallback
     try:
         text = pathlib.Path(args.config).read_text(encoding="utf-8")
     except FileNotFoundError:
-        return DEFAULT_SURFACE
+        return fallback
     except OSError as error:
         raise MonitorError(f"config {args.config} is unreadable: {error}")
     try:
         config = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise MonitorError(f"config {args.config} is unparsable: {error}")
-    section = config.get(DASHBOARD_SECTION, {})
+    if DASHBOARD_SECTION not in config:
+        return fallback
+    section = config[DASHBOARD_SECTION]
     if not isinstance(section, dict):
         raise MonitorError(f"config {args.config}: [{DASHBOARD_SECTION}] must be a table")
-    surface = section.get(SURFACE_KEY, DEFAULT_SURFACE)
+    surface = section.get(SURFACE_KEY, fallback)
     if surface not in SURFACES:
         raise MonitorError(
             f"config {args.config}: unknown {DASHBOARD_SECTION} {SURFACE_KEY} {surface!r}, "
@@ -1297,6 +1311,37 @@ def pin_directory(args):
     """
     given = pathlib.Path(args.pin_dir) if args.pin_dir else transcript_root(PIN_REGISTRY)
     return given.expanduser().resolve()
+
+
+def surface_preference_path():
+    """The machine-level dashboard surface preference beside the pin registry."""
+    return transcript_root(PIN_REGISTRY).parent / SURFACE_PREFERENCE_NAME
+
+
+def write_surface_preference():
+    """Record the surface the operator opted into by installing the pin."""
+    path = surface_preference_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(SURFACE_PIN + "\n", encoding="utf-8")
+    except OSError as error:
+        raise MonitorError(f"the machine surface preference could not be written: {error}")
+
+
+def surface_preference_is_pinned():
+    """Whether the machine preference exists and carries the installed surface value."""
+    try:
+        return surface_preference_path().read_text(encoding="utf-8").strip() == SURFACE_PIN
+    except (OSError, UnicodeError):
+        return False
+
+
+def remove_surface_preference():
+    """Remove the machine preference; an absent preference is already the desired state."""
+    try:
+        surface_preference_path().unlink(missing_ok=True)
+    except OSError as error:
+        raise MonitorError(f"the machine surface preference could not be removed: {error}")
 
 
 def pin_colour(args):
@@ -1649,6 +1694,7 @@ def run_pin_install(args):
     settings_file = pin_settings_path(args)
     wrapper = pin_wrapper_path(args, settings_file)
     settings = read_settings(settings_file)
+    preference = surface_preference_path()
     if args.uninstall:
         drift = uninstall_drift(settings, wrapper) if install_record(wrapper) else None
         if drift is not None:
@@ -1657,11 +1703,17 @@ def run_pin_install(args):
                 "the statusline has moved on since the install and nothing was written"
             )
         after, lines = plan_uninstall(settings, settings_file, wrapper)
+        if preference.exists():
+            lines.append(f"remove {preference}")
         if not lines:
             print("the pin is not installed here; nothing to undo")
             return 0
     else:
         after, text, lines = plan_install(settings, settings_file, wrapper)
+        wiring_needs_change = bool(lines)
+        preference_needs_write = not surface_preference_is_pinned()
+        if preference_needs_write:
+            lines.append(f"write {preference} = {SURFACE_PIN}")
         if not lines:
             print("the pin is already installed here; nothing to change")
             return 0
@@ -1671,13 +1723,19 @@ def run_pin_install(args):
         print("dry run — nothing written. Re-run with --apply to make these changes.")
         return 0
     if args.uninstall:
-        write_settings(settings_file, after)
-        back_up(wrapper)
-        wrapper.unlink(missing_ok=True)
+        if after is not None:
+            write_settings(settings_file, after)
+        if wrapper.exists():
+            back_up(wrapper)
+            wrapper.unlink()
+        remove_surface_preference()
     else:
         # The wrapper first: the settings must never name a script that is not there yet.
-        write_wrapper(wrapper, text)
-        write_settings(settings_file, after)
+        if wiring_needs_change:
+            write_wrapper(wrapper, text)
+            write_settings(settings_file, after)
+        if preference_needs_write:
+            write_surface_preference()
     return 0
 
 
@@ -1881,13 +1939,34 @@ def no_figures(root, worktree, undetermined):
     return detail
 
 
-def child_usage(executor, worktree):
+def review_sessions(records):
+    """Every session id the run's reviews already recorded a cost for.
+
+    A review runs in a session of its own and writes its own lane-tagged `session-cost` line, so
+    its transcript is spoken for. When the review lane and the child share a vendor that
+    transcript also sits in the child's worktree, where the glob below would otherwise bill the
+    ticket for it a second time.
+    """
+    found = set()
+    for record in records:
+        if record.get("event") != "session-cost" or not record.get("lane"):
+            continue
+        for session in str(record.get("session") or "").split(SESSION_SEPARATOR):
+            if session:
+                found.add(session)
+    return found
+
+
+def child_usage(executor, worktree, reviewed=()):
     """What one child spent: its sessions, their counters, or the diagnosis in place of both.
 
     Every failure on this path is diagnosed rather than raised, and a child with one unbillable
     transcript is diagnosed whole rather than billed for the rest: a total that quietly leaves
     out what could not be read is worse than no total at all. The pass runs after the run is
     over, so what it cannot read it will never be able to read.
+
+    `reviewed` names the sessions the run's reviews are already billed under, which are skipped
+    here rather than added to the child that was reviewed.
     """
     spec, usage_of = TRANSCRIPT_READERS[executor]
     root = transcript_root(spec)
@@ -1910,6 +1989,8 @@ def child_usage(executor, worktree):
             problems.append(f"{path}: {found['problem']}")
             continue
         session = str(found["session"]) if found["session"] else path.stem
+        if session in reviewed:
+            continue
         if session in sessions:
             # Two files claiming one session are two answers to what it spent, and adding them up
             # would bill the same tokens twice.
@@ -1989,6 +2070,7 @@ def cost_rows(records):
     for record in records:
         if record.get("event") == "launch":
             launches[str(record.get("ticket"))] = record
+    reviewed = review_sessions(records)
 
     rows = []
     for ticket, launch in sorted(launches.items()):
@@ -2004,7 +2086,7 @@ def cost_rows(records):
         if not worktree:
             usage = diagnosed("the launch event names no worktree to read a transcript in")
         else:
-            usage = child_usage(executor, worktree)
+            usage = child_usage(executor, worktree, reviewed)
         rows.append({
             "ticket": ticket,
             "executor": executor,
@@ -2202,7 +2284,7 @@ def build_parser():
     window.add_argument(
         "--config",
         help=f"the project's config, whose [{DASHBOARD_SECTION}] {SURFACE_KEY} chooses between "
-             f"{', '.join(SURFACES)} (default: {DEFAULT_SURFACE})",
+             f"{', '.join(SURFACES)} (default: machine preference or {DEFAULT_SURFACE})",
     )
     window.add_argument(
         "--coordinator-pid", type=int,

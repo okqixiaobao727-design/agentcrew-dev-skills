@@ -568,9 +568,17 @@ def build_parser():
     review.add_argument("--state", required=True, choices=REVIEW_STATES)
     review.add_argument("--detail")
 
-    cost = event_command("session-cost", "what one child's session spent, in tokens")
+    cost = event_command("session-cost", "what one session spent, in tokens")
     cost.set_defaults(handler=run_session_cost)
     cost.add_argument("--executor", required=True, choices=EXECUTORS)
+    # The same spelling the `review` event's lane carries, so a review's spend is filterable by
+    # the lane that spent it. Left unset by the cost pass, whose rows are implementing children:
+    # an absent lane is what says the session was the ticket's own work.
+    cost.add_argument(
+        "--lane",
+        help="the reviewing vendor and its model, when these figures are a review's;"
+             " absent means an implementing child",
+    )
     cost.add_argument("--model", required=True, help="the full model ID, never an alias")
     cost.add_argument("--session", help="the session whose transcript these figures were read off")
     for tokens in ("input", "output", "cache-read", "cache-creation", "total"):

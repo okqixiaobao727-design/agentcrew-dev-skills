@@ -6,6 +6,7 @@
             or, where the feature already carries an unfinished run, adopt that one instead
     clear   inventory one recorded run, ask the operator, and remove its recorded artefacts
     resume  put that loop back where a ruling stopped it
+    answer  deliver and record one coordinator answer to a Claude child
 
 The driver runs as a background task of the coordinator's own session, so it costs that session no
 turn while it works and its exit is what wakes it (ADR-0001). Two contracts follow from that and
@@ -26,9 +27,12 @@ run file, which is what keeps the oracle boundary intact; `monitor-wave.sh` and 
 `watch` already exit this way. A launched wave is not a wake reason: the driver prints its one
 launch line and goes on working, and only one of the four reasons ends it.
 
-The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle event:
-it prints a multi-line inventory, asks for confirmation, and reports errors directly instead of
-emitting a wake snapshot.
+The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle
+event: it prints a multi-line inventory, asks for confirmation, and reports errors directly instead
+of emitting a wake snapshot.
+
+The `answer` subcommand is also an operator terminal command, but its failures emit a `driver-error`
+wake snapshot so the coordinator can see why the child could not be answered.
 
 **A preflight failure never reaches the coordinator as diagnosis.** Preflight is the four read-only
 checks — a clean working tree, a base branch that resolves and fast-forwards, a valid routing on
@@ -224,6 +228,10 @@ NUDGE_MARKER = "CREW NUDGE"
 MERGE_MARKER = "CREW MERGE"
 ANCHOR_MARKER = "CREW ANCHOR"
 HANDED_OVER_MARKER = "CREW RULED"
+
+# The tmux key names the permission-prompt command accepts, kept narrow so an answer cannot
+# accidentally become an unsupported tmux key sequence.
+ANSWER_KEYS = tuple("0123456789") + ("Up", "Down", "Left", "Right", "Enter", "S-Enter")
 
 # The socket a Claude child authenticates its coordinator by, spelled as the first turn spells it.
 COORDINATOR_SOCKET = "uds:/tmp/cc-socks/{pid}.sock"
@@ -2127,15 +2135,27 @@ class Loop:
             ticket=ticket, pointer=str(self.log),
         )
 
-    def deliver(self, ticket, launch, text):
+    def deliver(self, ticket, launch, text=None, keys=None):
         """Say one thing to a child on its own channel, and record it; returns nothing.
 
         A Codex child is reached through the bridge, which logs the prompt as it sends it. A Claude
         child is reached through its tmux pane, which is the only channel a script has to it — the
         cross-session message tool belongs to a model — and keys pass no hook, so the instruction
-        is written into the log here rather than by being sent.
+        is written into the log here rather than by being sent. Claude keys are sent one at a time;
+        text is typed literally line by line, with S-Enter between lines and Enter at the end. The
+        ruling records the keys and text joined by a space.
         """
         if launch.get("executor") == CODEX:
+            if keys:
+                raise Unreachable(
+                    f"{ticket} is a Codex child and cannot receive tmux key answers",
+                    ticket=ticket, pointer=str(self.log),
+                )
+            if text is None:
+                raise DriverError(
+                    f"{ticket} needs text to receive an answer through the Codex bridge",
+                    ticket=ticket, pointer=str(self.log),
+                )
             run_command(
                 [
                     sys.executable, self.run["codex"]["bridge"], "send",
@@ -2156,17 +2176,33 @@ class Loop:
         # log this writes the instruction into — is the run's own record, and a failure there is a
         # driver error for whoever asked for the instruction.
         try:
-            tmux(
-                ["send-keys", "-t", window, "-l", text],
-                f"{ticket} could not be reached at {window}",
-            )
-            tmux(
-                ["send-keys", "-t", window, "Enter"],
-                f"{ticket} could not be reached at {window}",
-            )
+            for key in keys or ():
+                tmux(
+                    ["send-keys", "-t", window, key],
+                    f"{ticket} could not be reached at {window}",
+                )
+            if text is not None:
+                lines = text.split("\n")
+                for index, line in enumerate(lines):
+                    tmux(
+                        ["send-keys", "-t", window, "-l", "--", line],
+                        f"{ticket} could not be reached at {window}",
+                    )
+                    if index < len(lines) - 1:
+                        tmux(
+                            ["send-keys", "-t", window, "S-Enter"],
+                            f"{ticket} could not be reached at {window}",
+                        )
+                tmux(
+                    ["send-keys", "-t", window, "Enter"],
+                    f"{ticket} could not be reached at {window}",
+                )
         except DriverError as error:
             raise Unreachable(str(error), ticket=ticket, pointer=str(self.log)) from error
-        self.record_ruling(ticket, launch, text)
+        recorded = " ".join(keys or ())
+        if text is not None:
+            recorded = f"{recorded} {text}".strip()
+        self.record_ruling(ticket, launch, recorded)
 
     def record_ruling(self, ticket, launch, text):
         """Put one thing the run said to a child into the log; returns nothing."""
@@ -2852,6 +2888,41 @@ def run_resume(args):
     return wave_loop(args, repo, run_dir, table)
 
 
+def run_answer(args):
+    """Deliver and record one coordinator answer to a recorded Claude child."""
+    run_dir = pathlib.Path(args.run_dir).resolve()
+    table_path = run_dir / TABLE_NAME
+    if not table_path.exists():
+        raise DriverError(
+            f"{run_dir} holds no run to answer: {table_path} is not there",
+            pointer=str(run_dir),
+        )
+    loop = Loop(args, run_dir.parent, run_dir, table_path)
+    ticket = str(args.ticket)
+    launch = launch_records(loop.records()).get(ticket)
+    if launch is None:
+        raise DriverError(
+            f"{ticket} has no recorded child in {loop.log}", ticket=ticket, pointer=str(loop.log)
+        )
+    if launch.get("executor") != CLAUDE:
+        raise DriverError(
+            f"{ticket} is not a Claude child with a tmux permission prompt",
+            ticket=ticket, pointer=str(loop.log),
+        )
+    if args.text is None and not args.keys:
+        raise DriverError(
+            "an answer needs --text or at least one --key", ticket=ticket, pointer=str(loop.log)
+        )
+    unsupported = [key for key in args.keys if key not in ANSWER_KEYS]
+    if unsupported:
+        raise DriverError(
+            f"unsupported answer key(s): {', '.join(unsupported)}",
+            ticket=ticket, pointer=str(loop.log),
+        )
+    loop.deliver(ticket, launch, args.text, args.keys)
+    return 0
+
+
 # --- entry point ------------------------------------------------------------------------------
 
 
@@ -2907,6 +2978,18 @@ def build_parser():
         "--tmux-session", help="the session this run's windows live in (default: the driver's own)"
     )
     add_loop_arguments(resume)
+
+    answer = commands.add_parser(
+        "answer", help="deliver and record a coordinator answer to a Claude child"
+    )
+    answer.set_defaults(handler=run_answer)
+    answer.add_argument("--run-dir", required=True, help="the recorded run directory")
+    answer.add_argument("--ticket", required=True, help="the ticket whose child is being answered")
+    answer.add_argument("--text", help="literal text to type into the child pane")
+    answer.add_argument(
+        "--key", dest="keys", action="append", default=[], metavar="KEY",
+        help="a permission-prompt key name; repeat for a sequence",
+    )
     return parser
 
 

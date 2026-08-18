@@ -321,6 +321,58 @@ class EventTests(MachineLogTestCase):
         ):
             self.assertNotIn(field, entry)
 
+    def test_a_session_cost_for_a_review_carries_the_lane_it_was_reviewed_in(self):
+        result = run_cli(
+            "session-cost",
+            "--ticket", "07",
+            "--executor", "codex",
+            "--model", "gpt-5.6-sol",
+            "--lane", "codex gpt-5.6-sol",
+            "--session", "019fffeb-8a95-7543-b9f1-68e4e6c854f3",
+            "--input-tokens", "256833",
+            "--output-tokens", "37664",
+            "--cache-read-tokens", "11410432",
+            "--cache-creation-tokens", "0",
+            "--total-tokens", "11704929",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["event"], "session-cost")
+        self.assertEqual(entry["lane"], "codex gpt-5.6-sol")
+        self.assertEqual(entry["session"], "019fffeb-8a95-7543-b9f1-68e4e6c854f3")
+        self.assertEqual(entry["total_tokens"], 11704929)
+
+    def test_a_session_cost_without_a_lane_is_still_the_implementing_child_it_was(self):
+        """The lane is optional, so every row written before it existed keeps its meaning."""
+        result = run_cli(
+            "session-cost", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-opus-4-6-20260401",
+            "--input-tokens", "1", "--output-tokens", "2", "--cache-read-tokens", "3",
+            "--cache-creation-tokens", "4", "--total-tokens", "10",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("lane", self.only_line())
+
+    def test_a_review_whose_rollout_could_not_be_read_carries_lane_and_diagnosis(self):
+        result = run_cli(
+            "session-cost", "--ticket", "07", "--executor", "codex",
+            "--model", "gpt-5.6-sol", "--lane", "codex gpt-5.6-sol",
+            "--detail", "no rollout under /run/codex/sessions ends in thread-7",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["lane"], "codex gpt-5.6-sol")
+        self.assertEqual(
+            entry["detail"], "no rollout under /run/codex/sessions ends in thread-7"
+        )
+        self.assertNotIn("total_tokens", entry)
+
     def session_cost(self, *args):
         return run_cli(
             "session-cost", "--ticket", "07", "--executor", "claude",
