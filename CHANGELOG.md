@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-18
+
 ### Added
 - A `session-cost` line for every review, written by the bridge that ran it, so
   the run's own log can grade the review lane rather than leaving it a blind
