@@ -49,6 +49,31 @@ and this project uses [Semantic Versioning](https://semver.org/).
   settled parked. A `CREW COMPLETE` that arrives for a parked ticket takes the
   ordinary verify path, and the landable receipt it earns supersedes the parked
   one (#92).
+- A run abandoned before its own ending no longer leaves its hook in the repo's
+  settings and its landed worktrees on disk for ever. Only a run that reaches
+  `finish()` cleans up after itself, so an unresumed judgment-needed pause left a
+  `PostToolUse/SendMessage` hook spawning a python interpreter on every message
+  sent in that repo — one was found still firing for a run dead since Aug 15 —
+  and 36 MB of already-merged worktrees sitting where the epilogue would have
+  cleared them. A `start` now sweeps that repo before it does anything else:
+  every crew hook in the repo's settings whose run names no live coordinator is
+  uninstalled, and that dead run's landed worktrees and branches are cleared
+  through the same inventory and epilogue plan the run's own ending uses. The
+  liveness judgment is the pid the run recorded, read exactly as the pin
+  registry's own sweep reads it, and a hook is recognised by the script it runs
+  rather than by the arguments it carries, so a hook this project did not install
+  is never touched. Parked and failed children are untouched, here as everywhere
+  else — unmerged work is a human's call, and no automatic path deletes it; so
+  are the artefacts of a dead run that recorded a different repository, whose git
+  is not this driver's to edit even though the settings file is. Every problem the sweep meets is a warning on stderr and never a
+  stopped run, and the run being started or adopted is never swept (#89).
+- A wake monitor no longer outlives a driver that was killed. `disarm` covers
+  every ordinary exit, but a `kill -9` — the memory-pressure reap of
+  `docs/driver-external-kill.md` among them — left `monitor-wave.sh` looping for
+  a reader that would never read it, spawning a ~350 MB `claude agents --json`
+  every 20 seconds indefinitely. The driver now arms each monitor with its own
+  pid, and the monitor asks `kill -0` about it before every poll, leaving quietly
+  the first poll after that pid is gone (#89).
 
 ## [0.8.0] - 2026-08-18
 
