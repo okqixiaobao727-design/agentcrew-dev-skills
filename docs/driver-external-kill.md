@@ -14,7 +14,7 @@ notification with no reason and no exit code. Both of run #60's kills follow a s
 memory-pressure warning by under nine seconds, and every pressure event of the run that did *not*
 kill a task is explained by the same rule's guards.
 
-Versions and machine: Claude Code **2.1.233** (`/Users/simon/.local/share/claude/versions/2.1.233`,
+Versions and machine: Claude Code **2.1.233** (`/Users/<user>/.local/share/claude/versions/2.1.233`,
 a Bun-compiled binary), macOS on the maintainer's Mac, run #60 on 2026-08-17. Times below are UTC
 where they come from Claude Code's own records and local (UTC+12) where they come from the macOS
 unified log; both are given wherever the two are compared.
@@ -25,9 +25,9 @@ The driver runs as a Claude Code background bash task started by the coordinator
 (`skills/crew/SKILL.md:35-39`; the coordinator's session is `2c3ef71a-eb99-4ac9-932b-0e8b7f649dd6`,
 pid 82811, permission mode `bypassPermissions`). Six such tasks carried run #60 (confidence: high;
 source: the coordinator transcript
-`~/.claude/projects/-Users-simon-Documents-coding-skills-agentcrew-dev-skills/2c3ef71a-eb99-4ac9-932b-0e8b7f649dd6.jsonl`
+`~/.claude/projects/-Users-<user>-Documents-coding-skills-agentcrew-dev-skills/2c3ef71a-eb99-4ac9-932b-0e8b7f649dd6.jsonl`
 and the task output files under
-`/private/tmp/claude-501/-Users-simon-Documents-coding-skills-agentcrew-dev-skills/2c3ef71a-eb99-4ac9-932b-0e8b7f649dd6/tasks/`):
+`/private/tmp/claude-<uid>/-Users-<user>-Documents-coding-skills-agentcrew-dev-skills/2c3ef71a-eb99-4ac9-932b-0e8b7f649dd6/tasks/`):
 
 | Task | Started (UTC) | Ended (UTC) | Lifetime | How it ended |
 | --- | --- | --- | --- | --- |
@@ -208,4 +208,4 @@ Rejected alternatives, with reasons:
   operator who touches the coordinator window every half hour is immune, which would make "leave a
   keystroke" an unwritten mitigation. Not verified.
 - Whether the same reap explains any earlier unexplained silent deaths in runs before #60. Their
-  task output files under `/private/tmp/claude-501/...` are the place to look; not checked here.
+  task output files under `/private/tmp/claude-<uid>/...` are the place to look; not checked here.
