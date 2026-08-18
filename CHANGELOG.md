@@ -7,6 +7,25 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A `session-cost` line for every review, written by the bridge that ran it, so
+  the run's own log can grade the review lane rather than leaving it a blind
+  spot. The event gained an optional `lane` field carrying the reviewing vendor
+  and its model; a row without one is an implementing child's, as every row
+  written until now was. The Claude lane takes its four counters from the
+  headless result it already parses, summed over the review's rounds; the Codex
+  lane reads the last cumulative `token_count` out of the rollout its own thread
+  id names, which covers a resumed round two in one read. Both record the model
+  the session resolved to rather than the alias asked for, and both swallow every
+  bookkeeping failure — a review is never failed by its accounting, and a harvest
+  that came up empty writes the diagnosis in place of the figures. The cost pass
+  now skips the sessions those rows name, so a Claude child reviewed on the
+  Claude lane is no longer billed for its own review. A review that ran two
+  rounds writes a second line whose figures already cover the first, so a
+  consumer takes the last line per review session rather than summing them —
+  the log is append-only and no bridge knows at the end of round one whether a
+  round two is coming (#80).
+
 ## [0.6.0] - 2026-08-17
 
 ### Added

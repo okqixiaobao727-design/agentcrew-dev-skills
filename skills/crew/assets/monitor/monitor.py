@@ -1881,13 +1881,34 @@ def no_figures(root, worktree, undetermined):
     return detail
 
 
-def child_usage(executor, worktree):
+def review_sessions(records):
+    """Every session id the run's reviews already recorded a cost for.
+
+    A review runs in a session of its own and writes its own lane-tagged `session-cost` line, so
+    its transcript is spoken for. When the review lane and the child share a vendor that
+    transcript also sits in the child's worktree, where the glob below would otherwise bill the
+    ticket for it a second time.
+    """
+    found = set()
+    for record in records:
+        if record.get("event") != "session-cost" or not record.get("lane"):
+            continue
+        for session in str(record.get("session") or "").split(SESSION_SEPARATOR):
+            if session:
+                found.add(session)
+    return found
+
+
+def child_usage(executor, worktree, reviewed=()):
     """What one child spent: its sessions, their counters, or the diagnosis in place of both.
 
     Every failure on this path is diagnosed rather than raised, and a child with one unbillable
     transcript is diagnosed whole rather than billed for the rest: a total that quietly leaves
     out what could not be read is worse than no total at all. The pass runs after the run is
     over, so what it cannot read it will never be able to read.
+
+    `reviewed` names the sessions the run's reviews are already billed under, which are skipped
+    here rather than added to the child that was reviewed.
     """
     spec, usage_of = TRANSCRIPT_READERS[executor]
     root = transcript_root(spec)
@@ -1910,6 +1931,8 @@ def child_usage(executor, worktree):
             problems.append(f"{path}: {found['problem']}")
             continue
         session = str(found["session"]) if found["session"] else path.stem
+        if session in reviewed:
+            continue
         if session in sessions:
             # Two files claiming one session are two answers to what it spent, and adding them up
             # would bill the same tokens twice.
@@ -1989,6 +2012,7 @@ def cost_rows(records):
     for record in records:
         if record.get("event") == "launch":
             launches[str(record.get("ticket"))] = record
+    reviewed = review_sessions(records)
 
     rows = []
     for ticket, launch in sorted(launches.items()):
@@ -2004,7 +2028,7 @@ def cost_rows(records):
         if not worktree:
             usage = diagnosed("the launch event names no worktree to read a transcript in")
         else:
-            usage = child_usage(executor, worktree)
+            usage = child_usage(executor, worktree, reviewed)
         rows.append({
             "ticket": ticket,
             "executor": executor,

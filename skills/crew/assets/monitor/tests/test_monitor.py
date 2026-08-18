@@ -135,6 +135,8 @@ CODEX_TOTALS = {
     "input": 1000, "output": 700, "cache_read": 4000, "cache_creation": 250, "total": 5950,
 }
 CLAUDE_SESSION = "9d1f4c2a-0000-4000-8000-000000000001"
+# A review session that ran in a child's own worktree, on the same vendor as the child itself.
+REVIEW_SESSION = "9d1f4c2a-0000-4000-8000-000000000003"
 # The session driving the run, which works in the repository rather than in any child's worktree.
 COORDINATOR_SESSION = "9d1f4c2a-0000-4000-8000-000000000002"
 CODEX_SESSION = "019ffe0e-e154-7a93-88c2-3be07fd543cd"
@@ -2397,6 +2399,34 @@ class CostTests(MonitorTestCase):
                 "total_tokens": CLAUDE_TOTALS["total"],
             }],
         )
+
+    def test_a_same_vendor_review_transcript_is_not_folded_into_the_childs_row(self):
+        """A review is its own session, already costed under its own lane-tagged row.
+
+        Reviewing a Claude child on the Claude lane leaves a second transcript in the child's
+        worktree; billing the child for it would charge the ticket twice for tokens the review
+        lane already accounts for.
+        """
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.claude_transcript("06", session=REVIEW_SESSION)
+        self.fixture.append(
+            LAUNCH_TS, "session-cost", ticket="06", executor="claude", model=MODEL,
+            lane=f"claude {MODEL}", session=REVIEW_SESSION,
+            input_tokens=CLAUDE_TOTALS["input"], output_tokens=CLAUDE_TOTALS["output"],
+            cache_read_tokens=CLAUDE_TOTALS["cache_read"],
+            cache_creation_tokens=CLAUDE_TOTALS["cache_creation"],
+            total_tokens=CLAUDE_TOTALS["total"],
+        )
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        child = [entry for entry in self.costs() if "lane" not in entry]
+        self.assertEqual(len(child), 1, child)
+        self.assertEqual(child[0]["session"], CLAUDE_SESSION)
+        self.assertEqual(child[0]["total_tokens"], CLAUDE_TOTALS["total"])
 
     def test_a_claude_transcript_with_a_subdirectory_after_the_worktree_is_measured(self):
         worktree = self.fixture.worktree("06")

@@ -250,7 +250,10 @@ containment: a cwd at or below the launch event's worktree is that worktree, whi
 sibling, or other outside path is not. Claude sessions are under `$CLAUDE_CONFIG_DIR` (default
 `~/.claude`), Codex sessions under `$CODEX_HOME` (default `~/.codex`) — the same roots the two
 executors write to, so what is measured is what ran. Every session of a worktree counts toward its
-ticket, including a replacement child's and a review's.
+ticket, including a replacement child's — except a review's, which the review bridge has already
+costed under its own lane-tagged `session-cost` line and which is skipped here by the session id
+that line names. Without that, a Claude child reviewed on the Claude lane would be billed for its
+own review as well.
 
 A child whose transcript is missing, unreadable, or silent about usage is drawn as the `--` row
 above and logged with the diagnosis in place of its figures, so an unmeasured child is visible in
