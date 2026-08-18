@@ -6,7 +6,7 @@
             or, where the feature already carries an unfinished run, adopt that one instead
     clear   inventory one recorded run, ask the operator, and remove its recorded artefacts
     resume  put that loop back where a ruling stopped it
-    answer  deliver and record one coordinator answer to a Claude child
+    answer  deliver and record one coordinator answer to a child, on its own channel
 
 The driver runs as a background task of the coordinator's own session, so it costs that session no
 turn while it works and its exit is what wakes it (ADR-0001). Two contracts follow from that and
@@ -2889,7 +2889,7 @@ def run_resume(args):
 
 
 def run_answer(args):
-    """Deliver and record one coordinator answer to a recorded Claude child."""
+    """Deliver one coordinator answer on the recorded child's own channel; returns 0."""
     run_dir = pathlib.Path(args.run_dir).resolve()
     table_path = run_dir / TABLE_NAME
     if not table_path.exists():
@@ -2904,9 +2904,13 @@ def run_answer(args):
         raise DriverError(
             f"{ticket} has no recorded child in {loop.log}", ticket=ticket, pointer=str(loop.log)
         )
-    if launch.get("executor") != CLAUDE:
+    # Text reaches either executor — `deliver` already carries it to a Codex child over the
+    # bridge — so only the keys are guarded here: they answer a tmux permission prompt, and a
+    # Codex child runs with approvals off and has no pane to type into.
+    if args.keys and launch.get("executor") != CLAUDE:
         raise DriverError(
-            f"{ticket} is not a Claude child with a tmux permission prompt",
+            f"{ticket} is not a Claude child with a tmux permission prompt: Codex children"
+            " take text answers only, so answer it with --text",
             ticket=ticket, pointer=str(loop.log),
         )
     if args.text is None and not args.keys:
@@ -2980,15 +2984,18 @@ def build_parser():
     add_loop_arguments(resume)
 
     answer = commands.add_parser(
-        "answer", help="deliver and record a coordinator answer to a Claude child"
+        "answer", help="deliver and record a coordinator answer to a child on its own channel"
     )
     answer.set_defaults(handler=run_answer)
     answer.add_argument("--run-dir", required=True, help="the recorded run directory")
     answer.add_argument("--ticket", required=True, help="the ticket whose child is being answered")
-    answer.add_argument("--text", help="literal text to type into the child pane")
+    answer.add_argument(
+        "--text", help="literal text to deliver: typed into a Claude child's pane, sent to a"
+                       " Codex child as its next turn through the bridge",
+    )
     answer.add_argument(
         "--key", dest="keys", action="append", default=[], metavar="KEY",
-        help="a permission-prompt key name; repeat for a sequence",
+        help="a permission-prompt key name; repeat for a sequence (Claude children only)",
     )
     return parser
 

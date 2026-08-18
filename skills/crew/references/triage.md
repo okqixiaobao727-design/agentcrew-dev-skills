@@ -20,11 +20,12 @@ its channel for a distilled summary; the child's files stay unopened.
 Reply to a Claude child by SendMessage to its recorded name, ending with `ts=<unix time>` —
 identical bodies are silently dropped as duplicates.
 
-A Codex child has no message channel: its answer is its next turn, delivered through the bridge.
+A Codex child has no message channel: its answer is its next turn, delivered by the driver over
+whatever transport the child was launched on, so ruling never asks you which one that is.
 
 ```bash
-python3 <crew-skill-dir>/assets/codex/codex_bridge.py send \
-  --state-file <run-dir>/codex/<NN>.json --prompt-file <answer-file>
+python3 <crew-skill-dir>/assets/driver/driver.py answer \
+  --run-dir <run-dir> --ticket <NN> --text "Use the existing retention_audit table"
 ```
 
 ## Answer a permission prompt
@@ -65,12 +66,13 @@ The accepted `--key` names are single digits `0`–`9`, `Up`, `Down`, `Left`, `R
 ## Log
 
 The ruling hook copies every Claude message you send into the machine log verbatim as you send it,
-so an ordinary ASK answer is logged by being sent. A Codex answer goes through `codex_bridge.py
-send`, which records the prompt in the same way from the state file's machine-log configuration.
-Permission answers go through `driver.py answer`: it delivers first, then reuses the coordinator
-message event shape for the ruling. A delivery failure is surfaced and writes no ruling. The driver
-builds the report from these lines, so name the effect and its exact reversal inside the ruling
-itself whenever you approve something outside the worktree.
+so an ordinary ASK answer is logged by being sent. A Codex answer goes through `driver.py answer`,
+which relays it over the bridge; the bridge records the prompt as it sends it, and the marker it
+rotates is what makes the child's next turn visible to the watch. Permission answers go through
+`driver.py answer` too: it delivers first, then reuses the coordinator message event shape for the
+ruling. A delivery failure is surfaced and writes no ruling. The driver builds the report from
+these lines, so name the effect and its exact reversal inside the ruling itself whenever you
+approve something outside the worktree.
 
 ## Park
 
