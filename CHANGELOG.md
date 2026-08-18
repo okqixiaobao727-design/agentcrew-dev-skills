@@ -7,6 +7,74 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The repo-scope `code-review-graph` MCP server launches from the installed
+  console command instead of `uvx`. The uvx shell stayed resident beside the
+  server it started, so every session paid two processes per server rather than
+  one — measured machine-wide during a live crew run: 38 shells beside 38
+  servers, 364 MB across 24 sessions, half of it pure wrapper, and every crew
+  child multiplied it by carrying its own pair. uvx also re-resolved the
+  dependency tree on each launch and built a fresh ~440 MB environment whenever
+  any transitive dependency released, ~7 GB over three weeks here. `.mcp.json`
+  now names the command and lets PATH resolve it, so no machine-specific path is
+  committed; the one-time `uv tool install code-review-graph` is documented in
+  CONTRIBUTING.md, and a machine without it degrades exactly as before — the
+  server fails to connect and agents fall back to Grep/Glob/Read as AGENTS.md
+  prescribes. The graph hooks in `.claude/settings.json` already called the
+  command this way. A guard test keeps a convenience revert from slipping back
+  in (#88).
+
+### Fixed
+- A Codex child's final word can no longer be lost on the way in, at any of the
+  three points it used to be. The receipt grammar was anchored to the start of
+  the whole message, so a child that wrote a summary and bundled its
+  `CREW COMPLETE` under it was heard as making conversation and its ticket
+  stalled its wave — and the same strictness ate asks, logging a bundled
+  `CREW ASK` as a plain message the coordinator was never woken for. The verbs
+  are now read line by line: a whole line of its own, `CREW COMPLETE` spelled
+  with a full 40-character sha, so the same words quoted inside a sentence stay
+  prose; where a message carries more than one, the last is the word it sent.
+  The driver's rule table and the machine log's own classification share that
+  one judgment, so they cannot disagree about what a child said. The Codex
+  bridge's `watch` was marker-scoped and edge-triggered, which made every turn
+  it had not started itself — a child's answer to a ruling typed into its pane —
+  invisible for the life of the session, and dropped any message whose
+  busy-to-idle edge no watch happened to straddle. It now evaluates the thread's
+  latest terminal turn whatever started it, keeping the marker for finding the
+  thread, and logs on the message differing from the one already recorded rather
+  than on the edge, which also deduplicates repeated observations. Finally, a
+  child owed a handed-over ruling is no longer nudged while it waits: the nudge
+  asked a child that had nothing to report to report something, it honestly
+  answered `CREW PARKED`, and a ticket whose question had already been answered
+  settled parked. A `CREW COMPLETE` that arrives for a parked ticket takes the
+  ordinary verify path, and the landable receipt it earns supersedes the parked
+  one (#92).
+- A run abandoned before its own ending no longer leaves its hook in the repo's
+  settings and its landed worktrees on disk for ever. Only a run that reaches
+  `finish()` cleans up after itself, so an unresumed judgment-needed pause left a
+  `PostToolUse/SendMessage` hook spawning a python interpreter on every message
+  sent in that repo — one was found still firing for a run dead since Aug 15 —
+  and 36 MB of already-merged worktrees sitting where the epilogue would have
+  cleared them. A `start` now sweeps that repo before it does anything else:
+  every crew hook in the repo's settings whose run names no live coordinator is
+  uninstalled, and that dead run's landed worktrees and branches are cleared
+  through the same inventory and epilogue plan the run's own ending uses. The
+  liveness judgment is the pid the run recorded, read exactly as the pin
+  registry's own sweep reads it, and a hook is recognised by the script it runs
+  rather than by the arguments it carries, so a hook this project did not install
+  is never touched. Parked and failed children are untouched, here as everywhere
+  else — unmerged work is a human's call, and no automatic path deletes it; so
+  are the artefacts of a dead run that recorded a different repository, whose git
+  is not this driver's to edit even though the settings file is. Every problem the sweep meets is a warning on stderr and never a
+  stopped run, and the run being started or adopted is never swept (#89).
+- A wake monitor no longer outlives a driver that was killed. `disarm` covers
+  every ordinary exit, but a `kill -9` — the memory-pressure reap of
+  `docs/driver-external-kill.md` among them — left `monitor-wave.sh` looping for
+  a reader that would never read it, spawning a ~350 MB `claude agents --json`
+  every 20 seconds indefinitely. The driver now arms each monitor with its own
+  pid, and the monitor asks `kill -0` about it before every poll, leaving quietly
+  the first poll after that pid is gone (#89).
+
 ## [0.8.0] - 2026-08-18
 
 ### Fixed

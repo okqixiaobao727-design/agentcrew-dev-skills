@@ -17,6 +17,10 @@ ESCALATION_MESSAGE="CREW ASK 18 scope — choose option A or option B.
 ts=1755060060"
 RULING_MESSAGE="Use option A; it is reversible.
 ts=1755060070"
+# What a child says on a turn the bridge never started: the operator answered in the pane, and the
+# receipt that follows is the run's only word about the work.
+TYPED_TURN_MESSAGE="Ruling applied and the work is committed.
+CREW COMPLETE $STUB_SHA"
 
 WORK=$(mktemp -d -t codex-bridge-test)
 BIN="$WORK/bin"
@@ -117,6 +121,34 @@ for argv in selected:
         f"override block must end before positionals in argv {argv!r}"
     )
 PY
+}
+
+patch_state() { # <state-file> <key=value>...
+  "$PYTHON" - "$@" <<'PYPATCH'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    state = json.load(stream)
+for assignment in sys.argv[2:]:
+    key, _, value = assignment.partition("=")
+    state[key] = None if value == "null" else value
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, ensure_ascii=False, sort_keys=True)
+PYPATCH
+}
+
+assert_log_count() { # <log> <expected>
+  "$PYTHON" - "$@" <<'PYCOUNT'
+import json
+import sys
+
+path, expected = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    records = [json.loads(line) for line in stream if line.strip()]
+assert len(records) == int(expected), records
+PYCOUNT
 }
 
 wait_for_stub_argv() { # <dir> <minimum-count>
@@ -241,6 +273,75 @@ test_resume_keeps_logging_configuration() {
   assert_log_event "$log" 0 escalation child 18 "$ESCALATION_MESSAGE" \
     && ok "resume-log: logging configuration survived resume" \
     || fail "resume-log: resumed state did not log the escalation"
+}
+
+# --- Test 19: a turn the bridge never started is watched and its message logged ---
+test_unmarked_turn_is_watched() {
+  local dir; dir=$(make_child t19 receipt)
+  local sf="$WORK/t19.state.json" out="$WORK/t19.launch.json" snap="$WORK/t19.watch.json"
+  local log="$WORK/t19.log.jsonl"
+  launch_with_options "$dir" "$sf" 21 "$out" \
+    --machine-log "$log" --ticket 21 \
+    || { fail "unmarked-turn: launch exited $?"; return; }
+  watch "$snap" "$sf" \
+    || { fail "unmarked-turn: first watch exited $? ($(cat "$snap.err"))"; return; }
+  printf '%s' "$TYPED_TURN_MESSAGE" > "$dir/stub-typed-turn"
+  watch "$WORK/t19.watch-typed.json" "$sf" \
+    || { fail "unmarked-turn: second watch exited $?"; return; }
+  [ "$(json_field "$WORK/t19.watch-typed.json" sessions 0 finalMessage)" = "$TYPED_TURN_MESSAGE" ] \
+    && ok "unmarked-turn: the typed turn's message surfaced" \
+    || fail "unmarked-turn: watch reported the marked turn instead"
+  assert_log_event "$log" 1 message child 21 "$TYPED_TURN_MESSAGE" \
+    && ok "unmarked-turn: the typed turn's message reached the log" \
+    || fail "unmarked-turn: the typed turn's message was never logged"
+}
+
+# --- Test 20: a message whose busy->idle edge was missed is logged once, and only once ---
+test_missed_edge_is_still_logged_once() {
+  local dir; dir=$(make_child t20 message)
+  local sf="$WORK/t20.state.json" out="$WORK/t20.launch.json" snap="$WORK/t20.watch.json"
+  local log="$WORK/t20.log.jsonl"
+  launch_with_options "$dir" "$sf" 22 "$out" \
+    --machine-log "$log" --ticket 22 \
+    || { fail "missed-edge: launch exited $?"; return; }
+  # The edge a watch that died between polls consumed: the turn has finished, the state already
+  # says idle, and the message it went idle carrying was never recorded.
+  sleep 1
+  patch_state "$sf" status=idle turnStatus=completed finalMessage=null \
+    || { fail "missed-edge: could not stage the missed edge"; return; }
+  watch "$snap" "$sf" || { fail "missed-edge: watch exited $? ($(cat "$snap.err"))"; return; }
+  assert_log_event "$log" 0 message child 22 "$CHILD_MESSAGE" \
+    && ok "missed-edge: the message survived the missed edge" \
+    || fail "missed-edge: no edge meant no message"
+  watch "$WORK/t20.watch-again.json" "$sf" \
+    || { fail "missed-edge: repeated watch exited $?"; return; }
+  assert_log_count "$log" 1 \
+    && ok "missed-edge: an unchanged message was not logged twice" \
+    || fail "missed-edge: the message was logged twice"
+}
+
+# --- Test 21: a finished turn nobody recorded survives the turn started on top of it ---
+test_unrecorded_turn_survives_a_later_turn() {
+  local dir; dir=$(make_child t21 message)
+  local sf="$WORK/t21.state.json" out="$WORK/t21.launch.json"
+  local log="$WORK/t21.log.jsonl"
+  launch_with_options "$dir" "$sf" 23 "$out" \
+    --machine-log "$log" --ticket 23 \
+    || { fail "unrecorded-turn: launch exited $?"; return; }
+  # The turn finishes with no watch running, and the operator types the next one before one is:
+  # the finished turn is now behind an unfinished one, and only the thread still holds it.
+  sleep 1
+  printf 'x' > "$dir/stub-typed-turn-held"
+  # The session is busy, so watch cannot come back with a snapshot; it is run to its own timeout,
+  # and what is asserted is what reached the log while it watched.
+  if "$PYTHON" "$BRIDGE" watch --interval 0.3 --timeout 3 "$sf" \
+      > "$WORK/t21.watch.json" 2> "$WORK/t21.watch.err"; then
+    fail "unrecorded-turn: watch returned while the session was busy"
+    return
+  fi
+  assert_log_event "$log" 0 message child 23 "$CHILD_MESSAGE" \
+    && ok "unrecorded-turn: the finished turn's message still reached the log" \
+    || fail "unrecorded-turn: a later turn buried the message"
 }
 
 # --- Test 11: pinned model and effort reach both Codex argv lists and state ---
@@ -478,6 +579,9 @@ test_receipt
 test_escalation_logging
 test_ruling_logging
 test_resume_keeps_logging_configuration
+test_unmarked_turn_is_watched
+test_missed_edge_is_still_logged_once
+test_unrecorded_turn_survives_a_later_turn
 test_model_effort_overrides
 test_without_model_effort_overrides
 test_resume_keeps_pinned_model_effort

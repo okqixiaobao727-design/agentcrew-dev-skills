@@ -3,29 +3,62 @@
 set -uo pipefail
 
 usage() {
-  echo "usage: monitor-wave.sh [--log <log-path>] <parked-path-file> <worktree-path>..." >&2
+  echo "usage: monitor-wave.sh [--log <log-path>] [--driver-pid <pid>]" \
+    "<parked-path-file> <worktree-path>..." >&2
 }
 
 log_file=""
 log_option_given=0
-case "${1:-}" in
-  --log)
-    if [ "$#" -lt 3 ] || [ -z "$2" ]; then
-      usage
-      exit 2
-    fi
-    log_file=$2
-    log_option_given=1
-    shift 2
-    ;;
-  --log=*)
-    log_file=${1#--log=}
-    if [ -z "$log_file" ]; then
-      usage
-      exit 2
-    fi
-    log_option_given=1
-    shift
+driver_pid=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --log)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        usage
+        exit 2
+      fi
+      log_file=$2
+      log_option_given=1
+      shift 2
+      ;;
+    --log=*)
+      log_file=${1#--log=}
+      if [ -z "$log_file" ]; then
+        usage
+        exit 2
+      fi
+      log_option_given=1
+      shift
+      ;;
+    --driver-pid)
+      if [ "$#" -lt 2 ]; then
+        usage
+        exit 2
+      fi
+      driver_pid=$2
+      shift 2
+      ;;
+    --driver-pid=*)
+      driver_pid=${1#--driver-pid=}
+      if [ -z "$driver_pid" ]; then
+        usage
+        exit 2
+      fi
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# A pid is digits or it is nothing: a `kill -0` on anything else is a question about a process
+# nobody named, and a monitor that swallowed it would poll for ever under a driver already gone.
+case "$driver_pid" in
+  "") ;;
+  *[!0-9]*)
+    usage
+    exit 2
     ;;
 esac
 
@@ -70,12 +103,30 @@ resolve() {
   printf '%s\n' "$resolved"
 }
 
+# Whether the driver that armed this monitor is gone. A wake-up is only ever read by the driver
+# that armed it, so a monitor that outlives its own — the `kill -9` case, which no `disarm` can
+# reach — is polling for a reader that will never come back. The pid is the driver's own, passed
+# in at arm time, and `kill -0` is the same liveness judgment the pin registry's sweep makes;
+# a driver is always this monitor's own user, so the permission case that judgment separates
+# cannot arise here.
+driver_gone() {
+  [ -n "$driver_pid" ] || return 1
+  kill -0 "$driver_pid" 2>/dev/null && return 1
+  return 0
+}
+
 [ -f "$parked_file" ] || : >"$parked_file"
 expected=$(for path in "$@"; do resolve "$path"; done | jq -R . | jq -s .) \
   || fail 2 "invalid worktree paths"
 previous=""
 
 while true; do
+  # Checked before the poll costs anything: the driver reads a nonzero exit as a wake-up that
+  # failed, so a monitor with nothing left to report leaves quietly and says nothing.
+  if driver_gone; then
+    exit 0
+  fi
+
   if ! snapshot=$("$claude_bin" agents --json 2>/dev/null); then
     fail 3 "claude agents --json failed"
   fi

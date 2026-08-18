@@ -78,6 +78,9 @@ run_monitor() {
   local -a paths=("$@")
   [ "${#paths[@]}" -gt 0 ] || paths=(/wave/01 /wave/02)
   local -a monitor_args=("$parked_file" "${paths[@]}")
+  if [ -n "${MONITOR_TEST_DRIVER_PID:-}" ]; then
+    monitor_args=(--driver-pid "$MONITOR_TEST_DRIVER_PID" "${monitor_args[@]}")
+  fi
   if [ -n "${MONITOR_TEST_LOG_FILE:-}" ]; then
     monitor_args=(--log "$MONITOR_TEST_LOG_FILE" "${monitor_args[@]}")
   fi
@@ -221,5 +224,39 @@ fi
 
 assert_error aliased-duplicate 'MONITOR ERROR duplicate session' \
   "$MONITOR_TEST_LINK_PATH" /wave/02
+
+# A monitor outlives its driver only when the driver was killed, and what it holds then is a
+# wake-up with no reader: the loop ends on the first poll that finds the pid gone. It ends the way
+# a monitor with nothing to report must — exit 0, because the driver reads any nonzero exit as a
+# wake-up that failed — and without claiming a child is actionable.
+sleep 0 &
+dead_driver=$!
+wait "$dead_driver"
+
+gone_parked="$test_dir/driver-gone.parked"
+gone_output="$test_dir/driver-gone.output"
+gone_exit="$test_dir/driver-gone.exit"
+: >"$gone_parked"
+MONITOR_TEST_DRIVER_PID="$dead_driver" \
+  run_monitor all-busy "$gone_parked" "$gone_output" "$gone_exit"
+if [ "$(cat "$gone_exit")" -ne 0 ] || grep -q '^MONITOR ACTIONABLE$' "$gone_output"; then
+  printf 'FAIL monitor did not exit with its dead driver\n' >&2
+  sed -n '1,20p' "$gone_output" >&2
+  exit 1
+fi
+
+# The same wave under a driver that is very much alive stays armed, so the check answers the pid
+# it was given rather than ending every monitor that carries one.
+live_parked="$test_dir/driver-live.parked"
+live_output="$test_dir/driver-live.output"
+live_exit="$test_dir/driver-live.exit"
+: >"$live_parked"
+MONITOR_TEST_DRIVER_PID="$$" \
+  run_monitor all-busy "$live_parked" "$live_output" "$live_exit"
+if [ "$(cat "$live_exit")" -lt 128 ] || grep -q '^MONITOR ACTIONABLE$' "$live_output"; then
+  printf 'FAIL monitor under a live driver did not remain armed\n' >&2
+  sed -n '1,20p' "$live_output" >&2
+  exit 1
+fi
 
 printf 'MONITOR_WAKE_TESTS_OK\n'

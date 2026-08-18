@@ -263,11 +263,21 @@ The event name comes from the message the sender wrote, so the log reads the way
 | Message | `event` |
 | --- | --- |
 | anything sent by the coordinator | `ruling` |
-| sent by a child, beginning `CREW ASK` | `escalation` |
+| sent by a child whose last verb line is a `CREW ASK` | `escalation` |
 | anything else sent by a child | `message` |
 
 Only a child escalates — the coordinator is the top of the ladder — so the verb is read on the
 child side alone.
+
+The verbs are read line by line rather than off the opening of the message, because a child
+composes its final turn freely and bundles the verb under the summary it wrote first as readily
+as it sends the line bare. A verb counts when it is a whole line of its own — `CREW ASK`,
+`CREW PARKED` and `CREW FAILED` followed by their argument, `CREW COMPLETE` followed by a full
+40-character sha and an optional `ts=` stamp — so the same words quoted inside a sentence are
+prose, as they are in the instructions that taught them. Where a message carries more than one,
+the last one is the word it sent: a final turn speaks once, and a child that withdrew an ask and
+finished anyway has said the thing it ended on. The driver's rule table reads a child's word
+through the same judgment, so the log and the run can never disagree about what was said.
 
 A child's own `CREW COMPLETE` is a claim about a sha, not a verified receipt, so it is copied in
 as a `message`. Only the script that checked the sha writes a `receipt`, and the log therefore

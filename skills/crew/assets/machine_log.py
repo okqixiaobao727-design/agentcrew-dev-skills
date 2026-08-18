@@ -28,6 +28,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import shlex
 import sys
 import tempfile
@@ -53,11 +54,32 @@ SETTINGS_DIRECTORY = ".claude"
 COORDINATOR = "coordinator"
 CHILD = "child"
 
-# The one verb the hook reads off a message: an escalation announces itself, and it is the only
-# thing a child sends that the coordinator must answer. A receipt is deliberately not read here —
-# a child's own `CREW COMPLETE` is a claim, and only the verifying script's `receipt` event says
-# whether it held, so the two must never share an event name in the log.
+# The four verbs a child speaks, and the grammar that reads them off a message body. The hook
+# classifies on one of them — an escalation announces itself, and it is the only thing a child
+# sends that the coordinator must answer — while the driver rules on the other three; both read
+# the body through `final_verb` so the log and the rule table can never disagree about what a
+# child said. A receipt is deliberately not an event name of its own here — a child's own
+# `CREW COMPLETE` is a claim, and only the verifying script's `receipt` event says whether it
+# held, so the two must never share an event name in the log.
 ESCALATION_VERB = "CREW ASK"
+COMPLETE_VERB = "CREW COMPLETE"
+PARKED_VERB = "CREW PARKED"
+FAILED_VERB = "CREW FAILED"
+
+# The optional stamp every message a child sends ends on, which is deduplication for the message
+# bus rather than part of what the verb says.
+TIMESTAMP_SUFFIX = r"(?: ts=\d+)?"
+# Anchored to a whole line, because a child composes its final turn freely: the receipt is as
+# often bundled under a summary as sent bare, and only a whole-line match tells the verb apart
+# from the same words quoted out of the instructions that taught them. `CREW COMPLETE` carries a
+# full 40-character sha for the same reason — the one verb whose argument has a shape, spelled in
+# full so prose about a receipt cannot pass for one.
+VERB_GRAMMAR = (
+    (COMPLETE_VERB, re.compile(rf"{COMPLETE_VERB} [0-9a-fA-F]{{40}}{TIMESTAMP_SUFFIX}")),
+    (PARKED_VERB, re.compile(rf"{PARKED_VERB} \S.*")),
+    (FAILED_VERB, re.compile(rf"{FAILED_VERB} \S.*")),
+    (ESCALATION_VERB, re.compile(rf"{ESCALATION_VERB} \S.*")),
+)
 
 # The closed sets. A log that accepts an unknown verdict is a log a later agent cannot trust.
 VERDICTS = ("landable", "parked", "failed")
@@ -121,6 +143,28 @@ def append(path, record):
         os.close(descriptor)
 
 
+def final_verb(message):
+    """The last verb line of `message` as `(verb, line)`, or `(None, None)` where it speaks none.
+
+    The last one, because a final turn speaks once: a child that withdrew an ask and finished
+    anyway has said the thing it ended on, and reading the first verb instead would settle it on
+    a word it had already taken back.
+    """
+    if not isinstance(message, str):
+        return None, None
+    for line in reversed(message.split("\n")):
+        # Trailing padding only. Indentation is the way a quoted example is set apart from the
+        # prose around it, so a line that starts anywhere but the margin is being shown rather
+        # than spoken; nothing is quoted by padding its end, and refusing a padded line — a
+        # stray space, a `\r` off a CRLF sender — would cost a receipt for a difference nobody
+        # can see.
+        line = line.rstrip()
+        for verb, pattern in VERB_GRAMMAR:
+            if pattern.fullmatch(line):
+                return verb, line
+    return None, None
+
+
 def message_event(message, role):
     """The event name for an outgoing message: what the role sends, or a child's escalation.
 
@@ -129,7 +173,7 @@ def message_event(message, role):
     """
     if role == COORDINATOR:
         return "ruling"
-    if isinstance(message, str) and message.lstrip().startswith(ESCALATION_VERB):
+    if final_verb(message)[0] == ESCALATION_VERB:
         return "escalation"
     return "message"
 

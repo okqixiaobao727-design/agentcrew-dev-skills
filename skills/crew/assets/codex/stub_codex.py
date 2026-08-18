@@ -19,6 +19,12 @@ The scenario is read from `.codex-stub-scenario` in the working directory
     no-server    the app-server exits without creating its socket
 
 Follow-up turns started via turn/start always complete with a receipt.
+
+A file named `stub-typed-turn` in the working directory is the turn nobody sent through the
+bridge: the operator typing into the TUI pane. Its contents become the agent's final message on
+a turn carrying no bridge marker, which is what a session answering a hand-delivered ruling looks
+like from the outside. `stub-typed-turn-held` is the same turn still being worked: it never
+completes, so the thread holds a finished turn behind an unfinished one.
 """
 
 import asyncio
@@ -74,6 +80,23 @@ class StubThread:
         )
         return len(self.turns) - 1
 
+    def absorb_typed_turn(self):
+        """Take up a turn typed into the pane, once, if a scenario file has left one there."""
+        if any(turn["kind"] == "typed" for turn in self.turns):
+            return
+        for name, held in (("stub-typed-turn", False), ("stub-typed-turn-held", True)):
+            typed = pathlib.Path(name)
+            if not typed.is_file():
+                continue
+            self.turns.append({
+                "kind": "typed",
+                "text": "a ruling typed straight into the pane",
+                "answer": typed.read_text(encoding="utf-8"),
+                "held": held,
+                "created": time.monotonic(),
+            })
+            return
+
     def render_turn(self, index, active_scenario):
         turn = self.turns[index]
         elapsed = time.monotonic() - turn["created"]
@@ -91,6 +114,9 @@ class StubThread:
         elif elapsed >= TURN_DELAY_SECONDS:
             if turn["kind"] == "first":
                 status, message = first_turn_result(active_scenario)
+            elif turn["kind"] == "typed":
+                if not turn["held"]:
+                    status, message = "completed", turn["answer"]
             else:
                 status, message = "completed", receipt_message()
         if status == "completed" and message:
@@ -121,6 +147,8 @@ class StubServer:
             self.thread = StubThread(
                 self.prompt_file.read_text(encoding="utf-8")
             )
+        if self.thread is not None:
+            self.thread.absorb_typed_turn()
 
     def handle(self, method, params):
         self.ensure_thread()
