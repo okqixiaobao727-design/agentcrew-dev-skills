@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-18
+
 ### Fixed
 - The pinned dashboard's statusline tick no longer spawns a CLI per pane per
   tick. It read its Claude lane by running `claude agents --json`, a complete
