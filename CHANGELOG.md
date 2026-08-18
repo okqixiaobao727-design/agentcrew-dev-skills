@@ -25,6 +25,44 @@ and this project uses [Semantic Versioning](https://semver.org/).
   consumer takes the last line per review session rather than summing them —
   the log is append-only and no bridge knows at the end of round one whether a
   round two is coming (#80).
+- A driver `answer` subcommand, so a coordinator's reply to a child's terminal
+  permission prompt cannot be delivered without being recorded. The command
+  takes the run directory and the ticket, plus `--text` for literal typing and
+  `--key` for the narrow set of tmux keys a numbered menu needs (digits, arrows,
+  Enter, Shift-Enter), and it reuses the driver's own deliver-then-record pair:
+  the pane is typed into first and the coordinator ruling is written to the
+  machine log only once delivery succeeded, so the log never claims an answer
+  the child did not receive. Multi-line text types line by line with Shift-Enter
+  between lines and one Enter at the end, and the recorded ruling carries what
+  was actually sent. A ticket with no recorded child, or a Codex child — which
+  is reached through its bridge, not through keys — is refused rather than
+  answered. The triage reference now mandates the subcommand; its raw
+  `tmux send-keys` recipe and the paragraph asking the coordinator to please
+  also send the ruling as a message are both gone, so no honour-system logging
+  path is left documented (#77).
+- A machine-level dashboard surface preference, recorded by `pin-install` at the
+  moment the operator opts into the pin and removed again by `pin-uninstall`, so
+  the surface is chosen once per machine rather than once per project. It lives
+  beside the pin registry under the operator's Claude config, and the monitor's
+  existing surface-reading function now resolves three levels in order: the
+  project's explicit `[dashboard] surface`, else the machine preference, else the
+  shipped `window` default. A preference that is missing, unreadable, or carries
+  a value outside the surface vocabulary is treated as absent, so a damaged file
+  can never stop a run — and anyone who never ran `pin-install` sees exactly the
+  behaviour they had before (#81).
+
+### Changed
+- `docs/glossary.md` is now the single home for the project's vocabulary. It
+  absorbed every term from `CONTEXT.md`'s Language section into its existing six
+  sections, carrying each term's _Avoid_ annotation and merging rather than
+  duplicating the terms both documents defined, and `CONTEXT.md`'s section
+  shrank to a one-line pointer — so every agent's per-run context load drops
+  while the vocabulary stays reachable and a future term can no longer land in
+  one document and miss the other. The glossary also gained **stopped**, the
+  fifth `advance` decision shipped in v0.5.0, defined against the two terms it
+  exists to be distinguished from: `escalated` (a halted wave awaiting a ruling)
+  and `interrupted` (the operator stopped the run). Every existing link into the
+  glossary is unchanged (#68).
 
 ## [0.6.0] - 2026-08-17
 
