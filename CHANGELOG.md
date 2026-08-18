@@ -24,6 +24,32 @@ and this project uses [Semantic Versioning](https://semver.org/).
   command this way. A guard test keeps a convenience revert from slipping back
   in (#88).
 
+### Fixed
+- A Codex child's final word can no longer be lost on the way in, at any of the
+  three points it used to be. The receipt grammar was anchored to the start of
+  the whole message, so a child that wrote a summary and bundled its
+  `CREW COMPLETE` under it was heard as making conversation and its ticket
+  stalled its wave — and the same strictness ate asks, logging a bundled
+  `CREW ASK` as a plain message the coordinator was never woken for. The verbs
+  are now read line by line: a whole line of its own, `CREW COMPLETE` spelled
+  with a full 40-character sha, so the same words quoted inside a sentence stay
+  prose; where a message carries more than one, the last is the word it sent.
+  The driver's rule table and the machine log's own classification share that
+  one judgment, so they cannot disagree about what a child said. The Codex
+  bridge's `watch` was marker-scoped and edge-triggered, which made every turn
+  it had not started itself — a child's answer to a ruling typed into its pane —
+  invisible for the life of the session, and dropped any message whose
+  busy-to-idle edge no watch happened to straddle. It now evaluates the thread's
+  latest terminal turn whatever started it, keeping the marker for finding the
+  thread, and logs on the message differing from the one already recorded rather
+  than on the edge, which also deduplicates repeated observations. Finally, a
+  child owed a handed-over ruling is no longer nudged while it waits: the nudge
+  asked a child that had nothing to report to report something, it honestly
+  answered `CREW PARKED`, and a ticket whose question had already been answered
+  settled parked. A `CREW COMPLETE` that arrives for a parked ticket takes the
+  ordinary verify path, and the landable receipt it earns supersedes the parked
+  one (#92).
+
 ## [0.8.0] - 2026-08-18
 
 ### Fixed

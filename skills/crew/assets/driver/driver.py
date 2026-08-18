@@ -60,9 +60,10 @@ interruption, a driver crash or a coordinator restart costs.
 report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
 and, where it holds, settled in silence; an invalid receipt earns one re-ask and settles failed on
 the second; parked and failed receipts are recorded by the driver rather than by hand; an idle
-child earns one nudge and settles failed on the second silence; a vanished child settles failed; a
-settled wave is advanced, which lands its branches, hands a mechanical conflict to the
-budget-capped repair rung and launches the next wave; a semantic conflict is answered first by a
+child earns one nudge and settles failed on the second silence, unless it is idle because it is
+owed a ruling nothing has answered yet; a vanished child settles failed; a settled wave is
+advanced, which lands its branches, hands a mechanical conflict to the budget-capped repair rung
+and launches the next wave; a semantic conflict is answered first by a
 templated instruction to the child that has to resolve it; a merged ticket is closed in the run's
 tracker with its exact undo written into the log; and each wave's monitors are re-armed without a
 coordinator turn.
@@ -210,15 +211,17 @@ CLAUDE = "claude"
 
 # --- the rule table's own vocabulary ------------------------------------------------------------
 
-# What a child says, in the grammar its first turn gave it. Only the three settling verbs are read
-# here; `CREW ASK` is read by the log's own writer, which is why an escalation arrives as its own
-# event rather than as a message this has to recognise.
+# What a child says, in the grammar its first turn gave it. The grammar itself belongs to the
+# log's own writer — `machine_log.final_verb` reads a body line by line and answers with the verb
+# it ended on — so the rule table and the log can never disagree about what a child said. Only
+# the three settling verbs are ruled on here; `CREW ASK` is the fourth the same reader knows, and
+# it arrives as its own event rather than as a message this has to recognise.
 CHILD_ROLE = "child"
 COORDINATOR_ROLE = "coordinator"
 
-COMPLETE_VERB = "CREW COMPLETE"
-PARKED_VERB = "CREW PARKED"
-FAILED_VERB = "CREW FAILED"
+COMPLETE_VERB = machine_log.COMPLETE_VERB
+PARKED_VERB = machine_log.PARKED_VERB
+FAILED_VERB = machine_log.FAILED_VERB
 
 # What the driver says back. Each opens with its own marker, because the marker is how the loop
 # reads its own history out of the log: a rung that has already fired for a ticket is a ruling of
@@ -1745,6 +1748,32 @@ def awaiting_receipt(records, launches):
     return waiting
 
 
+def awaiting_a_ruling(records, launches):
+    """Every ticket whose handed-over escalation nothing has answered yet.
+
+    The handed-over line is the log's record that a child asked and the run stepped aside. Two
+    things end that wait and both are in the log: the coordinator's own answer, which `answer`
+    records as the ruling it delivered, and the child speaking again, which it does once it has
+    been answered by any channel at all. Until one of them lands, the child is idle because it is
+    waiting — and that is not a silence any rung of the table should read as one.
+    """
+    waiting = set()
+    for record in records:
+        ticket = record_ticket(record, launches)
+        if ticket is None:
+            continue
+        event = record.get("event")
+        message = record.get("message")
+        if event == "ruling" and isinstance(message, str):
+            if message.lstrip().startswith(HANDED_OVER_MARKER):
+                waiting.add(ticket)
+            else:
+                waiting.discard(ticket)
+        elif event in ("message", "escalation") and record.get("role") == CHILD_ROLE:
+            waiting.discard(ticket)
+    return waiting
+
+
 def current_wave(records):
     """The wave the run is working, as the log's own advance decisions leave it."""
     wave = 1
@@ -2260,19 +2289,26 @@ class Loop:
         return acted
 
     def rule_on_receipt(self, ticket, launch, message, records):
-        """Settle one child's final word; returns whether it settled anything."""
-        body = message.lstrip()
-        if body.startswith(PARKED_VERB):
-            self.park(ticket, launch, body)
+        """Settle one child's final word; returns whether it settled anything.
+
+        The word is the last verb line of the body rather than its opening: a child bundles its
+        receipt under the summary it wrote first as readily as it sends the line bare, and a run
+        that read only the opening left a finished ticket stalling its wave.
+        """
+        verb, line = machine_log.final_verb(message)
+        if verb == PARKED_VERB:
+            self.park(ticket, launch, line)
             return True
-        if body.startswith(FAILED_VERB):
-            self.settle(ticket, FAILED, body)
+        if verb == FAILED_VERB:
+            self.settle(ticket, FAILED, line)
             return True
-        if body.startswith(COMPLETE_VERB):
-            self.rule_on_completion(ticket, launch, body, records)
+        if verb == COMPLETE_VERB:
+            self.rule_on_completion(ticket, launch, line, records)
             return True
         # Anything else a child says is conversation, not a verdict: the run reads the grammar its
-        # first turn gave it and leaves everything outside it alone.
+        # first turn gave it and leaves everything outside it alone. A claim spelled outside that
+        # grammar — a short sha, a verb buried mid-line — is conversation too, and the idle rung
+        # below is what asks such a child for the receipt it thinks it sent.
         return False
 
     def park(self, ticket, launch, message):
@@ -2352,8 +2388,16 @@ class Loop:
         return acted
 
     def rule_on_idle(self, ticket, launch, records):
-        """One nudge for an idle child with no receipt; a second silence settles it failed."""
+        """One nudge for an idle child with no receipt; a second silence settles it failed.
+
+        Nothing is asked of a child still owed a ruling. It is idle because it asked a question
+        and is waiting for the answer, and a nudge there asks a child with nothing to report to
+        report something — which it honestly answers `CREW PARKED`, settling a ticket whose
+        question the coordinator had already answered.
+        """
         launches = launch_records(records)
+        if ticket in awaiting_a_ruling(records, launches):
+            return False
         if instructions_sent(records, launches, ticket, NUDGE_MARKER):
             self.settle(ticket, FAILED, "a nudged child went idle again with no receipt sent")
             return True

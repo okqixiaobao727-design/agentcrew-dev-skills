@@ -40,6 +40,14 @@ ESCALATION = (
     "one line per event; option A treats them as the same claim (mine), option B splits\n"
     "multi-line messages across lines. ts=1755060042"
 )
+# The same escalation as a child that talks before it asks sends it: a summary first, the verb
+# on its own line after it. A final turn is composed freely, so this shape is as ordinary as the
+# bare one and the log must classify the two alike.
+BUNDLED_ESCALATION = (
+    "I read both documents through and they do not agree about the log's shape.\n"
+    "\n" + ESCALATION
+)
+SHA = "b614ec84712aa8c351fe30ec69000e2e12518aeb"
 
 
 def run_cli(*args, log=None):
@@ -610,6 +618,58 @@ class HookTests(MachineLogTestCase):
         self.assertEqual(entry["ticket"], "07")
         self.assertEqual(entry["to"], "agentcrew-dev-skills-1f")
         self.assertEqual(entry["message"], ESCALATION)
+
+    def test_an_escalation_bundled_after_a_summary_is_still_an_escalation(self):
+        """A child that explains itself first has still asked, and the log must say so."""
+        result = run_hook(
+            send_message_event(BUNDLED_ESCALATION, to="agentcrew-dev-skills-1f"),
+            log=self.log, role="child", ticket="07",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        entry = self.only_line()
+        self.assertEqual(entry["event"], "escalation")
+        self.assertEqual(entry["message"], BUNDLED_ESCALATION)
+
+    def test_a_verb_quoted_inside_a_line_is_not_read_as_one(self):
+        """The verbs are anchored to a whole line, so prose that names one has not spoken it."""
+        quoted = (
+            "My first turn says to send CREW ASK 07 stuck when I am blocked. I am not blocked."
+        )
+
+        run_hook(send_message_event(quoted), log=self.log, role="child", ticket="07")
+
+        self.assertEqual(self.only_line()["event"], "message")
+
+    def test_an_indented_verb_line_is_quoting_rather_than_speaking(self):
+        """A whole line means the whole line: a quoted example is set in from the margin."""
+        quoted = (
+            "My first turn tells me to send this when I am blocked:\n"
+            "\n"
+            "    CREW ASK 07 stuck — question, options, pointers ts=1755060042\n"
+            "\n"
+            "I am not blocked, so I have not sent it."
+        )
+
+        run_hook(send_message_event(quoted), log=self.log, role="child", ticket="07")
+
+        self.assertEqual(self.only_line()["event"], "message")
+
+    def test_the_last_verb_line_of_a_message_is_the_one_it_is_classified_by(self):
+        """A final turn speaks once: whichever verb it ends on is the word it sent."""
+        cases = (
+            (f"CREW ASK 07 stuck — the fixture never came up.\nIt came up.\n"
+             f"CREW COMPLETE {SHA}", "message"),
+            (f"CREW COMPLETE {SHA}\nThat receipt was premature, the review is not back.\n"
+             "CREW ASK 07 stuck — should I hold the receipt back? ts=1755060042", "escalation"),
+        )
+
+        for message, _event in cases:
+            run_hook(send_message_event(message), log=self.log, role="child", ticket="07")
+
+        self.assertEqual(
+            [entry["event"] for entry in self.lines()], [event for _message, event in cases]
+        )
 
     def test_a_childs_own_receipt_claim_never_takes_the_verified_receipts_name(self):
         """`receipt` belongs to the script that checked the sha; a claim is only a message."""

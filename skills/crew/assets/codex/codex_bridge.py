@@ -12,6 +12,13 @@ orchestrator talks to the session through this CLI:
     stop    kill a session's window and runtime
 
 Each command prints one JSON object on stdout. Exit 0 on success, 1 on error.
+
+`watch` reads the thread's latest finished turn rather than the turn `send` started: a
+coordinator answers in the pane as readily as through this CLI, and a turn that carries no marker
+of ours is still the session speaking. The marker keeps its one job, which is finding the thread.
+What is copied to the machine log is keyed on the message rather than on the busy-to-idle edge
+that carried it, because an edge is seen only by the watch that happens to be polling either side
+of it, and one missed edge used to drop a child's last word for good.
 """
 
 import argparse
@@ -236,21 +243,20 @@ async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
     raise BridgeError(f"Timed out connecting to Codex app-server: {suffix}")
 
 
-def user_message_text(item):
-    if item.get("type") != "userMessage":
-        return ""
-    parts = []
-    for content in item.get("content") or []:
-        if content.get("type") == "text":
-            parts.append(content.get("text", ""))
-    return "\n".join(parts)
+def latest_terminal_turn(thread):
+    """The last turn of `thread` that has finished, whatever started it, or None where none has.
 
+    Whatever started it, because a session answers rulings that never came through `send`: a
+    coordinator types into the pane, and the turn that follows carries no marker of ours. Reading
+    only the marked turn made every such answer invisible for as long as the session lived.
 
-def find_marker_turn(thread, marker):
-    for turn in thread.get("turns") or []:
-        for item in turn.get("items") or []:
-            if marker in user_message_text(item):
-                return turn
+    The last *finished* one rather than the last one, because a turn can be started on top of a
+    turn whose message nobody has read yet — the session finishes, the operator types the next
+    thing before a watch polls — and the message under it is only ever in the thread.
+    """
+    for turn in reversed(thread.get("turns") or []):
+        if turn.get("status") in TERMINAL_TURN_STATUSES:
+            return turn
     return None
 
 
@@ -611,7 +617,9 @@ async def cmd_send(args):
     state["marker"] = marker
     state["status"] = "busy"
     state["turnStatus"] = None
-    state["finalMessage"] = None
+    # The recorded message is left standing rather than cleared: it is the message this turn is
+    # answering, it has already been copied to the log, and forgetting it here would have the
+    # next watch read the same turn out of the thread and copy it in a second time.
     state["updatedAt"] = time.time()
     write_json_atomic(args.state_file, state)
     print(
@@ -636,12 +644,14 @@ async def evaluate_session(state):
     finally:
         await client.__aexit__(None, None, None)
     thread = result.get("thread") or {}
-    turn = find_marker_turn(thread, state["marker"])
-    if turn is None:
-        return "busy", None, None
-    if turn.get("status") in TERMINAL_TURN_STATUSES:
-        return "idle", turn.get("status"), final_agent_message(turn)
-    return "busy", None, None
+    turns = thread.get("turns") or []
+    turn = latest_terminal_turn(thread)
+    message = final_agent_message(turn) if turn is not None else None
+    # The session is what its last turn is doing; the message is the last thing it said, which is
+    # a turn or more behind that whenever something was started on top of it.
+    if turn is not None and turns[-1] is turn:
+        return "idle", turn.get("status"), message
+    return "busy", None, message
 
 
 async def cmd_watch(args):
@@ -658,7 +668,6 @@ async def cmd_watch(args):
         actionable = False
         for path in state_files:
             state = read_state(path)
-            previous_status = state.get("status")
             try:
                 status, turn_status, message = await evaluate_session(state)
                 failures[path] = 0
@@ -670,12 +679,28 @@ async def cmd_watch(args):
                         f"is alive: {error}"
                     ) from error
                 status, turn_status, message = "busy", None, None
-            if status != state.get("status") or turn_status != state.get("turnStatus"):
-                if previous_status == "busy" and status == "idle" and message:
-                    log_message(state, "child", message)
+            # Keyed on what the session said rather than on the edge it said it across. An edge
+            # is seen once and only by the watch that happened to be polling either side of it:
+            # a watch that started after one, or died across it, dropped the message for good.
+            # The message itself keeps — the thread holds it for as long as the session lives,
+            # and the state file holds the last one copied to the log — so a message differing
+            # from the recorded one is a message to log, and an identical one is the same
+            # observation read a second time.
+            recorded = state.get("finalMessage")
+            if message and message != recorded:
+                log_message(state, "child", message)
+            # A recorded message stands until another replaces it. `busy` carries none, and a
+            # busy that is really a transport failure retried carries none either; forgetting the
+            # last message there would log it again when the same turn is read next poll.
+            kept = message or recorded
+            if (
+                status != state.get("status")
+                or turn_status != state.get("turnStatus")
+                or kept != recorded
+            ):
                 state["status"] = status
                 state["turnStatus"] = turn_status
-                state["finalMessage"] = message
+                state["finalMessage"] = kept
                 state["updatedAt"] = time.time()
                 write_json_atomic(path, state)
             row = {
