@@ -33,6 +33,10 @@ The wave table is one JSON object:
         "crew_skill_dir":          absolute path to the installed crew skill
         "tmux_session":            the session every child's window is created in
         "permission_mode":         the mode children launch under
+        "coordinator_config_home": the coordinator's own Claude configuration home, which is the
+                                   account a ticket naming none runs on
+        "declared_accounts":       the account names the project config declares, [] where it
+                                   declares none — diagnosis only, never a path
         "launch_hook":             optional {"command": str, "env": {name: value}}
         "codex":                   {"bridge": path, "state_dir": path} — required by a codex ticket
       },
@@ -40,6 +44,10 @@ The wave table is one JSON object:
         "id": "06", "title": str, "path": absolute ticket path,
         "workflow": one of the shapes, "executor": "claude" | "codex",
         "model": full model ID, "effort": str,
+        "account": absolute path to the Claude Code profile directory this ticket's processes
+                   run under — on every row and never absent, resolved from the ticket's own
+                   `Account` name or from the run's coordinator_config_home where it named
+                   none (ADR-0014),
         "review": {"vendor", "model", "effort"} — on `tdd` and `refactor` only,
         "slug": optional, defaulting to the ticket file's name after its number,
         "base_commit": optional, defaulting to `--base-commit` or the run's base commit,

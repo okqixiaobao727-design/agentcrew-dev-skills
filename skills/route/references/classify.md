@@ -72,6 +72,7 @@ Workflow: <tdd|refactor|direct|spike|ops|acceptance>
 Executor: <the implementer cell's executor>
 Model: <the implementer cell's model, a full model ID>
 Effort: <the implementer cell's effort>
+Account: <the account the user named, where they named one>
 Review: <the reviewer cell's executor, model, and effort, space-separated>
 Reasons: <the one-sentence reason from the approved table>
 ```
@@ -82,6 +83,14 @@ alias written here reaches the launch command as an alias, where plan mode mis-r
 The `Review` line goes in on a `tdd` or `refactor` ticket and is left out on the other four, whose
 routing is five lines rather than six. It is the ticket's last section, and a ticket carries exactly
 one.
+
+The `Account` line is the second line an approved entry may leave out, and the one value here that
+is *recorded* rather than concluded: no dimension of the classification proposes it and no cell of
+the config carries it — it is the user's answer at the approval checkpoint to which subscription
+pays for this ticket. A ticket without the line runs on the coordinator's own account, which is
+every ticket of a single-account project, so the line appears only where the user asked for it. The
+name has to be one the machine's account registry holds and one this repo's `agentcrew.toml`
+declares where it declares any, or the run stops in preflight naming which of the two is missing.
 
 The role string follows the workflow: an `acceptance` ticket is marked `ready-for-human`, every
 other ticket `ready-for-agent`.

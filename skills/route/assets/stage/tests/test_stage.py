@@ -81,6 +81,10 @@ ACCEPTANCE = {
     "effort": "medium",
     "reasons": "a human finishes it.",
 }
+# The account an approved entry may name: the one `## Routing` value `/route` records rather than
+# concludes, and the one this machine's registry has to hold before a run may start.
+ACCOUNT = "second"
+
 AGENT_ROLE = "ready-for-agent"
 HUMAN_ROLE = "ready-for-human"
 
@@ -125,6 +129,10 @@ class Fixture:
 
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
+        # The machine's account registry, moved off the real home by the override staging reads it
+        # through. Nothing is written here until a test registers an account, which is the machine
+        # of an operator who has never asked for a second one.
+        self.registry = self.root / "accounts.toml"
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         self._link_stub("gh", "stub_gh.py")
@@ -219,7 +227,20 @@ class Fixture:
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
+        environment["AGENTCREW_ACCOUNT_REGISTRY"] = str(self.registry)
         return environment
+
+    def register(self, **accounts):
+        """Write the machine-level registry mapping each account name to a profile directory."""
+        lines = ["[accounts]"]
+        for name, directory in accounts.items():
+            pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
+            lines.append(f'{name} = "{directory}"')
+        self.registry.write_text("\n".join(lines) + "\n")
+
+    def profile(self, name):
+        """A Claude Code profile directory on this fixture's machine."""
+        return self.root / "profiles" / name
 
     def stage(self, *arguments):
         return subprocess.run(
@@ -442,6 +463,31 @@ class StagingTests(unittest.TestCase):
         self.assertIn(APPROVED_SECTION, self.fixture.tracker_body("61"))
         self.assertEqual(parsed(self.fixture.run_dir())["tickets"][0]["effort"],
                          APPROVED["effort"])
+
+    def test_an_approved_account_reaches_the_ticket_and_the_drivers_own_parsing(self):
+        self.fixture.register(second=self.fixture.profile("second"))
+        approved = dict(APPROVED, account=ACCOUNT)
+        result = self.stage_two_approved({"61": approved, "62": approved})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for number in ("61", "62"):
+            self.assertIn(f"Account: {ACCOUNT}", self.fixture.tracker_body(number))
+        self.assertEqual(
+            [ticket["account"] for ticket in parsed(self.fixture.run_dir())["tickets"]],
+            [ACCOUNT, ACCOUNT],
+        )
+
+    def test_an_approved_entry_naming_no_account_writes_the_section_it_always_wrote(self):
+        result = self.stage_two_approved()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Account:", self.fixture.tracker_body("61"))
+        self.assertNotIn("account", parsed(self.fixture.run_dir())["tickets"][0])
+
+    def test_an_account_this_machine_has_not_registered_is_a_named_blocking_item(self):
+        approved = dict(APPROVED, account=ACCOUNT)
+        result = self.stage_two_approved({"61": approved, "62": approved})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(ACCOUNT, result.stderr)
+        self.assertIn(str(self.fixture.registry), result.stderr)
 
     def test_the_role_label_each_workflow_names_reaches_the_tracker(self):
         result = self.stage_two_approved({"61": dict(APPROVED), "62": dict(ACCEPTANCE)})

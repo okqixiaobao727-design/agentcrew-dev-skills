@@ -86,12 +86,14 @@ GH_SUB_ISSUES = "repos/{owner}/{repo}/issues/%s/sub_issues"
 TICKET_NUMBER = re.compile(r"#(\d+)")
 
 # The `## Routing` section `skills/route/references/classify.md` templates: these keys, in this
-# order, one line each. `review` is the one a workflow may take none of, so it is the one key an
-# approved entry may leave out; every other line is required, because a ticket missing one is
-# unrouted and the renderer would refuse it at the self-check anyway.
+# order, one line each. Two may be left out of an approved entry: `review`, which four of the six
+# workflows take none of, and `account`, which is the user's own override rather than anything
+# `/route` concludes — a ticket naming none runs on the coordinator's account and is written
+# exactly as it was before accounts existed. Every other line is required, because a ticket
+# missing one is unrouted and the renderer would refuse it at the self-check anyway.
 ROUTING_HEADING = "## Routing"
-ROUTING_ORDER = ("workflow", "executor", "model", "effort", "review", "reasons")
-ROUTING_OPTIONAL = ("review",)
+ROUTING_ORDER = ("workflow", "executor", "model", "effort", "account", "review", "reasons")
+ROUTING_OPTIONAL = ("review", "account")
 
 # The role strings classify.md names: an `acceptance` ticket is a human's to pick up, every other
 # ticket an agent's.
@@ -658,6 +660,7 @@ def self_check(repo, directory, config):
         problems += driver.routing_problems(tickets, run, scratch)
     problems += driver.graph_problems(tickets)
     problems += driver.config_problems(repo, run)
+    problems += driver.account_problems(tickets, run)
     if not problems:
         # The wave table is the last thing the driver builds before it dispatches, so a directory
         # that cannot be ordered into waves is not one a run starts from, whatever else passed.
@@ -739,9 +742,10 @@ def build_parser():
         "--routing", metavar="FILE",
         help=(
             "the routing the user approved, as JSON keyed by ticket number, each entry carrying"
-            " the `## Routing` lines (workflow, executor, model, effort, reasons, and review where"
-            " the workflow takes one); it is written back to the tracker with each ticket's role"
-            " label, and nothing is written to the tracker without it"
+            " the `## Routing` lines (workflow, executor, model, effort, reasons, review where"
+            " the workflow takes one, and account where the user named one); it is written back to"
+            " the tracker with each ticket's role label, and nothing is written to the tracker"
+            " without it"
         ),
     )
     parser.add_argument(
