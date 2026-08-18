@@ -35,6 +35,16 @@ sign-off, and the interactive approval step is gone
 unchanged — one routing authority, scripted verification, the accepted impersonation surface — with
 "approved table" read as "validated table" throughout.
 
+## Amendment (ADR-0014)
+
+"Advisory input used to *build* that table" is sharpened: building it **resolves** every optional
+routing key to a concrete value, so the validated table carries no absent key and no sentinel
+meaning "use the default"
+([ADR-0014](0014-optional-routing-keys-are-resolved-at-the-wave-table-boundary.md)). Optionality
+lives in the ticket and in the staging-time validation that reads it; it does not survive into the
+table. The single-routing-authority promise above is what forces this: a key left absent would
+oblige each consumer to re-derive its meaning, which is a second authority reassembled downstream.
+
 ## Consequences
 
 - **Model names are always full IDs, never aliases.** Measured: `--model haiku` under
