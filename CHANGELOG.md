@@ -7,6 +7,23 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The repo-scope `code-review-graph` MCP server launches from the installed
+  console command instead of `uvx`. The uvx shell stayed resident beside the
+  server it started, so every session paid two processes per server rather than
+  one — measured machine-wide during a live crew run: 38 shells beside 38
+  servers, 364 MB across 24 sessions, half of it pure wrapper, and every crew
+  child multiplied it by carrying its own pair. uvx also re-resolved the
+  dependency tree on each launch and built a fresh ~440 MB environment whenever
+  any transitive dependency released, ~7 GB over three weeks here. `.mcp.json`
+  now names the command and lets PATH resolve it, so no machine-specific path is
+  committed; the one-time `uv tool install code-review-graph` is documented in
+  CONTRIBUTING.md, and a machine without it degrades exactly as before — the
+  server fails to connect and agents fall back to Grep/Glob/Read as AGENTS.md
+  prescribes. The graph hooks in `.claude/settings.json` already called the
+  command this way. A guard test keeps a convenience revert from slipping back
+  in (#88).
+
 ## [0.8.0] - 2026-08-18
 
 ### Fixed

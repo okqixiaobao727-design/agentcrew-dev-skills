@@ -24,6 +24,19 @@ guesses at the cause.
 Running the skills themselves needs more than this (Claude Code, tmux, optionally the Codex CLI);
 see the README's Requirements section. Contributing to the Python code does not.
 
+One optional tool: `.mcp.json` and the graph hooks in `.claude/settings.json` both call
+`code-review-graph`, the knowledge-graph server AGENTS.md points every agent at. Install it once,
+so the command is on PATH:
+
+```sh
+uv tool install code-review-graph   # or: pipx install code-review-graph
+```
+
+Both call it by name rather than through `uvx`, which would leave a resident wrapper process beside
+every server it starts and rebuild a ~440 MB environment on each dependency release. Without the
+install, the MCP server fails to connect and the hooks exit quietly; agents fall back to
+Grep/Glob/Read, which AGENTS.md already allows. Nothing else in the repo depends on it.
+
 ## Running the checks
 
 These are the two commands CI runs, and they are the whole of the automated gate:
