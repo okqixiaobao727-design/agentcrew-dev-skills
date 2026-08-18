@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-18
+
 ### Added
 - `driver.py answer` delivers a coordinator's ruling to a Codex child. The
   subcommand rejected every ticket whose executor was not Claude, so a Codex
