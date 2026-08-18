@@ -17,3 +17,6 @@ crewtask/
 # The maintainer's own measurements of the merge and review lanes: working notes taken against
 # runs on one machine, kept local rather than shipped as documentation of the plugin.
 docs/merge-and-review-research.md
+# The maintainer's own measurement of Claude Code's process memory: readings taken from one
+# machine, named hosts and all, kept local rather than shipped as documentation of the plugin.
+docs/claude-code-process-memory-research.md

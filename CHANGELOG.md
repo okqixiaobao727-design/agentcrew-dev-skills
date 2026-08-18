@@ -7,6 +7,21 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `driver.py answer` delivers a coordinator's ruling to a Codex child. The
+  subcommand rejected every ticket whose executor was not Claude, so a Codex
+  child's `CREW ASK` had no deliverable ruling and the only path left was
+  hand-typed tmux keys, which rotate no marker and so leave the answered turn
+  invisible to the bridge's watch — a ticket answered that way settled parked.
+  Text was always deliverable: `deliver()` already carries it over the bridge's
+  `send`, the same path the driver's nudges ride, so lifting the guard costs no
+  new transport and the bridge records the prompt and rotates the marker as it
+  sends. The guard now covers `--key` alone, which stays Claude-only because a
+  Codex child runs with approvals off and has no permission prompt to answer;
+  its rejection now says so. Ruling therefore stops asking which executor a
+  child runs on (ADR-0010), and the triage guidance answers a Codex ask with the
+  same subcommand rather than reaching for the bridge by hand (#90).
+
 ### Changed
 - The repo-scope `code-review-graph` MCP server launches from the installed
   console command instead of `uvx`. The uvx shell stayed resident beside the
@@ -25,6 +40,21 @@ and this project uses [Semantic Versioning](https://semver.org/).
   in (#88).
 
 ### Fixed
+- Staging withholds a bare `/crew` command when the repository cannot resolve a
+  default base branch. `refs/remotes/origin/HEAD` is written by `git clone` and
+  never by `git init` plus `git remote add`, so such a repository permanently
+  lacks it, and `stage.py`'s self-check skipped the base-branch question
+  entirely — conflating *which* branch a run cuts from, genuinely an argument of
+  the run's start, with *whether a default can be resolved at all*, a property
+  of the repository at staging time. A fully green staging therefore printed a
+  command guaranteed to stop in the driver's preflight, the exact defect the
+  self-check exists to remove. The check is now `driver.default_base_branch()`
+  itself, called through the driver stage.py already imports, so staging and
+  preflight cannot drift apart; an explicit `--base-branch` at start time still
+  overrides it. Both messages now name the permanent fix,
+  `git remote set-head origin -a`, beside the per-run `--base-branch` workaround
+  — staging never runs `set-head` itself, because it touches the network and
+  mutates repository state, which is the operator's call (#91).
 - A Codex child's final word can no longer be lost on the way in, at any of the
   three points it used to be. The receipt grammar was anchored to the start of
   the whole message, so a child that wrote a summary and bundled its
@@ -65,8 +95,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
   is never touched. Parked and failed children are untouched, here as everywhere
   else — unmerged work is a human's call, and no automatic path deletes it; so
   are the artefacts of a dead run that recorded a different repository, whose git
-  is not this driver's to edit even though the settings file is. Every problem the sweep meets is a warning on stderr and never a
-  stopped run, and the run being started or adopted is never swept (#89).
+  is not this driver's to edit even though the settings file is. Every problem
+  the sweep meets is a warning on stderr and never a stopped run, and the run
+  being started or adopted is never swept (#89).
 - A wake monitor no longer outlives a driver that was killed. `disarm` covers
   every ordinary exit, but a `kill -9` — the memory-pressure reap of
   `docs/driver-external-kill.md` among them — left `monitor-wave.sh` looping for
