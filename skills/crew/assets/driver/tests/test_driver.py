@@ -1649,8 +1649,8 @@ class LoopTests(DriverTestCase):
 
 
 class AnswerTests(DriverTestCase):
-    def start(self):
-        self.fixture.ticket("01", "first thing")
+    def start(self, routing=ROUTING):
+        self.fixture.ticket("01", "first thing", routing=routing)
         self.fixture.commit_feature()
         process = self.fixture.launch()
         self.assertTrue(
@@ -1815,6 +1815,53 @@ class AnswerTests(DriverTestCase):
         self.assertNotIn("tmux send-keys", triage)
         self.assertNotIn("send it to that child as a message too", triage)
         self.assertIn("Reply to a Claude child by SendMessage", triage)
+
+    def test_a_codex_child_is_answered_through_the_bridge_send_and_the_ruling_is_recorded(self):
+        """A ruling for a Codex child rides the bridge, which is the channel it already has."""
+        self.start(routing=CODEX_ROUTING)
+        text = "Use the existing retention_audit table"
+        before = [
+            call["argv"] for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]
+        ]
+
+        result = self.answer("--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sends = [
+            call["argv"] for call in self.fixture.codex_calls() if call["argv"][:1] == ["send"]
+        ]
+        self.assertEqual(sends, [[
+            "send",
+            "--state-file", str(self.fixture.run_dir / "codex" / "01.json"),
+            "--machine-log", str(self.fixture.run_dir / "log.jsonl"),
+            "--ticket", "01",
+            "--prompt", text,
+        ]])
+        after = [
+            call["argv"] for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(after, before, "a Codex child was answered by tmux keys")
+        ruling = self.events("ruling", ticket="01")[-1]
+        self.assertEqual(ruling["role"], "coordinator")
+        self.assertEqual(ruling["message"], text)
+
+    def test_a_key_answer_to_a_codex_child_is_refused_as_text_only(self):
+        self.start(routing=CODEX_ROUTING)
+
+        result = self.answer("--key", "4")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("take text answers only", result.stdout)
+        self.assertEqual(
+            [call for call in self.fixture.codex_calls() if call["argv"][:1] == ["send"]], []
+        )
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_triage_answers_a_codex_ask_through_the_driver_rather_than_the_bridge(self):
+        triage = TRIAGE.read_text(encoding="utf-8")
+
+        self.assertIn("driver.py answer", triage)
+        self.assertNotIn("codex_bridge.py send", triage)
 
     def test_multiline_text_uses_literal_lines_and_shift_enter_before_submit(self):
         self.start()

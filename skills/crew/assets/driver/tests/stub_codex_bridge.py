@@ -3,14 +3,20 @@
 
 `launch` answers the way the real bridge does — one JSON object carrying `ok`, `windowId` and
 `threadId`, plus the state file it writes — and `watch` answers a snapshot and returns, which is
-what an armed Codex wake monitor does the moment a session stops being busy. Every call is recorded
-in `AGENTCREW_STUB_DIR/codex-calls.jsonl`, so a test reads both the launch and the arming from it.
+what an armed Codex wake monitor does the moment a session stops being busy. `send` copies the
+prompt into the machine log through the log's own writer, as the real bridge does, so a test reads
+the ruling out of the run's log rather than out of the stub. Every call is recorded in
+`AGENTCREW_STUB_DIR/codex-calls.jsonl`, so a test reads both the launch and the arming from it.
 """
 
 import json
 import os
 import pathlib
+import subprocess
 import sys
+
+
+MACHINE_LOG = pathlib.Path(__file__).resolve().parents[2] / "machine_log.py"
 
 
 def flag(argv, name):
@@ -25,6 +31,20 @@ def main():
 
     if argv[:1] == ["watch"]:
         print(json.dumps({"sessions": []}))
+        return 0
+
+    if argv[:1] == ["send"]:
+        machine_log = flag(argv, "--machine-log")
+        if machine_log:
+            command = [
+                sys.executable, str(MACHINE_LOG), "--log", machine_log, "message",
+                "--role", "coordinator", "--message", flag(argv, "--prompt"),
+            ]
+            ticket = flag(argv, "--ticket")
+            if ticket is not None:
+                command.extend(["--ticket", ticket])
+            subprocess.run(command, capture_output=True, text=True, check=False)
+        print(json.dumps({"ok": True, "stateFile": flag(argv, "--state-file")}))
         return 0
 
     if argv[:1] == ["stop"]:
