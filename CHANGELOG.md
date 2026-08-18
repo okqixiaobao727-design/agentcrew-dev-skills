@@ -7,6 +7,26 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A ticket may name the **account** it runs on. `## Routing` takes an optional
+  `Account:` line — the one routing value `/route` records rather than
+  concludes, written from what the user names at the approval checkpoint — and
+  the driver resolves it where it builds the wave table: every row carries a
+  concrete `account`, the Claude Code profile directory that ticket's processes
+  run under, with a ticket naming none taking the coordinator's own
+  configuration home, which the run section now records
+  (ADR-0014). A name resolves through a machine-level **account registry** at
+  `~/.claude/agentcrew/accounts.toml`, deliberately not resolved through
+  `CLAUDE_CONFIG_DIR` and overridable by `AGENTCREW_ACCOUNT_REGISTRY`
+  (ADR-0013); `skills/crew/assets/accounts.py` is the one entry point from a
+  name to a directory. The repository carries names only: `agentcrew.toml` may
+  declare the account names it expects under `[accounts] names`, and never a
+  path. A ticket naming an account the registry does not hold — or that the
+  config never declared — stops the run in preflight, in a message that says
+  which of the two is missing and never falls back to the coordinator's
+  account, and a machine with no registry file runs its single-account waves
+  with nothing to create (#97).
+
 ## [0.8.1] - 2026-08-18
 
 ### Added

@@ -115,6 +115,12 @@ REPAIR = "repair"
 REPAIR_MODEL = "model"
 # The tracker a run closes its merged tickets in. Two are exercised end to end
 # (`references/trackers.md`), and a run on any other would reach a CLI nobody named.
+# The account names a repository declares, and nothing else: the name-to-profile mapping is a
+# machine-level file this repository never carries (ADR-0013). Optional everywhere — a project
+# that declares none checks nothing, and the shipped defaults ship the section empty.
+ACCOUNTS = "accounts"
+ACCOUNT_NAMES = "names"
+
 TRACKER = "tracker"
 TRACKER_KIND = "kind"
 TRACKERS = ("github", "local")
@@ -304,7 +310,7 @@ def check_config_text(text, label, complete, aliases, problems):
         problems.append(f"{label}: unparsable: {error}")
         return
 
-    expected = {"implementer", "reviewer", "hooks", DASHBOARD, REPAIR, TRACKER}
+    expected = {"implementer", "reviewer", "hooks", ACCOUNTS, DASHBOARD, REPAIR, TRACKER}
     for section in sorted(set(config) - expected):
         problems.append(f"{label}: unknown section [{section}]")
 
@@ -323,6 +329,7 @@ def check_config_text(text, label, complete, aliases, problems):
         check_cell(config, f"reviewer.{case}", label, complete, aliases, problems)
 
     check_hook(config, label, complete, problems)
+    check_accounts(config, label, problems)
     check_dashboard(config, label, complete, problems)
     # Not governed by `complete`: neither of these is inheritable, so both are required of every
     # config this validates, the shipped defaults and a project file alike.
@@ -385,6 +392,35 @@ def check_tracker(config, label, problems):
         )
     for field in sorted(set(tracker) - {TRACKER_KIND}):
         problems.append(f"{label}: [{TRACKER}] carries an unknown field {field!r}")
+
+
+def check_accounts(config, label, problems):
+    """The account names this repo expects, which is the whole of what it may say about accounts.
+
+    Optional in every config: declaring none is the ordinary single-account project, and the check
+    it buys is diagnostic only. What is refused is a profile *path* written here — the mapping
+    from a name to a directory belongs to the machine-level registry, and a path committed to a
+    repository is configuration that is wrong on every other clone and still runnable (ADR-0013).
+    """
+    accounts = config.get(ACCOUNTS)
+    if accounts is None:
+        return
+    if not isinstance(accounts, dict):
+        problems.append(f"{label}: [{ACCOUNTS}] must be a table with a {ACCOUNT_NAMES} list")
+        return
+    names = accounts.get(ACCOUNT_NAMES)
+    if names is not None and (
+        not isinstance(names, list) or not all(isinstance(name, str) and name for name in names)
+    ):
+        problems.append(
+            f"{label}: [{ACCOUNTS}] {ACCOUNT_NAMES} must be a list of account names, as strings"
+        )
+    for field in sorted(set(accounts) - {ACCOUNT_NAMES}):
+        problems.append(
+            f"{label}: [{ACCOUNTS}] carries an unknown field {field!r} — this file declares"
+            " account names under `names` and never a profile directory, which lives in the"
+            " machine's own account registry"
+        )
 
 
 def check_dashboard(config, label, complete, problems):

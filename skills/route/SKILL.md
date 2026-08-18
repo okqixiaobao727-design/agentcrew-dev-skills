@@ -63,13 +63,19 @@ One table, one checkpoint — the shape `classify.md` gives it. Ask the user to 
 revision they give — re-cutting a ticket means re-classifying it — redisplay the full table, and ask
 again.
 
+The user may also name an **account** for any ticket at this checkpoint — the Claude login whose
+subscription that ticket's children spend. It is theirs to say and never yours to conclude: no
+classification proposes one, and a ticket the user names none for runs on the coordinator's own
+account exactly as every ticket does today. Carry each named account into the approved entry as
+its `account` key.
+
 **Done when** the user explicitly approves the complete table as displayed.
 
 ## 4. Stage the run
 
 Write the approved table to a JSON file — one object keyed by ticket number, each entry carrying
-that ticket's approved `workflow`, `executor`, `model`, `effort`, `reasons`, and `review` where the
-workflow takes one — and run the staging script:
+that ticket's approved `workflow`, `executor`, `model`, `effort`, `reasons`, `review` where the
+workflow takes one, and `account` where the user named one — and run the staging script:
 
 ```bash
 python3 <route-skill-dir>/assets/stage/stage.py --routing <approved-table.json> \
