@@ -259,6 +259,39 @@ class EventTests(MachineLogTestCase):
         # A decision is about a wave, so it carries no ticket at all.
         self.assertNotIn("ticket", entry)
 
+    def test_a_live_source_records_which_source_a_lane_was_read_from_and_why(self):
+        result = run_cli(
+            "live-source", "--lane", "claude", "--source", "command",
+            "--reason", "the sessions directory /home/x/.claude/sessions could not be read",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "live-source")
+        self.assertEqual(entry["lane"], "claude")
+        self.assertEqual(entry["source"], "command")
+        self.assertIn("sessions", entry["reason"])
+
+    def test_every_live_source_is_accepted_and_an_unknown_one_is_refused(self):
+        for source in ("sessions", "command", "bridge"):
+            self.assertEqual(
+                run_cli(
+                    "live-source", "--lane", "claude", "--source", source,
+                    "--reason", "why", log=self.log,
+                ).returncode,
+                0,
+            )
+
+        refused = run_cli(
+            "live-source", "--lane", "claude", "--source", "guesswork",
+            "--reason", "why", log=self.log,
+        )
+
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(len(self.lines()), 3)
+
     def test_a_monitor_error_records_the_monitor_and_its_reason(self):
         result = run_cli(
             "monitor-error", "--monitor", "monitor-wave.sh",

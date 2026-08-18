@@ -104,6 +104,17 @@ the driver asks it there rather than keeping a rule of its own.
 
 [monitor]: ../skills/crew/assets/monitor/monitor.py
 
+### `live-source` — which source a lane's live children were read from
+
+`lane`, `source`, `reason`. Appended by the dashboard when it could not read a lane's first-choice
+source and read a fallback instead
+([ADR-0012](adr/0012-the-statusline-tick-reads-the-sessions-files.md)).
+`lane` is `claude` or `codex`, `source` is `sessions`, `command` or `bridge`, and `reason` says
+what could not be read. One line per run: a statusline tick draws in silence
+([ADR-0008](adr/0008-the-pinned-dashboard-lives-in-claude-codes-statusline.md)), so this line is
+the only place a relocated sessions directory shows up, and appending it once keeps a surface that
+redraws every two seconds from filling the run's own record.
+
 ### `monitor-error` — a monitor that exited with an error
 
 `monitor`, `reason`. The wake monitor writes this line before it exits nonzero, so a failure is
@@ -176,6 +187,8 @@ machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state ru
 machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted|stopped \
                                     [--detail TEXT]
+machine_log.py --log <path> live-source --lane claude|codex \
+                                    --source sessions|command|bridge --reason TEXT
 machine_log.py --log <path> monitor-error --monitor NAME --reason TEXT
 machine_log.py --log <path> message --role coordinator|child [--ticket NN] [--to NAME] \
                                     --message TEXT

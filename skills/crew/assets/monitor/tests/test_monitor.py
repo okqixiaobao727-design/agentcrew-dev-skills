@@ -88,6 +88,11 @@ REVIEW_TS = "2026-08-13T09:10:00Z"
 REVIEW_ELAPSED = "00:02:31"
 REVIEW_LANE = "codex gpt-5.6-sol"
 
+# How far back a test moves the fallback cache's own clock to age it out. Comfortably past any
+# freshness window the renderer might hold, so the test says "long ago" rather than restating a
+# constant it would then have to be kept in step with.
+STALE_CACHE_SECONDS = 3600
+
 # The dashboard window's fixed name, and the file in the run dir that remembers its id.
 WINDOW_NAME = "crew-dashboard"
 WINDOW_RECORD = "dashboard-window"
@@ -427,25 +432,76 @@ class Fixture:
             return []
         return [json.loads(line) for line in self.log.read_text().splitlines() if line]
 
+    def sessions_dir(self):
+        """The CLI's own per-session files, under the Claude config this fixture points at.
+
+        The Claude lane's primary live source: the tick reads these and spawns nothing (ADR-0012).
+        """
+        return self.claude_home / "sessions"
+
     def agents(self, entries):
-        """The agents list `claude agents --json` answers with, keyed by ticket."""
+        """What the Claude lane's live source says about each ticket's child, keyed by ticket."""
         self.agents_at([
             (ticket, self.worktrees[ticket], status) for ticket, status in entries.items()
         ])
 
     def agents_at(self, entries):
-        """The same list, each session's `cwd` spelled as the caller wants it spelled."""
+        """The same, each session's `cwd` spelled as the caller wants it spelled."""
+        directory = self.sessions_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        for index, (ticket, cwd, status) in enumerate(entries):
+            # The CLI names each file after the session's pid, so two sessions in one worktree —
+            # the duplicate anomaly — are two files rather than one overwritten twice.
+            pid = 4000 + index
+            (directory / f"{pid}.json").write_text(json.dumps(
+                dict(self.session_record(ticket, cwd, status), pid=pid)
+            ))
+
+    @staticmethod
+    def session_record(ticket, cwd, status):
+        """One session as the CLI writes it, minus the pid its file is named for."""
+        return {
+            "cwd": str(cwd),
+            "kind": "interactive",
+            "sessionId": f"session-{ticket}",
+            "name": CHILDREN[ticket],
+            "status": status,
+        }
+
+    def session_file(self, name, text):
+        """A file of the caller's own making in the sessions directory — a half-written one."""
+        directory = self.sessions_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(text)
+        return path
+
+    def command_agents(self, entries):
+        """The list `claude agents --json` answers with, which is the lane's fallback and only
+        reached when the sessions directory above is not there to be read."""
         (self.stub_dir / "agents.json").write_text(json.dumps([
-            {
-                "pid": 4000 + index,
-                "cwd": str(cwd),
-                "kind": "interactive",
-                "sessionId": f"session-{ticket}-{index}",
-                "name": CHILDREN[ticket],
-                "status": status,
-            }
-            for index, (ticket, cwd, status) in enumerate(entries)
+            dict(self.session_record(ticket, self.worktrees[ticket], status), pid=4000 + index)
+            for index, (ticket, status) in enumerate(entries.items())
         ]))
+
+    def agents_cache(self):
+        """The fallback's machine-level shared answer, as it stands on disk right now."""
+        path = self.agents_cache_path()
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def agents_cache_path(self):
+        return self.pin_dir().parent / "agents-cache.json"
+
+    def expire_agents_cache(self):
+        """Age the shared answer past any freshness window, as the passage of time would.
+
+        The window is a constant rather than a seam, so a test that must see it expire moves the
+        clock the cache carries instead of waiting out the machine's.
+        """
+        path = self.agents_cache_path()
+        cached = json.loads(path.read_text())
+        cached["fetched_at"] = cached["fetched_at"] - STALE_CACHE_SECONDS
+        path.write_text(json.dumps(cached))
 
     def codex_state(self, ticket, status="busy", cwd=None):
         """The bridge state file a Codex child's launch writes: where it runs, and how it is."""
@@ -1580,7 +1636,9 @@ class ToastTests(MonitorTestCase):
 
         self.fixture.dashboard()
 
-        self.assertEqual(self.fixture.calls("claude"), [["agents", "--json"]])
+        # Not one call, but none at all: the lane is read from the CLI's own session files, so a
+        # frame costs no CLI start whatever — let alone one per pane per tick (ADR-0012).
+        self.assertEqual(self.fixture.calls("claude"), [])
         self.assertTrue(
             all(argv[:1] == ["display-message"] for argv in self.fixture.calls("tmux")),
             self.fixture.calls("tmux"),
@@ -2040,6 +2098,9 @@ class PinTests(MonitorTestCase):
     def test_a_live_source_that_times_out_is_an_unknown_row_and_the_frame_still_draws(self):
         self.live_run()
         self.fixture.pin()
+        # The lane's primary source is a directory read, which nothing can make slow. A source
+        # that does not answer is the fallback's: no sessions directory, and a CLI that hangs.
+        shutil.rmtree(self.fixture.sessions_dir())
         self.fixture.slow_agents(30)
 
         result = self.fixture.pin_frame("--no-color", "--timeout", "0.2")
@@ -2114,6 +2175,204 @@ class PinTests(MonitorTestCase):
                 self.assertNotIn("MONITOR ERROR", result.stderr)
                 self.assertEqual(result.stderr, "")
                 self.assertEqual(result.returncode, 0)
+
+
+class LiveSourceTests(MonitorTestCase):
+    """Where a tick reads the Claude lane from, and what it costs (ADR-0012).
+
+    The primary source is the CLI's own per-session files, which cost a few file reads; the
+    fallback is `claude agents --json`, which costs a whole CLI start and is therefore shared
+    machine-wide for a freshness window. Every assertion here is on what the tick spawned, drew
+    and left on disk — the spawn counter is the stub CLI's own call log.
+    """
+
+    def launch_wave_one(self):
+        self.fixture.table()
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+
+    def live_run(self, statuses=None):
+        """A pinned run of two launched children, drawn from each lane's primary source."""
+        self.launch_wave_one()
+        self.fixture.live(statuses or {"06": "busy", "07": "busy"})
+        self.fixture.pin()
+
+    def spawns(self):
+        return self.fixture.calls("claude")
+
+    def test_a_populated_sessions_directory_draws_every_tick_and_spawns_the_cli_never(self):
+        self.live_run({"06": "waiting", "07": "busy"})
+
+        frames = [self.fixture.pin_frame("--no-color").stdout for _ in range(3)]
+
+        self.assertEqual(self.spawns(), [])
+        for drawn in frames:
+            self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+                          drawn)
+
+    def test_the_sessions_files_draw_the_frame_the_command_would_have_drawn(self):
+        self.live_run({"06": "waiting", "07": "busy"})
+
+        primary = self.fixture.pin_frame("--no-color")
+        shutil.rmtree(self.fixture.sessions_dir())
+        self.fixture.command_agents({"06": "waiting"})
+        fallback = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.spawns(), [["agents", "--json"]])
+        self.assertEqual(frame(primary.stdout), frame(fallback.stdout))
+
+    def test_the_fallback_is_fetched_once_a_window_and_shared_by_every_tick(self):
+        self.live_run()
+        shutil.rmtree(self.fixture.sessions_dir())
+        self.fixture.command_agents({"06": "busy"})
+
+        first = self.fixture.pin_frame("--no-color")
+        second = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.spawns(), [["agents", "--json"]])
+        self.assertEqual(frame(first.stdout), frame(second.stdout))
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      first.stdout)
+
+    def test_a_fetch_older_than_the_window_is_made_again(self):
+        self.live_run()
+        shutil.rmtree(self.fixture.sessions_dir())
+        self.fixture.command_agents({"06": "busy"})
+        self.fixture.pin_frame("--no-color")
+
+        self.fixture.expire_agents_cache()
+        self.fixture.command_agents({"06": "waiting"})
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.spawns(), [["agents", "--json"], ["agents", "--json"]])
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+                      result.stdout)
+
+    def test_a_fallback_that_fails_too_stays_silent_and_is_not_asked_again_this_window(self):
+        """Both sources gone: the row is `unknown`, the tick says nothing, and the cost is capped.
+
+        A CLI that cannot answer is cached as an answer, so a broken fallback cannot bring the
+        per-pane spawn storm back through its own failure path.
+        """
+        self.live_run()
+        shutil.rmtree(self.fixture.sessions_dir())
+
+        first = self.fixture.pin_frame("--no-color")
+        second = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.spawns(), [["agents", "--json"]])
+        for result in (first, second):
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, "")
+            self.assertIn(f"{AGENTS_UNREADABLE}\n", result.stdout)
+
+    def test_a_tick_whose_run_is_over_prints_nothing_and_writes_no_stderr(self):
+        """The silence contract with neither source available (ADR-0008)."""
+        self.launch_wave_one()
+        self.fixture.pin()
+        shutil.rmtree(self.fixture.sessions_dir(), ignore_errors=True)
+        self.fixture.append(NOW_TS, "advance", wave="2", decision="complete")
+
+        result = self.fixture.pin_frame()
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_falling_back_is_recorded_in_the_run_log_once_and_never_on_screen(self):
+        self.live_run()
+        shutil.rmtree(self.fixture.sessions_dir())
+        self.fixture.command_agents({"06": "busy"})
+
+        self.fixture.pin_frame("--no-color")
+        self.fixture.expire_agents_cache()
+        result = self.fixture.pin_frame("--no-color")
+
+        lines = [line for line in self.fixture.log_lines() if line["event"] == "live-source"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["lane"], "claude")
+        self.assertEqual(lines[0]["source"], "command")
+        self.assertIn(str(self.fixture.sessions_dir()), lines[0]["reason"])
+        self.assertNotIn("live-source", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_spent_budget_draws_unknown_without_reaching_for_the_fallback(self):
+        """A lane that ran out of time is not a lane whose source is missing.
+
+        The fallback is a whole CLI start — slower than the read that just failed to finish — so a
+        tick with no budget left draws `unknown` and spawns nothing, and the machine's shared
+        answer is not overwritten with a failure that says nothing about the CLI.
+        """
+        self.live_run()
+
+        result = self.fixture.pin_frame("--no-color", "--timeout", "0")
+
+        self.assertEqual(self.spawns(), [])
+        self.assertIsNone(self.fixture.agents_cache())
+        self.assertIn(f"{AGENTS_UNREADABLE}\n", result.stdout)
+
+    def test_a_child_at_a_shell_prompt_is_waiting_and_says_so_in_its_own_words(self):
+        self.live_run({"06": "shell", "07": "busy"})
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.spawns(), [])
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+                      result.stdout)
+        self.assertEqual(self.fixture.toasts(), ["crew 06 sitting at a shell prompt"])
+
+    def test_a_stopped_child_and_one_at_a_shell_prompt_are_not_toasted_alike(self):
+        self.live_run({"06": "idle", "07": "busy"})
+
+        self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.fixture.toasts(), ["crew 06 stopped without finishing"])
+
+    def test_a_sessions_directory_that_cannot_be_read_falls_back_to_the_command(self):
+        """Unreadable is not empty.
+
+        A directory this tick has no permission to list is one whose answer it does not have, so
+        it goes to the command — where a tick that read the empty answer as the truth would draw
+        every live child `vanished` instead.
+        """
+        self.live_run()
+        self.fixture.command_agents({"06": "busy"})
+        sessions = self.fixture.sessions_dir()
+        sessions.chmod(0o000)
+        self.addCleanup(sessions.chmod, 0o755)
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.spawns(), [["agents", "--json"]])
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+
+    def test_a_half_written_sessions_file_is_skipped_and_the_tick_still_draws(self):
+        self.live_run()
+        self.fixture.session_file("99999.json", '{"cwd": "/half/written", "stat')
+
+        result = self.fixture.pin_frame("--no-color")
+
+        self.assertEqual(self.spawns(), [])
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+
+    def test_a_pin_whose_coordinator_has_gone_is_swept_and_a_live_one_is_left(self):
+        self.live_run()
+        abandoned = self.fixture.pin(
+            run_dir=self.fixture.second_run(), pid=self.fixture.dead_pid(), session="$9",
+        )
+        self.assertEqual(len(self.fixture.pins()), 2)
+
+        result = self.fixture.pin_frame("--no-color")
+
+        # The abandoned run's file is gone and this run's — whose coordinator is this process —
+        # is untouched, so the frame it names still draws.
+        self.assertFalse(abandoned.exists())
+        self.assertEqual(len(self.fixture.pins()), 1)
+        self.assertIn(f"crew {RUN_ID} —", result.stdout)
 
 
 class WindowTests(MonitorTestCase):

@@ -12,8 +12,8 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|monitor-error|
-                                  session-cost|message ...
+    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|live-source|
+                                  monitor-error|session-cost|message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
     machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
@@ -75,6 +75,10 @@ DECISIONS = ("launched", "escalated", "complete", "interrupted", "stopped")
 # The two lanes a child runs in. A usage figure is only readable against the executor that wrote
 # it, so an executor this log does not know is an executor whose figures nobody can check.
 EXECUTORS = ("claude", "codex")
+# Where a lane's live children were read from, when a dashboard had to read them from anywhere but
+# its first choice (ADR-0012). The set is closed on the sources a lane actually has, so a line
+# saying a dashboard fell back names something a reader can go and look at.
+LIVE_SOURCES = ("sessions", "command", "bridge")
 # What a session cost is made of: four disjoint counters and the total they must come to. A line
 # carrying some of them, or a total that is not their sum, is arithmetic a later agent would trust
 # and be wrong to, so it is refused like a value outside a closed set.
@@ -592,6 +596,14 @@ def build_parser():
     advance.add_argument("--wave", required=True, help="the wave the decision is about")
     advance.add_argument("--decision", required=True, choices=DECISIONS)
     advance.add_argument("--detail")
+
+    live_source = subcommands.add_parser(
+        "live-source", help="record which source a lane's live children were read from"
+    )
+    live_source.set_defaults(handler=run_event)
+    live_source.add_argument("--lane", required=True, choices=EXECUTORS)
+    live_source.add_argument("--source", required=True, choices=LIVE_SOURCES)
+    live_source.add_argument("--reason", required=True, help="why that source and not the first")
 
     monitor_error = subcommands.add_parser(
         "monitor-error", help="record a monitor that exited with an error"

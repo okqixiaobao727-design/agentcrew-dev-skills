@@ -149,14 +149,19 @@ LIVE_SOURCES = {
     CODEX: "the codex bridge state",
 }
 LIVE_STATES = {
-    CLAUDE: {"busy": RUNNING, "waiting": WAITING, "idle": WAITING, "parked": PARKED},
+    CLAUDE: {
+        "busy": RUNNING, "waiting": WAITING, "idle": WAITING, "shell": WAITING, "parked": PARKED,
+    },
     CODEX: {"busy": RUNNING, "idle": WAITING, "stopped": VANISHED},
 }
-# What a child that has stopped is toasted as. The two situations send the operator to different
-# places, so neither is announced in the other's words.
+# What a child that has stopped is toasted as. The three situations send the operator to three
+# different places, so none is announced in another's words. `shell` is the word only the sessions
+# files carry (ADR-0012): the fallback command folds it into `busy`, so a tick drawn from the
+# fallback draws such a child `running` and never reaches this line.
 ATTENTION_TOASTS = {
     "waiting": "stuck at a permission prompt",
     "idle": "stopped without finishing",
+    "shell": "sitting at a shell prompt",
 }
 # The qualifier each event carries, in the order an annotation looks for one.
 EVENT_QUALIFIERS = ("verdict", "outcome", "result", "decision", "state")
@@ -235,6 +240,28 @@ TMUX_ENVIRONMENT_FIELDS = 3
 SESSION_PREFIX = "$"
 SESSION_TARGET_SUFFIX = ":"
 
+# The Claude lane's primary live source (ADR-0012): the CLI's own per-session files, one JSON
+# object per live session, under the same configured home the pin registry hangs off. Reading them
+# costs a few file reads, where the fallback command below costs a whole CLI start per tick.
+CLAUDE_SESSIONS = ("CLAUDE_CONFIG_DIR", ".claude", "sessions")
+SESSION_SUFFIX = ".json"
+SESSION_CWD = "cwd"
+SESSION_STATUS = "status"
+# The fallback's one shared answer, beside the pin registry so every pane of the machine reads the
+# same file, and how long a fetched answer stands before another tick goes and gets one. The
+# window is what bounds the spawn rate to the machine rather than to the pane count; a failed
+# fetch is cached too, so a broken CLI cannot be asked seven times a second either.
+AGENTS_CACHE_NAME = "agents-cache.json"
+AGENTS_CACHE_SECONDS = 10.0
+AGENTS_CACHE_FETCHED = "fetched_at"
+AGENTS_CACHE_STATES = "states"
+# What the run's machine log records when a tick could not read the sessions directory, so a
+# relocated directory is diagnosable without the statusline ever saying a word (ADR-0008). One
+# line per run: a tick appends it only while the run's own log carries none.
+LIVE_SOURCE_EVENT = "live-source"
+FALLBACK_SOURCE = "command"
+FALLBACK_REASON = "the sessions directory {directory} could not be read"
+
 DEFAULT_REFRESH_SECONDS = 5.0
 # How long one statusline tick gives a live source before drawing its row `unknown` instead. The
 # tick draws the status line the operator's whole session depends on, so nothing in it may wait
@@ -275,6 +302,13 @@ SESSION_SEPARATOR = ","
 # the two facts a reader passes back when it cannot answer the question it was asked.
 MALFORMED = object()
 UNDETERMINED = object()
+# The fallback cache has nothing this tick may use — no file, an unreadable one, or one older than
+# its freshness window. Distinct from the None a cached failure carries, which is an answer.
+NO_CACHE = object()
+# The tick's budget was spent before a source finished answering. Distinct from the None that says
+# a source is not there: a lane that simply ran out of time is drawn `unknown` and nothing is
+# reached for in its place, because the fallback is slower than the source that just timed out.
+OUT_OF_TIME = object()
 
 # The operator's Claude Code wiring the pin's install edits, and the environment variable that
 # moves it — the same one the executor itself honours, so the settings edited are the ones in use.
@@ -387,6 +421,10 @@ def read_log(path):
 def agent_states(claude_bin, timeout=None):
     """Each live session's status by its `cwd`, or None when the agents list cannot be read.
 
+    The fallback lane and nothing else (ADR-0012): every call here is a whole CLI start, which is
+    why the source a tick reaches for first is `session_states` and why what this answers is
+    shared machine-wide rather than fetched again by the next pane.
+
     A worktree the list carries twice has no single status, so it is reported as the duplicate the
     wake monitor calls an error — the dashboard draws it and leaves the stopping to the wake-up.
 
@@ -456,9 +494,157 @@ def codex_states(run_dir, timeout=None):
     return states
 
 
-def live_sources(claude_bin, run_dir, timeout=None):
-    """What each lane says about its own children: the agents list, and the bridge state files."""
-    return {CLAUDE: agent_states(claude_bin, timeout), CODEX: codex_states(run_dir, timeout)}
+def sessions_directory():
+    """The CLI's own per-session files, under the same configured home the pin registry hangs off.
+
+    One seam for both (ADR-0012): a test that moves the config directory moves the sessions files,
+    the fallback's cache and the registry together, which is how a fixture gets a machine of its
+    own without a flag per path.
+    """
+    return transcript_root(CLAUDE_SESSIONS)
+
+
+def session_states(timeout=None):
+    """Each live session's status by its `cwd`, read from the files the CLI keeps itself, or None
+    when that directory is not there to be read.
+
+    The Claude lane's primary source (ADR-0012). It answers the same question `agent_states` does
+    — which sessions are alive and what each is doing — for the cost of a few file reads instead
+    of a whole CLI start, and it carries one word that lane cannot: `shell`, a child sitting at a
+    shell prompt, which the command folds into `busy`.
+
+    A half-written file is skipped rather than fatal, as the Codex lane's are: the CLI rewrites
+    these on every status change, so a tick that catches one mid-write reads the rest and draws.
+    The whole read is bounded by `timeout` like the other lane's, and the two ways it can fail are
+    kept apart: a directory that cannot be listed — gone, moved, or not this user's to read —
+    answers None, the caller's signal to fall back, while a budget spent answers `OUT_OF_TIME`,
+    which is not a reason to go and start a CLI.
+    """
+    directory = sessions_directory()
+    try:
+        # Listed rather than globbed: a glob answers an unreadable directory with no matches, so a
+        # tick that trusted it would draw every live child `vanished` instead of falling back.
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    paths = sorted(directory / name for name in names if name.endswith(SESSION_SUFFIX))
+    deadline = None if timeout is None else time.monotonic() + timeout
+    states = {}
+    for path in paths:
+        if deadline is not None and time.monotonic() >= deadline:
+            return OUT_OF_TIME
+        try:
+            session = json.loads(read_without_blocking(path))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(session, dict) or not session.get(SESSION_CWD):
+            continue
+        cwd = worktree_key(session[SESSION_CWD])
+        states[cwd] = DUPLICATE if cwd in states else str(session.get(SESSION_STATUS, UNKNOWN))
+    return states
+
+
+def agents_cache_path():
+    """Where the fallback's one shared answer lives: beside the pin registry, not inside it.
+
+    Machine-level on purpose: every pane of every session reads this same file, which is what
+    stops the fallback from spawning once per pane per tick.
+    """
+    return transcript_root(PIN_REGISTRY).parent / AGENTS_CACHE_NAME
+
+
+def read_agents_cache(moment):
+    """The fallback answer this machine already has and may still use, or `NO_CACHE`.
+
+    A cached failure is an answer too — it is returned as the None the lane draws `unknown` from —
+    so a CLI that cannot answer is asked once per window rather than once per tick.
+    """
+    try:
+        cached = json.loads(read_without_blocking(agents_cache_path()))
+    except (OSError, ValueError):
+        return NO_CACHE
+    if not isinstance(cached, dict):
+        return NO_CACHE
+    fetched = cached.get(AGENTS_CACHE_FETCHED)
+    if not isinstance(fetched, (int, float)) or isinstance(fetched, bool):
+        return NO_CACHE
+    if not 0 <= moment - fetched < AGENTS_CACHE_SECONDS:
+        return NO_CACHE
+    states = cached.get(AGENTS_CACHE_STATES)
+    return states if isinstance(states, dict) else None
+
+
+def write_agents_cache(states, moment):
+    """Share one fetch with every other pane on the machine; returns nothing.
+
+    Put in place by rename, so no tick ever reads a half-written answer. A cache that could not be
+    written is not a failure anybody is told about: the next tick simply fetches again, which is
+    exactly what would have happened anyway.
+    """
+    path = agents_cache_path()
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps({AGENTS_CACHE_FETCHED: moment, AGENTS_CACHE_STATES: states}) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
+def announce_fallback(run_dir, records, timeout=None):
+    """Record in the run's own log that this lane is reading its fallback; returns nothing.
+
+    ADR-0008's silence holds on screen, so the one place a relocated sessions directory can be
+    diagnosed from is here. One line per run, not per tick: the run's log is read for the frame
+    anyway, so a run that has already said it is in fallback says nothing more.
+    """
+    if run_dir is None or any(record.get("event") == LIVE_SOURCE_EVENT for record in records):
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            [
+                sys.executable, str(MACHINE_LOG),
+                "--log", str(pathlib.Path(run_dir) / MACHINE_LOG_NAME), LIVE_SOURCE_EVENT,
+                "--lane", CLAUDE, "--source", FALLBACK_SOURCE,
+                "--reason", FALLBACK_REASON.format(directory=sessions_directory()),
+            ],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout,
+        )
+
+
+def claude_states(claude_bin, run_dir=None, timeout=None, records=()):
+    """What the Claude lane's children are doing: the sessions files, or the command behind them.
+
+    The primary source is read every time and cached nowhere — it is already as cheap as a cache
+    would be, so nothing here can go stale. Only a directory that cannot be read at all sends the
+    tick to the command, and there the machine's shared answer stands for a freshness window
+    before any pane spawns another (ADR-0012).
+    """
+    states = session_states(timeout)
+    if states is OUT_OF_TIME:
+        return None
+    if states is not None:
+        return states
+    announce_fallback(run_dir, records, timeout)
+    cached = read_agents_cache(time.time())
+    if cached is not NO_CACHE:
+        return cached
+    fetched = agent_states(claude_bin, timeout)
+    write_agents_cache(fetched, time.time())
+    return fetched
+
+
+def live_sources(claude_bin, run_dir, timeout=None, records=()):
+    """What each lane says about its own children: the sessions files behind `claude agents
+    --json`, and the Codex bridge's state files."""
+    return {
+        CLAUDE: claude_states(claude_bin, run_dir, timeout, records),
+        CODEX: codex_states(run_dir, timeout),
+    }
 
 
 def read_table(run_dir):
@@ -978,7 +1164,9 @@ def draw(args, run_dir, moment):
     """Draw one frame of the whole run; returns whether the run it drew is over."""
     waves = read_table(run_dir)
     records = read_log(run_dir / MACHINE_LOG_NAME)
-    rows = build_rows(waves, records, moment, live_sources(args.claude_bin, run_dir))
+    rows = build_rows(
+        waves, records, moment, live_sources(args.claude_bin, run_dir, records=records)
+    )
     print(
         render(
             rows, run_dir.name, len(waves), moment,
@@ -1251,6 +1439,7 @@ def read_pin(path):
     if not run_dir or not isinstance(pid, int) or isinstance(pid, bool):
         return None
     return {
+        "path": pathlib.Path(path),
         "run_dir": pathlib.Path(worktree_key(run_dir)),
         "pid": pid,
         "session": session_key(pin.get(PIN_SESSION)),
@@ -1270,6 +1459,28 @@ def read_registry(pin_dir):
         return [], 0
     pins = [pin for pin in (read_pin(path) for path in paths) if pin is not None]
     return pins, len(paths) - len(pins)
+
+
+def sweep_registry(pins):
+    """Take out every pin whose coordinator has gone; returns the pins that are still live.
+
+    A run ends by unpinning itself, and a coordinator abandoned after a judgment-needed or
+    driver-error pause never reaches that step — so without this the registry keeps a file naming
+    a run nobody will ever resume, and every tick of every pane goes on reading it. Sweeping is
+    safe because a pin is not state: every wave writes it again, so a run the operator resumes
+    re-pins itself on its next dispatch.
+
+    A pin that cannot be removed is left where it is. This is a statusline tick's housekeeping,
+    not its job, and a registry on a read-only disk is nobody's emergency.
+    """
+    live = []
+    for pin in pins:
+        if alive(pin["pid"]):
+            live.append(pin)
+            continue
+        with contextlib.suppress(OSError):
+            pin["path"].unlink(missing_ok=True)
+    return live
 
 
 def select_pin(pins, session):
@@ -1363,7 +1574,7 @@ def pin_frame_data(args, run_dir, moment):
     if over(records):
         return None
     waves = read_table(run_dir)
-    sources = live_sources(args.claude_bin, run_dir, args.timeout)
+    sources = live_sources(args.claude_bin, run_dir, args.timeout, records)
     rows = build_rows(waves, records, moment, sources)
     frame = render(
         rows, run_dir.name, len(waves), moment,
@@ -1391,6 +1602,10 @@ def run_pin(args):
     Claude Code writes its own JSON to this command's stdin. Nothing here reads it, and no source
     this spawns inherits it, so a tick can neither block on that stream nor eat what is on it.
 
+    A tick is also the registry's only housekeeper: a pin whose coordinator has gone is swept
+    before any of them is matched, because nothing but a normal finish ever unpins a run and an
+    abandoned one would otherwise be read by every pane for as long as the machine stays up.
+
     `--from-wrapper` adds ADR-0011's one exception, and only for the caller that cannot judge it
     itself: the wrapper reads the registry with `sed`, so a file that is named like a pin and is
     not one is a judgment only this JSON parser can make. Where nothing was drawn and the registry
@@ -1399,9 +1614,9 @@ def run_pin(args):
     try:
         directory = pin_directory(args)
         pins, unreadable = read_registry(directory)
-        pin = select_pin(pins, caller_session(args.tmux_bin, args.timeout))
+        pin = select_pin(sweep_registry(pins), caller_session(args.tmux_bin, args.timeout))
         data = None
-        if pin is not None and alive(pin["pid"]):
+        if pin is not None:
             data = pin_frame_data(args, pin["run_dir"], args.now or now())
         if data is None:
             if unreadable and args.from_wrapper:
