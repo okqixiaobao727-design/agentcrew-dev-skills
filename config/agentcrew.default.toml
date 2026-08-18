@@ -135,8 +135,9 @@ command = ""
 # has; `pin` skips that window and draws the same frame into the coordinator's Claude Code
 # statusline instead, so there is nothing left to close when the run ends; `both` runs each, and
 # the run's shared toast state keeps them from announcing the same thing twice. The window is the
-# default, so upgrading agentcrew changes nobody's run. What the pin is and how it is wired in is
-# in `docs/monitor-dashboard.md`.
+# shipped default for projects without the machine preference recorded by `pin-install`, so
+# upgrading agentcrew changes nobody's run. What the pin is and how it is wired in is in
+# `docs/monitor-dashboard.md`.
 
 [dashboard]
 surface = "window"

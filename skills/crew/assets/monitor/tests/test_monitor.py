@@ -499,6 +499,13 @@ class Fixture:
         """The pin registry's default location, under the Claude config this fixture points at."""
         return self.claude_home.joinpath(*PIN_REGISTRY)
 
+    def surface_preference_files(self):
+        """The machine-level surface preference files beside, not inside, the pin registry."""
+        parent = self.pin_dir().parent
+        if not parent.is_dir():
+            return []
+        return sorted(path for path in parent.iterdir() if path.is_file())
+
     def pin(self, run_dir=None, pid=None, session=CALLER_SESSION, directory=None,
             renderer=MONITOR, interpreter=sys.executable):
         """A pin naming a live run: its run directory, the coordinator's pid, its tmux session,
@@ -2270,6 +2277,66 @@ class SurfaceTests(MonitorTestCase):
         self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
         self.assertEqual(self.fixture.pins(), [])
 
+    def test_a_silent_project_uses_the_machine_surface_preference(self):
+        installed = self.fixture.pin_install("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        result = self.fixture.window("--coordinator-pid", COORDINATOR_PID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.window_calls(), [])
+        self.assertEqual(self.fixture.live_windows(), {})
+        self.assertEqual(len(self.fixture.pins()), 1)
+
+    def test_a_dashboard_section_without_surface_uses_the_machine_surface_preference(self):
+        installed = self.fixture.pin_install("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        config = self.fixture.root / "agentcrew.toml"
+        config.write_text("[dashboard]\nunrelated = true\n")
+
+        result = self.fixture.window(
+            "--config", config, "--coordinator-pid", COORDINATOR_PID
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.window_calls(), [])
+        self.assertEqual(self.fixture.live_windows(), {})
+        self.assertEqual(len(self.fixture.pins()), 1)
+
+    def test_a_project_surface_overrides_the_machine_surface_preference(self):
+        installed = self.fixture.pin_install("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        result = self.surfaced("window")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_an_invalid_machine_surface_preference_falls_back_to_the_window(self):
+        installed = self.fixture.pin_install("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        preference = self.fixture.surface_preference_files()[0]
+        preference.write_text("popup\n")
+
+        result = self.fixture.window("--coordinator-pid", COORDINATOR_PID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        self.assertEqual(self.fixture.pins(), [])
+
+    def test_an_unreadable_machine_surface_preference_falls_back_to_the_window(self):
+        installed = self.fixture.pin_install("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        preference = self.fixture.surface_preference_files()[0]
+        preference.write_bytes(b"\xff")
+
+        result = self.fixture.window("--coordinator-pid", COORDINATOR_PID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fixture.window_calls()), 1, self.fixture.calls("tmux"))
+        self.assertEqual(self.fixture.pins(), [])
+
     def test_a_config_file_that_is_not_there_is_the_default_surface(self):
         result = self.fixture.window(
             "--config", self.fixture.root / "absent.toml",
@@ -2894,6 +2961,7 @@ class PinInstallTests(MonitorTestCase):
         self.assertEqual(self.fixture.settings_path.read_text(), before)
         self.assertFalse(self.fixture.wrapper_path.exists())
         self.assertEqual(self.fixture.backups(self.fixture.settings_path), [])
+        self.assertEqual(self.fixture.surface_preference_files(), [])
 
     def test_applying_over_an_existing_statusline_keeps_it_and_prints_it_first(self):
         self.wired()
@@ -2910,6 +2978,16 @@ class PinInstallTests(MonitorTestCase):
         self.assertEqual(drawn.stdout.splitlines()[0], PREVIOUS_STATUSLINE)
         backups = self.fixture.backups(self.fixture.settings_path)
         self.assertEqual([backup.read_text() for backup in backups], [before])
+
+    def test_install_records_the_machine_surface_preference(self):
+        self.wired()
+
+        result = self.fixture.pin_install("--apply")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        preferences = self.fixture.surface_preference_files()
+        self.assertEqual(len(preferences), 1)
+        self.assertEqual(preferences[0].read_text().strip(), "pin")
 
     def test_the_wrapper_carries_no_path_that_a_release_can_expire(self):
         """What the installer writes is a permanent stub: neither the release that wrote it nor
@@ -3008,6 +3086,48 @@ class PinInstallTests(MonitorTestCase):
         self.assertEqual(
             self.fixture.settings_json(), {UNRELATED_SETTING[0]: UNRELATED_SETTING[1]}
         )
+
+    def test_uninstalling_removes_the_preference_and_reinstalling_restores_it(self):
+        self.wired()
+        self.fixture.pin_install("--apply")
+
+        removed = self.fixture.pin_install("--uninstall", "--apply")
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(self.fixture.surface_preference_files(), [])
+
+        restored = self.fixture.pin_install("--apply")
+
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        preferences = self.fixture.surface_preference_files()
+        self.assertEqual(len(preferences), 1)
+        self.assertEqual(preferences[0].read_text().strip(), "pin")
+
+    def test_uninstalling_without_wiring_still_removes_the_preference(self):
+        self.wired()
+        self.fixture.pin_install("--apply")
+        self.fixture.wrapper_path.unlink()
+
+        result = self.fixture.pin_install("--uninstall", "--apply")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.surface_preference_files(), [])
+
+    def test_reinstalling_with_existing_wiring_rewrites_a_missing_preference(self):
+        self.wired()
+        self.fixture.pin_install("--apply")
+        settings = self.fixture.settings_path.read_text()
+        wrapper = self.fixture.wrapper_path.read_text()
+        self.fixture.surface_preference_files()[0].unlink()
+
+        result = self.fixture.pin_install("--apply")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.settings_path.read_text(), settings)
+        self.assertEqual(self.fixture.wrapper_path.read_text(), wrapper)
+        preferences = self.fixture.surface_preference_files()
+        self.assertEqual(len(preferences), 1)
+        self.assertEqual(preferences[0].read_text().strip(), "pin")
 
     def test_uninstalling_refuses_when_the_statusline_has_moved_on(self):
         self.wired()
