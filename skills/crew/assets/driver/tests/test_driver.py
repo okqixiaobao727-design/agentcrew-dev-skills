@@ -49,6 +49,9 @@ TRACKER = "local"
 # The loop's dials, wound down so a test drives a run in seconds rather than in poll intervals.
 POLL_SECONDS = "0.2"
 LOOP_TIMEOUT = "20"
+# Long enough for the loop to have polled a status many times over, which is what makes "it was
+# never nudged" an observation rather than a race won.
+QUIET_SECONDS = 3.0
 
 ROUTING = f"""## Routing
 
@@ -311,6 +314,16 @@ class Fixture:
     def completes(self, ticket, text="work\n", name=None):
         """The whole of what a child that finished does: commit the work, send the receipt."""
         self.says(ticket, f"CREW COMPLETE {self.commit_work(ticket, text, name)}")
+
+    def answers(self, ticket, text):
+        """Deliver the coordinator's ruling the way the coordinator delivers one."""
+        subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer", "--run-dir", str(self.run_dir),
+                "--ticket", ticket, "--text", text,
+            ],
+            check=True, capture_output=True, env=self.environment(), cwd=str(self.repo),
+        )
 
     def agents(self):
         path = self.stub_dir / "agents.json"
@@ -1221,6 +1234,36 @@ class LoopTests(DriverTestCase):
 
     # --- the receipt rungs ----------------------------------------------------------------
 
+    def test_a_receipt_bundled_under_a_summary_is_read_as_the_childs_final_word(self):
+        """A child composes its last turn freely, and the receipt arrives under the summary."""
+        process = self.start(("01", ()))
+
+        sha = self.fixture.commit_work("01")
+        self.fixture.says(
+            "01",
+            "Implemented the change, the tests pass and the review came back clean.\n"
+            f"CREW COMPLETE {sha} ts=1",
+        )
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+        self.assertEqual(self.instructions("01", "CREW RECHECK"), [])
+
+    def test_an_ask_bundled_under_a_summary_reaches_the_coordinator_as_an_escalation(self):
+        """The same strictness that ate receipts ate asks, which is a child invisibly stuck."""
+        process = self.start(("01", ()))
+
+        self.fixture.says(
+            "01",
+            "I read the spec and the ticket through and they disagree about the table.\n"
+            "CREW ASK 01 doc-conflict — which table? ts=1",
+        )
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("which table?", snapshot["detail"])
+        self.assertEqual(len(self.events("escalation", ticket="01")), 1)
+
     def test_an_invalid_receipt_is_re_asked_once_and_the_valid_one_after_it_settles(self):
         process = self.start(("01", ()))
 
@@ -1255,6 +1298,39 @@ class LoopTests(DriverTestCase):
         parked = (self.fixture.run_dir / "parked-paths").read_text()
         self.assertIn(str(self.fixture.worktree("01")), parked)
         self.assertIn("checklist.md", self.events("receipt", ticket="01")[-1]["detail"])
+
+    def test_a_parked_ticket_that_finishes_after_all_supersedes_its_parked_receipt(self):
+        """A park waits on a human, and a child that finished has left that human nothing to do."""
+        process = self.start(("01", ()), ("02", ()))
+
+        self.fixture.says("01", "CREW PARKED features/demo/checklist.md")
+        self.wait_for_verdict("01", "parked")
+        self.fixture.completes("01")
+        self.fixture.completes("02")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(
+            [record["verdict"] for record in self.events("receipt", ticket="01")],
+            ["parked", "landable"],
+        )
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_parked_ticket_whose_late_receipt_does_not_verify_stays_parked(self):
+        """The late receipt takes the normal verify path, which a bad claim does not survive.
+
+        02 is in the wave to keep it open while 01's claim is ruled on; the run is left running,
+        because what is pinned here is what the failed verify did to the parked receipt and not
+        how the wave ends afterwards.
+        """
+        self.start(("01", ()), ("02", ()))
+
+        self.fixture.says("01", "CREW PARKED features/demo/checklist.md")
+        self.wait_for_verdict("01", "parked")
+        self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
+        self.wait_for_instruction("01", "CREW RECHECK")
+
+        self.assertEqual(self.verdict("01"), "parked")
+        self.assertEqual(self.events("receipt", ticket="01", verdict="landable"), [])
 
     def test_a_parked_ticket_with_descendants_blocks_them_and_ends_the_run(self):
         """The parked verdict and the blocked descendants are both rules; neither is judgment."""
@@ -1308,6 +1384,37 @@ class LoopTests(DriverTestCase):
 
         self.assertIn("CREW COMPLETE", instruction)
         self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
+    def test_a_child_awaiting_a_handed_over_ruling_is_not_nudged_until_it_is_answered(self):
+        """A nudge to a child waiting on an answer races an answered ask into a parked receipt.
+
+        The child asked, the run handed the ask up, and the answer travels by a channel that
+        reaches no log — so the one thing the loop knows is that the child is owed a reply. Idle
+        is what waiting for one looks like, and nudging it there asks a child that has nothing to
+        report to report something. What it honestly reports is `CREW PARKED`, which settles a
+        ticket whose question had already been answered.
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+        self.fixture.goes("01", "idle")
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        time.sleep(QUIET_SECONDS)
+
+        self.assertEqual(self.instructions("01", "CREW NUDGE"), [])
+
+        # The coordinator answers, and the run is owed nothing: an idle child is one the ordinary
+        # rung nudges again.
+        self.fixture.answers("01", "Use the existing retention_audit table")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.goes("01", "busy")
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+        self.assertEqual(self.verdict("01"), "completed")
 
     def test_a_second_idle_silence_settles_the_ticket_failed(self):
         process = self.start(("01", ()))
