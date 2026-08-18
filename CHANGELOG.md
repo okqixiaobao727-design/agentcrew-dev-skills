@@ -7,6 +7,54 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- The pinned dashboard's statusline tick no longer spawns a CLI per pane per
+  tick. It read its Claude lane by running `claude agents --json`, a complete
+  CLI start costing ~350 MB of transient RSS and 0.58 s of CPU per call whatever
+  the session count, because ~75% of that footprint is the binary itself being
+  mapped. Every pane of the pinned session ticks independently, so a ten-pane run
+  at the two-second default spawned ~7 CLIs a second — enough to congest the
+  machine until every call exceeded the tick's own two-second timeout, at which
+  point the frame drew `unknown` and the whole cost had been paid for nothing.
+  The lane now reads the per-session JSON files the CLI maintains under its
+  config directory, which measured as the same set of sessions with
+  byte-identical `cwd`s and a superset of fields, and costs a few file reads —
+  the same order as drawing the frame. `claude agents --json` remains the
+  fallback for the day that undocumented directory moves, and its parsed result
+  is shared machine-wide through a small cache file written by atomic rename, so
+  the spawn rate is bounded by a ten-second freshness window rather than by pane
+  count; a fetch that failed is cached too, so a CLI that cannot answer is asked
+  once a window rather than once a tick. Nothing is cached on the primary path,
+  so nothing there can go stale, and a tick whose sources have both failed draws
+  `unknown` in silence exactly as ADR-0008 requires — entering fallback is
+  recorded as one `live-source` line in the run's own machine log and never on
+  screen. A tick that runs out of budget is kept distinct from one whose
+  directory is missing: it draws `unknown` rather than reaching for the slower
+  source, and an unreadable directory falls back rather than reading as empty,
+  which would have drawn every live child `vanished`. The data-source choice and
+  the fallback contract that fences the undocumented dependency are recorded in
+  ADR-0012 (#87).
+- A run abandoned after a judgment-needed or driver-error pause no longer leaves
+  its pin in the registry for ever. Nothing but a normal finish removed one, so
+  the burn continued for as long as the coordinator's session stayed open and the
+  stale file outlived it. A tick now removes every pin whose recorded coordinator
+  pid is dead before matching any of them — safe because a pin is not state, and
+  every wave writes it again, so a resumed run re-pins itself on its next
+  dispatch. A pin whose coordinator is alive is untouched, which is what keeps the
+  awaiting-ruling frame on screen through a pause; the driver's exit paths are not
+  changed (#87).
+
+### Added
+- `shell` joins the live-state vocabulary as `waiting`, with its own attention
+  toast — a child sitting at a shell prompt sends the operator somewhere
+  different from one that stopped without finishing, so neither is announced in
+  the other's words. The word exists only in the sessions files; the fallback
+  command folds it into `busy`, so in fallback mode such a child is drawn
+  `running`, and that asymmetry is accepted (#87).
+- A `live-source` machine-log event, recording which source a lane's live
+  children were read from when a dashboard could not read its first choice
+  (#87).
+
 ## [0.7.0] - 2026-08-18
 
 ### Added
