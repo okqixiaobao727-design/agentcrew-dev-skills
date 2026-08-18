@@ -25,6 +25,7 @@ TESTS_DIR = pathlib.Path(__file__).resolve().parent
 DRIVER = TESTS_DIR.parent / "driver.py"
 MACHINE_LOG = DRIVER.parent.parent / "machine_log.py"
 TRIAGE = DRIVER.parent.parent.parent / "references" / "triage.md"
+MONITOR = DRIVER.parent.parent / "monitor" / "monitor.py"
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -195,6 +196,16 @@ class Fixture:
         environment.pop("AGENTCREW_STUB_TRANSCRIPT_MODEL", None)
         environment.update(overrides or {})
         return environment
+
+    def pin_install(self):
+        """Record the machine preference through the monitor's public installer command."""
+        return subprocess.run(
+            [
+                sys.executable, str(MONITOR), "pin-install",
+                "--settings", self.config_dir / "settings.json", "--apply",
+            ],
+            capture_output=True, text=True, env=self.environment(), cwd=str(self.repo),
+        )
 
     def start_argv(self, extra=()):
         return [
@@ -926,6 +937,16 @@ class LaunchTests(DriverTestCase):
         self.assertIn(str(self.fixture.run_dir), command)
         recorded = (self.fixture.run_dir / "dashboard-window").read_text().strip()
         self.assertEqual(recorded, next(iter(windows)))
+
+    def test_a_machine_pin_preference_starts_the_silent_project_without_a_dashboard_window(self):
+        installed = self.fixture.pin_install()
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        self.start_a_run()
+
+        self.assertEqual(self.fixture.windows_named(DASHBOARD_WINDOW), {})
+        pins = list((self.fixture.config_dir / "agentcrew" / "pins").glob("*.json"))
+        self.assertEqual(len(pins), 1)
 
     def test_the_wake_monitor_is_armed_over_the_wave_s_children(self):
         self.start_a_run()

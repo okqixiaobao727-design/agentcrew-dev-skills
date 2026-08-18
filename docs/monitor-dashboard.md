@@ -290,7 +290,16 @@ it says.
 
 This is also the command that chooses the surface, because it is the one dispatch already calls in
 every wave. `--config` names the project's `agentcrew.toml`, whose `[dashboard] surface` is
-`window`, `pin`, or `both`:
+`window`, `pin`, or `both`. Resolution is, in order:
+
+1. the project's explicit `[dashboard] surface`;
+2. the machine preference at `$CLAUDE_CONFIG_DIR/agentcrew/surface`, falling back to
+   `~/.claude/agentcrew/surface`, when the project is silent and the file contains a valid surface
+   value; or
+3. the shipped `window` default.
+
+The machine preference is written as `pin` by `pin-install --apply` and removed by
+`pin-install --uninstall --apply`. A missing, unreadable or invalid preference is treated as absent.
 
 | `surface` | The window | The pin |
 | --- | --- | --- |
@@ -299,9 +308,9 @@ every wave. `--config` names the project's `agentcrew.toml`, whose `[dashboard] 
 | `both` | as above | written |
 
 A run whose config names no surface, whose config has no `[dashboard]` section, and a run given no
-`--config` at all, all get `window` — so upgrading agentcrew changes nobody's run. On `both`, the
-two passes dedup their toasts through the one file the run directory holds, which is what stops
-the same thing being announced twice.
+`--config` at all use the machine preference when one is installed, and otherwise get `window` —
+so upgrading agentcrew changes nobody's run. On `both`, the two passes dedup their toasts through
+the one file the run directory holds, which is what stops the same thing being announced twice.
 
 Writing the pin needs `--coordinator-pid`, the pid of the session driving the run: a pin is the
 handle on a live coordinator, and one written without a pid to check would be a frame nothing
@@ -385,10 +394,12 @@ monitor.py pin-install [--apply] [--uninstall] [--settings <file>] [--statusline
 ```
 
 `pin-install` wires the pin into the operator's own Claude Code statusline: it writes a wrapper
-script beside their settings and points `statusLine.command` at it. The wrapper runs whatever the
-statusline ran before, prints that first, and draws the pin's frame beneath it. Nothing is written
-without `--apply`, every file is copied aside first, and `--uninstall` reads the record the wrapper
-carries to put the statusline back exactly.
+script beside their settings, points `statusLine.command` at it, and records the machine preference
+as `pin` at `$CLAUDE_CONFIG_DIR/agentcrew/surface`, falling back to
+`~/.claude/agentcrew/surface`. The wrapper runs whatever the statusline ran before, prints that
+first, and draws the pin's frame beneath it. Nothing is written without
+`--apply`, every settings/wrapper file is copied aside first, and `--uninstall` reads the record the
+wrapper carries to put the statusline back exactly while removing the machine preference.
 
 That wrapper names no release. It reads the registry above, and runs the renderer and interpreter
 the live pin names — so the release that draws the frame is the release that dispatched the run,

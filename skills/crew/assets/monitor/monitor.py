@@ -81,8 +81,8 @@ DASHBOARD_WINDOW_NAME = "crew-dashboard"
 # A pin is named for the run it names, so a run re-pinning itself every wave still has one pin.
 PIN_NAME_LENGTH = 16
 
-# Which surface a run draws itself on, from `[dashboard] surface` in the project's config. The
-# window is the default, so upgrading agentcrew changes nobody's run.
+# Which surface a run draws itself on: an explicit project value, the machine preference recorded
+# by pin-install for a silent project, or the shipped window default.
 DASHBOARD_SECTION = "dashboard"
 SURFACE_KEY = "surface"
 SURFACE_WINDOW = "window"
@@ -207,6 +207,7 @@ COLOUR_RESET = "\x1b[0m"
 # The pin registry (`docs/monitor-dashboard.md`): the directory a live run leaves the file naming
 # itself in, under the operator's Claude config, and the five things that file carries.
 PIN_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "agentcrew/pins")
+SURFACE_PREFERENCE_NAME = "surface"
 PIN_SUFFIX = ".json"
 PIN_GLOB = f"*{PIN_SUFFIX}"
 PIN_RUN_DIR = "run_dir"
@@ -1055,28 +1056,41 @@ def window_lock(run_dir):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def machine_surface_preference():
+    """The installed machine preference, or None when it is absent or unusable."""
+    try:
+        value = surface_preference_path().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value if value in SURFACES else None
+
+
 def configured_surface(args):
     """Which surface this run draws itself on, read from the project's config file.
 
-    A run that names no config, or whose config has no `[dashboard]` section, gets the window it
-    has always got: the surface is a choice a repo makes, never one an upgrade makes for it.
+    A project's explicit surface wins. A silent project inherits the machine preference recorded by
+    pin-install, and a machine with no usable preference keeps the shipped window default.
     """
+    machine_surface = machine_surface_preference()
+    fallback = machine_surface or DEFAULT_SURFACE
     if not args.config:
-        return DEFAULT_SURFACE
+        return fallback
     try:
         text = pathlib.Path(args.config).read_text(encoding="utf-8")
     except FileNotFoundError:
-        return DEFAULT_SURFACE
+        return fallback
     except OSError as error:
         raise MonitorError(f"config {args.config} is unreadable: {error}")
     try:
         config = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise MonitorError(f"config {args.config} is unparsable: {error}")
-    section = config.get(DASHBOARD_SECTION, {})
+    if DASHBOARD_SECTION not in config:
+        return fallback
+    section = config[DASHBOARD_SECTION]
     if not isinstance(section, dict):
         raise MonitorError(f"config {args.config}: [{DASHBOARD_SECTION}] must be a table")
-    surface = section.get(SURFACE_KEY, DEFAULT_SURFACE)
+    surface = section.get(SURFACE_KEY, fallback)
     if surface not in SURFACES:
         raise MonitorError(
             f"config {args.config}: unknown {DASHBOARD_SECTION} {SURFACE_KEY} {surface!r}, "
@@ -1297,6 +1311,37 @@ def pin_directory(args):
     """
     given = pathlib.Path(args.pin_dir) if args.pin_dir else transcript_root(PIN_REGISTRY)
     return given.expanduser().resolve()
+
+
+def surface_preference_path():
+    """The machine-level dashboard surface preference beside the pin registry."""
+    return transcript_root(PIN_REGISTRY).parent / SURFACE_PREFERENCE_NAME
+
+
+def write_surface_preference():
+    """Record the surface the operator opted into by installing the pin."""
+    path = surface_preference_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(SURFACE_PIN + "\n", encoding="utf-8")
+    except OSError as error:
+        raise MonitorError(f"the machine surface preference could not be written: {error}")
+
+
+def surface_preference_is_pinned():
+    """Whether the machine preference exists and carries the installed surface value."""
+    try:
+        return surface_preference_path().read_text(encoding="utf-8").strip() == SURFACE_PIN
+    except (OSError, UnicodeError):
+        return False
+
+
+def remove_surface_preference():
+    """Remove the machine preference; an absent preference is already the desired state."""
+    try:
+        surface_preference_path().unlink(missing_ok=True)
+    except OSError as error:
+        raise MonitorError(f"the machine surface preference could not be removed: {error}")
 
 
 def pin_colour(args):
@@ -1649,6 +1694,7 @@ def run_pin_install(args):
     settings_file = pin_settings_path(args)
     wrapper = pin_wrapper_path(args, settings_file)
     settings = read_settings(settings_file)
+    preference = surface_preference_path()
     if args.uninstall:
         drift = uninstall_drift(settings, wrapper) if install_record(wrapper) else None
         if drift is not None:
@@ -1657,11 +1703,17 @@ def run_pin_install(args):
                 "the statusline has moved on since the install and nothing was written"
             )
         after, lines = plan_uninstall(settings, settings_file, wrapper)
+        if preference.exists():
+            lines.append(f"remove {preference}")
         if not lines:
             print("the pin is not installed here; nothing to undo")
             return 0
     else:
         after, text, lines = plan_install(settings, settings_file, wrapper)
+        wiring_needs_change = bool(lines)
+        preference_needs_write = not surface_preference_is_pinned()
+        if preference_needs_write:
+            lines.append(f"write {preference} = {SURFACE_PIN}")
         if not lines:
             print("the pin is already installed here; nothing to change")
             return 0
@@ -1671,13 +1723,19 @@ def run_pin_install(args):
         print("dry run — nothing written. Re-run with --apply to make these changes.")
         return 0
     if args.uninstall:
-        write_settings(settings_file, after)
-        back_up(wrapper)
-        wrapper.unlink(missing_ok=True)
+        if after is not None:
+            write_settings(settings_file, after)
+        if wrapper.exists():
+            back_up(wrapper)
+            wrapper.unlink()
+        remove_surface_preference()
     else:
         # The wrapper first: the settings must never name a script that is not there yet.
-        write_wrapper(wrapper, text)
-        write_settings(settings_file, after)
+        if wiring_needs_change:
+            write_wrapper(wrapper, text)
+            write_settings(settings_file, after)
+        if preference_needs_write:
+            write_surface_preference()
     return 0
 
 
@@ -2226,7 +2284,7 @@ def build_parser():
     window.add_argument(
         "--config",
         help=f"the project's config, whose [{DASHBOARD_SECTION}] {SURFACE_KEY} chooses between "
-             f"{', '.join(SURFACES)} (default: {DEFAULT_SURFACE})",
+             f"{', '.join(SURFACES)} (default: machine preference or {DEFAULT_SURFACE})",
     )
     window.add_argument(
         "--coordinator-pid", type=int,
