@@ -47,7 +47,8 @@ predecessor skill document's settlement prose, not a new invention: verify on `C
 settle in silence; one re-ask on an invalid receipt and failed on the second; parked and failed
 receipts recorded by the driver; a parked ticket with no descendants does not gate its wave; one
 nudge for an idle child and failed on the second silence; vanished settles failed; a mechanical
-conflict to the budget-capped repair rung; a templated first answer to a semantic conflict; tracker
+conflict resolved in the merge driver itself, and only what it will not rewrite to the
+budget-capped repair rung; a templated first answer to a semantic conflict; tracker
 closes for merged tickets; wave advancement, monitor re-arming and the dashboard. The report — the
 outcome table, the duration rows, the rulings, the undo list and the cost rollup with the
 coordinator's own row — is rendered by the driver from the machine log.

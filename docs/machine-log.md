@@ -58,14 +58,18 @@ the ones the crew skill's watch step settles a launched ticket into.
 ### `merge` — one ticket branch's trip into the integration branch
 
 `ticket`, `branch`, `into`, `result`, `sha`, `detail`. `result` is one of the escalation
-ladder's four stops ([ADR-0004](adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md)):
+ladder's stops ([ADR-0004](adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md)):
 
 | `result` | Meaning |
 | --- | --- |
 | `clean` | the scripted merge succeeded, no model involved |
 | `conflict` | the merge conflicted and was handed down the ladder |
+| `resolved` | the driver kept both sides' insertions itself, no model involved |
 | `repaired` | the budget-capped repair session resolved it |
 | `escalated` | a semantic conflict or a repair double failure went to the coordinator |
+
+`resolved` and `repaired` are two words rather than one because a log that spells them alike
+cannot say which merges cost a model anything.
 
 ### `outcome` — a ticket's one report outcome
 
@@ -191,7 +195,8 @@ machine_log.py --log <path> launch  --ticket NN --child NAME --workflow W --exec
 machine_log.py --log <path> launch-failed --ticket NN --detail TEXT
 machine_log.py --log <path> receipt --ticket NN --verdict landable|parked|failed \
                                     [--sha SHA] [--detail TEXT]
-machine_log.py --log <path> merge   --ticket NN --result clean|conflict|repaired|escalated \
+machine_log.py --log <path> merge   --ticket NN \
+                                    --result clean|conflict|resolved|repaired|escalated \
                                     [--branch B] [--into B] [--sha SHA] [--detail TEXT]
 machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parked|blocked \
                                     [--detail TEXT]

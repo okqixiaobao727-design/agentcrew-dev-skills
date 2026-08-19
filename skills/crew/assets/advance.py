@@ -65,7 +65,7 @@ PARKED = "parked"
 # A failed ticket always stops the chain; a parked ticket only halts it when it has descendants.
 BLOCKED = "blocked"
 # The merge results that mean the branch is on the integration branch (`docs/merge-driver.md`).
-LANDED_RESULTS = ("clean", "repaired")
+LANDED_RESULTS = ("clean", "repaired", "resolved")
 
 LAUNCHED = "launched"
 ESCALATED = "escalated"

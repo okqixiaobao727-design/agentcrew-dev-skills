@@ -45,6 +45,9 @@ INTEGRATION_BRANCH = "crew/demo"
 BASE_BRANCH = "main"
 # The two decisions the project's config carries, which the driver records into the run.
 REPAIR_MODEL = "claude-sonnet-5"
+# A file carrying a line that reads as an opening conflict marker: the merge driver will not
+# rewrite a conflict in it, so this is the shape that still climbs to the repair rung.
+UNREWRITABLE = "one\n<<<<<<< left over from an earlier merge\nthree\n"
 TRACKER = "local"
 # The loop's dials, wound down so a test drives a run in seconds rather than in poll intervals.
 POLL_SECONDS = "0.2"
@@ -1811,11 +1814,30 @@ class LoopTests(DriverTestCase):
         self.assertIn("second time", snapshot["detail"])
         self.assertEqual(len(self.instructions("02", "CREW MERGE")), 1)
 
-    def test_a_mechanical_conflict_goes_to_the_repair_rung_on_the_configured_model(self):
+    def test_a_mechanical_conflict_is_resolved_by_the_driver_without_a_repair_session(self):
+        """Both children only inserted, so the run lands the wave itself and ends on its own."""
         process = self.start(("01", ()), ("02", ()), shared="one\n")
 
         self.fixture.completes("01", "one\nfrom 01\n", name="shared.txt")
         self.fixture.completes("02", "one\nfrom 02\n", name="shared.txt")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(
+            [call for call in self.fixture.claude_calls() if "--print" in call["argv"]], [],
+            "a proven-mechanical conflict wakes neither the repair rung nor the coordinator",
+        )
+        self.assertIn(
+            "mechanical", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
+        )
+        self.assertEqual(len(self.events("merge", ticket="02", result="resolved")), 1)
+        self.assertEqual(self.instructions("02", "CREW MERGE"), [])
+
+    def test_the_conflict_the_driver_will_not_rewrite_reaches_the_configured_repair_model(self):
+        """A file whose own text reads as an opening conflict marker is still the rung's work."""
+        process = self.start(("01", ()), ("02", ()), shared=UNREWRITABLE)
+
+        self.fixture.completes("01", UNREWRITABLE + "from 01\n", name="shared.txt")
+        self.fixture.completes("02", UNREWRITABLE + "from 02\n", name="shared.txt")
         self.woken(process, "judgment-needed")
 
         repairs = [

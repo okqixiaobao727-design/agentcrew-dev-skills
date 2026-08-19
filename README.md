@@ -195,9 +195,11 @@ What the pinned dashboard is and how it is wired into Claude Code is in
 ### `[repair]` — the model the merge ladder repairs on
 
 A mechanical merge conflict — two children inserting at the same point, neither rewriting the
-other's work — goes to a headless session under a hard budget cap before anything reaches the
-coordinator. Pick a cheap model: the rung exists to keep mechanical work off the expensive one. A
-full model ID, never an alias, and no default — a run whose config names none stops in preflight.
+other's work — is resolved by the merge driver itself, at no cost. The one it will not rewrite,
+where the file's own text carries a line that reads as a conflict marker, goes to a headless
+session under a hard budget cap before anything reaches the coordinator. Pick a cheap model: the
+rung exists to keep mechanical work off the expensive one. A full model ID, never an alias, and no
+default — a run whose config names none stops in preflight.
 
 ```toml
 [repair]

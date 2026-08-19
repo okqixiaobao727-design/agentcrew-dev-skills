@@ -62,9 +62,9 @@ and, where it holds, settled in silence; an invalid receipt earns one re-ask and
 the second; parked and failed receipts are recorded by the driver rather than by hand; an idle
 child earns one nudge and settles failed on the second silence, unless it is idle because it is
 owed a ruling nothing has answered yet; a vanished child settles failed; a settled wave is
-advanced, which lands its branches, hands a mechanical conflict to the budget-capped repair rung
-and launches the next wave; a semantic conflict is answered first by a
-templated instruction to the child that has to resolve it; a merged ticket is closed in the run's
+advanced, which lands its branches, resolves a mechanical conflict in the merge driver itself and
+launches the next wave; a semantic conflict is answered first by a templated instruction to the
+child that has to resolve it; a merged ticket is closed in the run's
 tracker with its exact undo written into the log; and each wave's monitors are re-armed without a
 coordinator turn.
 
@@ -299,7 +299,7 @@ LAUNCHED = "launched"
 # The advance decision this loop writes itself: the run ended because the chain stopped on reasons
 # the rule table had already settled, which no other decision in the log's vocabulary says.
 STOPPED = "stopped"
-LANDED_RESULTS = ("clean", "repaired")
+LANDED_RESULTS = ("clean", "repaired", "resolved")
 ESCALATED = "escalated"
 SEMANTIC_PREFIX = "semantic: "
 
@@ -2751,9 +2751,9 @@ class Loop:
         """Land the settled wave and launch the next; returns the wave to work, or None when done.
 
         Every rung below the coordinator lives inside this one call — the merge driver classifies a
-        conflict and hands a mechanical one to the budget-capped repair rung, and advance launches
-        the next wave and blocks what a stopped ticket stopped. What comes back is a decision, and
-        only two of them are this loop's to act on.
+        conflict and resolves a mechanical one itself, and advance launches the next wave and
+        blocks what a stopped ticket stopped. What comes back is a decision, and only two of them
+        are this loop's to act on.
         """
         result = subprocess.run(
             [

@@ -104,7 +104,7 @@ never reads an internal word:
 | `parked` | a `receipt` verdict or an `outcome` of `parked`, or its lane says so |
 | `landable` | a `receipt` verdict of `landable` |
 | `settling` | `landable`, in a wave every ticket of which has settled, in a run that is not over |
-| `merged` | a `merge` result of `clean` or `repaired`, or an `outcome` of `completed` |
+| `merged` | a `merge` result of `clean`, `resolved` or `repaired`, or an `outcome` of `completed` |
 | `failed` | a `receipt` verdict or an `outcome` of `failed` |
 | `vanished` | it was launched, nothing settled it, and its lane has no live entry for it |
 

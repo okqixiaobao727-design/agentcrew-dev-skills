@@ -28,7 +28,8 @@ child's diff, a worktree — stay closed, and nothing puts them in front of you.
 what a ruling needs is answered by asking its sender for exactly what it lacks.
 
 **Product code belongs to a child**, merge-conflict resolution included: answer with design
-direction or pseudocode, and the child writes the edit.
+direction or pseudocode, and the child writes the edit. The conflicts that reach you at all are the
+ones no rule settles — the merge driver resolves a mechanical conflict itself.
 
 ## Start the run
 

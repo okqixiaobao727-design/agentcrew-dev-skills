@@ -498,13 +498,13 @@ class EventTests(MachineLogTestCase):
                 run_cli("outcome", "--ticket", "07", "--outcome", outcome, log=self.log).returncode,
                 0,
             )
-        for result in ("clean", "conflict", "repaired", "escalated"):
+        for result in ("clean", "conflict", "repaired", "resolved", "escalated"):
             self.assertEqual(
                 run_cli("merge", "--ticket", "07", "--result", result, log=self.log).returncode,
                 0,
             )
 
-        self.assertEqual(len(self.lines()), 11)
+        self.assertEqual(len(self.lines()), 12)
 
     def test_a_value_outside_a_closed_set_is_refused_and_appends_nothing(self):
         result = run_cli("receipt", "--ticket", "07", "--verdict", "landed", log=self.log)
