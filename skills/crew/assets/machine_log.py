@@ -81,10 +81,22 @@ VERB_GRAMMAR = (
     (ESCALATION_VERB, re.compile(rf"{ESCALATION_VERB} \S.*")),
 )
 
+LIVE = "live"
+LANDABLE = "landable"
+COMPLETED = "completed"
+FAILED = "failed"
+PARKED = "parked"
+BLOCKED = "blocked"
+CLEAN = "clean"
+CONFLICT = "conflict"
+REPAIRED = "repaired"
+ESCALATED = "escalated"
+
 # The closed sets. A log that accepts an unknown verdict is a log a later agent cannot trust.
-VERDICTS = ("landable", "parked", "failed")
-OUTCOMES = ("completed", "failed", "parked", "blocked")
-MERGE_RESULTS = ("clean", "conflict", "repaired", "escalated")
+VERDICTS = (LANDABLE, PARKED, FAILED)
+OUTCOMES = (COMPLETED, FAILED, PARKED, BLOCKED)
+MERGE_RESULTS = (CLEAN, CONFLICT, REPAIRED, ESCALATED)
+LANDED_MERGE_RESULTS = (CLEAN, REPAIRED)
 # The two ends of one review. A review that started and never came back is a row the dashboard
 # would leave standing, so the vocabulary is closed at "it is running" and "it is not".
 REVIEW_STATES = ("running", "returned")
@@ -108,6 +120,46 @@ COST_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_cr
 COST_TOTAL = "total_tokens"
 
 LOG_FILE_MODE = 0o644
+
+
+def settlement_state(records, ticket):
+    """Return one of live, landable, completed, failed, parked, or blocked.
+
+    Precedence, from highest to lowest:
+
+    ================  ==============================================================
+    Log evidence      State
+    ================  ==============================================================
+    latest outcome    that outcome; it refines a receipt and never un-settles it
+    latest receipt    its verdict, except landable plus a landed merge is completed
+    neither           live
+    ================  ==============================================================
+
+    A completed outcome needs no receipt or merge lookup here: the tracker close that writes it
+    only happens after a landed merge. For a landable receipt, the latest merge result must be
+    clean or repaired; a conflict or escalation leaves the ticket landable rather than done.
+    """
+    ticket = str(ticket)
+    latest_outcome = None
+    latest_receipt = None
+    latest_merge = None
+    for record in records:
+        if str(record.get("ticket")) != ticket:
+            continue
+        event = record.get("event")
+        if event == "outcome" and record.get("outcome") in OUTCOMES:
+            latest_outcome = str(record["outcome"])
+        elif event == "receipt" and record.get("verdict") in VERDICTS:
+            latest_receipt = str(record["verdict"])
+        elif event == "merge" and record.get("result") in MERGE_RESULTS:
+            latest_merge = str(record["result"])
+    if latest_outcome is not None:
+        return latest_outcome
+    if latest_receipt == LANDABLE and latest_merge in LANDED_MERGE_RESULTS:
+        return COMPLETED
+    if latest_receipt is not None:
+        return latest_receipt
+    return LIVE
 
 
 def now():

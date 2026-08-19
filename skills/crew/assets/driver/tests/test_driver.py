@@ -1539,6 +1539,23 @@ class LoopTests(DriverTestCase):
         )
         self.assertEqual(self.events("advance", decision="stopped")[0]["wave"], "1")
 
+    def test_stopped_refuses_an_unlaunched_ticket_the_halt_did_not_block(self):
+        process = self.start(("01", ()), ("02", ("01",)))
+        process.kill()
+        process.communicate()
+        table_path = self.fixture.run_dir / "wave-table.json"
+        table = json.loads(table_path.read_text())
+        table["waves"][1]["tickets"][0]["blocked_by"] = []
+        table_path.write_text(json.dumps(table))
+
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.fixture.says("01", "CREW FAILED the approach does not work")
+        snapshot = self.woken(resumed, "driver-error")
+
+        self.assertIn("stopped refused: ticket 02 is still launchable", snapshot["detail"])
+        self.assertEqual(self.events("advance", decision="stopped"), [])
+
     def test_a_failure_receipt_is_recorded_by_the_driver(self):
         process = self.start(("01", ()))
 

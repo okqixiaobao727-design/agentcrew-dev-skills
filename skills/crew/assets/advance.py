@@ -51,6 +51,7 @@ import sys
 # what launches a wave, so both come from the one script that owns them.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
 import dispatch  # noqa: E402
+import machine_log  # noqa: E402
 
 ASSETS = pathlib.Path(__file__).resolve().parent
 MACHINE_LOG = ASSETS / "machine_log.py"
@@ -59,13 +60,12 @@ DISPATCH = ASSETS / "dispatch" / "dispatch.py"
 
 TMUX_BIN = "tmux"
 
-LANDABLE = "landable"
-FAILED = "failed"
-PARKED = "parked"
+LANDABLE = machine_log.LANDABLE
+COMPLETED = machine_log.COMPLETED
+FAILED = machine_log.FAILED
+PARKED = machine_log.PARKED
 # A failed ticket always stops the chain; a parked ticket only halts it when it has descendants.
-BLOCKED = "blocked"
-# The merge results that mean the branch is on the integration branch (`docs/merge-driver.md`).
-LANDED_RESULTS = ("clean", "repaired")
+BLOCKED = machine_log.BLOCKED
 
 LAUNCHED = "launched"
 ESCALATED = "escalated"
@@ -149,15 +149,6 @@ def settled_states(records):
 
 def launched_tickets(records):
     return {str(record.get("ticket")) for record in records if record.get("event") == "launch"}
-
-
-def merge_results(records):
-    """{ticket: how its branch's last trip into the integration branch ended}."""
-    results = {}
-    for record in records:
-        if record.get("event") == "merge" and record.get("result"):
-            results[str(record.get("ticket"))] = str(record["result"])
-    return results
 
 
 # --- the table --------------------------------------------------------------------------------
@@ -362,15 +353,13 @@ def advance_wave(table, table_path, wave, options, interrupt):
     lines = land(table_path, wave, options)
 
     records = read_log(options["log"])
-    states = settled_states(records)
-    merges = merge_results(records)
     all_tickets = None
     reasons = []
     roots = {}
     passed_over = []
     for ticket in tickets:
         number = str(ticket["id"])
-        state = states.get(number)
+        state = machine_log.settlement_state(records, number)
         if state == PARKED:
             if all_tickets is None:
                 all_tickets = every_ticket(table)
@@ -382,9 +371,12 @@ def advance_wave(table, table_path, wave, options, interrupt):
         elif state == FAILED:
             roots[number] = state
             reasons.append(f"{number} {state}; {pointers(ticket)}")
+        elif state == COMPLETED:
+            passed_over.append(f"{number} completed passed over as already landed")
+            continue
         elif state != LANDABLE:
             reasons.append(f"{number} settled {state}; {pointers(ticket)}")
-        elif merges.get(number) not in LANDED_RESULTS:
+        else:
             reasons.append(f"{number} did not land; {pointers(ticket)}")
     if reasons:
         return (
