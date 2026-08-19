@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-19
+
 ### Added
 - A ticket may name the **account** it runs on. `## Routing` takes an optional
   `Account:` line — the one routing value `/route` records rather than
