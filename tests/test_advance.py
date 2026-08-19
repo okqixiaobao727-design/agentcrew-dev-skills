@@ -179,6 +179,7 @@ class Fixture:
             "crew_skill_dir": str(CREW_SKILL_DIR),
             "tmux_session": TMUX_SESSION,
             "permission_mode": PERMISSION_MODE,
+            "coordinator_config_home": str(self.config_dir),
         }
         waves = [
             {
@@ -192,6 +193,9 @@ class Fixture:
                         "executor": "claude",
                         "model": MODEL,
                         "effort": EFFORT,
+                        # Concrete on every row, as the driver leaves it: this run names no
+                        # account, so every ticket takes the coordinator's own home (ADR-0014).
+                        "account": str(self.config_dir),
                         "review": dict(REVIEW),
                         "blocked_by": list(blocked_by),
                     }

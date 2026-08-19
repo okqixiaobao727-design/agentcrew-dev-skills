@@ -6,7 +6,9 @@ preflight notice's text, the dashboard command, and the kill that cleared a stal
 live in `tmux-windows.json` there: `new-window` records one and prints its id, `list-windows`
 prints them in the format it was asked for, and `kill-window` takes one away.
 
-`send-keys` runs the keys it was given through `sh -c` in the window's own directory, so a stubbed
+`send-keys` runs the keys it was given through `sh -c` in the window's own directory and in the
+window's own environment — the `-e NAME=VALUE` pairs it was created with, which is how a child is
+put on its ticket's account — so a stubbed
 launch reaches the stub `claude` exactly as a real one reaches the real CLI — unless they were sent
 with `-l`, which is text typed at whoever is reading the pane and is recorded rather than run. A
 window's own command is recorded and never run: the dashboard's refresh loop would otherwise
@@ -44,6 +46,16 @@ def flag(argv, name):
     return argv[argv.index(name) + 1] if name in argv else None
 
 
+def window_environment(argv):
+    """The `NAME=VALUE` pairs the window is created with, as real tmux's `-e` gives it one."""
+    environment = {}
+    for index, value in enumerate(argv):
+        if value == "-e" and index + 1 < len(argv):
+            name, _, setting = argv[index + 1].partition("=")
+            environment[name] = setting
+    return environment
+
+
 def fill(template, window_id, window):
     """One window rendered into the format string tmux was asked for."""
     text = template.replace("#{window_id}", window_id)
@@ -79,6 +91,7 @@ def new_window(argv):
         "name": flag(argv, "-n"),
         "target": flag(argv, "-t"),
         "cwd": flag(argv, "-c") or os.getcwd(),
+        "env": window_environment(argv),
         "command": argv[-1],
         "detached": "-d" in argv,
     }
@@ -140,8 +153,10 @@ def send_keys(argv):
     if all(key in ANSWER_KEYS for key in sent):
         return 0
     window = table.get(target, {})
+    environment = dict(os.environ)
+    environment.update(window.get("env") or {})
     result = subprocess.run(
-        ["sh", "-c", " ".join(keys)], cwd=window.get("cwd") or os.getcwd()
+        ["sh", "-c", " ".join(keys)], cwd=window.get("cwd") or os.getcwd(), env=environment,
     )
     return result.returncode
 

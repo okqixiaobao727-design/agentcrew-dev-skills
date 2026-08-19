@@ -26,6 +26,50 @@ and this project uses [Semantic Versioning](https://semver.org/).
   which of the two is missing and never falls back to the coordinator's
   account, and a machine with no registry file runs its single-account waves
   with nothing to create (#97).
+- A crew child launches on its ticket's account and is verified there. The
+  child's tmux window is created with that account's configuration home in its
+  own environment — the only injection point that works, since a new window's
+  environment otherwise comes from the tmux server as it was when that server
+  started and the launch line deliberately bypasses the window's interactive
+  shell — so the whole window belongs to the account, including a `claude` the
+  operator types into it by hand. Post-launch verification then reads that same
+  account for both of its surfaces, the live agents list and the transcript that
+  asserts the child's model, so a correctly launched child is never reported as
+  missing and the coordinator need not be logged into any account it dispatches
+  into. The machine log's `launch` event records the account a Claude child
+  launched under, which is what makes a run's spend attributable after the
+  fact, and the verification timeout — the one surface an unauthenticated
+  profile appears on, since nothing here checks a login — names that account
+  rather than the worktree. `account` therefore joins the routing keys the
+  renderer requires of every row, absolute like every other path the table
+  records, and preflight — which asks the renderer for its verdict on a
+  candidate table — resolves the same concrete account onto that candidate's
+  rows before handing it over. A project launch hook's own variables cannot
+  overrule the account. A `codex` ticket is unaffected: it launches on its own
+  vendor's credentials and its launch event records no account (#98).
+- A ticket's **reviewer child and merge-repair session run on that ticket's
+  account**, so the one-ticket-one-account invariant covers every Claude process
+  a ticket owns rather than the implementer alone. The rendered Claude review
+  command carries `--account <profile directory>`, which
+  `claude_review_bridge.py` puts in the headless reviewer's environment, and the
+  merge ladder launches its repair session under the account on the ticket's own
+  row. Both read that already-resolved directory from the wave table and neither
+  opens the account registry, and neither falls back: the merge ladder escalates
+  a conflict whose ticket row carries no account rather than repairing it on
+  whichever account it happens to be running under. A `codex` review lane is
+  untouched: another vendor, its own credentials (#99).
+
+### Fixed
+- The dashboard reads every account the run touches, so a healthy child on
+  another account is no longer drawn `vanished` and no longer pushes a
+  `vanished` toast. Both of the Claude lane's live sources are per account — the
+  per-session files it judges ticket state from and the shared agents-list
+  fallback cache behind them — and each ticket is read from the profile
+  directory its wave-table row names, with the fallback's CLI spawned under that
+  account. The primary path spawns nothing for the extra account, only an
+  account whose per-session source cannot be read falls back, and a run naming
+  one account behaves exactly as it did, spawn count included. A child that
+  really has gone is still `vanished`, and still toasts, on any account (#100).
 
 ### Changed
 - The cost pass now reads each Claude child's transcripts from the profile directory

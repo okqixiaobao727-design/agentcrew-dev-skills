@@ -48,6 +48,12 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # resolves the machine's reviewer) would follow this reviewer into its session
 # and answer a lookup it never makes, so it is dropped.
 REVIEWER_CONFIG_ENV_VAR = "CODE_REVIEWER_FILE"
+# Which Claude login the reviewer spends on. A ticket's account is the ticket's, not any one
+# process's, so the reviewer this bridge spawns runs on it exactly as the child being reviewed
+# does — Claude Code scopes login state to this variable, so setting it is what routes the spend.
+# The value arrives already resolved to a profile directory: the wave table is where a ticket's
+# account name stopped being a name (ADR-0014), and this bridge reads no account registry.
+CONFIG_HOME_ENV_VAR = "CLAUDE_CONFIG_DIR"
 BINARY_ENV_VAR = "CODE_REVIEW_CLAUDE_BINARY"
 STATE_DIR_ENV_VAR = "CODE_REVIEW_CLAUDE_STATE_DIR"
 # The optional knowledge-graph CLI that scores the range under review. It is an enhancement, never
@@ -196,14 +202,22 @@ def resolve_claude_binary(explicit=None, environment=None):
     return str(resolved)
 
 
-def child_session_env(hook):
+def child_session_env(hook, account=None):
     """Environment for the headless Claude this bridge spawns.
 
     A review child is a child launch like any other, so it carries whatever the
     project's on-child-launch hook adds — nothing, until a project configures it.
+
+    `account` is the ticket's own profile directory, and it overrides whatever
+    login the caller happens to be on: a child dispatched to a second account
+    reviews on that account, and its reviewer is not a hole in the ticket's
+    spend. A call given none is every call made before accounts existed, and
+    inherits the caller's login untouched.
     """
     env = hook.child_env()
     env.pop(REVIEWER_CONFIG_ENV_VAR, None)
+    if account:
+        env[CONFIG_HOME_ENV_VAR] = account
     return env
 
 
@@ -575,7 +589,7 @@ def parse_claude_json(stdout):
     )
 
 
-def run_claude(command, cwd, timeout_seconds):
+def run_claude(command, cwd, timeout_seconds, account=None):
     hook = launch_hook.load_hook(cwd)
     # The headless reviewer owns no window, so the hook is told which working
     # directory launched and nothing else.
@@ -584,7 +598,7 @@ def run_claude(command, cwd, timeout_seconds):
         completed = subprocess.run(
             command,
             cwd=cwd,
-            env=child_session_env(hook),
+            env=child_session_env(hook, account),
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -809,7 +823,7 @@ def run_bridge(args, review=None):
 
     started = time.monotonic()
     exit_code, stdout, stderr, timeout_error = run_claude(
-        command, args.cwd, args.timeout
+        command, args.cwd, args.timeout, args.account
     )
     duration_ms = int((time.monotonic() - started) * 1000)
     header = (
@@ -914,6 +928,11 @@ def build_parser():
         "--ticket",
         help="the ticket this review is for, as the machine log spells it; the review's event"
              " pair is written only when this and --machine-log are both given",
+    )
+    parser.add_argument(
+        "--account",
+        help="the Claude profile directory this ticket runs on, which the reviewer is launched"
+             " under; without it the reviewer inherits the caller's own login",
     )
     parser.add_argument("--state-dir", help=argparse.SUPPRESS)
     parser.add_argument("--claude-binary", help=argparse.SUPPRESS)

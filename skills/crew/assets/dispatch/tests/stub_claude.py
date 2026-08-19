@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """A Claude CLI stand-in for the dispatch tests.
 
-`agents --json` prints the sessions this stub has been asked to start. Any other invocation is
-treated as an interactive launch: it records its argv and working directory in
-`AGENTCREW_STUB_DIR/launches.jsonl`, adds itself to the agents list, and writes a transcript under
-`CLAUDE_CONFIG_DIR/projects/` carrying the model it ran on — the two surfaces post-launch
-verification reads.
+`agents --json` prints the sessions this stub has been asked to start **in the configuration home
+it is called under**: the list lives inside `CLAUDE_CONFIG_DIR`, so two accounts answer with two
+disjoint lists exactly as two logged-in profiles do. Any other invocation is treated as an
+interactive launch: it records its argv, working directory and configuration home in
+`AGENTCREW_STUB_DIR/launches.jsonl`, adds itself to that home's agents list, and writes a
+transcript under `CLAUDE_CONFIG_DIR/projects/` carrying the model it ran on — the two surfaces
+post-launch verification reads.
 
 `AGENTCREW_STUB_TRANSCRIPT_MODEL` writes a different model into that transcript than the one the
 launch named, which is the silent-downgrade case the renderer has to catch.
@@ -22,8 +24,13 @@ def state_dir():
     return pathlib.Path(os.environ["AGENTCREW_STUB_DIR"])
 
 
+def config_home():
+    return pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"])
+
+
 def agents_path():
-    return state_dir() / "agents.json"
+    """This account's own agents list: inside its configuration home, never beside the others."""
+    return config_home() / "agents.json"
 
 
 def read_agents():
@@ -36,7 +43,7 @@ def flag(argv, name):
 
 
 def write_transcript(session_id, cwd, model):
-    root = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects"
+    root = config_home() / "projects"
     project = root / cwd.replace("/", "-").replace(".", "-")
     project.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -58,7 +65,10 @@ def main():
     session_id = str(uuid.uuid4())
     model = flag(argv, "--model")
     with (state_dir() / "launches.jsonl").open("a") as handle:
-        handle.write(json.dumps({"argv": argv, "cwd": cwd, "sessionId": session_id}) + "\n")
+        handle.write(json.dumps({
+            "argv": argv, "cwd": cwd, "sessionId": session_id,
+            "configHome": str(config_home()),
+        }) + "\n")
 
     agents = read_agents()
     agents.append(
@@ -71,6 +81,7 @@ def main():
             "status": "busy",
         }
     )
+    agents_path().parent.mkdir(parents=True, exist_ok=True)
     agents_path().write_text(json.dumps(agents))
     write_transcript(
         session_id, cwd, os.environ.get("AGENTCREW_STUB_TRANSCRIPT_MODEL") or model
