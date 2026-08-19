@@ -89,6 +89,10 @@ class Fixture:
             "executor": "claude",
             "model": CLAUDE_MODEL,
             "effort": CLAUDE_EFFORT,
+            # Every row of a validated wave table carries the account its ticket's processes run
+            # on, resolved from the ticket's own name or from the coordinator's own configuration
+            # home where it named none (ADR-0014). This fixture's rows are on the coordinator's.
+            "account": str(self.config_dir),
             "review": {"vendor": "codex", "model": CODEX_MODEL, "effort": CODEX_EFFORT},
         }
         ticket.update(overrides)
@@ -465,22 +469,29 @@ class ReviewEventRenderTests(DispatchTestCase):
             prompt,
         )
 
-    def test_the_claude_review_command_carries_the_ticket_and_the_runs_machine_log(self):
-        prompt = self.prompt_for(
-            "--log", str(self.machine_log),
+    def claude_lane(self, account=None, **overrides):
+        """A ticket whose reviewer is the Claude lane, on the account the caller names."""
+        return dict(
             workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+            account=str(account or self.fixture.config_dir),
+            **overrides,
         )
+
+    def test_the_claude_review_command_carries_the_ticket_and_the_runs_machine_log(self):
+        prompt = self.prompt_for("--log", str(self.machine_log), **self.claude_lane())
 
         self.assertIn(
             "python3 %s/assets/review/scripts/claude_review_bridge.py \\\n"
             "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
+            "  --account %s \\\n"
             "  --base %s \\\n"
             "  --verification '<the commands you ran to verify this work, and that they"
             " passed>' \\\n"
             "  'the changes in this worktree since %s'"
             % (CREW_SKILL_DIR, self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT,
-               self.machine_log, self.fixture.base_commit, self.fixture.base_commit),
+               self.machine_log, self.fixture.config_dir, self.fixture.base_commit,
+               self.fixture.base_commit),
             prompt,
         )
 
@@ -509,6 +520,60 @@ class ReviewEventRenderTests(DispatchTestCase):
             "  -- 'the changes in this worktree since %s'"
             % (CREW_SKILL_DIR, self.worktree, CODEX_MODEL, CODEX_EFFORT,
                self.fixture.base_commit),
+            prompt,
+        )
+
+
+class ReviewAccountTests(ReviewEventRenderTests):
+    """The reviewer of a ticket runs on that ticket's account, whichever account that is.
+
+    The renderer hands the bridge the profile directory the wave table resolved for the row, so
+    the review lane spends where the ticket spends. The Codex lane is a different vendor with its
+    own credentials and takes none of this.
+    """
+
+    def test_the_claude_reviewer_is_launched_on_the_tickets_own_account(self):
+        second = self.fixture.root / "claude-config-b"
+        second.mkdir()
+
+        prompt = self.prompt_for(**self.claude_lane(account=second))
+
+        self.assertIn(f"--account {second} \\\n", prompt)
+
+    def test_a_ticket_on_the_coordinators_account_names_it_just_the_same(self):
+        """A ticket that named no account was resolved to the coordinator's, and says so."""
+        prompt = self.prompt_for(**self.claude_lane())
+
+        self.assertIn(f"--account {self.fixture.config_dir} \\\n", prompt)
+
+    def test_the_codex_review_lane_is_handed_no_account(self):
+        prompt = self.prompt_for(account=str(self.fixture.config_dir))
+
+        self.assertIn("tui_review_bridge.py", prompt)
+        self.assertNotIn("--account", prompt)
+
+    def test_a_profile_directory_with_a_space_reaches_the_bridge_as_one_argument(self):
+        """A profile directory is the operator's path, and an operator's path can carry a space."""
+        second = self.fixture.root / "claude config b"
+        second.mkdir()
+
+        prompt = self.prompt_for(**self.claude_lane(account=second))
+
+        self.assertIn(f"--account '{second}' \\\n", prompt)
+
+    def test_a_row_with_no_account_renders_the_command_it_rendered_before_accounts(self):
+        """The one table whose rows carry no account: the candidate the driver's preflight renders.
+
+        Preflight asks this renderer whether a ticket's routing is valid, and it asks before the
+        wave table has resolved that ticket's account — so a row without one renders, and renders
+        the review command exactly as it read before accounts existed.
+        """
+        prompt = self.prompt_for(**(self.claude_lane() | {"account": ""}))
+
+        self.assertNotIn("--account", prompt)
+        self.assertIn(
+            "  --cwd %s --model %s --effort %s \\\n  --base %s \\\n"
+            % (self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT, self.fixture.base_commit),
             prompt,
         )
 
