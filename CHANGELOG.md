@@ -59,6 +59,18 @@ and this project uses [Semantic Versioning](https://semver.org/).
   whichever account it happens to be running under. A `codex` review lane is
   untouched: another vendor, its own credentials (#99).
 
+### Fixed
+- The dashboard reads every account the run touches, so a healthy child on
+  another account is no longer drawn `vanished` and no longer pushes a
+  `vanished` toast. Both of the Claude lane's live sources are per account — the
+  per-session files it judges ticket state from and the shared agents-list
+  fallback cache behind them — and each ticket is read from the profile
+  directory its wave-table row names, with the fallback's CLI spawned under that
+  account. The primary path spawns nothing for the extra account, only an
+  account whose per-session source cannot be read falls back, and a run naming
+  one account behaves exactly as it did, spawn count included. A child that
+  really has gone is still `vanished`, and still toasts, on any account (#100).
+
 ## [0.8.1] - 2026-08-18
 
 ### Added

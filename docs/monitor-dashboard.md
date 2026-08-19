@@ -363,6 +363,21 @@ Each lane is read from its own source, and the Claude lane has two of them
    file for a ten-second freshness window before any of them fetches again. A fetch that fails is
    cached too, so a CLI that cannot answer is asked once a window rather than once a tick.
 
+Both are read per **account**. Claude Code scopes a login — and with it the sessions files, the
+fallback's answer and everything else under a configuration home — to one profile directory, so
+two accounts' live sources are disjoint: a child of a second account is absent from the
+coordinator's sessions files and from the coordinator's `claude agents --json`. The wave table
+names the profile directory every ticket runs under, and each ticket is read from its own
+account's home: its sessions files at `<account>/sessions/`, and its own shared fallback answer at
+`<account>/agentcrew/agents-cache.json`, fetched by a CLI spawned with that account as its
+`CLAUDE_CONFIG_DIR`. Without this a healthy child on another account is drawn `vanished` and
+toasts the operator about it. The primary path spawns nothing for the extra account — an account
+more is a directory listing more — and only an account whose sessions directory cannot be read
+falls back, so a run naming one account costs exactly what it cost before. A wave table with no
+`account` on its rows was written before accounts existed, and is read from the configuration home
+the tick itself was started under. The Codex lane has no account: a Codex child's bridge state
+lives in the run directory, and it is read once and shared by every account of the run.
+
 Nothing is cached on the first path — reading the files is already as cheap as reading a cache
 would be, so there is nothing there to go stale. A tick whose sources have both failed draws the
 row `unknown` and says nothing at all, exactly as

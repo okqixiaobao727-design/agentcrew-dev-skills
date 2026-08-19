@@ -84,6 +84,10 @@ TITLES = {"06": "Dispatch launch path", "07": "Path handling", "08": "Skill copy
 EXECUTORS = {"06": "claude", "07": "codex", "08": "claude"}
 MODELS = {"06": MODEL, "07": CODEX_MODEL, "08": MODEL}
 WAVES = {1: ("06", "07"), 2: ("08",)}
+# The same three tickets in one wave, which is the shape a mixed run is read in: two Claude
+# children on two different accounts, and the Codex child whose lane has no account at all.
+MIXED_WAVE = ("06", "07", "08")
+MIXED_WAVES = {1: MIXED_WAVE}
 REVIEW_TS = "2026-08-13T09:10:00Z"
 REVIEW_ELAPSED = "00:02:31"
 REVIEW_LANE = "codex gpt-5.6-sol"
@@ -219,6 +223,10 @@ class Fixture:
         # fixture so nothing on the machine running the tests is ever opened.
         self.claude_home = self.root / "claude-config"
         self.codex_home = self.root / "codex-home"
+        # A second Claude account's profile directory: the home a ticket routed elsewhere keeps
+        # its sessions, its fallback answer and its transcripts in. Nothing resolves a registry
+        # here — the wave table carries the profile directory itself, already resolved.
+        self.claude_home_b = self.root / "claude-config-b"
 
         # The operator's own Claude Code wiring the installer edits: the settings file, the
         # statusline script it already points at, and the wrapper the installer writes. All three
@@ -260,8 +268,15 @@ class Fixture:
         )
         target.chmod(0o755)
 
-    def table(self, waves=WAVES):
-        """The approved wave table: every ticket of every wave, in the schema dispatch reads."""
+    def table(self, waves=WAVES, accounts=None):
+        """The approved wave table: every ticket of every wave, in the schema dispatch reads.
+
+        `accounts` names the profile directory a ticket runs under, for the tickets that run
+        somewhere other than the coordinator's own. Every row carries an `account` either way:
+        the driver resolves the key for every ticket as it builds the table, so a table the
+        dashboard reads never has the question left open on it.
+        """
+        accounts = accounts or {}
         self.table_path.write_text(json.dumps({
             "run": {
                 "repo_root": str(self.repo),
@@ -280,6 +295,7 @@ class Fixture:
                             "executor": EXECUTORS[ticket],
                             "model": MODELS[ticket],
                             "effort": "medium",
+                            "account": str(accounts.get(ticket, self.claude_home)),
                         }
                         for ticket in tickets
                     ],
@@ -287,6 +303,18 @@ class Fixture:
                 for wave, tickets in waves.items()
             ],
         }))
+
+    def drop_accounts(self):
+        """Take the `account` key off every row — the table a release before accounts wrote.
+
+        A run interrupted under that release and resumed under this one hands the dashboard such
+        a table, and it is drawn from the configured home exactly as it was drawn then.
+        """
+        table = json.loads(self.table_path.read_text())
+        for wave in table["waves"]:
+            for entry in wave["tickets"]:
+                entry.pop("account", None)
+        self.table_path.write_text(json.dumps(table))
 
     def worktree(self, ticket, commits=1):
         """The ticket's worktree, cut from the base commit and carrying `commits` of its own."""
@@ -432,22 +460,27 @@ class Fixture:
             return []
         return [json.loads(line) for line in self.log.read_text().splitlines() if line]
 
-    def sessions_dir(self):
-        """The CLI's own per-session files, under the Claude config this fixture points at.
+    def sessions_dir(self, home=None):
+        """The CLI's own per-session files, under one account's profile directory.
 
         The Claude lane's primary live source: the tick reads these and spawns nothing (ADR-0012).
+        Each account keeps its own, which is why a child of a second account is invisible in the
+        coordinator's.
         """
-        return self.claude_home / "sessions"
+        return (home or self.claude_home) / "sessions"
 
-    def agents(self, entries):
-        """What the Claude lane's live source says about each ticket's child, keyed by ticket."""
+    def agents(self, entries, home=None):
+        """What the Claude lane's live source says about each ticket's child, keyed by ticket.
+
+        Written into `home`'s own sessions directory — the account the child runs under.
+        """
         self.agents_at([
             (ticket, self.worktrees[ticket], status) for ticket, status in entries.items()
-        ])
+        ], home=home)
 
-    def agents_at(self, entries):
+    def agents_at(self, entries, home=None):
         """The same, each session's `cwd` spelled as the caller wants it spelled."""
-        directory = self.sessions_dir()
+        directory = self.sessions_dir(home)
         directory.mkdir(parents=True, exist_ok=True)
         for index, (ticket, cwd, status) in enumerate(entries):
             # The CLI names each file after the session's pid, so two sessions in one worktree —
@@ -476,29 +509,34 @@ class Fixture:
         path.write_text(text)
         return path
 
-    def command_agents(self, entries):
+    def command_agents(self, entries, home=None):
         """The list `claude agents --json` answers with, which is the lane's fallback and only
-        reached when the sessions directory above is not there to be read."""
-        (self.stub_dir / "agents.json").write_text(json.dumps([
+        reached when the sessions directory above is not there to be read.
+
+        One list per account, as the CLI has: the list it answers with is the list of the profile
+        `CLAUDE_CONFIG_DIR` named it under, and a home given no list here answers as a CLI that
+        could not read one.
+        """
+        (self.stub_dir / f"agents-{(home or self.claude_home).name}.json").write_text(json.dumps([
             dict(self.session_record(ticket, self.worktrees[ticket], status), pid=4000 + index)
             for index, (ticket, status) in enumerate(entries.items())
         ]))
 
-    def agents_cache(self):
-        """The fallback's machine-level shared answer, as it stands on disk right now."""
-        path = self.agents_cache_path()
+    def agents_cache(self, home=None):
+        """One account's shared fallback answer, as it stands on disk right now."""
+        path = self.agents_cache_path(home)
         return json.loads(path.read_text()) if path.exists() else None
 
-    def agents_cache_path(self):
-        return self.pin_dir().parent / "agents-cache.json"
+    def agents_cache_path(self, home=None):
+        return self.pin_dir(home).parent / "agents-cache.json"
 
-    def expire_agents_cache(self):
+    def expire_agents_cache(self, home=None):
         """Age the shared answer past any freshness window, as the passage of time would.
 
         The window is a constant rather than a seam, so a test that must see it expire moves the
         clock the cache carries instead of waiting out the machine's.
         """
-        path = self.agents_cache_path()
+        path = self.agents_cache_path(home)
         cached = json.loads(path.read_text())
         cached["fetched_at"] = cached["fetched_at"] - STALE_CACHE_SECONDS
         path.write_text(json.dumps(cached))
@@ -553,9 +591,9 @@ class Fixture:
             shutil.copytree(self.run_dir, path)
         return path
 
-    def pin_dir(self):
-        """The pin registry's default location, under the Claude config this fixture points at."""
-        return self.claude_home.joinpath(*PIN_REGISTRY)
+    def pin_dir(self, home=None):
+        """The pin registry's default location, under one account's profile directory."""
+        return (home or self.claude_home).joinpath(*PIN_REGISTRY)
 
     def surface_preference_files(self):
         """The machine-level surface preference files beside, not inside, the pin registry."""
@@ -775,6 +813,18 @@ class Fixture:
 
     def window_calls(self):
         return [argv for argv in self.calls("tmux") if argv[0] == "new-window"]
+
+    def claude_call_homes(self):
+        """The configuration home each `claude` call was made under, in the order they were made.
+
+        Which account a spawn was billed to, read off the stub itself rather than inferred.
+        """
+        path = self.stub_dir / "claude-calls.jsonl"
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)["config_home"] for line in path.read_text().splitlines() if line
+        ]
 
     def calls(self, name):
         path = self.stub_dir / f"{name}-calls.jsonl"
@@ -2373,6 +2423,176 @@ class LiveSourceTests(MonitorTestCase):
         self.assertFalse(abandoned.exists())
         self.assertEqual(len(self.fixture.pins()), 1)
         self.assertIn(f"crew {RUN_ID} —", result.stdout)
+
+
+class MultiAccountTests(MonitorTestCase):
+    """A wave whose children are spread across two accounts, drawn from its published command line.
+
+    Claude Code scopes a session's login — and so its per-session files, its shared fallback
+    answer and everything else under its configuration home — to one profile directory. A run's
+    wave table names the profile directory every ticket runs under, so the dashboard reads each
+    ticket's state out of its own account's home. A tick that read only the coordinator's would
+    draw every healthy child of a second account `vanished` and toast the operator about it.
+    """
+
+    def mixed_wave(self):
+        """One wave over two accounts: `06` on the coordinator's, `08` on the second, `07` codex.
+
+        The Codex ticket rides along because its lane has no account at all — its bridge state
+        lives in the run directory — so a frame drawn per account has to keep drawing it.
+        """
+        self.fixture.table(waves=MIXED_WAVES, accounts={"08": self.fixture.claude_home_b})
+        for ticket in MIXED_WAVE:
+            self.fixture.worktree(ticket)
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.launch("08")
+
+    def test_a_live_child_on_a_second_account_is_running_rather_than_vanished(self):
+        self.mixed_wave()
+        self.fixture.agents({"06": "busy"})
+        self.fixture.agents({"08": "busy"}, home=self.fixture.claude_home_b)
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+
+    def test_no_vanished_toast_is_pushed_for_a_child_alive_on_another_account(self):
+        self.mixed_wave()
+        self.fixture.agents({"06": "busy"})
+        self.fixture.agents({"08": "busy"}, home=self.fixture.claude_home_b)
+        self.fixture.codex_state("07")
+
+        self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.toasts(), [])
+
+    def test_a_child_that_has_gone_from_its_own_account_is_vanished_and_toasts(self):
+        """The word keeps meaning what it means, on the second account as on the first."""
+        self.mixed_wave()
+        self.fixture.agents({"06": "busy"})
+        # The second account is there and answering; what it has nothing to say about is `08`.
+        self.fixture.agents({}, home=self.fixture.claude_home_b)
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "vanished", LIVE_ELAPSED, width=8),
+                      result.stdout)
+        self.assertEqual(self.fixture.toasts(), ["crew 08 vanished"])
+
+    def test_a_child_listed_only_in_the_coordinators_account_is_vanished_from_its_own(self):
+        """An account is where a child is looked for, not one place among several.
+
+        A session in `08`'s worktree in the coordinator's home is not `08`: the ticket runs under
+        the second account, and a tick that would take that entry has stopped reading accounts at
+        all.
+        """
+        self.mixed_wave()
+        self.fixture.agents({"06": "busy", "08": "busy"})
+        self.fixture.agents({}, home=self.fixture.claude_home_b)
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "vanished", LIVE_ELAPSED, width=8),
+                      result.stdout)
+
+    def test_every_ticket_of_a_two_account_wave_is_drawn_from_its_own_account(self):
+        self.mixed_wave()
+        self.fixture.agents({"06": "busy"})
+        self.fixture.agents({"08": "idle"}, home=self.fixture.claude_home_b)
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(frame(result.stdout).splitlines()[:5], [
+            f"crew {RUN_ID} — wave 1/1 · running=2 waiting=1 · elapsed {LIVE_ELAPSED}",
+            header(),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            row("1", "08", TITLES["08"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+        ])
+
+    def test_reading_the_extra_account_spawns_no_cli_at_all(self):
+        """The primary path is file reads, per account: an account more is a directory more."""
+        self.mixed_wave()
+        self.fixture.agents({"06": "busy"})
+        self.fixture.agents({"08": "busy"}, home=self.fixture.claude_home_b)
+        self.fixture.codex_state("07")
+
+        self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.calls("claude"), [])
+
+    def test_the_fallback_answers_each_account_out_of_its_own_list(self):
+        """Neither account's answer stands for the other's, and the cost is one spawn per account.
+
+        Both per-session sources are missing here, so both accounts fall back — and the lists
+        they fall back to are disjoint, exactly as two profiles' lists are. A tick that shared one
+        answer between them would draw one of these two children `vanished`.
+        """
+        self.mixed_wave()
+        self.fixture.codex_state("07")
+        self.fixture.command_agents({"06": "busy"})
+        self.fixture.command_agents({"08": "waiting"}, home=self.fixture.claude_home_b)
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.claude_call_homes(),
+                         [str(self.fixture.claude_home), str(self.fixture.claude_home_b)])
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+                      result.stdout)
+
+    def test_two_accounts_falling_back_at_once_record_one_live_source_line(self):
+        """The log's one line per run survives a run with more than one account in it.
+
+        Every account of a frame is read against the same snapshot of the log, so nothing the
+        first of them writes is visible to the second; a frame that let each account speak for
+        itself would say the same thing twice about one run.
+        """
+        self.mixed_wave()
+        self.fixture.codex_state("07")
+        self.fixture.command_agents({"06": "busy"})
+        self.fixture.command_agents({"08": "busy"}, home=self.fixture.claude_home_b)
+
+        result = self.fixture.dashboard()
+
+        lines = [line for line in self.fixture.log_lines() if line["event"] == "live-source"]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(str(self.fixture.sessions_dir()), lines[0]["reason"])
+        self.assertEqual(result.stderr, "")
+
+    def test_only_the_account_whose_source_is_unreadable_falls_back(self):
+        """A run naming one account costs what it costs today: one spawn, under that account."""
+        self.mixed_wave()
+        self.fixture.agents({"06": "busy"})
+        self.fixture.codex_state("07")
+        self.fixture.command_agents({"08": "busy"}, home=self.fixture.claude_home_b)
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.claude_call_homes(), [str(self.fixture.claude_home_b)])
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+
+    def test_a_wave_table_from_before_accounts_is_drawn_from_the_configured_home(self):
+        """A run interrupted under the release before this one is resumed, not broken."""
+        self.mixed_wave()
+        self.fixture.drop_accounts()
+        self.fixture.agents({"06": "busy", "08": "busy"})
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.calls("claude"), [])
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
 
 
 class WindowTests(MonitorTestCase):
