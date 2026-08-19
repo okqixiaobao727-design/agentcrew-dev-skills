@@ -3,7 +3,7 @@ set -euo pipefail
 
 UPSTREAM_REPOSITORY="https://github.com/okqixiaobao727-design/review-switch"
 UPSTREAM_RAW_BASE="https://raw.githubusercontent.com/okqixiaobao727-design/review-switch"
-UPSTREAM_COMMIT="03f89b2400580c8998b2404bed12187effb94abe"
+UPSTREAM_COMMIT="a5fdabada7eb628a476683b7e885f1478209159a"
 UPSTREAM_PATH="skills/review-switch-codex/scripts/tui_review_bridge.py"
 VENDORED_PATH="skills/crew/assets/review/scripts/tui_review_bridge.py"
 

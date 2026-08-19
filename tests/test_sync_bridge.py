@@ -14,10 +14,28 @@ SYNC_SCRIPT = REPOSITORY_ROOT / "scripts" / "sync-bridge.sh"
 VENDORED_BRIDGE = pathlib.Path(
     "skills/crew/assets/review/scripts/tui_review_bridge.py"
 )
-UPSTREAM_REPOSITORY = "https://github.com/okqixiaobao727-design/review-switch"
-UPSTREAM_RAW_BASE = "https://raw.githubusercontent.com/okqixiaobao727-design/review-switch"
-UPSTREAM_COMMIT = "03f89b2400580c8998b2404bed12187effb94abe"
-UPSTREAM_PATH = "skills/review-switch-codex/scripts/tui_review_bridge.py"
+
+
+def pinned(name):
+    """One `NAME="value"` assignment, read from the script that owns it.
+
+    The pin is the script's to declare, and a copy of it here would be a second
+    place to edit on every upgrade — one that goes stale silently, since a test
+    asserting a sha nobody fetches proves nothing. What these tests are for is
+    that the sha the script fetches and the sha it writes into the header are the
+    same one, whatever it is.
+    """
+    for line in SYNC_SCRIPT.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key == name:
+            return value.strip().strip('"')
+    raise AssertionError(f"{SYNC_SCRIPT} declares no {name}")
+
+
+UPSTREAM_REPOSITORY = pinned("UPSTREAM_REPOSITORY")
+UPSTREAM_RAW_BASE = pinned("UPSTREAM_RAW_BASE")
+UPSTREAM_COMMIT = pinned("UPSTREAM_COMMIT")
+UPSTREAM_PATH = pinned("UPSTREAM_PATH")
 EXPECTED_SOURCE_URL = f"{UPSTREAM_RAW_BASE}/{UPSTREAM_COMMIT}/{UPSTREAM_PATH}"
 EXPECTED_HEADER = (
     f"# Vendored from {UPSTREAM_REPOSITORY}\n"
