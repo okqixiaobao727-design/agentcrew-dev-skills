@@ -7,6 +7,22 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- The vendored review bridge is back in step with the repository it is vendored
+  from, so the check that holds ADR-0009 passes again. The review lane's
+  session-cost harvest was written straight into the vendored copy of
+  `tui_review_bridge.py` and never reached upstream, so `sync-bridge.sh`
+  overwrote those 210 lines on every run and the diff behind it never came back
+  empty — red on every push since 0.7.0. The check was right and the change was
+  in the wrong repository: it now lives upstream (review-switch#4), tested there
+  at the seam that repository tests, since the machine-log writer belongs to
+  whichever consumer configures `--machine-log` and what the lane owns is the
+  argv it hands over. The pin moves to that merge commit and the vendored copy
+  is what the script fetches from it, byte-identical to what was already here.
+  Worth knowing for the next release: this check runs only on the 3.11 job and
+  fails in four seconds, so it went red for four releases while the three other
+  jobs went green beside it.
+
 ## [0.8.2] - 2026-08-19
 
 ### Added
