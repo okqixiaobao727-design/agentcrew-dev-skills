@@ -2383,9 +2383,10 @@ class AdoptionTests(DriverTestCase):
         self.fixture.vanishes("01")
 
         adopted = self.fixture.launch()
-        self.wait_for_verdict("01", "failed")
         self.woken(adopted, "run-complete")
 
+        # `run-complete` means every ticket is settled, so this assertion needs no clock.
+        self.assertEqual(self.verdict("01"), "failed")
         self.assertIn("vanished", self.events("receipt", ticket="01")[-1]["detail"])
         self.assertEqual(self.events("ruling", ticket="01"), [])
 
@@ -2488,10 +2489,15 @@ class AdoptionTests(DriverTestCase):
         adopted = self.fixture.launch(
             extra=("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
         )
-        self.wait_for_verdict("01", "failed")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.events("ruling", ticket="02")),
+            "the adopted run never re-anchored its live child",
+        )
         self.fixture.completes("02")
         self.woken(adopted, "run-complete")
 
+        # `run-complete` means every ticket is settled, so this assertion needs no clock.
+        self.assertEqual(self.verdict("01"), "failed")
         self.assertEqual(self.events("ruling", ticket="01"), [])
         anchor = self.events("ruling", ticket="02")
         self.assertEqual(len(anchor), 1, f"02 was not re-anchored once: {anchor}")
