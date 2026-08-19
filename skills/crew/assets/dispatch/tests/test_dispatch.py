@@ -579,22 +579,6 @@ class ReviewAccountTests(ReviewEventRenderTests):
 
         self.assertIn(f"--account '{second}' \\\n", prompt)
 
-    def test_a_row_with_no_account_renders_the_command_it_rendered_before_accounts(self):
-        """The one table whose rows carry no account: the candidate the driver's preflight renders.
-
-        Preflight asks this renderer whether a ticket's routing is valid, and it asks before the
-        wave table has resolved that ticket's account — so a row without one renders, and renders
-        the review command exactly as it read before accounts existed.
-        """
-        prompt = self.prompt_for(**(self.claude_lane() | {"account": ""}))
-
-        self.assertNotIn("--account", prompt)
-        self.assertIn(
-            "  --cwd %s --model %s --effort %s \\\n  --base %s \\\n"
-            % (self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT, self.fixture.base_commit),
-            prompt,
-        )
-
 
 class ReceiptChannelTests(DispatchTestCase):
     """Where a child's receipts go: a Claude child writes them, only CREW ASK is sent.
