@@ -223,9 +223,9 @@ class Fixture:
         # fixture so nothing on the machine running the tests is ever opened.
         self.claude_home = self.root / "claude-config"
         self.codex_home = self.root / "codex-home"
-        # A second Claude account's profile directory: the home a ticket routed elsewhere keeps
-        # its sessions, its fallback answer and its transcripts in. Nothing resolves a registry
-        # here — the wave table carries the profile directory itself, already resolved.
+        # A dashboard-only second Claude account's profile directory: the home a ticket routed
+        # elsewhere keeps its sessions and fallback answer in. Nothing resolves a registry here —
+        # the wave table carries the profile directory itself, already resolved.
         self.claude_home_b = self.root / "claude-config-b"
 
         # The operator's own Claude Code wiring the installer edits: the settings file, the
@@ -364,10 +364,12 @@ class Fixture:
         )
 
     def claude_transcript(
-        self, ticket, session=CLAUDE_SESSION, turns=CLAUDE_TURNS, model=MODEL, cwd=None
+        self, ticket, session=CLAUDE_SESSION, turns=CLAUDE_TURNS, model=MODEL, cwd=None,
+        config_home=None,
     ):
         """A Claude transcript for that worktree, one assistant record per turn's usage."""
-        path = self.claude_home / "projects" / f"project-{session}" / f"{session}.jsonl"
+        home = pathlib.Path(config_home) if config_home is not None else self.claude_home
+        path = home / "projects" / f"project-{session}" / f"{session}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
         for number, turn in enumerate(turns):
@@ -2912,6 +2914,10 @@ class SurfaceTests(MonitorTestCase):
 class CostTests(MonitorTestCase):
     """The cost pass at run completion: one event per child, and the run's rollup."""
 
+    def setUp(self):
+        super().setUp()
+        self.fixture.table()
+
     def cost(self, *extra):
         return self.fixture.run_monitor("cost", "--log", self.fixture.log, *extra)
 
@@ -3103,6 +3109,7 @@ class CostTests(MonitorTestCase):
         self.assertEqual(entry["total_tokens"], CODEX_TOTALS["total"])
 
     def test_the_rollup_carries_a_row_per_child_and_a_total_that_adds_them_up(self):
+        self.fixture.table(waves={1: ("06", "07")})
         self.fixture.worktree("06")
         self.fixture.worktree("07")
         self.fixture.launch("06")
@@ -3122,6 +3129,109 @@ class CostTests(MonitorTestCase):
                 ["07", "codex", CODEX_MODEL, "1000", "700", "4000", "250", "5950"],
                 ["TOTAL", "--", "--", "1024", "746", "10800", "1150", "13720"],
             ],
+        )
+
+    def test_the_rollup_reads_claude_children_from_every_account_named_by_the_wave_table(self):
+        self.fixture.table(
+            waves={1: ("06", "08")},
+            accounts={
+                "06": self.fixture.claude_home,
+                "08": self.fixture.claude_home_b,
+            },
+        )
+        self.fixture.worktree("06")
+        self.fixture.worktree("08")
+        self.fixture.launch("06")
+        self.fixture.launch("08")
+        self.fixture.claude_transcript("06", config_home=self.fixture.claude_home)
+        self.fixture.claude_transcript(
+            "08", session="second-account-session", config_home=self.fixture.claude_home_b
+        )
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            cost_rows(result.stdout),
+            [
+                ["TICKET", "EXECUTOR", "MODEL", "INPUT", "OUTPUT",
+                 "CACHE-READ", "CACHE-CREATION", "TOTAL"],
+                ["06", "claude", MODEL, "24", "46", "6800", "900", "7770"],
+                ["08", "claude", MODEL, "24", "46", "6800", "900", "7770"],
+                ["TOTAL", "--", "--", "48", "92", "13600", "1800", "15540"],
+            ],
+        )
+
+    def test_a_table_without_an_account_uses_the_current_claude_home_for_compatibility(self):
+        self.fixture.table(waves={1: ("06",)})
+        self.fixture.drop_accounts()
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.costs()[0]["total_tokens"], CLAUDE_TOTALS["total"])
+
+    def test_an_unreadable_wave_table_diagnoses_claude_cost_instead_of_failing_or_zeroing(self):
+        self.fixture.table(waves={1: ("06",)})
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.table_path.write_text("{ not json\n")
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertIn("wave table", entry["detail"])
+        self.assertNotIn("total_tokens", entry)
+        self.assertEqual(
+            cost_rows(result.stdout)[1],
+            ["06", "claude", MODEL, "--", "--", "--", "--", "--"],
+        )
+
+    def test_an_unreadable_wave_table_leaves_codex_cost_measured(self):
+        self.fixture.table(waves={1: ("06", "07")})
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.claude_transcript("06")
+        self.fixture.codex_rollout("07")
+        self.fixture.table_path.write_text("{ not json\n")
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = {entry["ticket"]: entry for entry in self.costs()}
+        self.assertNotIn("total_tokens", entries["06"])
+        self.assertEqual(entries["07"]["total_tokens"], CODEX_TOTALS["total"])
+        self.assertEqual(
+            cost_rows(result.stdout)[2],
+            ["07", "codex", CODEX_MODEL] + [
+                str(CODEX_TOTALS[name])
+                for name in ("input", "output", "cache_read", "cache_creation", "total")
+            ],
+        )
+
+    def test_a_missing_wave_table_diagnoses_claude_cost_instead_of_failing_or_zeroing(self):
+        self.fixture.table(waves={1: ("06",)})
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.table_path.unlink()
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.costs()[0]
+        self.assertIn("wave table", entry["detail"])
+        self.assertNotIn("total_tokens", entry)
+        self.assertEqual(
+            cost_rows(result.stdout)[1],
+            ["06", "claude", MODEL, "--", "--", "--", "--", "--"],
         )
 
     def test_one_session_cost_event_is_appended_per_launched_child(self):
@@ -3149,6 +3259,10 @@ class CostTests(MonitorTestCase):
         self.assertEqual(entry["session"], f"{CLAUDE_SESSION},resumed-{CLAUDE_SESSION}")
 
     def test_a_child_with_no_transcript_is_diagnosed_rather_than_left_out(self):
+        self.fixture.table(
+            waves={1: ("06",)},
+            accounts={"06": self.fixture.claude_home_b},
+        )
         self.fixture.worktree("06")
         self.fixture.launch("06")
 
@@ -3158,6 +3272,7 @@ class CostTests(MonitorTestCase):
         entry = self.costs()[0]
         self.assertEqual(entry["ticket"], "06")
         self.assertEqual(entry["executor"], "claude")
+        self.assertIn(str(self.fixture.claude_home_b / "projects"), entry["detail"])
         self.assertIn(str(self.fixture.worktrees["06"]), entry["detail"])
         for field in ("session", "input_tokens", "output_tokens", "total_tokens"):
             self.assertNotIn(field, entry)

@@ -731,6 +731,23 @@ def read_table(run_dir):
     return waves
 
 
+def account_homes(run_dir):
+    """The Claude profile directory each ticket's wave-table row names, keyed by ticket."""
+    homes = {}
+    for wave in read_table(run_dir):
+        tickets = wave.get("tickets") if isinstance(wave, dict) else None
+        if not isinstance(tickets, list):
+            continue
+        for ticket in tickets:
+            if not isinstance(ticket, dict):
+                continue
+            identifier = ticket.get("id")
+            account = ticket.get("account")
+            if identifier is not None and account:
+                homes[str(identifier)] = str(account)
+    return homes
+
+
 def settling_state(record):
     """The word this record settles a ticket into, or None when it settles nothing."""
     key, words = SETTLED_STATES.get(str(record.get("event")), (None, {}))
@@ -2031,15 +2048,14 @@ def transcript_root(spec, account=None):
     The same three parts every time — the variable that moves the home, the home's own name under
     `~`, and the fixed subdirectory inside it.
 
-    `account` is a configuration home named outright, which is what a ticket routed to another
-    account carries: the wave table holds the profile directory itself, already resolved, so a
-    read for that ticket goes to that home rather than to the one this process was started under.
+    `account` is an explicitly supplied profile directory, which is what a ticket routed to
+    another account carries and what a cost read uses for its ticket. The wave table holds the
+    profile directory itself, already resolved, so a read for that ticket goes to that home rather
+    than to the one this process was started under.
     """
     variable, home, subdirectory = spec
-    if account is not None:
-        return pathlib.Path(account) / subdirectory
-    configured = os.environ.get(variable)
-    return pathlib.Path(configured or pathlib.Path.home() / home) / subdirectory
+    account = os.environ.get(variable) if account is None else account
+    return pathlib.Path(account or pathlib.Path.home() / home) / subdirectory
 
 
 def within_path(path, root):
@@ -2249,7 +2265,7 @@ def review_sessions(records):
     return found
 
 
-def child_usage(executor, worktree, reviewed=()):
+def child_usage(executor, worktree, reviewed=(), config_home=None):
     """What one child spent: its sessions, their counters, or the diagnosis in place of both.
 
     Every failure on this path is diagnosed rather than raised, and a child with one unbillable
@@ -2261,7 +2277,7 @@ def child_usage(executor, worktree, reviewed=()):
     here rather than added to the child that was reviewed.
     """
     spec, usage_of = TRANSCRIPT_READERS[executor]
-    root = transcript_root(spec)
+    root = transcript_root(spec, config_home)
     sessions = {}
     counters = zero_counters()
     undetermined = 0
@@ -2352,17 +2368,20 @@ def coordinator_usage(session):
     return {**row, "sessions": [session], "counters": counters}
 
 
-def cost_rows(records):
+def cost_rows(records, claude_homes=None, account_problem=None):
     """One row per launched ticket, in ticket order: what it was routed to, and what it spent.
 
     A ticket launched twice into the same worktree — a replacement child — is one row, and its
     figures are every session that ran there, because both children spent the ticket's tokens.
+    `account_problem` diagnoses Claude rows when the run's account map cannot be read; Codex rows
+    remain readable from their own configured root.
     """
     launches = {}
     for record in records:
         if record.get("event") == "launch":
             launches[str(record.get("ticket"))] = record
     reviewed = review_sessions(records)
+    claude_homes = claude_homes or {}
 
     rows = []
     for ticket, launch in sorted(launches.items()):
@@ -2377,8 +2396,11 @@ def cost_rows(records):
             )
         if not worktree:
             usage = diagnosed("the launch event names no worktree to read a transcript in")
+        elif executor == CLAUDE and account_problem:
+            usage = diagnosed(account_problem)
         else:
-            usage = child_usage(executor, worktree, reviewed)
+            config_home = claude_homes.get(ticket) if executor == CLAUDE else None
+            usage = child_usage(executor, worktree, reviewed, config_home)
         rows.append({
             "ticket": ticket,
             "executor": executor,
@@ -2453,10 +2475,21 @@ def log_session_cost(log, row):
 def run_cost(args):
     """Append one `session-cost` per launched child and print the run's rollup; returns 0.
 
+    The log's parent holds the wave table that maps Claude tickets to profile directories. If that
+    table cannot be read, Claude rows carry the diagnosis rather than guessing a root; Codex rows
+    still use their own configured home.
+
     The coordinator's row is printed and not logged: the log's `session-cost` is a launched
     ticket's line, and the session that drives the run is not one.
     """
-    rows = cost_rows(read_log(args.log))
+    run_dir = pathlib.Path(args.log).parent
+    try:
+        homes = account_homes(run_dir)
+        account_problem = None
+    except MonitorError as error:
+        homes = {}
+        account_problem = str(error)
+    rows = cost_rows(read_log(args.log), homes, account_problem)
     for row in rows:
         log_session_cost(args.log, row)
     coordinator = None
