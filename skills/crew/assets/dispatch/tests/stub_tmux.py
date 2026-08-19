@@ -3,8 +3,9 @@
 
 Windows are numbered from a counter in `AGENTCREW_STUB_DIR`; every call is appended to
 `tmux-calls.jsonl` there. `send-keys` runs the keys it was given through `sh -c` in the window's
-own directory, so a stubbed launch reaches the stub `claude` exactly as a real one reaches the
-real CLI.
+own directory **and in the window's own environment**, so a stubbed launch reaches the stub
+`claude` exactly as a real one reaches the real CLI — including the `-e NAME=VALUE` pairs the
+window was created with, which is how a child is put on its ticket's account.
 """
 
 import json
@@ -36,6 +37,16 @@ def flag(argv, name):
     return argv[argv.index(name) + 1] if name in argv else None
 
 
+def window_environment(argv):
+    """The `NAME=VALUE` pairs the window is created with, as real tmux's `-e` gives it one."""
+    environment = {}
+    for index, value in enumerate(argv):
+        if value == "-e" and index + 1 < len(argv):
+            name, _, setting = argv[index + 1].partition("=")
+            environment[name] = setting
+    return environment
+
+
 def main():
     argv = sys.argv[1:]
     record({"argv": argv})
@@ -50,6 +61,7 @@ def main():
             "cwd": flag(argv, "-c") or os.getcwd(),
             "name": flag(argv, "-n"),
             "target": flag(argv, "-t"),
+            "env": window_environment(argv),
         }
         save_windows(table)
         print(window_id)
@@ -59,8 +71,11 @@ def main():
         target = flag(argv, "-t")
         keys = [value for value in argv[argv.index(target) + 1:] if value != "Enter"]
         window = windows().get(target, {})
+        environment = dict(os.environ)
+        environment.update(window.get("env") or {})
         result = subprocess.run(
-            ["sh", "-c", " ".join(keys)], cwd=window.get("cwd") or os.getcwd()
+            ["sh", "-c", " ".join(keys)], cwd=window.get("cwd") or os.getcwd(),
+            env=environment,
         )
         return result.returncode
 
