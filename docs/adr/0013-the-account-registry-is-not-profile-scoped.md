@@ -1,5 +1,5 @@
 ---
-status: proposed — decided while specifying #95, accepted when #95 lands
+status: accepted
 ---
 
 # The account registry is a machine-level file, deliberately not resolved through `CLAUDE_CONFIG_DIR`

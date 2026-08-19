@@ -58,6 +58,19 @@ and this project uses [Semantic Versioning](https://semver.org/).
   a conflict whose ticket row carries no account rather than repairing it on
   whichever account it happens to be running under. A `codex` review lane is
   untouched: another vendor, its own credentials (#99).
+- Accounts are documented for the operator who has to run one:
+  [`docs/accounts.md`](docs/accounts.md) is what an account is, where the
+  machine-level registry lives and how to move it, the file format, the names a
+  repo may declare in `agentcrew.toml`, and what the run does on each path an
+  operator actually hits — a ticket naming none, a name the config never
+  declared, a name the registry does not hold, a machine with no registry file,
+  a wave split across two accounts, a resume, a `codex` ticket. It states
+  plainly that no login check is performed anywhere, and quotes the
+  verification-timeout message that is therefore the only surface an
+  unauthenticated profile appears on, so that failure is diagnosable from the
+  docs rather than from the source. The README's configuration reference gains
+  the `[accounts]` section, and ADR-0013 and ADR-0014 — written ahead of the
+  code and marked `proposed` until it landed — are now `accepted` (#102).
 
 ### Fixed
 - The dashboard reads every account the run touches, so a healthy child on
