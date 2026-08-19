@@ -318,6 +318,29 @@ def review_log_flags(ticket, log):
     return f" --machine-log {log} --ticket {ticket['id']}"
 
 
+def review_account_flag(ticket):
+    """The flag that puts the Claude reviewer on this ticket's account, or nothing.
+
+    A Claude reviewer is a Claude process belonging to this ticket, so it spends on the ticket's
+    own account rather than on whichever login the child it reviews for happens to have been
+    started from. The value is the profile directory the row already carries: the wave table is
+    where a ticket's account name stopped being a name (ADR-0014), and nothing here reads the
+    account registry.
+
+    A row carrying none renders the command exactly as it rendered before accounts existed. That
+    is not the table's ordinary case — a validated wave table carries an account on every row —
+    but it is the candidate table the driver's preflight renders to ask this renderer whether a
+    ticket's routing is valid, which is asked before a ticket's account has been resolved.
+
+    Quoted, unlike every other path this renderer writes into the command: those are the run's own
+    directories, and this one is whatever the operator registered the account against — a profile
+    directory under a path with a space in it would otherwise reach the bridge as two arguments,
+    and the review would be launched on an account nobody named.
+    """
+    account = ticket.get("account")
+    return f"  --account {shlex.quote(str(account))} \\\n" if account else ""
+
+
 def run_log_script(log):
     """The machine log's own writer, as the run keeps it: the copy beside the log itself.
 
@@ -372,6 +395,10 @@ def render_turn(run, ticket, templates, log=None):
                 "<review effort>": review["effort"],
                 "<review log>": review_log_flags(ticket, log),
                 "<rounds contract>": block(templates["review"]["rounds"]),
+                # Only the Claude lane spends a Claude login, and only its block carries this
+                # placeholder: the Codex lane is another vendor with its own credentials, and
+                # takes none of it.
+                "<review account>": review_account_flag(ticket),
             },
         )
         workflow_block = workflow_block.replace("<review block>", review_block)

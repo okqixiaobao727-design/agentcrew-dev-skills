@@ -69,6 +69,11 @@ class Fixture:
         self.base_commit = git_out(self.repo, "rev-parse", "HEAD")
         run_git(self.repo, "checkout", "-b", INTEGRATION_BRANCH)
 
+        # The coordinator's own Claude configuration home, which is what a ticket that named no
+        # account was resolved to as the wave table was built (ADR-0014).
+        self.coordinator_account = self.root / "claude-config"
+        self.coordinator_account.mkdir()
+
         self.log = self.root / "machine.log"
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
@@ -81,7 +86,13 @@ class Fixture:
         claude.chmod(0o755)
         self.tickets = []
 
-    def ticket(self, number, slug, changes, verdict="landable"):
+    def account(self, name):
+        """A second Claude profile directory, as a ticket routed to another account resolves to."""
+        directory = self.root / name
+        directory.mkdir(exist_ok=True)
+        return directory
+
+    def ticket(self, number, slug, changes, verdict="landable", account=None):
         """A ticket: its file, its branch carrying `changes`, and its receipt in the machine log."""
         path = self.repo / FEATURE / f"{number}-{slug}.md"
         path.write_text(f"# {number} {slug}\n")
@@ -105,6 +116,9 @@ class Fixture:
             "executor": "claude",
             "model": "claude-opus-4-5-20251101",
             "effort": "medium",
+            # Every row of a validated wave table carries the account its ticket's processes run
+            # on, the coordinator's own where the ticket named none.
+            "account": str(account or self.coordinator_account),
         })
         return branch
 
@@ -453,6 +467,68 @@ class MechanicalConflictTests(MergeDriverTestCase):
         self.assertIn("alias", result.stderr)
         self.assertEqual(self.fixture.repairs(), [], "nothing is launched on an unresolved name")
         self.assertEqual(self.fixture.events("merge"), [])
+
+
+class RepairAccountTests(MergeDriverTestCase):
+    """The repair session is a Claude process of the ticket it repairs, so it runs on its account.
+
+    Repairing a ticket's conflict is spend that ticket caused, and a ticket moved to a second
+    account that leaves its repairs on the first has only half moved. The account arrives already
+    resolved on the ticket's own row (ADR-0014); this ladder reads no account registry.
+    """
+
+    CONFIG_HOME = "CLAUDE_CONFIG_DIR"
+
+    def conflict(self, account=None):
+        branch = self.fixture.ticket(
+            "07", "alpha", {SHARED: SHARED_BASE + "from the ticket\n"}, account=account
+        )
+        self.fixture.commit_on_integration(
+            SHARED, SHARED_BASE + "from the integration branch\n",
+            "integration adds a line",
+        )
+        return branch
+
+    def test_the_repair_runs_on_the_account_its_ticket_was_routed_to(self):
+        routed = self.fixture.account("claude-config-b")
+        branch = self.conflict(account=routed)
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.fixture.merged(branch))
+        repairs = self.fixture.repairs()
+        self.assertEqual(len(repairs), 1, repairs)
+        self.assertEqual(repairs[0]["env"][self.CONFIG_HOME], str(routed))
+
+    def test_a_ticket_on_the_coordinators_account_repairs_there(self):
+        """A ticket that named no account repairs where every ticket repairs today."""
+        self.conflict()
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.fixture.repairs()[0]["env"][self.CONFIG_HOME],
+            str(self.fixture.coordinator_account),
+        )
+
+    def test_a_row_carrying_no_account_escalates_rather_than_repairing_on_the_coordinators(self):
+        """No fallback: a repair that quietly bills the wrong account is what this key removes."""
+        branch = self.conflict()
+        self.fixture.tickets[-1].pop("account")
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(self.fixture.repairs(), [], "no session is launched on a guessed account")
+        self.assertFalse(self.fixture.merged(branch))
+        escalations = [
+            entry for entry in self.fixture.events("merge") if entry["result"] == "escalated"
+        ]
+        self.assertEqual(len(escalations), 1, escalations)
+        self.assertIn("account", escalations[0]["detail"])
+        self.assertOnIntegrationBranch()
 
 
 class SemanticConflictTests(MergeDriverTestCase):

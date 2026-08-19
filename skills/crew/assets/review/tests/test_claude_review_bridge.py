@@ -239,6 +239,68 @@ class LaunchHookTests(BridgeTestCase):
         self.assertEqual(self.marker_lines(), ["launched", "launched"])
 
 
+class AccountTests(BridgeTestCase):
+    """Which Claude login the headless reviewer spends on: its ticket's, never the caller's.
+
+    A ticket's account is a property of the ticket, and every Claude process belonging to that
+    ticket runs on it — the reviewer included. The account reaches this bridge already resolved to
+    a profile directory, because the wave table is where a ticket's account name stops being a
+    name (ADR-0014); nothing here reads the account registry.
+    """
+
+    CONFIG_HOME = "CLAUDE_CONFIG_DIR"
+
+    def profile(self, name):
+        directory = pathlib.Path(self.work.name) / name
+        directory.mkdir()
+        return directory
+
+    def test_the_reviewer_runs_on_the_account_it_was_given(self):
+        routed = self.profile("profile-b")
+
+        run = self.run_bridge("HEAD", "--account", str(routed), watch_env=[self.CONFIG_HOME])
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.invocations[0]["env"][self.CONFIG_HOME], str(routed))
+
+    def test_the_ticket_account_beats_the_one_the_caller_is_on(self):
+        """The caller is the child, which may sit in any account; the ticket's is the answer."""
+        routed = self.profile("profile-b")
+        callers = self.profile("profile-a")
+
+        run = self.run_bridge(
+            "HEAD", "--account", str(routed),
+            env={self.CONFIG_HOME: str(callers)}, watch_env=[self.CONFIG_HOME],
+        )
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.invocations[0]["env"][self.CONFIG_HOME], str(routed))
+
+    def test_a_review_given_no_account_launches_exactly_as_it_did_before(self):
+        """A ticket naming no account is every ticket dispatched today: the caller's login."""
+        callers = self.profile("profile-a")
+
+        run = self.run_bridge(
+            "HEAD", env={self.CONFIG_HOME: str(callers)}, watch_env=[self.CONFIG_HOME]
+        )
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.invocations[0]["env"][self.CONFIG_HOME], str(callers))
+
+    def test_a_resumed_round_stays_on_the_same_account(self):
+        """Round two resumes a session that lives inside that account's profile directory."""
+        routed = self.profile("profile-b")
+
+        first = self.run_bridge("HEAD", "--account", str(routed))
+        run = self.run_bridge(
+            "HEAD", "--account", str(routed),
+            "--resume-session", first.output["lineageId"], watch_env=[self.CONFIG_HOME],
+        )
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.invocations[-1]["env"][self.CONFIG_HOME], str(routed))
+
+
 class DeSkilledPromptTests(BridgeTestCase):
     """The prompt carries the review itself: no skill to resolve, no config to read.
 

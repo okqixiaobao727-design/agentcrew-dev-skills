@@ -47,6 +47,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
   rows before handing it over. A project launch hook's own variables cannot
   overrule the account. A `codex` ticket is unaffected: it launches on its own
   vendor's credentials and its launch event records no account (#98).
+- A ticket's **reviewer child and merge-repair session run on that ticket's
+  account**, so the one-ticket-one-account invariant covers every Claude process
+  a ticket owns rather than the implementer alone. The rendered Claude review
+  command carries `--account <profile directory>`, which
+  `claude_review_bridge.py` puts in the headless reviewer's environment, and the
+  merge ladder launches its repair session under the account on the ticket's own
+  row. Both read that already-resolved directory from the wave table and neither
+  opens the account registry, and neither falls back: the merge ladder escalates
+  a conflict whose ticket row carries no account rather than repairing it on
+  whichever account it happens to be running under. A `codex` review lane is
+  untouched: another vendor, its own credentials (#99).
 
 ## [0.8.1] - 2026-08-18
 
