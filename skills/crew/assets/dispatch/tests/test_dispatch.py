@@ -61,8 +61,12 @@ class Fixture:
 
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
+        # The coordinator's own configuration home, which is what the driver resolves a ticket
+        # naming no account to, and a second account's home beside it for the mixed-wave cases.
         self.config_dir = self.root / "claude-config"
         self.config_dir.mkdir()
+        self.other_account = self.root / "claude-account-b"
+        self.other_account.mkdir()
         self.out_dir = self.root / "render"
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
@@ -89,6 +93,7 @@ class Fixture:
             "executor": "claude",
             "model": CLAUDE_MODEL,
             "effort": CLAUDE_EFFORT,
+            "account": str(self.config_dir),
             "review": {"vendor": "codex", "model": CODEX_MODEL, "effort": CODEX_EFFORT},
         }
         ticket.update(overrides)
@@ -105,6 +110,7 @@ class Fixture:
             "crew_skill_dir": str(CREW_SKILL_DIR),
             "tmux_session": TMUX_SESSION,
             "permission_mode": PERMISSION_MODE,
+            "coordinator_config_home": str(self.config_dir),
             "codex": {
                 "bridge": str(self.codex_bridge),
                 "state_dir": str(self.feature_dir / ".crew-codex"),
@@ -163,6 +169,19 @@ class Fixture:
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def transcripts(self, account):
+        """Every session id that account's profile holds a transcript for."""
+        return sorted(
+            path.stem for path in (pathlib.Path(account) / "projects").glob("*/*.jsonl")
+        )
+
+    def agents_listed(self, account):
+        """The names in that account's own live agents list, empty where it holds none."""
+        path = pathlib.Path(account) / "agents.json"
+        if not path.exists():
+            return []
+        return sorted(entry["name"] for entry in json.loads(path.read_text()))
 
     def turn(self, number):
         return (self.out_dir / f"{number}.turn.txt").read_text()
@@ -1124,6 +1143,268 @@ class MixedWaveTests(DispatchTestCase):
         self.assertEqual(len(lines), 2, result.stdout)
         self.assertTrue(lines[0].startswith("06 launched claude"), lines[0])
         self.assertTrue(lines[1].startswith("07 launched codex"), lines[1])
+
+
+class AccountRoutingTests(DispatchTestCase):
+    """A child launches on its ticket's account and is verified there (#98).
+
+    The wave table carries a concrete account on every row — the profile directory the driver
+    resolved the ticket's name to, or the coordinator's own where the ticket named none. These
+    cases drive the whole launch: the stub multiplexer carries the window's environment into the
+    keys it runs, so the stub CLI writes its transcript into whichever profile the window was put
+    on, and a transcript in the routed profile is what proves the launch rather than the arguments
+    the launch was recorded with.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.other = str(self.fixture.other_account)
+        self.coordinator_account = str(self.fixture.config_dir)
+
+    def window_environment(self, name):
+        """The `NAME=VALUE` pairs the window for that ticket was created with."""
+        for call in self.fixture.tmux_calls():
+            argv = call["argv"]
+            if argv[0] != "new-window" or argv[argv.index("-n") + 1] != name:
+                continue
+            return dict(
+                argv[index + 1].split("=", 1)
+                for index, value in enumerate(argv) if value == "-e"
+            )
+        return None
+
+    def test_a_ticket_lacking_an_account_is_refused_before_any_launch(self):
+        """Ambiguity ended at the wave table (ADR-0014): every row carries a concrete account."""
+        table = self.fixture.table([self.fixture.ticket("06", "unrouted", account=None)])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        offence = [line for line in result.stderr.splitlines() if line.startswith("06")]
+        self.assertTrue(offence, result.stderr)
+        self.assertIn("Account", offence[0])
+        self.assertEqual(self.fixture.launches(), [])
+        self.assertEqual(self.fixture.tmux_calls(), [])
+
+    def test_a_child_runs_under_the_account_its_ticket_names(self):
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "routed", account=self.other)]
+        )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        launches = self.fixture.launches()
+        self.assertEqual(len(launches), 1, launches)
+        self.assertEqual(launches[0]["configHome"], self.other)
+        self.assertEqual(
+            self.fixture.transcripts(self.other), [launches[0]["sessionId"]]
+        )
+        self.assertEqual(self.fixture.transcripts(self.coordinator_account), [])
+
+    def test_a_shell_in_that_window_sees_the_account_too(self):
+        """The window itself is put on the account, so a `claude` typed by hand stays on it."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "routed", account=self.other)]
+        )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(
+            self.window_environment("06"), {"CLAUDE_CONFIG_DIR": self.other}
+        )
+
+    def test_a_ticket_naming_no_account_runs_under_the_coordinators(self):
+        """Which the table spells as the coordinator's own configuration home."""
+        table = self.fixture.table([self.fixture.ticket("06", "unnamed")])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        launches = self.fixture.launches()
+        self.assertEqual(launches[0]["configHome"], self.coordinator_account)
+        self.assertEqual(
+            self.fixture.transcripts(self.coordinator_account), [launches[0]["sessionId"]]
+        )
+        self.assertEqual(self.fixture.transcripts(self.other), [])
+        self.assertEqual(
+            self.window_environment("06"), {"CLAUDE_CONFIG_DIR": self.coordinator_account}
+        )
+
+    def test_a_wave_mixing_two_accounts_launches_every_child_under_its_own(self):
+        table = self.fixture.table([
+            self.fixture.ticket("06", "on-the-coordinators"),
+            self.fixture.ticket("07", "on-the-other", account=self.other),
+        ])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2, result.stdout)
+        launched = {entry["argv"][entry["argv"].index("--agent") + 1]: entry
+                    for entry in self.fixture.launches()}
+        self.assertEqual(launched["crew-06"]["configHome"], self.coordinator_account)
+        self.assertEqual(launched["crew-07"]["configHome"], self.other)
+        self.assertEqual(
+            self.fixture.transcripts(self.coordinator_account),
+            [launched["crew-06"]["sessionId"]],
+        )
+        self.assertEqual(
+            self.fixture.transcripts(self.other), [launched["crew-07"]["sessionId"]]
+        )
+
+    def test_a_child_present_only_in_its_own_accounts_list_is_still_found(self):
+        """Two profiles answer `agents --json` with two disjoint lists; the routed one is read."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "routed", account=self.other)]
+        )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.fixture.agents_listed(self.other), ["stub-child-1"])
+        self.assertEqual(self.fixture.agents_listed(self.coordinator_account), [])
+
+    def test_the_transcript_read_that_asserts_the_model_reads_the_childs_account(self):
+        """A downgrade written into the routed profile is still caught, so that profile was read."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "routed", account=self.other)]
+        )
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, extra=("--verify-timeout", "5"),
+            env_overrides={"AGENTCREW_STUB_TRANSCRIPT_MODEL": "claude-haiku-4-5-20251001"},
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        line = result.stdout.strip()
+        self.assertTrue(line.startswith("06 FAILED"), line)
+        self.assertIn("claude-haiku-4-5-20251001", line)
+        self.assertIn(CLAUDE_MODEL, line)
+
+    def test_the_launch_event_records_the_account_the_child_launched_under(self):
+        log = self.fixture.root / "log.jsonl"
+        table = self.fixture.table([
+            self.fixture.ticket("06", "on-the-coordinators"),
+            self.fixture.ticket("07", "on-the-other", account=self.other),
+        ])
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, extra=("--log", str(log)),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        events = [record for record in self.fixture.log_records(log)
+                  if record["event"] == "launch"]
+        self.assertEqual(
+            [(event["ticket"], event["account"]) for event in events],
+            [("06", self.coordinator_account), ("07", self.other)],
+            events,
+        )
+
+    def test_the_verification_timeout_names_the_tickets_account(self):
+        """With no login check anywhere, this timeout is where an unauthenticated profile shows."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "routed", account=self.other)]
+        )
+        # A CLI that starts nothing: the routed account's list stays empty, as an unauthenticated
+        # profile's does.
+        (self.fixture.bin_dir / "claude").write_text(
+            "#!/bin/sh\nif [ \"$1\" = agents ]; then echo '[]'; fi\nexit 0\n"
+        )
+        (self.fixture.bin_dir / "claude").chmod(0o755)
+
+        result = self.fixture.run_dispatch("dispatch", table, extra=("--verify-timeout", "1"))
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        line = result.stdout.strip()
+        self.assertTrue(line.startswith("06 FAILED"), line)
+        self.assertIn(self.other, line)
+
+    def test_a_hook_variable_cannot_move_a_child_off_its_tickets_account(self):
+        """The window carries the account; the launch line's hook variables never overrule it."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "routed", account=self.other)],
+            launch_hook={
+                "command": "true",
+                "env": {"CLAUDE_CONFIG_DIR": self.coordinator_account},
+            },
+        )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        launches = self.fixture.launches()
+        self.assertEqual(launches[0]["configHome"], self.other)
+        self.assertEqual(
+            self.fixture.transcripts(self.other), [launches[0]["sessionId"]]
+        )
+        self.assertEqual(self.fixture.transcripts(self.coordinator_account), [])
+
+    def test_an_account_that_is_not_an_absolute_path_is_refused_before_any_launch(self):
+        """ADR-0007: the child reads this path in its own worktree, not in the dispatcher's."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "relative-account", account="claude-config")]
+        )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        offence = [line for line in result.stderr.splitlines() if line.startswith("06")]
+        self.assertTrue(offence, result.stderr)
+        self.assertIn("claude-config", offence[0])
+        self.assertIn("absolute path", offence[0])
+        self.assertEqual(self.fixture.launches(), [])
+        self.assertEqual(self.fixture.tmux_calls(), [])
+
+    def test_a_codex_childs_launch_event_records_no_claude_account(self):
+        """A Codex child launches on its own vendor's credentials, not on a Claude profile."""
+        log = self.fixture.root / "log.jsonl"
+        table = self.fixture.table([
+            self.fixture.ticket("06", "claude-child", account=self.other),
+            self.fixture.ticket(
+                "07", "codex-child", account=self.other,
+                executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+                review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+            ),
+        ])
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, extra=("--log", str(log)),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        events = {record["ticket"]: record for record in self.fixture.log_records(log)
+                  if record["event"] == "launch"}
+        self.assertEqual(events["06"]["account"], self.other)
+        self.assertNotIn("account", events["07"])
+
+    def test_a_codex_ticket_in_the_same_wave_is_unaffected(self):
+        table = self.fixture.table([
+            self.fixture.ticket("06", "claude-child", account=self.other),
+            self.fixture.ticket(
+                "07", "codex-child", account=self.other,
+                executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+                review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+            ),
+        ])
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines[1].startswith("07 launched codex"), lines)
+        argv = self.fixture.codex_launches()[0]["argv"]
+        self.assertNotIn("--account", argv)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", " ".join(argv))
+        self.assertEqual(
+            [call["argv"] for call in self.fixture.tmux_calls()
+             if call["argv"][0] == "new-window" and call["argv"][
+                 call["argv"].index("-n") + 1] == "07"],
+            [],
+        )
 
 
 if __name__ == "__main__":

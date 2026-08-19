@@ -30,8 +30,11 @@ reader can tell "not recorded" from "recorded as nothing".
 
 ### `launch` — a child started on a ticket
 
-`ticket`, `child`, `workflow`, `executor`, `model`, `effort`, `branch`, `worktree`, `window`.
-`model` is a full model ID, never an alias.
+`ticket`, `child`, `workflow`, `executor`, `model`, `effort`, `branch`, `worktree`, `window`,
+`account`. `model` is a full model ID, never an alias; `account` is the Claude Code profile
+directory the child launched under, which is what makes a run's spend attributable after the
+fact, and a Claude child's alone — a Codex child launches on its own vendor's credentials and
+records no account.
 
 The dispatch renderer writes this one itself, as each child comes up, given `--log`: the launched
 set is what wave advancement and the dashboard read, and it costs the coordinator no turn. `child`
@@ -175,7 +178,7 @@ reformatting, no summary. A structured message is recorded as the object it was.
 ```sh
 machine_log.py --log <path> launch  --ticket NN --child NAME --workflow W --executor E \
                                     --model ID --effort E \
-                                    [--branch B] [--worktree P] [--window W]
+                                    [--branch B] [--worktree P] [--window W] [--account DIR]
 machine_log.py --log <path> receipt --ticket NN --verdict landable|parked|failed \
                                     [--sha SHA] [--detail TEXT]
 machine_log.py --log <path> merge   --ticket NN --result clean|conflict|repaired|escalated \

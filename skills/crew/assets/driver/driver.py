@@ -618,7 +618,8 @@ def routing_problems(tickets, run, launch_dir):
     candidate = launch_dir / "candidate-table.json"
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_text(
-        json.dumps({"run": run, "waves": [{"wave": 1, "tickets": tickets}]}), encoding="utf-8"
+        json.dumps({"run": run, "waves": [{"wave": 1, "tickets": accounted(tickets, run)}]}),
+        encoding="utf-8",
     )
     result = subprocess.run(
         [
@@ -632,6 +633,28 @@ def routing_problems(tickets, run, launch_dir):
     if result.returncode == 0:
         return []
     return [line for line in result.stderr.splitlines() if line.strip()]
+
+
+def accounted(tickets, run):
+    """This run's tickets, copied, with the concrete account a wave table's rows carry.
+
+    What the renderer is handed is a wave table, and on a wave table `account` is concrete on
+    every row (ADR-0014) — while these tickets are the pre-table input, where the key is still the
+    optional name the operator wrote or nothing at all. `normalise_accounts` is the one place that
+    rule lives, so it is what fills the copies in.
+
+    A name the registry cannot resolve puts every row on the coordinator's home instead, because
+    what this table is for is the renderer's verdict on *routing*: `account_problems` is the check
+    that names an unregistered account and the registry it searched, and it says so far better
+    than a second line about the same account from the renderer would.
+    """
+    candidates = [dict(ticket) for ticket in tickets]
+    try:
+        return normalise_accounts(candidates, run)
+    except accounts.AccountsError:
+        for candidate in candidates:
+            candidate[ACCOUNT_KEY] = run["coordinator_config_home"]
+        return candidates
 
 
 def config_problems(repo, run):
