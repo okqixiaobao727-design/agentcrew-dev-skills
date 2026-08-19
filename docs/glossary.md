@@ -101,27 +101,26 @@ skipped.
 **Executor** — The kind of agent that takes a ticket: `claude` (an interactive Claude session in
 tmux) or `codex` (a Codex bridge window). Chosen per ticket; a single wave may mix both.
 
-**Account** *(#95, not built yet)* — A named Claude Code login, under which a ticket's Claude
-processes run and against whose subscription their tokens are billed. Named per ticket, and unlike
-every other routing value it is **not** concluded from the ticket's classification: which
-subscription pays is a fact about the operator's wallet, not about the kind of work. A ticket that
-names none runs on the coordinator's account, so a single-account run never mentions the word. A
-single wave may mix accounts.
+**Account** — A named Claude Code login, under which a ticket's Claude processes run and against
+whose subscription their tokens are billed. Named per ticket, and unlike every other routing value
+it is **not** concluded from the ticket's classification: which subscription pays is a fact about
+the operator's wallet, not about the kind of work. A ticket that names none runs on the
+coordinator's account, so a single-account run never mentions the word. A single wave may mix
+accounts.
 _Avoid_: profile (the directory an account resolves to, not the account), subscription (the billing
 plan behind the login, not the login)
 
-**One ticket, one account** *(#95, not built yet)* — The invariant that every Claude process
-belonging to a ticket runs on that ticket's account: the implementer child, the reviewer child, and
-the exception handler that repairs that ticket's merge conflict. The account is a property of the
-ticket, not of the process, so a ticket moved to another account takes all of its spend with it.
+**One ticket, one account** — The invariant that every Claude process belonging to a ticket runs
+on that ticket's account: the implementer child, the reviewer child, and the exception handler that
+repairs that ticket's merge conflict. The account is a property of the ticket, not of the process,
+so a ticket moved to another account takes all of its spend with it.
 
-**Account registry** *(#95, not built yet)* — The machine-level file mapping account names to
-Claude Code profile directories. It is deliberately not profile-scoped: a map *between* accounts
-cannot be stored per account
-([ADR-0013](adr/0013-the-account-registry-is-not-profile-scoped.md)). The repository holds names
-only — a ticket names an account, the crew config file may declare which names this repo expects,
-and neither ever holds a path. A name the registry does not hold stops the run; it never falls back
-to the coordinator's account.
+**Account registry** — The machine-level file mapping account names to Claude Code profile
+directories. It is deliberately not profile-scoped: a map *between* accounts cannot be stored per
+account ([ADR-0013](adr/0013-the-account-registry-is-not-profile-scoped.md)). The repository holds
+names only — a ticket names an account, the crew config file may declare which names this repo
+expects, and neither ever holds a path. A name the registry does not hold stops the run; it never
+falls back to the coordinator's account.
 
 **Core / non-core** — First axis of the tdd/refactor quadrant. Core means downstream tickets couple
 to *this ticket's design decisions* — change the internal approach and downstream code must follow

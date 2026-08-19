@@ -240,6 +240,12 @@ TMUX_ENVIRONMENT_FIELDS = 3
 SESSION_PREFIX = "$"
 SESSION_TARGET_SUFFIX = ":"
 
+# The wave table's per-ticket account: the profile directory itself, resolved by the driver as it
+# built the table, never a name this end resolves (ADR-0014). A row without the key is a table
+# written before accounts existed, and its ticket is read from the configuration home this process
+# was started under, which is where that release's children were looked for.
+ACCOUNT_KEY = "account"
+
 # The Claude lane's primary live source (ADR-0012): the CLI's own per-session files, one JSON
 # object per live session, under the same configured home the pin registry hangs off. Reading them
 # costs a few file reads, where the fallback command below costs a whole CLI start per tick.
@@ -418,7 +424,19 @@ def read_log(path):
     return records
 
 
-def agent_states(claude_bin, timeout=None):
+def account_environment(account):
+    """This process's environment with `account` as its Claude configuration home, or None.
+
+    None where no account was named, which is what leaves a spawn's environment exactly as it is
+    inherited — the single-account run, unchanged. Claude Code scopes a login to this one
+    variable, so setting it is the whole of asking a second account its own question.
+    """
+    if account is None:
+        return None
+    return dict(os.environ, **{CLAUDE_SESSIONS[0]: str(account)})
+
+
+def agent_states(claude_bin, timeout=None, account=None):
     """Each live session's status by its `cwd`, or None when the agents list cannot be read.
 
     The fallback lane and nothing else (ADR-0012): every call here is a whole CLI start, which is
@@ -435,6 +453,7 @@ def agent_states(claude_bin, timeout=None):
         result = subprocess.run(
             [claude_bin, "agents", "--json"],
             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+            env=account_environment(account),
         )
     except subprocess.TimeoutExpired:
         return None
@@ -494,17 +513,18 @@ def codex_states(run_dir, timeout=None):
     return states
 
 
-def sessions_directory():
-    """The CLI's own per-session files, under the same configured home the pin registry hangs off.
+def sessions_directory(account=None):
+    """The CLI's own per-session files, under one account's configuration home.
 
     One seam for both (ADR-0012): a test that moves the config directory moves the sessions files,
     the fallback's cache and the registry together, which is how a fixture gets a machine of its
-    own without a flag per path.
+    own without a flag per path. An account named here moves all three the same way, for the one
+    ticket that runs under it.
     """
-    return transcript_root(CLAUDE_SESSIONS)
+    return transcript_root(CLAUDE_SESSIONS, account)
 
 
-def session_states(timeout=None):
+def session_states(timeout=None, account=None):
     """Each live session's status by its `cwd`, read from the files the CLI keeps itself, or None
     when that directory is not there to be read.
 
@@ -520,7 +540,7 @@ def session_states(timeout=None):
     answers None, the caller's signal to fall back, while a budget spent answers `OUT_OF_TIME`,
     which is not a reason to go and start a CLI.
     """
-    directory = sessions_directory()
+    directory = sessions_directory(account)
     try:
         # Listed rather than globbed: a glob answers an unreadable directory with no matches, so a
         # tick that trusted it would draw every live child `vanished` instead of falling back.
@@ -544,23 +564,25 @@ def session_states(timeout=None):
     return states
 
 
-def agents_cache_path():
-    """Where the fallback's one shared answer lives: beside the pin registry, not inside it.
+def agents_cache_path(account=None):
+    """Where the fallback's shared answer lives: beside the pin registry, not inside it.
 
     Machine-level on purpose: every pane of every session reads this same file, which is what
-    stops the fallback from spawning once per pane per tick.
+    stops the fallback from spawning once per pane per tick. One such file per account, because
+    what it holds is one account's list of live sessions and the accounts' lists are disjoint —
+    a single file would serve one account's children as the answer about another's.
     """
-    return transcript_root(PIN_REGISTRY).parent / AGENTS_CACHE_NAME
+    return transcript_root(PIN_REGISTRY, account).parent / AGENTS_CACHE_NAME
 
 
-def read_agents_cache(moment):
+def read_agents_cache(moment, account=None):
     """The fallback answer this machine already has and may still use, or `NO_CACHE`.
 
     A cached failure is an answer too — it is returned as the None the lane draws `unknown` from —
     so a CLI that cannot answer is asked once per window rather than once per tick.
     """
     try:
-        cached = json.loads(read_without_blocking(agents_cache_path()))
+        cached = json.loads(read_without_blocking(agents_cache_path(account)))
     except (OSError, ValueError):
         return NO_CACHE
     if not isinstance(cached, dict):
@@ -574,14 +596,14 @@ def read_agents_cache(moment):
     return states if isinstance(states, dict) else None
 
 
-def write_agents_cache(states, moment):
+def write_agents_cache(states, moment, account=None):
     """Share one fetch with every other pane on the machine; returns nothing.
 
     Put in place by rename, so no tick ever reads a half-written answer. A cache that could not be
     written is not a failure anybody is told about: the next tick simply fetches again, which is
     exactly what would have happened anyway.
     """
-    path = agents_cache_path()
+    path = agents_cache_path(account)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -595,55 +617,97 @@ def write_agents_cache(states, moment):
             temporary.unlink(missing_ok=True)
 
 
-def announce_fallback(run_dir, records, timeout=None):
+def announce_fallback(run_dir, records, timeout=None, account=None, announced=None):
     """Record in the run's own log that this lane is reading its fallback; returns nothing.
 
     ADR-0008's silence holds on screen, so the one place a relocated sessions directory can be
-    diagnosed from is here. One line per run, not per tick: the run's log is read for the frame
-    anyway, so a run that has already said it is in fallback says nothing more.
+    diagnosed from is here. One line per run — not per tick, and not per account: the run's log is
+    read for the frame anyway, so a run that has already said it is in fallback says nothing more.
+
+    `announced` is what carries that across the accounts of one frame, which the log alone cannot:
+    every account of a frame is read against the same snapshot of the log, taken before any of
+    them had written anything, so a second falling-back account would otherwise repeat the line
+    the first had just written. The accounts are read in the wave table's order, so the directory
+    the line names is the first one a run could not read.
     """
-    if run_dir is None or any(record.get("event") == LIVE_SOURCE_EVENT for record in records):
+    if run_dir is None or announced:
         return
+    if any(record.get("event") == LIVE_SOURCE_EVENT for record in records):
+        return
+    if announced is not None:
+        announced.append(account)
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run(
             [
                 sys.executable, str(MACHINE_LOG),
                 "--log", str(pathlib.Path(run_dir) / MACHINE_LOG_NAME), LIVE_SOURCE_EVENT,
                 "--lane", CLAUDE, "--source", FALLBACK_SOURCE,
-                "--reason", FALLBACK_REASON.format(directory=sessions_directory()),
+                "--reason", FALLBACK_REASON.format(directory=sessions_directory(account)),
             ],
             capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout,
         )
 
 
-def claude_states(claude_bin, run_dir=None, timeout=None, records=()):
-    """What the Claude lane's children are doing: the sessions files, or the command behind them.
+def claude_states(claude_bin, run_dir=None, timeout=None, records=(), account=None,
+                  announced=None):
+    """What one account's Claude children are doing: its sessions files, or the command behind
+    them.
 
     The primary source is read every time and cached nowhere — it is already as cheap as a cache
     would be, so nothing here can go stale. Only a directory that cannot be read at all sends the
     tick to the command, and there the machine's shared answer stands for a freshness window
-    before any pane spawns another (ADR-0012).
+    before any pane spawns another (ADR-0012). Both halves are asked of the account's own home, so
+    an account more costs a few directory listings on the path a tick actually takes, and a spawn
+    only on the exceptional path that already spawns.
     """
-    states = session_states(timeout)
+    states = session_states(timeout, account)
     if states is OUT_OF_TIME:
         return None
     if states is not None:
         return states
-    announce_fallback(run_dir, records, timeout)
-    cached = read_agents_cache(time.time())
+    announce_fallback(run_dir, records, timeout, account, announced)
+    cached = read_agents_cache(time.time(), account)
     if cached is not NO_CACHE:
         return cached
-    fetched = agent_states(claude_bin, timeout)
-    write_agents_cache(fetched, time.time())
+    fetched = agent_states(claude_bin, timeout, account)
+    write_agents_cache(fetched, time.time(), account)
     return fetched
 
 
-def live_sources(claude_bin, run_dir, timeout=None, records=()):
-    """What each lane says about its own children: the sessions files behind `claude agents
-    --json`, and the Codex bridge's state files."""
+def table_accounts(waves):
+    """Every account the wave table names, once each, in the order the table names them.
+
+    A row without the key is the table a release before accounts wrote, and its account is None —
+    the configuration home this process was started under, which is where that release's children
+    were looked for and found.
+    """
+    named = []
+    for wave in waves:
+        for entry in wave.get("tickets") or []:
+            account = entry.get(ACCOUNT_KEY)
+            if account not in named:
+                named.append(account)
+    return named or [None]
+
+
+def live_sources(claude_bin, run_dir, timeout=None, records=(), accounts=(None,)):
+    """What each lane says about the children of each account the run touches.
+
+    Keyed by account and then by lane, because that is the order a row is read in: a ticket knows
+    which account it runs under before it knows anything about its lane's source. The Claude lane
+    is asked once per account — its per-session files and its login are the account's — and the
+    Codex lane is asked once for the run and shared, because a Codex child's bridge state lives in
+    the run directory and no Claude profile has anything to say about it.
+    """
+    codex = codex_states(run_dir, timeout)
+    # The one line a frame may record about falling back, shared by every account it reads.
+    announced = []
     return {
-        CLAUDE: claude_states(claude_bin, run_dir, timeout, records),
-        CODEX: codex_states(run_dir, timeout),
+        account: {
+            CLAUDE: claude_states(claude_bin, run_dir, timeout, records, account, announced),
+            CODEX: codex,
+        }
+        for account in accounts
     }
 
 
@@ -667,6 +731,23 @@ def read_table(run_dir):
     return waves
 
 
+def account_homes(run_dir):
+    """The Claude profile directory each ticket's wave-table row names, keyed by ticket."""
+    homes = {}
+    for wave in read_table(run_dir):
+        tickets = wave.get("tickets") if isinstance(wave, dict) else None
+        if not isinstance(tickets, list):
+            continue
+        for ticket in tickets:
+            if not isinstance(ticket, dict):
+                continue
+            identifier = ticket.get("id")
+            account = ticket.get("account")
+            if identifier is not None and account:
+                homes[str(identifier)] = str(account)
+    return homes
+
+
 def settling_state(record):
     """The word this record settles a ticket into, or None when it settles nothing."""
     key, words = SETTLED_STATES.get(str(record.get("event")), (None, {}))
@@ -688,7 +769,7 @@ def settled(events):
     return None, None
 
 
-def reworking(events, settling, launch, sources):
+def reworking(events, settling, launch, sources, account=None):
     """Whether this ticket's child is working on the conflict its escalated merge left behind.
 
     Three things make it true, and the order between the first two is the whole point: the last
@@ -706,7 +787,7 @@ def reworking(events, settling, launch, sources):
         return False
     if str(settling.get("result")) != MERGE_ESCALATED:
         return False
-    if not working(launch, sources):
+    if not working(launch, sources, account):
         return False
     for record in events[index_of(events, settling) + 1:]:
         if record.get("event") != RULING_EVENT:
@@ -717,14 +798,14 @@ def reworking(events, settling, launch, sources):
     return False
 
 
-def working(launch, sources):
+def working(launch, sources, account=None):
     """Whether this ticket's own lane can see a child of its own busy on it right now.
 
     Stricter than "the lane did not say `idle`": a reading that produced an anomaly answered about
     itself rather than about the child, and a state read off a source that could not be read is no
     evidence that anyone is working.
     """
-    state, anomaly, status = live_state(launch, sources)
+    state, anomaly, status = live_state(launch, sources, account)
     return state == RUNNING and anomaly is None and status is not None
 
 
@@ -754,12 +835,15 @@ def settling_wave(settlements, records):
     return not over(records)
 
 
-def live_state(launch, sources):
+def live_state(launch, sources, account=None):
     """What a launched, unsettled ticket is doing now: its state, its anomaly, and its raw status.
 
     Each lane is read from its own source, chosen by the executor its launch names, because the
     two do not overlap: a Claude child is in the agents list and a Codex child is in its bridge
-    state file, and asking either about the other's children answers `vanished`.
+    state file, and asking either about the other's children answers `vanished`. The account the
+    wave table routed the ticket to chooses which copy of those sources is asked, on the same
+    reasoning: two accounts' live sources are disjoint, and asking one about the other's children
+    answers `vanished` too.
 
     An anomaly is not a state: `duplicate` and `unknown` say what a reading did, not where the
     ticket got to, so the row keeps the state its own log line justifies and carries the anomaly
@@ -769,7 +853,7 @@ def live_state(launch, sources):
     executor = str(launch.get("executor", ""))
     if executor not in LIVE_STATES:
         return RUNNING, (UNKNOWN, f"the launch names executor {executor or '(none)'}"), None
-    states = sources.get(executor)
+    states = sources.get(account, {}).get(executor)
     if states is None:
         return RUNNING, (UNKNOWN, f"{LIVE_SOURCES[executor]} could not be read"), None
     status = states.get(worktree_key(launch.get("worktree")))
@@ -859,6 +943,7 @@ def build_rows(waves, records, moment, sources):
         merging = settling_wave([settling for settling, _ in wave_settled.values()], records)
         for entry in entries:
             ticket = str(entry.get("id", ""))
+            account = entry.get(ACCOUNT_KEY)
             events = wave_events[ticket]
             launch = launches.get(ticket)
             settling, settled_into = wave_settled[ticket]
@@ -870,12 +955,12 @@ def build_rows(waves, records, moment, sources):
                 started = parse_timestamp(launch.get("ts"))
                 if settling is not None:
                     state, end = settled_into, parse_timestamp(settling.get("ts"))
-                    if state == WAITING and reworking(events, settling, launch, sources):
+                    if state == WAITING and reworking(events, settling, launch, sources, account):
                         state = REWORKING
                     elif state == LANDABLE and merging:
                         state = SETTLING
                 else:
-                    state, anomaly, status = live_state(launch, sources)
+                    state, anomaly, status = live_state(launch, sources, account)
                     end = moment
             escalation_count = sum(record.get("event") == ESCALATION_EVENT for record in events)
             rows.append({
@@ -1165,7 +1250,8 @@ def draw(args, run_dir, moment):
     waves = read_table(run_dir)
     records = read_log(run_dir / MACHINE_LOG_NAME)
     rows = build_rows(
-        waves, records, moment, live_sources(args.claude_bin, run_dir, records=records)
+        waves, records, moment,
+        live_sources(args.claude_bin, run_dir, records=records, accounts=table_accounts(waves)),
     )
     print(
         render(
@@ -1574,7 +1660,9 @@ def pin_frame_data(args, run_dir, moment):
     if over(records):
         return None
     waves = read_table(run_dir)
-    sources = live_sources(args.claude_bin, run_dir, args.timeout, records)
+    sources = live_sources(
+        args.claude_bin, run_dir, args.timeout, records, table_accounts(waves)
+    )
     rows = build_rows(waves, records, moment, sources)
     frame = render(
         rows, run_dir.name, len(waves), moment,
@@ -1954,15 +2042,20 @@ def run_pin_install(args):
     return 0
 
 
-def transcript_root(spec):
+def transcript_root(spec, account=None):
     """A directory under an executor's configured home: a transcript root, or the pin registry.
 
     The same three parts every time — the variable that moves the home, the home's own name under
     `~`, and the fixed subdirectory inside it.
+
+    `account` is an explicitly supplied profile directory, which is what a ticket routed to
+    another account carries and what a cost read uses for its ticket. The wave table holds the
+    profile directory itself, already resolved, so a read for that ticket goes to that home rather
+    than to the one this process was started under.
     """
     variable, home, subdirectory = spec
-    configured = os.environ.get(variable)
-    return pathlib.Path(configured or pathlib.Path.home() / home) / subdirectory
+    account = os.environ.get(variable) if account is None else account
+    return pathlib.Path(account or pathlib.Path.home() / home) / subdirectory
 
 
 def within_path(path, root):
@@ -2172,7 +2265,7 @@ def review_sessions(records):
     return found
 
 
-def child_usage(executor, worktree, reviewed=()):
+def child_usage(executor, worktree, reviewed=(), config_home=None):
     """What one child spent: its sessions, their counters, or the diagnosis in place of both.
 
     Every failure on this path is diagnosed rather than raised, and a child with one unbillable
@@ -2184,7 +2277,7 @@ def child_usage(executor, worktree, reviewed=()):
     here rather than added to the child that was reviewed.
     """
     spec, usage_of = TRANSCRIPT_READERS[executor]
-    root = transcript_root(spec)
+    root = transcript_root(spec, config_home)
     sessions = {}
     counters = zero_counters()
     undetermined = 0
@@ -2275,17 +2368,20 @@ def coordinator_usage(session):
     return {**row, "sessions": [session], "counters": counters}
 
 
-def cost_rows(records):
+def cost_rows(records, claude_homes=None, account_problem=None):
     """One row per launched ticket, in ticket order: what it was routed to, and what it spent.
 
     A ticket launched twice into the same worktree — a replacement child — is one row, and its
     figures are every session that ran there, because both children spent the ticket's tokens.
+    `account_problem` diagnoses Claude rows when the run's account map cannot be read; Codex rows
+    remain readable from their own configured root.
     """
     launches = {}
     for record in records:
         if record.get("event") == "launch":
             launches[str(record.get("ticket"))] = record
     reviewed = review_sessions(records)
+    claude_homes = claude_homes or {}
 
     rows = []
     for ticket, launch in sorted(launches.items()):
@@ -2300,8 +2396,11 @@ def cost_rows(records):
             )
         if not worktree:
             usage = diagnosed("the launch event names no worktree to read a transcript in")
+        elif executor == CLAUDE and account_problem:
+            usage = diagnosed(account_problem)
         else:
-            usage = child_usage(executor, worktree, reviewed)
+            config_home = claude_homes.get(ticket) if executor == CLAUDE else None
+            usage = child_usage(executor, worktree, reviewed, config_home)
         rows.append({
             "ticket": ticket,
             "executor": executor,
@@ -2376,10 +2475,21 @@ def log_session_cost(log, row):
 def run_cost(args):
     """Append one `session-cost` per launched child and print the run's rollup; returns 0.
 
+    The log's parent holds the wave table that maps Claude tickets to profile directories. If that
+    table cannot be read, Claude rows carry the diagnosis rather than guessing a root; Codex rows
+    still use their own configured home.
+
     The coordinator's row is printed and not logged: the log's `session-cost` is a launched
     ticket's line, and the session that drives the run is not one.
     """
-    rows = cost_rows(read_log(args.log))
+    run_dir = pathlib.Path(args.log).parent
+    try:
+        homes = account_homes(run_dir)
+        account_problem = None
+    except MonitorError as error:
+        homes = {}
+        account_problem = str(error)
+    rows = cost_rows(read_log(args.log), homes, account_problem)
     for row in rows:
         log_session_cost(args.log, row)
     coordinator = None

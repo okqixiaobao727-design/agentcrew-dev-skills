@@ -660,6 +660,18 @@ class ProjectConfigTests(unittest.TestCase):
     def test_an_unknown_case_is_rejected(self):
         self.assert_rejects_with_required("[reviewer.core-tricky]\n", "core-tricky")
 
+    def test_a_project_declaring_the_account_names_it_expects_is_accepted(self):
+        self.assert_accepts_with_required('[accounts]\nnames = ["work", "side"]\n')
+
+    def test_a_project_declaring_an_account_as_a_profile_path_is_rejected(self):
+        """The repository carries names, never paths: the mapping is machine-level (ADR-0013)."""
+        self.assert_rejects_with_required(
+            '[accounts]\nwork = "/Users/someone/.claude"\n', "work"
+        )
+
+    def test_a_project_declaring_account_names_that_are_not_a_list_is_rejected(self):
+        self.assert_rejects_with_required('[accounts]\nnames = "work"\n', "names")
+
     def test_a_project_choosing_another_surface_is_accepted(self):
         self.assert_accepts_with_required('[dashboard]\nsurface = "both"\n')
 

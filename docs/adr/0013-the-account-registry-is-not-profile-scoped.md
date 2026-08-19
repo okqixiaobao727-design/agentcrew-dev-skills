@@ -1,5 +1,5 @@
 ---
-status: proposed — decided while specifying #95, accepted when #95 lands
+status: accepted
 ---
 
 # The account registry is a machine-level file, deliberately not resolved through `CLAUDE_CONFIG_DIR`
@@ -52,6 +52,23 @@ oversight.
 Its location is overridable by an explicit switch, in the shape the pin registry already uses — a
 fixed default plus an override — which is also the test seam, since no test may write into a real
 home directory.
+
+Concretely, as #97 fixes it and the shipped config file's own header states it:
+
+- **Default location** — `~/.claude/agentcrew/accounts.toml`, read from the home directory itself
+  and never through `CLAUDE_CONFIG_DIR`.
+- **Format** — TOML, one `[accounts]` table of `name = "<profile directory>"` entries.
+- **Override** — `AGENTCREW_ACCOUNT_REGISTRY`, an absolute path to the registry file; a relative
+  one is refused rather than resolved.
+- **Entry point** — `profile_directory(name)` in `skills/crew/assets/accounts.py`. Nothing else
+  reads the registry.
+
+The override is an environment variable rather than a command-line flag because a run is many
+processes — the driver, the dispatch renderer, the dashboard, and every one a resume starts later
+— and each of them has to reach the same registry. A flag would have to be threaded through each
+launch, and a launch that forgot it would read a different registry, which is the shadowing
+failure this ADR exists to prevent. The variable is single-valued: it moves the one registry, and
+unlike `CLAUDE_CONFIG_DIR` it does not split it per account.
 
 Two rules ride with it:
 

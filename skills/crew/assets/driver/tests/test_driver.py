@@ -74,6 +74,13 @@ Reasons: a fixture ticket.
 """
 
 
+def routing_naming(account):
+    """The fixture routing carrying the optional `Account` line an operator may name."""
+    return ROUTING.replace(
+        f"Effort: {CLAUDE_EFFORT}\n", f"Effort: {CLAUDE_EFFORT}\nAccount: {account}\n"
+    )
+
+
 def git(repo, *args, check=True):
     return subprocess.run(
         ["git", "-C", str(repo), *args], check=check, capture_output=True, text=True
@@ -114,6 +121,10 @@ class Fixture:
         self.stub_dir.mkdir()
         self.config_dir = self.root / "claude-config"
         self.config_dir.mkdir()
+        # The machine's account registry, moved off the real home by the override every run reads
+        # it through. No file is written here until a test writes one, which is the machine that
+        # has never registered an account.
+        self.registry = self.root / "accounts.toml"
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         self._link_stub("claude", "stub_claude.py")
@@ -134,7 +145,8 @@ class Fixture:
 
     # --- the project's config -------------------------------------------------------------
 
-    def write_config(self, repair_model=REPAIR_MODEL, tracker=TRACKER, surface=None):
+    def write_config(self, repair_model=REPAIR_MODEL, tracker=TRACKER, surface=None,
+                     accounts=None):
         """The project config the run reads its repair model and its tracker out of."""
         lines = []
         if repair_model is not None:
@@ -143,7 +155,24 @@ class Fixture:
             lines += ["[tracker]", f'kind = "{tracker}"']
         if surface is not None:
             lines += ["[dashboard]", f'surface = "{surface}"']
+        if accounts is not None:
+            names = ", ".join(f'"{name}"' for name in accounts)
+            lines += ["[accounts]", f"names = [{names}]"]
         (self.repo / "agentcrew.toml").write_text("\n".join(lines) + "\n")
+
+    # --- the machine's account registry -----------------------------------------------------
+
+    def profile(self, name):
+        """A Claude Code profile directory on this fixture's machine."""
+        path = self.root / "profiles" / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def register(self, **accounts):
+        """Write the machine-level registry mapping each account name to a profile directory."""
+        lines = ["[accounts]"]
+        lines += [f'{name} = "{directory}"' for name, directory in accounts.items()]
+        self.registry.write_text("\n".join(lines) + "\n")
 
     def configure(self, **values):
         """Rewrite and commit the project config, because an uncommitted fix is not one."""
@@ -195,6 +224,7 @@ class Fixture:
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
         environment["CLAUDE_CONFIG_DIR"] = str(self.config_dir)
+        environment["AGENTCREW_ACCOUNT_REGISTRY"] = str(self.registry)
         environment["CREW_POLL_SECONDS"] = "1"
         environment.pop("AGENTCREW_STUB_TRANSCRIPT_MODEL", None)
         environment.update(overrides or {})
@@ -817,6 +847,144 @@ class PreflightTests(DriverTestCase):
         git(self.fixture.repo, "commit", "-m", "route it")
 
         self.started()
+
+
+class AccountTests(DriverTestCase):
+    """Which account each ticket of a run spends on, from the ticket line to the wave table.
+
+    An account is a name in the ticket and a profile directory on the machine, and the two are
+    joined by the machine-level registry the override here points at. Every assertion is on what
+    the run wrote or refused: the table it built, and the preflight notice it stopped on.
+    """
+
+    def rows(self):
+        """Every ticket of the built table, by its number."""
+        return {
+            ticket["id"]: ticket
+            for wave in self.fixture.table()["waves"] for ticket in wave["tickets"]
+        }
+
+    def test_a_ticket_naming_no_account_carries_the_coordinators_own_configuration_home(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.ticket("02", "second thing")
+        self.fixture.commit_feature()
+
+        self.started()
+
+        table = self.fixture.table()
+        self.assertEqual(
+            table["run"]["coordinator_config_home"], str(self.fixture.config_dir)
+        )
+        for number, row in self.rows().items():
+            self.assertEqual(row["account"], str(self.fixture.config_dir), number)
+
+    def test_a_ticket_naming_a_registered_account_carries_that_accounts_profile_directory(self):
+        profile = self.fixture.profile("second")
+        self.fixture.register(second=profile)
+        self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
+        self.fixture.ticket("02", "second thing")
+        self.fixture.commit_feature()
+
+        self.started()
+
+        rows = self.rows()
+        self.assertEqual(rows["01"]["account"], str(profile))
+        self.assertEqual(rows["02"]["account"], str(self.fixture.config_dir))
+
+    def test_a_registry_nothing_asks_for_is_never_read(self):
+        """No ticket names an account, so no registry is opened — broken or otherwise.
+
+        The file is only needed once a ticket asks for an account, which is what keeps this
+        feature free for the operator who never uses it.
+        """
+        self.fixture.registry.write_text("this is not = = toml\n")
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+
+        self.started()
+
+        self.assertEqual(
+            self.rows()["01"]["account"], str(self.fixture.config_dir)
+        )
+
+    def test_a_registry_override_that_is_not_an_absolute_path_stops_the_run(self):
+        """One override, one registry: a relative path would name a different file per process."""
+        self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
+        self.fixture.commit_feature()
+
+        result = self.fixture.start(env_overrides={"AGENTCREW_ACCOUNT_REGISTRY": "accounts.toml"})
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("AGENTCREW_ACCOUNT_REGISTRY", notice)
+        self.assertIn("accounts.toml", notice)
+
+    def test_a_ticket_naming_an_unregistered_account_stops_the_run(self):
+        self.fixture.register(second=self.fixture.profile("second"))
+        self.fixture.ticket("01", "first thing", routing=routing_naming("third"))
+        self.fixture.commit_feature()
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("third", notice)
+        self.assertIn(str(self.fixture.registry), notice)
+
+    def test_a_machine_with_no_registry_file_stops_a_run_whose_ticket_names_an_account(self):
+        self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
+        self.fixture.commit_feature()
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("second", notice)
+        self.assertIn(str(self.fixture.registry), notice)
+
+    def test_an_account_the_config_never_declared_is_told_apart_from_an_unregistered_one(self):
+        self.fixture.register(second=self.fixture.profile("second"))
+        self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
+        self.fixture.commit_feature()
+        self.fixture.configure(accounts=["first"])
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("second", notice)
+        self.assertIn("agentcrew.toml", notice)
+        self.assertNotIn(str(self.fixture.registry), notice)
+
+    def test_the_default_registry_is_not_the_one_the_coordinators_own_profile_holds(self):
+        """The registry is machine-level: a copy under CLAUDE_CONFIG_DIR is not one (ADR-0013).
+
+        Driven with the override emptied, so the run resolves the default location itself — under
+        the home directory, and never under the configuration home the coordinator's own account
+        moves.
+        """
+        home = self.fixture.root / "home"
+        (home / ".claude").mkdir(parents=True)
+        shadow = self.fixture.config_dir / "agentcrew" / "accounts.toml"
+        shadow.parent.mkdir(parents=True)
+        shadow.write_text(f'[accounts]\nsecond = "{self.fixture.profile("second")}"\n')
+        self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
+        self.fixture.commit_feature()
+
+        result = self.fixture.start(
+            env_overrides={"HOME": str(home), "AGENTCREW_ACCOUNT_REGISTRY": ""}
+        )
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn(str(home / ".claude" / "agentcrew" / "accounts.toml"), notice)
+
+    def test_an_account_whose_profile_directory_is_not_there_stops_the_run(self):
+        missing = self.fixture.root / "profiles" / "gone"
+        self.fixture.register(second=missing)
+        self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
+        self.fixture.commit_feature()
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("second", notice)
+        self.assertIn(str(missing), notice)
 
 
 class LaunchTests(DriverTestCase):

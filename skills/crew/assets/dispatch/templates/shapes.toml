@@ -240,7 +240,7 @@ own, so a headless one reviews for you. Once the work is in place and before you
 
 python3 <crew-skill-dir>/assets/review/scripts/claude_review_bridge.py \
   --cwd <worktree-abs-path> --model <review model> --effort <review effort><review log> \
-  --base <ticket base commit> \
+<review account>  --base <ticket base commit> \
   --verification '<the commands you ran to verify this work, and that they passed>' \
   'the changes in this worktree since <ticket base commit>'
 

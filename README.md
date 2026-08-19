@@ -216,6 +216,22 @@ stops the run in preflight rather than reaching a CLI nobody named.
 kind = "local"
 ```
 
+### `[accounts]` — which Claude logins this repo's tickets may name
+
+A ticket may name the **account** it runs on: a named Claude Code login whose subscription that
+ticket's children spend. This section declares the names this repository expects, never a path —
+the name-to-profile-directory map is a machine-level file. Both are optional, and a project on one
+subscription leaves this section out and creates no file.
+
+```toml
+[accounts]
+names = ["work", "side"]
+```
+
+What an account is, where the registry lives, what a ticket naming an unregistered one does, and
+why an unauthenticated profile surfaces at the verification timeout are in
+[`docs/accounts.md`](docs/accounts.md).
+
 ## Tracker support
 
 Both skills read your repo's `docs/agents/issue-tracker.md` and hard-code no tracker.
@@ -248,6 +264,8 @@ stays inert; the other four still run.
 
 - [`docs/design.md`](docs/design.md) — the architecture, the red line, and the rejected alternatives.
 - [`docs/glossary.md`](docs/glossary.md) — the vocabulary both skills speak.
+- [`docs/accounts.md`](docs/accounts.md) — running a wave's tickets on more than one Claude
+  subscription: the registry, what a ticket names, and what each failure path says.
 - [`docs/dogfooding-run.md`](docs/dogfooding-run.md) — the run in the demo above: what it did, what
   it found, and what it left open.
 - [`docs/cost-baseline.md`](docs/cost-baseline.md) — the measured predecessor run ADR-0001 was

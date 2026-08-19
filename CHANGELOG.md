@@ -7,6 +7,90 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A ticket may name the **account** it runs on. `## Routing` takes an optional
+  `Account:` line — the one routing value `/route` records rather than
+  concludes, written from what the user names at the approval checkpoint — and
+  the driver resolves it where it builds the wave table: every row carries a
+  concrete `account`, the Claude Code profile directory that ticket's processes
+  run under, with a ticket naming none taking the coordinator's own
+  configuration home, which the run section now records
+  (ADR-0014). A name resolves through a machine-level **account registry** at
+  `~/.claude/agentcrew/accounts.toml`, deliberately not resolved through
+  `CLAUDE_CONFIG_DIR` and overridable by `AGENTCREW_ACCOUNT_REGISTRY`
+  (ADR-0013); `skills/crew/assets/accounts.py` is the one entry point from a
+  name to a directory. The repository carries names only: `agentcrew.toml` may
+  declare the account names it expects under `[accounts] names`, and never a
+  path. A ticket naming an account the registry does not hold — or that the
+  config never declared — stops the run in preflight, in a message that says
+  which of the two is missing and never falls back to the coordinator's
+  account, and a machine with no registry file runs its single-account waves
+  with nothing to create (#97).
+- A crew child launches on its ticket's account and is verified there. The
+  child's tmux window is created with that account's configuration home in its
+  own environment — the only injection point that works, since a new window's
+  environment otherwise comes from the tmux server as it was when that server
+  started and the launch line deliberately bypasses the window's interactive
+  shell — so the whole window belongs to the account, including a `claude` the
+  operator types into it by hand. Post-launch verification then reads that same
+  account for both of its surfaces, the live agents list and the transcript that
+  asserts the child's model, so a correctly launched child is never reported as
+  missing and the coordinator need not be logged into any account it dispatches
+  into. The machine log's `launch` event records the account a Claude child
+  launched under, which is what makes a run's spend attributable after the
+  fact, and the verification timeout — the one surface an unauthenticated
+  profile appears on, since nothing here checks a login — names that account
+  rather than the worktree. `account` therefore joins the routing keys the
+  renderer requires of every row, absolute like every other path the table
+  records, and preflight — which asks the renderer for its verdict on a
+  candidate table — resolves the same concrete account onto that candidate's
+  rows before handing it over. A project launch hook's own variables cannot
+  overrule the account. A `codex` ticket is unaffected: it launches on its own
+  vendor's credentials and its launch event records no account (#98).
+- A ticket's **reviewer child and merge-repair session run on that ticket's
+  account**, so the one-ticket-one-account invariant covers every Claude process
+  a ticket owns rather than the implementer alone. The rendered Claude review
+  command carries `--account <profile directory>`, which
+  `claude_review_bridge.py` puts in the headless reviewer's environment, and the
+  merge ladder launches its repair session under the account on the ticket's own
+  row. Both read that already-resolved directory from the wave table and neither
+  opens the account registry, and neither falls back: the merge ladder escalates
+  a conflict whose ticket row carries no account rather than repairing it on
+  whichever account it happens to be running under. A `codex` review lane is
+  untouched: another vendor, its own credentials (#99).
+- Accounts are documented for the operator who has to run one:
+  [`docs/accounts.md`](docs/accounts.md) is what an account is, where the
+  machine-level registry lives and how to move it, the file format, the names a
+  repo may declare in `agentcrew.toml`, and what the run does on each path an
+  operator actually hits — a ticket naming none, a name the config never
+  declared, a name the registry does not hold, a machine with no registry file,
+  a wave split across two accounts, a resume, a `codex` ticket. It states
+  plainly that no login check is performed anywhere, and quotes the
+  verification-timeout message that is therefore the only surface an
+  unauthenticated profile appears on, so that failure is diagnosable from the
+  docs rather than from the source. The README's configuration reference gains
+  the `[accounts]` section, and ADR-0013 and ADR-0014 — written ahead of the
+  code and marked `proposed` until it landed — are now `accepted` (#102).
+
+### Fixed
+- The dashboard reads every account the run touches, so a healthy child on
+  another account is no longer drawn `vanished` and no longer pushes a
+  `vanished` toast. Both of the Claude lane's live sources are per account — the
+  per-session files it judges ticket state from and the shared agents-list
+  fallback cache behind them — and each ticket is read from the profile
+  directory its wave-table row names, with the fallback's CLI spawned under that
+  account. The primary path spawns nothing for the extra account, only an
+  account whose per-session source cannot be read falls back, and a run naming
+  one account behaves exactly as it did, spawn count included. A child that
+  really has gone is still `vanished`, and still toasts, on any account (#100).
+
+### Changed
+- The cost pass now reads each Claude child's transcripts from the profile directory
+  named by its wave-table `account`, so a mixed-account run includes every child's
+  figures in its rollup. An unreadable wave table diagnoses Claude rows instead of
+  failing the pass or silently undercounting them; Codex remains on its own root
+  (#101).
+
 ## [0.8.1] - 2026-08-18
 
 ### Added

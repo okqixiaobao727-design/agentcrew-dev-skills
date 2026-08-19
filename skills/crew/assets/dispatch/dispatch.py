@@ -15,6 +15,13 @@ turn spent on bookkeeping (ADR-0001) — and every rendered review command carri
 ticket, so the review bridge writes the ticket's `review` event pair the same way. Child windows
 are created detached: a launching wave never takes the operator's focus.
 
+Every Claude process of a ticket runs on that ticket's account. The account is set on the child's
+window itself, so the whole window belongs to it — a `claude` the operator types in there by hand
+included — and post-launch verification reads that same account for both of its surfaces, so a
+child alive in its own account is never reported missing. Nothing here checks that an account is
+logged in: an unauthenticated profile answers the agents list exactly as an idle authenticated one
+does, so it surfaces at the verification timeout, which names the account.
+
 The approved wave table is the only routing source this script reads (ADR-0003): a ticket's
 `## Routing` section is advisory input used to build that table, never a second authority. The
 first-turn skeleton, the workflow shapes and the review-lane variants live beside this script in
@@ -33,6 +40,10 @@ The wave table is one JSON object:
         "crew_skill_dir":          absolute path to the installed crew skill
         "tmux_session":            the session every child's window is created in
         "permission_mode":         the mode children launch under
+        "coordinator_config_home": the coordinator's own Claude configuration home, which is the
+                                   account a ticket naming none runs on
+        "declared_accounts":       the account names the project config declares, [] where it
+                                   declares none — diagnosis only, never a path
         "launch_hook":             optional {"command": str, "env": {name: value}}
         "codex":                   {"bridge": path, "state_dir": path} — required by a codex ticket
       },
@@ -40,6 +51,10 @@ The wave table is one JSON object:
         "id": "06", "title": str, "path": absolute ticket path,
         "workflow": one of the shapes, "executor": "claude" | "codex",
         "model": full model ID, "effort": str,
+        "account": absolute path to the Claude Code profile directory this ticket's processes
+                   run under — on every row and never absent, resolved from the ticket's own
+                   `Account` name or from the run's coordinator_config_home where it named
+                   none (ADR-0014),
         "review": {"vendor", "model", "effort"} — on `tdd` and `refactor` only,
         "slug": optional, defaulting to the ticket file's name after its number,
         "base_commit": optional, defaulting to `--base-commit` or the run's base commit,
@@ -103,7 +118,18 @@ TICKET_KEYS = {
     "executor": "Executor",
     "model": "Model",
     "effort": "Effort",
+    # Concrete on every row by the time the table is validated: the profile directory this
+    # ticket's Claude processes run under, which the driver resolved from the ticket's account
+    # name or from the coordinator's own configuration home (ADR-0014).
+    "account": "Account",
 }
+
+# A child's transcripts, as the three parts `monitor.py` and `launch.py` already spell such a
+# directory in: the variable that moves the configuration home, the home's own name under `~`, and
+# the fixed subdirectory inside it. Reading it through the shared shape rather than inline is what
+# lets one account's home be substituted for the environment's (ADR-0014).
+CONFIG_HOME_VARIABLE = "CLAUDE_CONFIG_DIR"
+TRANSCRIPTS = (CONFIG_HOME_VARIABLE, ".claude", "projects")
 
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 90.0
 DEFAULT_HOOK_TIMEOUT_SECONDS = 120.0
@@ -204,6 +230,11 @@ def validate(table, templates):
             fault = alias_problem("Model", ticket["model"], aliases)
             if fault:
                 faults.append(fault)
+        account = ticket.get("account")
+        if account and not os.path.isabs(str(account)):
+            # ADR-0007: the child reads this path in its own worktree, where a relative spelling
+            # names another directory — one profile written and another verified.
+            faults.append(f"Account `{account}` is not an absolute path")
         if str(ticket.get("id")) in seen:
             faults.append("is listed twice")
         seen.add(str(ticket.get("id")))
@@ -287,6 +318,29 @@ def review_log_flags(ticket, log):
     return f" --machine-log {log} --ticket {ticket['id']}"
 
 
+def review_account_flag(ticket):
+    """The flag that puts the Claude reviewer on this ticket's account, or nothing.
+
+    A Claude reviewer is a Claude process belonging to this ticket, so it spends on the ticket's
+    own account rather than on whichever login the child it reviews for happens to have been
+    started from. The value is the profile directory the row already carries: the wave table is
+    where a ticket's account name stopped being a name (ADR-0014), and nothing here reads the
+    account registry.
+
+    A row carrying none renders the command exactly as it rendered before accounts existed. That
+    is not the table's ordinary case — a validated wave table carries an account on every row —
+    but it is the candidate table the driver's preflight renders to ask this renderer whether a
+    ticket's routing is valid, which is asked before a ticket's account has been resolved.
+
+    Quoted, unlike every other path this renderer writes into the command: those are the run's own
+    directories, and this one is whatever the operator registered the account against — a profile
+    directory under a path with a space in it would otherwise reach the bridge as two arguments,
+    and the review would be launched on an account nobody named.
+    """
+    account = ticket.get("account")
+    return f"  --account {shlex.quote(str(account))} \\\n" if account else ""
+
+
 def run_log_script(log):
     """The machine log's own writer, as the run keeps it: the copy beside the log itself.
 
@@ -341,6 +395,10 @@ def render_turn(run, ticket, templates, log=None):
                 "<review effort>": review["effort"],
                 "<review log>": review_log_flags(ticket, log),
                 "<rounds contract>": block(templates["review"]["rounds"]),
+                # Only the Claude lane spends a Claude login, and only its block carries this
+                # placeholder: the Codex lane is another vendor with its own credentials, and
+                # takes none of it.
+                "<review account>": review_account_flag(ticket),
             },
         )
         workflow_block = workflow_block.replace("<review block>", review_block)
@@ -503,10 +561,18 @@ def tmux(*args):
 
 
 def new_window(run, ticket, worktree):
-    """The child's own window, detached: a wave leaves the operator's focus where it was."""
+    """The child's own window, detached and on the ticket's account.
+
+    Detached: a wave leaves the operator's focus where it was. On the account: a new window's
+    environment otherwise comes from the multiplexer server as it was when that server started,
+    and the launch line deliberately bypasses the window's interactive shell, so the window itself
+    is the only place the account can be set — which is also what keeps a `claude` the operator
+    types into this window by hand on the ticket's account.
+    """
     return tmux(
         "new-window", "-d", "-t", run["tmux_session"], "-n", ticket["id"],
-        "-c", str(worktree), "-P", "-F", "#{window_id}",
+        "-c", str(worktree), "-e", f"{CONFIG_HOME_VARIABLE}={ticket['account']}",
+        "-P", "-F", "#{window_id}",
     )
 
 
@@ -515,9 +581,17 @@ def launch_command(run, ticket, launch_json):
 
     `command claude` bypasses any `claude` wrapper the window's interactive shell defines, and the
     launch JSON is read from its file so the line stays short enough for one send-keys.
+
+    The project's launch-hook variables ride on this line, but the account is not among them
+    whatever the hook declares: the window itself is what carries it, and a project variable that
+    happens to be spelled the same must not be able to move a child off the account its ticket
+    routed it to — the child would then write its transcript into one profile while verification
+    read another.
     """
     prefix = "".join(
-        f"{name}={shlex.quote(value)} " for name, value in sorted(hook_environment(run).items())
+        f"{name}={shlex.quote(value)} "
+        for name, value in sorted(hook_environment(run).items())
+        if name != CONFIG_HOME_VARIABLE
     )
     return (
         f"{prefix}command claude"
@@ -532,9 +606,30 @@ def launch_command(run, ticket, launch_json):
 # --- post-launch verification ---------------------------------------------------------------
 
 
-def agents_list():
+def harness_directory(spec, home=None):
+    """A directory under a Claude configuration home: here, the root a child's transcript is in.
+
+    The same three parts `monitor.py` and `launch.py` read theirs through, with one addition this
+    script needs and they do not: `home` is the configuration home to read *instead of* the
+    environment's, which is how a child is looked for in its ticket's account rather than in the
+    coordinator's.
+    """
+    variable, default_home, subdirectory = spec
+    configured = home or os.environ.get(variable)
+    return pathlib.Path(configured or pathlib.Path.home() / default_home) / subdirectory
+
+
+def account_environment(account):
+    """This process's environment, moved onto that account: what a read of it is performed in."""
+    environment = dict(os.environ)
+    environment[CONFIG_HOME_VARIABLE] = str(account)
+    return environment
+
+
+def agents_list(account):
     result = subprocess.run(
-        ["claude", "agents", "--json"], capture_output=True, text=True
+        ["claude", "agents", "--json"], capture_output=True, text=True,
+        env=account_environment(account),
     )
     if result.returncode != 0:
         raise LaunchError(f"claude agents --json failed: {result.stderr.strip()}")
@@ -544,18 +639,16 @@ def agents_list():
         raise LaunchError(f"claude agents --json returned no JSON: {error}") from error
 
 
-def find_agent(worktree):
+def find_agent(worktree, account):
     wanted = os.path.realpath(str(worktree))
-    for entry in agents_list():
+    for entry in agents_list(account):
         if os.path.realpath(entry.get("cwd", "")) == wanted:
             return entry
     return None
 
 
-def transcript_model(session_id):
-    root = pathlib.Path(
-        os.environ.get("CLAUDE_CONFIG_DIR") or pathlib.Path.home() / ".claude"
-    ) / "projects"
+def transcript_model(session_id, account):
+    root = harness_directory(TRANSCRIPTS, account)
     for transcript in root.glob(f"*/{session_id}.jsonl"):
         for line in transcript.read_text().splitlines():
             try:
@@ -570,16 +663,28 @@ def transcript_model(session_id):
 
 
 def verify_child(ticket, worktree, timeout):
-    """Assert the child is live on the routed model, from the agents list and its own transcript."""
+    """Assert the child is live on the routed model, from the agents list and its own transcript.
+
+    Both reads are performed in the ticket's own account, which is where the child was launched:
+    two profiles answer with two disjoint agents lists and keep two disjoint transcript roots, so
+    a child looked for in the coordinator's account is a correctly launched child reported missing.
+
+    No account is checked for a login anywhere in this feature — an unauthenticated profile
+    answers the agents list with an empty list and exit code 0, which an authenticated profile
+    with nothing running does too. This timeout is therefore the one surface such a profile
+    appears on, so it names the account rather than the worktree.
+    """
+    account = ticket["account"]
     deadline = time.monotonic() + timeout
     entry = None
     while True:
-        entry = find_agent(worktree)
+        entry = find_agent(worktree, account)
         if entry:
             break
         if time.monotonic() >= deadline:
             raise LaunchError(
-                f"no entry with cwd {worktree} in the live agents list after {timeout:g}s"
+                f"no entry for this child in the live agents list of the account {account}"
+                f" after {timeout:g}s — that account may not be logged in"
             )
         time.sleep(VERIFY_POLL_SECONDS)
 
@@ -592,12 +697,13 @@ def verify_child(ticket, worktree, timeout):
 
     model = None
     while True:
-        model = transcript_model(entry["sessionId"])
+        model = transcript_model(entry["sessionId"], account)
         if model:
             break
         if time.monotonic() >= deadline:
             raise LaunchError(
-                f"transcript {entry['sessionId']} names no model after {timeout:g}s"
+                f"transcript {entry['sessionId']} under the account {account} names no model"
+                f" after {timeout:g}s"
             )
         time.sleep(VERIFY_POLL_SECONDS)
 
@@ -624,7 +730,10 @@ def launch_claude_child(run, ticket, artifacts, timeouts):
         f" window={window_id} name={entry['name']} pid={entry['pid']}"
         f" session={entry['sessionId']}{hook_note(hook)}"
     )
-    return line, {"child": entry["name"], "window": window_id, "worktree": str(worktree)}
+    return line, {
+        "child": entry["name"], "window": window_id, "worktree": str(worktree),
+        "account": ticket["account"],
+    }
 
 
 def verify_codex_child(ticket, worktree, state_file):
@@ -722,6 +831,11 @@ def log_launch(log, ticket, details):
         "--branch", branch_name(ticket),
         "--worktree", str(details["worktree"]),
     ]
+    # What makes a run's spend attributable after the fact: which account paid for this child.
+    # Only the Claude lane has one — a Codex child launches under its own vendor's credentials,
+    # and recording a Claude profile against it would record an account it never ran on.
+    if details.get("account"):
+        arguments += ["--account", str(details["account"])]
     if details.get("window"):
         arguments += ["--window", str(details["window"])]
     result = subprocess.run(arguments, capture_output=True, text=True)

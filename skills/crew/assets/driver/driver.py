@@ -126,6 +126,10 @@ sys.path.insert(0, str(DISPATCH.parent))
 import dispatch  # noqa: E402
 sys.path.insert(0, str(ASSETS))
 import machine_log  # noqa: E402
+# And the account registry owns one more: what a named account resolves to on this machine. It is
+# the one documented way from an account name to a profile directory, and this driver is where the
+# ticket's name is turned into one, once, as the wave table is built (ADR-0014).
+import accounts  # noqa: E402
 # The monitor owns one more: whether a log says the run is over. The operator's surfaces and this
 # loop have to agree on that word — a second implementation here is how they came to disagree —
 # so it is asked for, in the same way and from the same place.
@@ -162,6 +166,11 @@ LAUNCH_HOOK_SECTION = ("hooks", "on-child-launch")
 # which committing the config permanently clears.
 REPAIR_MODEL_KEYS = ("repair", "model")
 TRACKER_KIND_KEYS = ("tracker", "kind")
+# The account *names* this repository expects, declared in its committed config and never a path
+# (ADR-0013). Declaring none is the ordinary case and checks nothing; declaring some makes a
+# ticket naming an account outside them a problem stated in the config's own terms, which is a
+# different fault from a name this machine never registered.
+ACCOUNT_NAMES_KEYS = ("accounts", "names")
 
 # The two trackers `references/trackers.md` declares exercised end to end, and the whole of what a
 # close operation may be asked for: anything else stops the run rather than guessing a CLI.
@@ -204,6 +213,11 @@ BLOCKED_BY_SECTION = "blocked by"
 # The routing keys the table carries under their own names, and the review lane's three words.
 ROUTING_KEYS = ("workflow", "executor", "model", "effort")
 REVIEW_KEY = "review"
+# The one routing key an operator names and `/route` never concludes, and the only one that is
+# optional in a ticket beside the review line. It is optional in the ticket alone: the table
+# carries it on every row, resolved to a concrete profile directory where the ticket named none
+# (ADR-0014).
+ACCOUNT_KEY = "account"
 REVIEW_FIELDS = ("vendor", "model", "effort")
 
 CODEX = "codex"
@@ -441,7 +455,9 @@ def routing_of(section):
 
     A key the section does not carry is left out rather than defaulted: routing has no default and
     no fallback, and a ticket missing one is unrouted — which the renderer's validation is the
-    authority on, not this parser.
+    authority on, not this parser. `account` is the one key whose absence is ordinary rather than
+    a fault, and it is left out here too: what it means when absent is settled where the table is
+    built, not here (ADR-0014).
     """
     values = {}
     for line in section.splitlines():
@@ -450,7 +466,7 @@ def routing_of(section):
             continue
         key = match.group(1).strip().lower()
         value = match.group(2).strip()
-        if key in ROUTING_KEYS:
+        if key in ROUTING_KEYS or key == ACCOUNT_KEY:
             values[key] = value
         elif key == REVIEW_KEY:
             words = value.split()
@@ -602,7 +618,8 @@ def routing_problems(tickets, run, launch_dir):
     candidate = launch_dir / "candidate-table.json"
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_text(
-        json.dumps({"run": run, "waves": [{"wave": 1, "tickets": tickets}]}), encoding="utf-8"
+        json.dumps({"run": run, "waves": [{"wave": 1, "tickets": accounted(tickets, run)}]}),
+        encoding="utf-8",
     )
     result = subprocess.run(
         [
@@ -616,6 +633,28 @@ def routing_problems(tickets, run, launch_dir):
     if result.returncode == 0:
         return []
     return [line for line in result.stderr.splitlines() if line.strip()]
+
+
+def accounted(tickets, run):
+    """This run's tickets, copied, with the concrete account a wave table's rows carry.
+
+    What the renderer is handed is a wave table, and on a wave table `account` is concrete on
+    every row (ADR-0014) — while these tickets are the pre-table input, where the key is still the
+    optional name the operator wrote or nothing at all. `normalise_accounts` is the one place that
+    rule lives, so it is what fills the copies in.
+
+    A name the registry cannot resolve puts every row on the coordinator's home instead, because
+    what this table is for is the renderer's verdict on *routing*: `account_problems` is the check
+    that names an unregistered account and the registry it searched, and it says so far better
+    than a second line about the same account from the renderer would.
+    """
+    candidates = [dict(ticket) for ticket in tickets]
+    try:
+        return normalise_accounts(candidates, run)
+    except accounts.AccountsError:
+        for candidate in candidates:
+            candidate[ACCOUNT_KEY] = run["coordinator_config_home"]
+        return candidates
 
 
 def config_problems(repo, run):
@@ -649,6 +688,82 @@ def config_problems(repo, run):
             f" {', '.join(TRACKERS)}, the two `references/trackers.md` declares exercised"
         )
     return problems
+
+
+def account_problems(tickets, run):
+    """Whether every account a ticket names is one this repo declares and this machine registers.
+
+    Nothing is checked for a run whose tickets name no account: the registry is read only once a
+    ticket asks for one, so a machine that has never registered an account runs its single-account
+    waves exactly as it did before accounts existed, with no file to create.
+
+    Two faults are kept apart, because their fixes are in different files. A name this repository's
+    config never declared is answered in the config's own terms — the repo expects a set of names
+    and this is not one of them. A name the registry does not hold is answered with the registry
+    that was searched, which is the file the operator has to edit. Neither falls back to the
+    coordinator's account: a silent fallback is the defect the account key exists to remove
+    (ADR-0013).
+
+    Registration and directory existence are the whole of the check. Whether that profile is
+    logged in is deliberately not asked here — the CLI cannot be made to answer it, and the
+    reasoning is in the spec — so an unauthenticated account surfaces at verification, not here.
+    """
+    named = [(ticket, ticket[ACCOUNT_KEY]) for ticket in tickets if ticket.get(ACCOUNT_KEY)]
+    if not named:
+        return []
+    try:
+        registry = accounts.registry_path()
+        registered = accounts.load_registry(registry)
+    except accounts.AccountsError as error:
+        return [f"account: {error}"]
+    declared = run.get("declared_accounts") or []
+    config = pathlib.Path(run["repo_root"]) / CONFIG_NAME
+    problems = []
+    for ticket, name in named:
+        where = f"{ticket['id']} {ticket['path']}:"
+        if declared and name not in declared:
+            problems.append(
+                f"{where} names the account `{name}`, which {config} does not declare — this"
+                f" repository expects {', '.join(declared)}; add `{name}` to its [accounts] names,"
+                " or route the ticket to an account it declares"
+            )
+            continue
+        try:
+            directory = accounts.profile_directory(name, registered)
+        except accounts.UnknownAccount as error:
+            problems.append(f"{where} {error}")
+            continue
+        if not pathlib.Path(directory).is_dir():
+            problems.append(
+                f"{where} names the account `{name}`, whose profile directory {directory} is not"
+                f" there — the registry {registry} names it, so create it or point the entry at"
+                " the profile that account logs in under"
+            )
+    return problems
+
+
+def normalise_accounts(tickets, run):
+    """Give every ticket the concrete account it runs on, in place.
+
+    Where ambiguity ends (ADR-0014). A ticket that named an account carries the profile directory
+    that name resolves to; a ticket that named none carries the coordinator's own configuration
+    home. From the table onward the key is on every row with a value on it, so no consumer
+    downstream repeats the rule, and none can get it wrong on its own.
+
+    Every name here is known registered: `account_problems` is what says so, and preflight is what
+    runs it before this. The registry is opened only where a ticket named an account, on the same
+    rule that check follows: a wave nobody asked an account for is a wave with no registry to read,
+    whatever the machine does or does not keep at that path.
+    """
+    named = any(ticket.get(ACCOUNT_KEY) for ticket in tickets)
+    registered = accounts.load_registry() if named else {}
+    for ticket in tickets:
+        name = ticket.get(ACCOUNT_KEY)
+        ticket[ACCOUNT_KEY] = (
+            accounts.profile_directory(name, registered) if name
+            else run["coordinator_config_home"]
+        )
+    return tickets
 
 
 def alias_problem(model):
@@ -825,6 +940,25 @@ def launch_hook(config):
     return section if isinstance(section, dict) and section else None
 
 
+def declared_accounts(config):
+    """The account names this repository's config declares, or none where it declares none."""
+    names = config_value(config, ACCOUNT_NAMES_KEYS)
+    if not isinstance(names, list):
+        return []
+    return [str(name).strip() for name in names if str(name).strip()]
+
+
+def coordinator_config_home():
+    """The Claude configuration home this coordinator itself runs under.
+
+    Which is the account a ticket naming none runs on: the run inherits the operator's own login
+    exactly as every run did before accounts existed.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return str(pathlib.Path(configured).expanduser() if configured
+               else pathlib.Path.home() / accounts.CONFIG_HOME)
+
+
 def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit,
                 config):
     """The table's `run` section: everything about this run that is not a ticket."""
@@ -848,6 +982,11 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
         # `agentcrew.toml` mid-run cannot silently retarget a run already under way.
         "repair_model": config_value(config, REPAIR_MODEL_KEYS),
         "tracker": config_value(config, TRACKER_KIND_KEYS),
+        # The account names this repository declares, and the coordinator's own configuration
+        # home — which is the account a ticket naming none runs on, written down here so the
+        # value, and not the rule that produced it, is what every consumer reads (ADR-0014).
+        "declared_accounts": declared_accounts(config),
+        "coordinator_config_home": coordinator_config_home(),
         "codex": {
             "bridge": str(args.codex_bridge or CODEX_BRIDGE),
             "state_dir": str(run_dir / CODEX_DIR_NAME),
@@ -1643,6 +1782,7 @@ def preflight(repo, tickets, base_branch, upstream, run):
         problems += routing_problems(tickets, run, directory)
     problems += graph_problems(tickets)
     problems += config_problems(repo, run)
+    problems += account_problems(tickets, run)
     return problems
 
 
@@ -1708,7 +1848,9 @@ def run_start(args):
         args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit, config
     )
     table_path.write_text(
-        json.dumps({"run": run, "waves": assign_waves(tickets)}, indent=2) + "\n",
+        json.dumps(
+            {"run": run, "waves": assign_waves(normalise_accounts(tickets, run))}, indent=2
+        ) + "\n",
         encoding="utf-8",
     )
 

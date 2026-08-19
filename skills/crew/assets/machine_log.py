@@ -591,6 +591,11 @@ def build_parser():
     launch.add_argument("--branch")
     launch.add_argument("--worktree")
     launch.add_argument("--window")
+    launch.add_argument(
+        "--account", help="the Claude Code profile directory this child launched under, which"
+                          " is what makes a run's spend attributable after the fact; a Claude"
+                          " child's alone, a Codex child running on its own vendor's credentials",
+    )
 
     receipt = event_command("receipt", "a child's final word, as verified by script")
     receipt.add_argument("--verdict", required=True, choices=VERDICTS)

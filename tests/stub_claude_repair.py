@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """A Claude CLI stand-in for the merge driver tests: the repair session the ladder launches.
 
-Every invocation records its argv and working directory in `AGENTCREW_STUB_DIR/repairs.jsonl`,
-which is how the tests read the command the driver composed. What it then does to the conflicted
+Every invocation records its argv, working directory and the Claude login it was launched under
+in `AGENTCREW_STUB_DIR/repairs.jsonl`, which is how the tests read the command the driver composed
+and the account it spent on. What it then does to the conflicted
 worktree is `AGENTCREW_STUB_REPAIR` :
 
     resolve  strip the conflict markers and keep both sides — a repair that worked. It stages
@@ -37,11 +38,17 @@ def state_dir():
     return pathlib.Path(os.environ["AGENTCREW_STUB_DIR"])
 
 
+# The Claude login a session runs on lives in this one variable, so recording it is how a test
+# reads which account the ladder spent the repair on.
+CONFIG_HOME = "CLAUDE_CONFIG_DIR"
+
+
 def record(argv, cwd):
     """Append this invocation and return how many have been made, this one included."""
     path = state_dir() / "repairs.jsonl"
+    entry = {"argv": argv, "cwd": cwd, "env": {CONFIG_HOME: os.environ.get(CONFIG_HOME)}}
     with path.open("a") as handle:
-        handle.write(json.dumps({"argv": argv, "cwd": cwd}) + "\n")
+        handle.write(json.dumps(entry) + "\n")
     return len(path.read_text().splitlines())
 
 

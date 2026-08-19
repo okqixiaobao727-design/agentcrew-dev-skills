@@ -36,6 +36,7 @@ started.
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -60,6 +61,13 @@ DEFAULT_BUDGET_USD = 2.0
 DEFAULT_REPAIR_ATTEMPTS = 2
 DEFAULT_REPAIR_TIMEOUT_SECONDS = 900.0
 REPAIR_PERMISSION_MODE = "acceptEdits"
+# The account the repair session spends on. Repairing a ticket's conflict is spend that ticket
+# caused, so the session runs on the ticket's own Claude login exactly as its child did — Claude
+# Code scopes login state to this variable, so setting it is what routes that spend. The value is
+# read off the ticket's row, already a profile directory: the wave table is where a ticket's
+# account name stopped being a name (ADR-0014), and this script reads no account registry.
+CONFIG_HOME_ENV_VAR = "CLAUDE_CONFIG_DIR"
+ACCOUNT_KEY = "account"
 
 # The conflict markers, in the style the merge is run under: `diff3` keeps the base section, and
 # whether that section is empty is the whole of the mechanical/semantic test.
@@ -274,11 +282,19 @@ def repair_command(model, budget, prompt):
     ]
 
 
-def run_repair(repo, command, timeout):
+def repair_env(account):
+    """This script's environment with the ticket's account in it, for the session it launches."""
+    environment = dict(os.environ)
+    environment[CONFIG_HOME_ENV_VAR] = str(account)
+    return environment
+
+
+def run_repair(repo, command, timeout, account):
     """Whether the repair session exited cleanly; a session that overruns its time has not."""
     try:
         result = subprocess.run(
-            command, cwd=str(repo), capture_output=True, text=True, timeout=timeout
+            command, cwd=str(repo), capture_output=True, text=True, timeout=timeout,
+            env=repair_env(account),
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -319,7 +335,7 @@ def strayed_outside(before, after, allowed):
     )
 
 
-def repair_attempt(repo, paths, command, timeout, baseline):
+def repair_attempt(repo, paths, command, timeout, baseline, account):
     """Run one repair session and stage what it left; returns None, or why it did not settle it.
 
     The session edits files and nothing else — staging is done here, so the session needs no
@@ -329,7 +345,7 @@ def repair_attempt(repo, paths, command, timeout, baseline):
     puts tracked files back but leaves a stray untracked file standing, and a second session must
     not inherit the first one's mess as the state it is measured against.
     """
-    if not run_repair(repo, command, timeout):
+    if not run_repair(repo, command, timeout, account):
         return "the repair session did not finish"
     strays = strayed_outside(baseline, working_state(repo), set(paths))
     if strays:
@@ -405,6 +421,15 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
     if classification == SEMANTIC:
         return None, reason
 
+    account = ticket.get(ACCOUNT_KEY)
+    if not account:
+        # Every row of a validated wave table carries the account its ticket's processes run on,
+        # so a row without one is a table this ladder cannot spend against. Falling back to
+        # whichever account this script happens to be running under is forbidden: a repair billed
+        # to the wrong subscription is indistinguishable afterwards from a correct one, which is
+        # the defect the account key exists to remove.
+        return None, "the ticket's row carries no account for the repair session to run on"
+
     command = repair_command(
         options["repair_model"], options["repair_budget"],
         repair_prompt(repo, branch, into, paths),
@@ -417,7 +442,9 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
             # session made of it.
             git_or_raise(repo, "merge", "--abort")
             start_merge(repo, branch)
-        failure = repair_attempt(repo, paths, command, options["repair_timeout"], baseline)
+        failure = repair_attempt(
+            repo, paths, command, options["repair_timeout"], baseline, account
+        )
         if failure is None:
             git_or_raise(repo, "commit", "--no-edit")
             sha = git_or_raise(repo, "rev-parse", "HEAD")
