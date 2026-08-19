@@ -718,22 +718,35 @@ def verify_child(ticket, worktree, timeout):
 # --- per-executor launches ---------------------------------------------------------------
 
 
-def launch_claude_child(run, ticket, artifacts, timeouts):
+def launch_claude_child(run, ticket, artifacts, timeouts, log=None):
     worktree = prepare_worktree(run, ticket)
     install_guard_assets(run, worktree)
     window_id = new_window(run, ticket, worktree)
     hook = run_launch_hook(run, worktree, window_id, timeouts["hook"])
     tmux("send-keys", "-t", window_id, launch_command(run, ticket, artifacts["launchJson"]), "Enter")
-    entry = verify_child(ticket, worktree, timeouts["verify"])
+    details = {
+        "child": "",
+        "window": window_id,
+        "worktree": str(worktree),
+        "account": ticket["account"],
+    }
+    started_note = log_note(log, ticket, details)
+    try:
+        entry = verify_child(ticket, worktree, timeouts["verify"])
+    except LaunchError as error:
+        failure_note = log_launch_failure_note(log, ticket, error)
+        if failure_note:
+            raise LaunchError(f"{error}; {failure_note}") from error
+        raise
+    details["child"] = entry["name"]
+    verified_note = log_note(log, ticket, details)
+    note = started_note or verified_note
     line = (
         f"{ticket['id']} launched {ticket['executor']} {ticket['model']} {ticket['effort']}"
         f" window={window_id} name={entry['name']} pid={entry['pid']}"
         f" session={entry['sessionId']}{hook_note(hook)}"
     )
-    return line, {
-        "child": entry["name"], "window": window_id, "worktree": str(worktree),
-        "account": ticket["account"],
-    }
+    return line, note
 
 
 def verify_codex_child(ticket, worktree, state_file):
@@ -805,9 +818,10 @@ def launch_codex_child(run, ticket, artifacts, timeouts, log=None):
         f" window={window_id} state={state_file}{hook_note(hook)}"
     )
     # A Codex child has no agents-list name; the thread the bridge pinned is what identifies it.
-    return line, {
+    details = {
         "child": state.get("threadId"), "window": window_id, "worktree": str(worktree),
     }
+    return line, log_note(log, ticket, details)
 
 
 # --- the launch event ------------------------------------------------------------------------
@@ -861,22 +875,37 @@ def log_note(log, ticket, details):
     return ""
 
 
+def log_launch_failure_note(log, ticket, error):
+    """Record why a live child failed verification; return any logging failure as a note."""
+    if not log:
+        return ""
+    arguments = [
+        sys.executable, str(MACHINE_LOG), "--log", str(log), "launch-failed",
+        "--ticket", str(ticket["id"]), "--detail", str(error),
+    ]
+    result = subprocess.run(arguments, capture_output=True, text=True)
+    if result.returncode != 0:
+        return f"log-failed={str(result.stderr or result.stdout).strip()}"
+    return ""
+
+
 def dispatch_wave(run, tickets, rendered, timeouts, log=None):
     lines = []
     failed = False
     for ticket, artifacts in zip(tickets, rendered):
         try:
             if ticket["executor"] == "claude":
-                line, details = launch_claude_child(run, ticket, artifacts, timeouts)
+                line, note = launch_claude_child(
+                    run, ticket, artifacts, timeouts, log=log
+                )
             else:
-                line, details = launch_codex_child(
+                line, note = launch_codex_child(
                     run, ticket, artifacts, timeouts, log=log
                 )
         except LaunchError as error:
             failed = True
             lines.append(f"{ticket['id']} FAILED {error}".replace("\n", " "))
             continue
-        note = log_note(log, ticket, details)
         failed = failed or bool(note)
         lines.append(line + note)
     return lines, failed

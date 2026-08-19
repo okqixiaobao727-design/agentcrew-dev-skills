@@ -37,9 +37,18 @@ fact, and a Claude child's alone — a Codex child launches on its own vendor's 
 records no account.
 
 The dispatch renderer writes this one itself, as each child comes up, given `--log`: the launched
-set is what wave advancement and the dashboard read, and it costs the coordinator no turn. `child`
-is the agent name a Claude child took in the live agents list, and the thread the bridge pinned for
-a Codex child.
+set is what wave advancement and the dashboard read, and it costs the coordinator no turn. A
+Claude launch first records the known window, worktree and branch with an empty `child`, before
+post-launch verification can fail; successful verification appends the amended launch with the
+agent name. Consumers take the last launch per ticket. A Codex launch records the thread the
+bridge pinned.
+
+### `launch-failed` — a live child failed post-launch verification
+
+`ticket`, `detail`. Dispatch writes this after the corresponding `launch` when the child window
+has started but the agents list or transcript verification fails. The `launch` remains the
+adoption record; `detail` preserves the verification failure instead of leaving it only on the
+driver's transient stderr surface.
 
 ### `receipt` — a child's final word, as verified by script
 
@@ -179,6 +188,7 @@ reformatting, no summary. A structured message is recorded as the object it was.
 machine_log.py --log <path> launch  --ticket NN --child NAME --workflow W --executor E \
                                     --model ID --effort E \
                                     [--branch B] [--worktree P] [--window W] [--account DIR]
+machine_log.py --log <path> launch-failed --ticket NN --detail TEXT
 machine_log.py --log <path> receipt --ticket NN --verdict landable|parked|failed \
                                     [--sha SHA] [--detail TEXT]
 machine_log.py --log <path> merge   --ticket NN --result clean|conflict|repaired|escalated \

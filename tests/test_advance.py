@@ -330,7 +330,11 @@ class GreenWaveTests(AdvanceTestCase):
 
         started = [record for record in self.fixture.records("launch")
                    if record["ticket"] in ("08", "09")]
-        self.assertEqual([record["ticket"] for record in started], ["08", "09"], started)
+        self.assertEqual(
+            [record["ticket"] for record in started], ["08", "08", "09", "09"], started
+        )
+        self.assertEqual([record["child"] for record in started[::2]], ["", ""])
+        self.assertTrue(all(record["child"] for record in started[1::2]), started)
 
     def test_the_milestone_toast_names_the_wave_that_launched(self):
         self.green_wave_one()

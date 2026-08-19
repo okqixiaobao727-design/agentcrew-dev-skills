@@ -1077,19 +1077,21 @@ class LaunchTests(DriverTestCase):
         self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
         self.assertEqual(self.fixture.current_branch(), INTEGRATION_BRANCH)
 
-    def test_only_wave_one_is_dispatched_and_every_launch_is_logged(self):
+    def test_only_wave_one_is_dispatched_and_its_launch_amendment_is_logged(self):
         self.start_a_run()
 
         launched = [
             record for record in self.fixture.log_records() if record["event"] == "launch"
         ]
-        self.assertEqual([record["ticket"] for record in launched], ["01"])
+        self.assertEqual([record["ticket"] for record in launched], ["01", "01"])
+        self.assertEqual(launched[0]["child"], "")
+        self.assertEqual(launched[1]["child"], "stub-child-1")
         self.assertEqual(len(self.fixture.launches()), 1)
         self.assertEqual(
-            launched[0]["worktree"],
+            launched[1]["worktree"],
             str(self.fixture.repo / ".claude" / "worktrees" / "01-01"),
         )
-        self.assertEqual(launched[0]["model"], CLAUDE_MODEL)
+        self.assertEqual(launched[1]["model"], CLAUDE_MODEL)
 
     def test_the_run_directory_holds_the_layout_the_index_names(self):
         self.start_a_run()
@@ -1385,6 +1387,53 @@ class LoopTests(DriverTestCase):
         landable = self.events("receipt", ticket="01", verdict="landable")
         self.assertEqual(len(landable), 1, self.fixture.log_records())
         self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def missing_launch_snapshot(self, message):
+        self.feature(("01", ()))
+        process = self.fixture.launch(extra=("--timeout", "5"))
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: (self.fixture.launch_record("01") or {}).get("child")
+            ),
+            "01 never finished launch verification",
+        )
+        records = [
+            record for record in self.fixture.log_records()
+            if record.get("event") != "launch"
+        ]
+        (self.fixture.run_dir / "log.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+        self.fixture.says("01", message)
+        return self.woken(process, "driver-error")
+
+    def test_a_completion_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW COMPLETE " + "0" * 40)
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW COMPLETE", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
+
+    def test_a_parked_receipt_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW PARKED features/demo/checklist.md")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW PARKED", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
+
+    def test_a_failure_receipt_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW FAILED the approach does not work")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW FAILED", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
+
+    def test_an_escalation_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW ASK 01 scope — which table? ts=1")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW ASK", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
 
     def test_no_row_of_the_rule_table_wakes_the_coordinator(self):
         """The wake surface, stated as what is not on it.
@@ -2028,7 +2077,11 @@ class AnswerTests(DriverTestCase):
     def test_missing_recorded_window_reports_unreachable_and_writes_no_ruling(self):
         self.start()
         records = self.fixture.log_records()
-        launch = next(record for record in records if record.get("event") == "launch")
+        launch = next(
+            record
+            for record in reversed(records)
+            if record.get("event") == "launch" and record.get("ticket") == "01"
+        )
         launch["window"] = None
         (self.fixture.run_dir / "log.jsonl").write_text(
             "\n".join(json.dumps(record) for record in records) + "\n"
@@ -2238,7 +2291,7 @@ class AdoptionTests(DriverTestCase):
         # A start that began again would have cut its integration branch afresh and recorded the
         # commit it cut it from; the run the adoption carried on is the one already on the ground.
         self.assertEqual(self.fixture.table()["run"], run, "the adopted run was started afresh")
-        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
 
     def test_a_settled_ticket_is_not_dispatched_again_by_the_run_that_adopts_it(self):
@@ -2250,8 +2303,8 @@ class AdoptionTests(DriverTestCase):
         self.fixture.completes("02")
         self.woken(adopted, "run-complete")
 
-        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
-        self.assertEqual(len(self.events("launch", ticket="02")), 1, "02 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="02")), 2, "02 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
 
     def test_a_run_whose_wave_escalated_is_unfinished_and_is_adopted(self):
@@ -2267,7 +2320,7 @@ class AdoptionTests(DriverTestCase):
         self.fixture.completes("01")
         self.woken(adopted, "run-complete")
 
-        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
         self.assertEqual(self.verdict("01"), "completed")
         self.assertEqual(
             [record["decision"] for record in self.events("advance")], ["escalated", "complete"]
