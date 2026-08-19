@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-08-19
+
 ### Fixed
 - The vendored review bridge is back in step with the repository it is vendored
   from, so the check that holds ADR-0009 passes again. The review lane's
