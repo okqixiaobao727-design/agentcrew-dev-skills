@@ -1,5 +1,5 @@
 ---
-status: proposed — decided while specifying #95, accepted when #95 lands
+status: accepted
 ---
 
 # An optional routing key is resolved to a concrete value where the wave table is built
@@ -56,10 +56,12 @@ reads it. It does not survive the table.
 - A resumed run reads its account assignment out of the table it already has, so a ticket cannot
   change account across a restart. Nothing needs to remember how the resolution was originally
   made, because the answer, not the rule, is what was written down.
-- **Normalising the data does not force rendering it.** The table's account column is drawn only
-  when a run spans more than one account, so a single-account run's rendered table is unchanged
-  even though every row now carries a concrete account. Uniform values are a display question; the
-  stored value is not.
+- **Normalising the data does not force rendering it.** The intent is that the table's account
+  column is drawn only where a run spans more than one account, so a single-account run's rendered
+  table is unchanged even though every row now carries a concrete account. That rendering is not
+  built: the approval table `/route` presents draws no account column yet, and doing so is
+  follow-up work under this feature's parent. Uniform values are a display question; the stored
+  value is not.
 - The staging script inherits this for free: it does not reimplement routing validation or the
   wave-table build, it calls the driver's own functions, so a ticket staged by `/route` is
   normalised by the same code that will normalise it at `/crew`.
