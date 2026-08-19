@@ -214,8 +214,9 @@ conflict verdict, or a scope decision.
 _Avoid_: decision (overloaded), answer
 
 **Escalation ladder** — The fixed order in which a mechanical failure is retried: script →
-budget-capped headless Sonnet repair → coordinator. Only a double failure or a semantic conflict
-reaches the top.
+budget-capped headless Sonnet repair → coordinator. The script rung resolves a mechanical merge
+conflict itself, so only what it will not rewrite reaches the repair session; only a double failure
+or a semantic conflict reaches the top.
 
 **Exception handler** — The budget-capped headless cheap-model session a script launches to fix a
 mechanical failure. It is not resident, and the coordinator learns it ran only when it fails.

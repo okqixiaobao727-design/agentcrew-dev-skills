@@ -84,7 +84,7 @@ VERB_GRAMMAR = (
 # The closed sets. A log that accepts an unknown verdict is a log a later agent cannot trust.
 VERDICTS = ("landable", "parked", "failed")
 OUTCOMES = ("completed", "failed", "parked", "blocked")
-MERGE_RESULTS = ("clean", "conflict", "repaired", "escalated")
+MERGE_RESULTS = ("clean", "conflict", "repaired", "resolved", "escalated")
 # The two ends of one review. A review that started and never came back is a row the dashboard
 # would leave standing, so the vocabulary is closed at "it is running" and "it is not".
 REVIEW_STATES = ("running", "returned")

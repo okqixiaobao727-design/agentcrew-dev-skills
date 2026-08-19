@@ -136,7 +136,8 @@ SETTLED_STATES = {
     # queued to land either, so it leaves `landable` for the abnormal state that owes the operator
     # a line: "waiting its turn to merge" and "the merge blew up" are not the same row.
     "merge": ("result", {
-        "clean": MERGED, "repaired": MERGED, "conflict": WAITING, "escalated": WAITING,
+        "clean": MERGED, "repaired": MERGED, "resolved": MERGED, "conflict": WAITING,
+        "escalated": WAITING,
     }),
 }
 # Where a live child of each lane says how it is doing, and what its words mean to the operator.

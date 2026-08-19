@@ -7,6 +7,23 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The merge driver resolves a conflict it has already classified as mechanical
+  itself, instead of paying a repair session to do it. Every hunk with an empty
+  base section is both sides inserting at the same point, which the classifier
+  already proves; the driver now keeps both insertions — ours, then theirs, with
+  the markers and the empty base removed — stages, commits, and records the merge
+  `resolved`, a new word in the machine log's closed vocabulary that says the
+  merge cost no model anything where `repaired` says a session ran. With every
+  ticket appending a `CHANGELOG.md` entry, this conflict shape recurs on
+  essentially every multi-ticket wave, and it was costing a session each time —
+  or two, plus an escalation, when the session wandered. The repair rung is
+  unchanged and still reached by the mechanical conflict the rewrite refuses: a
+  file whose markers do not open and close in order, or whose own text carries a
+  line that reads as one, since `=======` is also how prose underlines a heading.
+  A semantic conflict still skips that rung for the coordinator, and a merge with
+  one semantic file among mechanical ones is semantic entire, as it always was.
+
 ## [0.8.3] - 2026-08-19
 
 ### Fixed

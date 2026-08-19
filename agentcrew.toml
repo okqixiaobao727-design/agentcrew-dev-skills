@@ -142,9 +142,10 @@ command = ""
 surface = "pin"
 
 # --- Merge repair -----------------------------------------------------------
-# The model the merge ladder's repair rung runs on, cheap on purpose: a mechanical conflict is
-# repaired here rather than on the coordinator's model. A full model ID, never an alias, and no
-# default — a missing or aliased value stops the run in preflight.
+# The model the merge ladder's repair rung runs on, cheap on purpose: the mechanical conflict the
+# merge driver will not rewrite itself is repaired here rather than on the coordinator's model.
+# A full model ID, never an alias, and no default — a missing or aliased value stops the run in
+# preflight.
 
 [repair]
 model = "claude-sonnet-5"

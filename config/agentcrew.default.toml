@@ -144,8 +144,10 @@ surface = "window"
 
 # --- Merge repair -----------------------------------------------------------
 # The model the merge ladder's repair rung runs on. A mechanical merge conflict — two children
-# editing the same region, neither rewriting the other's work — is handed to a headless session on
-# this model under a hard budget cap before anything reaches the coordinator
+# editing the same region, neither rewriting the other's work — is resolved by the merge driver
+# itself; the one it will not rewrite, where the file's own text carries a line that reads as a
+# conflict marker, is handed to a headless session on this model under a hard budget cap before
+# anything reaches the coordinator
 # (`docs/adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md`). Pick a cheap model:
 # the rung exists to keep mechanical work off the expensive one. A full model ID, never an alias,
 # on the same rule every other model value here follows.
