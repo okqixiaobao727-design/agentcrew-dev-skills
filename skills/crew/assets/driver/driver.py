@@ -236,6 +236,7 @@ COORDINATOR_ROLE = "coordinator"
 COMPLETE_VERB = machine_log.COMPLETE_VERB
 PARKED_VERB = machine_log.PARKED_VERB
 FAILED_VERB = machine_log.FAILED_VERB
+ESCALATION_VERB = machine_log.ESCALATION_VERB
 
 # What the driver says back. Each opens with its own marker, because the marker is how the loop
 # reads its own history out of the log: a rung that has already fired for a ticket is a ruling of
@@ -1071,15 +1072,15 @@ def install_hook(log, settings, role, ticket=None):
 
 
 def launched_children(log):
-    """Every child this run's log records as launched: its ticket, worktree and executor."""
-    children = []
+    """The last launch record per child: its ticket, worktree and executor."""
+    children = {}
     for line in pathlib.Path(log).read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         record = json.loads(line)
-        if record.get("event") == "launch":
-            children.append(record)
-    return children
+        if record.get("event") == "launch" and record.get("ticket") is not None:
+            children[str(record["ticket"])] = record
+    return list(children.values())
 
 
 def arm_monitors(run_dir, log, children, bridge):
@@ -1213,8 +1214,8 @@ def clear_tickets(table, records):
 
 
 def clear_launches(records):
-    """The launch records whose paths and ids are authorized for this clear."""
-    launches = []
+    """The last launch per ticket whose paths and ids are authorized for this clear."""
+    launches = {}
     for record in records:
         if record.get("event") != "launch":
             continue
@@ -1223,8 +1224,8 @@ def clear_launches(records):
             raise ClearError(
                 "a launch record lacks " + ", ".join(missing) + "; refusing to guess an artefact"
             )
-        launches.append(record)
-    return launches
+        launches[str(record["ticket"])] = record
+    return list(launches.values())
 
 
 def clear_codex_state_files(run, launches):
@@ -2009,7 +2010,7 @@ def record_ticket(record, launches):
     if not isinstance(recipient, str):
         return None
     for ticket, launch in launches.items():
-        if launch.get("child") == recipient:
+        if recipient and launch.get("child") == recipient:
             return ticket
     return None
 
@@ -2614,9 +2615,15 @@ class Loop:
         acted = False
         for ticket, (index, record) in sorted(unanswered(records, launches).items()):
             launch = launches.get(ticket)
-            if launch is None:
-                continue
             message = record.get("message") or ""
+            if launch is None:
+                verb, _ = machine_log.final_verb(message)
+                if verb in (COMPLETE_VERB, PARKED_VERB, FAILED_VERB, ESCALATION_VERB):
+                    raise DriverError(
+                        f"ticket {ticket} sent {verb} with no launch record",
+                        ticket=ticket, pointer=str(self.log),
+                    )
+                continue
             if record.get("event") == "escalation":
                 self.hand_over(ticket, launch, message)
             acted = self.rule_on_receipt(ticket, launch, message, records) or acted

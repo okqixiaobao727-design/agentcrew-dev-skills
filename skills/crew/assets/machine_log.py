@@ -12,8 +12,8 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|live-source|
-                                  monitor-error|session-cost|message ...
+    machine_log.py --log <path> launch|launch-failed|receipt|merge|outcome|review|advance|
+                                  live-source|monitor-error|session-cost|message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
     machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
@@ -596,6 +596,11 @@ def build_parser():
                           " is what makes a run's spend attributable after the fact; a Claude"
                           " child's alone, a Codex child running on its own vendor's credentials",
     )
+
+    launch_failed = event_command(
+        "launch-failed", "a live child failed post-launch verification"
+    )
+    launch_failed.add_argument("--detail", required=True)
 
     receipt = event_command("receipt", "a child's final word, as verified by script")
     receipt.add_argument("--verdict", required=True, choices=VERDICTS)

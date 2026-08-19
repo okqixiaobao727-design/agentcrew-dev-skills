@@ -160,6 +160,21 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["worktree"], "/repo/.claude/worktrees/07-machine-log")
         self.assertEqual(entry["window"], "crew:07")
 
+    def test_a_launch_failure_records_why_verification_failed(self):
+        result = run_cli(
+            "launch-failed",
+            "--ticket", "07",
+            "--detail", "no entry for this child in the live agents list",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "launch-failed")
+        self.assertEqual(entry["ticket"], "07")
+        self.assertEqual(entry["detail"], "no entry for this child in the live agents list")
+
     def test_a_receipt_records_the_verified_verdict(self):
         result = run_cli(
             "receipt",

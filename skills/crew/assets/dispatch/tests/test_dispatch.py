@@ -1090,7 +1090,7 @@ class LaunchEventTests(DispatchTestCase):
         return [record for record in self.fixture.log_records(self.log)
                 if record["event"] == "launch"]
 
-    def test_each_launched_child_earns_one_launch_event(self):
+    def test_a_claude_launch_is_recorded_before_and_after_verification(self):
         tickets = [
             self.fixture.ticket("06", "claude-child"),
             self.fixture.ticket(
@@ -1106,19 +1106,21 @@ class LaunchEventTests(DispatchTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         events = self.launch_events()
-        self.assertEqual([event["ticket"] for event in events], ["06", "07"], events)
-        claude, codex = events
-        self.assertEqual(claude["executor"], "claude")
-        self.assertEqual(claude["model"], CLAUDE_MODEL)
-        self.assertEqual(claude["effort"], CLAUDE_EFFORT)
-        self.assertEqual(claude["workflow"], "tdd")
-        self.assertEqual(claude["child"], "stub-child-1")
-        self.assertEqual(claude["branch"], "worktree-06-claude-child")
+        self.assertEqual([event["ticket"] for event in events], ["06", "06", "07"], events)
+        started, verified, codex = events
+        self.assertEqual(started["child"], "")
+        self.assertEqual(verified["executor"], "claude")
+        self.assertEqual(verified["model"], CLAUDE_MODEL)
+        self.assertEqual(verified["effort"], CLAUDE_EFFORT)
+        self.assertEqual(verified["workflow"], "tdd")
+        self.assertEqual(verified["child"], "stub-child-1")
+        self.assertEqual(verified["branch"], "worktree-06-claude-child")
         self.assertEqual(
-            claude["worktree"],
+            verified["worktree"],
             str(self.fixture.repo / ".claude" / "worktrees" / "06-claude-child"),
         )
-        self.assertTrue(claude["window"].startswith("@"), claude)
+        self.assertEqual(started["window"], verified["window"])
+        self.assertTrue(verified["window"].startswith("@"), verified)
         self.assertEqual(codex["executor"], "codex")
         self.assertEqual(codex["model"], CODEX_MODEL)
         self.assertEqual(codex["effort"], CODEX_EFFORT)
@@ -1137,6 +1139,36 @@ class LaunchEventTests(DispatchTestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertEqual(self.launch_events(), [])
+
+    def test_a_live_child_that_fails_verification_is_recorded_for_adoption(self):
+        table = self.fixture.table([self.fixture.ticket("06", "dispatch-renderer")])
+        (self.fixture.bin_dir / "claude").write_text(
+            "#!/bin/sh\nif [ \"$1\" = agents ]; then echo '[]'; fi\nexit 0\n"
+        )
+        (self.fixture.bin_dir / "claude").chmod(0o755)
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table,
+            extra=("--log", str(self.log), "--verify-timeout", "1"),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        records = self.fixture.log_records(self.log)
+        self.assertEqual(records[0]["event"], "launch", records)
+        launch = self.launch_events()[0]
+        self.assertEqual(launch["ticket"], "06")
+        self.assertEqual(launch["branch"], "worktree-06-dispatch-renderer")
+        self.assertEqual(launch["worktree"], str(
+            self.fixture.repo / ".claude" / "worktrees" / "06-dispatch-renderer"
+        ))
+        self.assertTrue(launch["window"].startswith("@"), launch)
+        failures = [
+            record for record in records
+            if record.get("event") != "launch" and record.get("ticket") == "06"
+        ]
+        self.assertEqual(len(failures), 1, records)
+        self.assertEqual(failures[0]["event"], "launch-failed")
+        self.assertIn("no entry for this child", failures[0].get("detail", ""))
 
     def test_a_launch_the_log_could_not_record_fails_the_dispatch(self):
         """A child the log never heard of is a child wave advancement cannot see, so a wave that
@@ -1348,7 +1380,12 @@ class AccountRoutingTests(DispatchTestCase):
                   if record["event"] == "launch"]
         self.assertEqual(
             [(event["ticket"], event["account"]) for event in events],
-            [("06", self.coordinator_account), ("07", self.other)],
+            [
+                ("06", self.coordinator_account),
+                ("06", self.coordinator_account),
+                ("07", self.other),
+                ("07", self.other),
+            ],
             events,
         )
 
