@@ -21,6 +21,8 @@ import unittest
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "skills" / "crew" / "assets" / "machine_log.py"
+sys.path.insert(0, str(SCRIPT.parent))
+import machine_log  # noqa: E402
 
 # The run's one timestamp format: `date -u +%Y-%m-%dT%H:%M:%SZ`, as the crew skill reads it.
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -126,6 +128,53 @@ class MachineLogTestCase(unittest.TestCase):
         )
         drift = abs((datetime.datetime.now(datetime.timezone.utc) - recorded).total_seconds())
         self.assertLess(drift, 120, "the stamp is UTC, not local time")
+
+
+class SettlementStateTests(unittest.TestCase):
+    """The one public predicate every settlement-quality reader shares."""
+
+    def test_a_ticket_with_no_settling_event_is_live(self):
+        records = [{"event": "launch", "ticket": "104"}]
+
+        self.assertEqual(machine_log.settlement_state(records, "104"), "live")
+
+    def test_the_latest_receipt_maps_through_the_merge_result(self):
+        cases = (
+            ("landable without a merge", [{"event": "receipt", "ticket": "104",
+                                            "verdict": "landable"}], "landable"),
+            ("landable merged clean", [
+                {"event": "receipt", "ticket": "104", "verdict": "landable"},
+                {"event": "merge", "ticket": "104", "result": "clean"},
+            ], "completed"),
+            ("landable merged after repair", [
+                {"event": "receipt", "ticket": "104", "verdict": "landable"},
+                {"event": "merge", "ticket": "104", "result": "repaired"},
+            ], "completed"),
+            ("failed", [{"event": "receipt", "ticket": "104",
+                          "verdict": "failed"}], "failed"),
+            ("parked", [{"event": "receipt", "ticket": "104",
+                          "verdict": "parked"}], "parked"),
+        )
+        for label, records, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(machine_log.settlement_state(records, "104"), expected)
+
+    def test_the_latest_outcome_wins_even_without_or_after_a_receipt(self):
+        self.assertEqual(
+            machine_log.settlement_state(
+                [{"event": "outcome", "ticket": "104", "outcome": "completed"}], "104"
+            ),
+            "completed",
+        )
+        for outcome in ("completed", "failed", "parked", "blocked"):
+            records = [
+                {"event": "outcome", "ticket": "104", "outcome": "failed"},
+                {"event": "outcome", "ticket": "104", "outcome": outcome},
+                {"event": "receipt", "ticket": "104", "verdict": "landable"},
+                {"event": "merge", "ticket": "104", "result": "clean"},
+            ]
+            with self.subTest(outcome):
+                self.assertEqual(machine_log.settlement_state(records, "104"), outcome)
 
 
 class EventTests(MachineLogTestCase):

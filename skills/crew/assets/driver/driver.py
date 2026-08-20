@@ -126,6 +126,7 @@ sys.path.insert(0, str(DISPATCH.parent))
 import dispatch  # noqa: E402
 sys.path.insert(0, str(ASSETS))
 import machine_log  # noqa: E402
+import advance as wave_advance  # noqa: E402
 # And the account registry owns one more: what a named account resolves to on this machine. It is
 # the one documented way from an account name to a profile directory, and this driver is where the
 # ticket's name is turned into one, once, as the wave table is built (ADR-0014).
@@ -290,16 +291,16 @@ MERGE_TEMPLATE = (
 )
 
 # The verdicts and events the loop reads back out of the log. The writer owns their spelling.
-LANDABLE = "landable"
-PARKED = "parked"
-FAILED = "failed"
-COMPLETED = "completed"
-BLOCKED = "blocked"
+LANDABLE = machine_log.LANDABLE
+PARKED = machine_log.PARKED
+FAILED = machine_log.FAILED
+COMPLETED = machine_log.COMPLETED
+BLOCKED = machine_log.BLOCKED
 LAUNCHED = "launched"
 # The advance decision this loop writes itself: the run ended because the chain stopped on reasons
 # the rule table had already settled, which no other decision in the log's vocabulary says.
 STOPPED = "stopped"
-LANDED_RESULTS = ("clean", "repaired", "resolved")
+LANDED_RESULTS = machine_log.LANDED_MERGE_RESULTS
 ESCALATED = "escalated"
 SEMANTIC_PREFIX = "semantic: "
 
@@ -2211,23 +2212,9 @@ def report_settlements(records, ticket):
 
 def report_outcome(records, ticket, launched):
     """The one report outcome a ticket settled into, or a clear error if the log has a hole."""
-    settlements = report_settlements(records, ticket)
-    for record in reversed(settlements):
-        if record.get("event") == "outcome" and record.get("outcome") in REPORT_OUTCOMES:
-            return record["outcome"]
-    for record in reversed(settlements):
-        verdict = record.get("verdict")
-        if verdict == PARKED:
-            return PARKED
-        if verdict == FAILED:
-            return FAILED
-        if verdict == LANDABLE and any(
-            record_for_ticket.get("event") == "merge"
-            and record_for_ticket.get("result") in LANDED_RESULTS
-            for record_for_ticket in records
-            if str(record_for_ticket.get("ticket")) == ticket
-        ):
-            return COMPLETED
+    state = machine_log.settlement_state(records, ticket)
+    if state in REPORT_OUTCOMES:
+        return state
     state = "launched" if launched else "not launched"
     raise DriverError(f"ticket {ticket} has no report outcome in the machine log ({state})")
 
@@ -2827,10 +2814,10 @@ class Loop:
             )
         # Every reason the chain stopped on is one the rule table already settled, so there is
         # nothing left for this run to launch and nothing for anyone to rule on.
-        self.record_stopped(wave)
+        self.record_stopped(wave, records)
         return None
 
-    def record_stopped(self, wave):
+    def record_stopped(self, wave, records):
         """Put this run's ending into the log, where every surface reads it from; returns nothing.
 
         The `escalated` decision above it cannot carry that meaning: the same word is written when
@@ -2838,6 +2825,26 @@ class Loop:
         line reads as still going — a dashboard redrawing it forever, saying a ruling is owed that
         nobody is waiting for.
         """
+        tickets = wave_advance.every_ticket(self.table)
+        launches = set(launch_records(records))
+        states = {
+            number: machine_log.settlement_state(records, number) for number in tickets
+        }
+        stopping_roots = {
+            number for number, state in states.items() if state in (FAILED, PARKED)
+        }
+        stopped_descendants = set(wave_advance.descendants(tickets, stopping_roots))
+        for number in tickets:
+            if number in launches or states[number] != machine_log.LIVE:
+                continue
+            if number in stopped_descendants:
+                continue
+            raise DriverError(
+                f"stopped refused: ticket {number} is still launchable",
+                ticket=number,
+                pointer=str(self.log),
+            )
+
         run_command(
             [
                 sys.executable, MACHINE_LOG, "--log", self.log, "advance",
@@ -2855,12 +2862,10 @@ class Loop:
         the log says is `landable` and never landed is a merge the ladder could not finish, and
         that is nobody's but the coordinator's.
         """
-        states = settled_states(records)
-        merges = merge_results(records)
         return [
             str(ticket["id"]) for ticket in self.tickets_of(wave)
-            if states.get(str(ticket["id"])) not in (FAILED, PARKED)
-            and merges.get(str(ticket["id"])) not in LANDED_RESULTS
+            if machine_log.settlement_state(records, str(ticket["id"]))
+            not in (COMPLETED, FAILED, PARKED)
         ]
 
     def halt_detail(self, records, result):

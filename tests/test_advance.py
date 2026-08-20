@@ -387,6 +387,33 @@ class GreenWaveTests(AdvanceTestCase):
         self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
         self.assertEqual(len(self.fixture.launches()), 2)
 
+    def test_a_resumed_wave_advances_after_its_tracker_outcomes_completed(self):
+        """The ticket-104 incident: tracker close outcomes must not un-settle landed work."""
+        for number, slug, _ in WAVES[2]:
+            head = self.fixture.settled_ticket(number, slug)
+            run_git(self.fixture.repo, "merge", "--no-ff", "--no-edit", head)
+            self.fixture.log_event(
+                "merge", "--ticket", number, "--result", "clean", "--sha", head,
+            )
+            self.fixture.log_event(
+                "outcome", "--ticket", number, "--outcome", "completed",
+            )
+
+        result = self.fixture.advance(2)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        decision = self.assertOneDecision(3, "launched")
+        for number in ("08", "09"):
+            self.assertIn(
+                f"{number} completed passed over as already landed",
+                decision.get("detail", ""),
+            )
+        self.assertNotIn("settled completed", result.stdout + result.stderr)
+        self.assertEqual(
+            [pathlib.Path(launch["cwd"]).name for launch in self.fixture.launches()],
+            ["11-skill-body"],
+        )
+
     def test_the_last_wave_ends_the_run_instead_of_launching(self):
         self.fixture.settled_ticket("11", "skill-body")
 

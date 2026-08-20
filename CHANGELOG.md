@@ -24,6 +24,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
   A semantic conflict still skips that rung for the coordinator, and a merge with
   one semantic file among mechanical ones is semantic entire, as it always was.
 
+### Fixed
+- Resumed runs now read a ticket's settlement from one machine-log predicate, so a tracker-close
+  `completed` outcome remains landed when advance, halt handling, and report rendering read it.
+  Advance decisions account for those completed tickets as already landed, and the driver refuses
+  to record the run as `stopped` while unrelated launchable work remains (#104, #108).
+
 ## [0.8.3] - 2026-08-19
 
 ### Fixed
