@@ -14,7 +14,7 @@ import subprocess
 import sys
 import unittest
 
-from test_driver import BASE_BRANCH, DRIVER, Fixture, INTEGRATION_BRANCH, git
+from harness import BASE_BRANCH, DRIVER, Fixture, INTEGRATION_BRANCH, git
 
 
 MERGED_BRANCH = "recorded/merged"

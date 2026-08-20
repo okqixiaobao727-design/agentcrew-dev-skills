@@ -16,7 +16,7 @@ import subprocess
 import sys
 import unittest
 
-from test_driver import BASE_BRANCH, DRIVER, DriverTestCase, git
+from harness import BASE_BRANCH, DRIVER, DriverTestCase, git
 
 
 MACHINE_LOG = DRIVER.parents[1] / "machine_log.py"
