@@ -518,11 +518,12 @@ class DriverTestCase(unittest.TestCase):
         preflight looks like is a run directory with a table in it, not an exit code.
         """
         process = self.fixture.launch(extra=extra)
-        self.assertTrue(
-            self.fixture.wait_for(lambda: (self.fixture.run_dir / "wave-table.json").exists()),
-            f"the run never started:\n{self.fixture.ended(process, timeout=60).stdout}",
-        )
+        if not self.fixture.wait_for(lambda: (self.fixture.run_dir / "wave-table.json").exists()):
+            # Drained here rather than in an assertion message: a message is built on the passing
+            # path too, and draining there waits the loop out on every call.
+            self.fail(f"the run never started:\n{self.fixture.ended(process, timeout=60).stdout}")
         self.assertEqual(self.fixture.windows_named(PREFLIGHT_WINDOW), {})
+        self.assertIsNone(process.poll(), "the run was caught after it had already ended")
         return process
 
     def assert_preflight_failed(self, result, problems):
