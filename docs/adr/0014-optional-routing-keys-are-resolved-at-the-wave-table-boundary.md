@@ -65,3 +65,44 @@ reads it. It does not survive the table.
 - The staging script inherits this for free: it does not reimplement routing validation or the
   wave-table build, it calls the driver's own functions, so a ticket staged by `/route` is
   normalised by the same code that will normalise it at `/crew`.
+
+## Amendment (#110): concrete means identity *and* execution mode
+
+The first implementation of this decision resolved an account-less ticket to the coordinator's
+configuration home and stopped there — a path, and nothing else. That reading of "concrete" was
+wrong, and it broke two things at once.
+
+`CLAUDE_CONFIG_DIR` set to the default home and `CLAUDE_CONFIG_DIR` left unset name the same
+directory and are **not** the same login: the explicit spelling failed the credential lookup the
+inherited one succeeded at, so account-less reviewers and merge-repair sessions were told `Not
+logged in` on a machine whose operator was signed in. Meanwhile the Claude wake monitor, which
+never received the account dimension at all, polled one live-agents list for a whole wave and
+called a child on a second account `vanished` ten seconds after launching it, settling a live
+ticket `failed`.
+
+Both are the same missing distinction, so the resolved value is now a **binding** of two facts:
+
+- the **resolved configuration home** — what identifies the account, what a child's transcript,
+  cost and session files are read at, and what the machine log records for attribution;
+- the **execution mode** — `explicit` for a ticket that named an account, `inherited` for a ticket
+  that named none.
+
+A ticket that named no account still carries a directory, because observation and attribution need
+one; what it no longer carries is an instruction to set that directory as an environment. Every
+Claude process of the ticket — implementer, reviewer, merge-repair session and wake monitor —
+takes its environment from one shared contract (`accounts.environment_delta`), which answers with
+the one variable for an explicit binding and with nothing at all for an inherited one. No consumer
+re-derives the distinction from a path, a name, the coordinator's home or its own environment.
+
+The rest of the decision stands. Optionality still dies at the wave table, the table still carries
+a value on every row, and "carry the absence downstream" is still a recorded rejection — what the
+row carries is simply the whole of the resolved value rather than half of it.
+
+One consequence is accepted knowingly. An account-less child's tmux window is now created with no
+`-e` pair, so its login is whatever the multiplexer server's environment holds rather than the
+home the run recorded. On a machine whose operator runs no `CLAUDE_CONFIG_DIR` — every
+single-account machine — the two are the same directory and the inherited one is the only one that
+authenticates. On a machine whose coordinator runs under a non-default home *and* whose tmux server
+does not carry it, an account-less child could start on the default login instead: the answer there
+is to name the account on the ticket, which is what an explicit binding is for. Restoring the
+window variable "just in case" would put every account-less run back on the spelling that fails.

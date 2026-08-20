@@ -70,6 +70,28 @@ and this project uses [Semantic Versioning](https://semver.org/).
   one semantic file among mechanical ones is semantic entire, as it always was.
 
 ### Fixed
+- An account-less ticket now means "the login this run was started on", not "the
+  default configuration home, spelled out". The wave table's resolved account is
+  a **binding** of two facts — the configuration home the ticket is identified,
+  observed and attributed by, and whether that home is selected explicitly or
+  inherited — and one shared contract turns a binding into the environment every
+  Claude process of the ticket is started in: the implementer child's window, the
+  reviewer, the merge-repair session and the wake monitor. Two live failures
+  close with it. Reviewers and repair sessions for account-less tickets were
+  being told `Not logged in` on a machine whose operator was signed in, because
+  `CLAUDE_CONFIG_DIR` set to the default home fails the credential lookup that
+  leaving it unset succeeds at. And a Claude wake monitor, the one part of the
+  stack the account feature never reached, polled a single live-agents list for a
+  whole wave: a child launched on a second account is missing from a list that
+  could not contain it, so it was reported `vanished` on the monitor's first poll
+  and settled `failed` ten seconds after launch — while it was working, and about
+  to escalate. Monitors are now armed one per account binding, each polling under
+  the account its children run on, and a lane is re-armed per group so no two
+  monitors watch one session. A genuinely exited child still settles `failed`
+  under either mode, and a single-account run's monitor, window, reviewer and
+  repair session are byte-for-byte what they were: no `CLAUDE_CONFIG_DIR` delta
+  anywhere. Wave tables written before this release carry an account with no
+  mode, and are read as the explicit selection that release made.
 - A receipt that misses the verb grammar is answered instead of being dropped. A
   child that appended prose to its `CREW COMPLETE` line once left a finished
   ticket reading `waiting` for eight and a half minutes behind a live, polling

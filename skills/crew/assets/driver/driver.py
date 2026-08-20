@@ -226,9 +226,14 @@ ROUTING_KEYS = ("workflow", "executor", "model", "effort")
 REVIEW_KEY = "review"
 # The one routing key an operator names and `/route` never concludes, and the only one that is
 # optional in a ticket beside the review line. It is optional in the ticket alone: the table
-# carries it on every row, resolved to a concrete profile directory where the ticket named none
+# carries the profile directory on every row, the coordinator's own where the ticket named none
 # (ADR-0014).
-ACCOUNT_KEY = "account"
+ACCOUNT_KEY = accounts.ACCOUNT_KEY
+# Beside it on every row: how that ticket's Claude processes select the directory. A ticket that
+# named an account selects it explicitly; a ticket that named none inherits the environment the
+# run was started in, and the directory it carries is what identifies and observes it rather than
+# something to be set (ADR-0014, as amended by #110).
+ACCOUNT_MODE_KEY = accounts.ACCOUNT_MODE_KEY
 REVIEW_FIELDS = ("vendor", "model", "effort")
 
 CODEX = "codex"
@@ -740,7 +745,7 @@ def accounted(tickets, run):
         return normalise_accounts(candidates, run)
     except accounts.AccountsError:
         for candidate in candidates:
-            candidate[ACCOUNT_KEY] = run["coordinator_config_home"]
+            bind(candidate, accounts.inherited(run["coordinator_config_home"]))
         return candidates
 
 
@@ -830,12 +835,18 @@ def account_problems(tickets, run):
 
 
 def normalise_accounts(tickets, run):
-    """Give every ticket the concrete account it runs on, in place.
+    """Give every ticket the concrete account binding it runs on, in place.
 
-    Where ambiguity ends (ADR-0014). A ticket that named an account carries the profile directory
-    that name resolves to; a ticket that named none carries the coordinator's own configuration
-    home. From the table onward the key is on every row with a value on it, so no consumer
-    downstream repeats the rule, and none can get it wrong on its own.
+    Where ambiguity ends (ADR-0014). A ticket that named an account is bound explicitly to the
+    profile directory that name resolves to; a ticket that named none is bound to the
+    coordinator's own configuration home, inherited. From the table onward both halves are on
+    every row, so no consumer downstream repeats the rule, and none can get it wrong on its own.
+
+    Concrete means *both* halves. Resolving an account-less ticket to a directory alone was the
+    first version of this rule, and it lost the one fact that separates the two cases: whether the
+    ticket's processes set `CLAUDE_CONFIG_DIR` at all. Setting it to the default home is not the
+    same as leaving it unset — the explicit spelling failed the login the inherited one succeeded
+    at, and account-less reviewers and repair sessions were told they were not logged in (#110).
 
     Every name here is known registered: `account_problems` is what says so, and preflight is what
     runs it before this. The registry is opened only where a ticket named an account, on the same
@@ -846,11 +857,16 @@ def normalise_accounts(tickets, run):
     registered = accounts.load_registry() if named else {}
     for ticket in tickets:
         name = ticket.get(ACCOUNT_KEY)
-        ticket[ACCOUNT_KEY] = (
-            accounts.profile_directory(name, registered) if name
-            else run["coordinator_config_home"]
-        )
+        bind(ticket, (
+            accounts.explicit(accounts.profile_directory(name, registered)) if name
+            else accounts.inherited(run["coordinator_config_home"])
+        ))
     return tickets
+
+
+def bind(ticket, binding):
+    """Write that account binding onto the row, both halves of it; returns nothing."""
+    ticket[ACCOUNT_KEY], ticket[ACCOUNT_MODE_KEY] = binding.directory, binding.mode
 
 
 def alias_problem(model):
@@ -1169,43 +1185,55 @@ def launched_children(log):
     return list(children.values())
 
 
-def arm_monitors(run_dir, log, children, bridge):
-    """Arm the wake monitors over this wave's live children, Claude and Codex each under theirs.
+def arm_monitors(run_dir, log, children, bridge, bindings):
+    """Arm the wake monitors over this wave's live children, one per watch lane.
 
     Each is a one-shot wake-up: armed while every child under it is busy, exiting with its snapshot
     as soon as one needs attention. They are this process's own children now rather than detached
     watchers — the driver is the loop their exit reports to, so a monitor outliving the driver would
     be a wake-up nobody is left to read.
 
-    Returns one armed monitor per lane, each carrying the process and the worktree paths it stands
-    over, so the lane a snapshot came from is never guessed from its shape.
+    The Claude lane is one monitor **per account binding**, not one per wave. Its whole reading is
+    `claude agents --json`, which lists the account the command runs under and no other, so a child
+    on a second account is missing from a list that could never have held it — and a monitor that
+    read one list for a mixed wave called that child `vanished` ten seconds after launching it,
+    while it was working (#110). Each group is therefore polled in its own binding's environment,
+    which for an inherited binding is this process's own, untouched.
+
+    Returns one armed monitor per lane, each carrying the process, the lane's account binding and
+    the paths or tickets it stands over, so the lane a snapshot came from is never guessed from
+    its shape, and a lane re-armed after firing is re-armed for its own group alone.
     """
     parked_paths = run_dir / PARKED_PATHS_NAME
     parked_paths.touch()
-    claude_worktrees = [
-        child["worktree"] for child in children
-        if child.get("executor") != CODEX and child.get("worktree")
-    ]
-    codex_states = {
-        str(run_dir / CODEX_DIR_NAME / f"{child['ticket']}.json"): str(child["ticket"])
-        for child in children if child.get("executor") == CODEX
-    }
+    claude_groups = {}
+    codex_states = {}
+    for child in children:
+        ticket = str(child.get("ticket"))
+        if child.get("executor") == CODEX:
+            codex_states[str(run_dir / CODEX_DIR_NAME / f"{ticket}.json")] = ticket
+        elif child.get("worktree"):
+            claude_groups.setdefault(bindings.get(ticket), []).append(child["worktree"])
     armed = []
-    if claude_worktrees:
+    for binding, worktrees in claude_groups.items():
         armed.append({
             "lane": CLAUDE,
+            "account": binding,
             "process": spawn([
                 str(MONITOR_WAVE), "--log", str(log),
                 # Its own pid, because the wake-up it holds is readable by this process and no
                 # other: a driver killed outright runs no `disarm`, and a monitor that outlived
                 # one polled for ever, spawning a CLI every poll for nobody.
                 "--driver-pid", str(os.getpid()),
-                str(parked_paths), *claude_worktrees,
-            ]),
+                str(parked_paths), *worktrees,
+            ], environment=accounts.process_environment(binding)),
         })
     if codex_states:
         armed.append({
             "lane": CODEX,
+            # A Codex child's liveness is a bridge state file in the run directory, which no Claude
+            # profile has anything to say about: this lane is account-agnostic and stays one watch.
+            "account": None,
             "tickets": codex_states,
             "process": spawn([sys.executable, str(bridge), "watch", *codex_states]),
         })
@@ -1217,12 +1245,27 @@ def lane_of(child):
     return CODEX if child.get("executor") == CODEX else CLAUDE
 
 
-def spawn(arguments):
-    """Start a wake monitor with its snapshot on a pipe; returns the process."""
+def watch_lane(child, binding):
+    """The identity of the monitor that watches this child: its lane, and the account behind it.
+
+    Two accounts' live sources are disjoint, so two Claude children on different bindings are
+    watched by different monitors — collapsing them to the lane alone would leave one group
+    unwatched every time the other was re-armed. The Codex lane carries no binding.
+    """
+    return (CODEX, None) if child.get("executor") == CODEX else (CLAUDE, binding)
+
+
+def spawn(arguments, environment=None):
+    """Start a wake monitor with its snapshot on a pipe; returns the process.
+
+    `environment` is what `accounts.process_environment` answered for the lane's binding: None
+    where the lane inherits this process's environment as it stands, which is every lane of a
+    single-account run.
+    """
     return subprocess.Popen(
         [str(argument) for argument in arguments],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        start_new_session=True,
+        start_new_session=True, env=environment,
     )
 
 
@@ -3104,21 +3147,36 @@ class Loop:
     def arm(self, wave, records):
         """Arm a monitor over the wave's live children in every lane that has none; returns nothing.
 
-        Lane by lane, because the two exit independently: a Claude monitor that has fired and been
+        Lane by lane, because they exit independently: a Claude monitor that has fired and been
         settled must be re-armed while the Codex watch beside it is still standing, and re-arming
-        both would leave two watching the same session.
+        both would leave two watching the same session. A lane is its executor *and*, on the
+        Claude side, the account binding it polls under — one wave's two accounts are two lanes,
+        and one settling must not re-arm a second monitor over the other's children.
         """
-        armed = {monitor["lane"] for monitor in self.monitors}
+        bindings = self.bindings()
+        armed = {(monitor["lane"], monitor["account"]) for monitor in self.monitors}
         launches = launch_records(records)
         children = [
             launches[ticket] for ticket in self.live(wave, records)
             if ticket in launches and launches[ticket].get("worktree")
-            and lane_of(launches[ticket]) not in armed
+            and watch_lane(launches[ticket], bindings.get(ticket)) not in armed
         ]
         if children:
             self.monitors += arm_monitors(
-                self.run_dir, self.log, children, self.run["codex"]["bridge"]
+                self.run_dir, self.log, children, self.run["codex"]["bridge"], bindings
             )
+
+    def bindings(self):
+        """The account binding of every ticket of the run, by ticket, from the wave table.
+
+        Read from the table rather than from the launch record: the table is the run's sole
+        routing authority (ADR-0003), and the log's `launch` line records which account paid for
+        a child — an attribution, not the execution semantics a monitor has to reproduce.
+        """
+        return {
+            str(ticket["id"]): accounts.row_binding(ticket)
+            for ticket in dispatch.walk_tickets(self.table)
+        }
 
     def harvest(self):
         """What every monitor that has exited since the last poll reports the children doing.

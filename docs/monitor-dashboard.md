@@ -408,9 +408,15 @@ fallback's answer and everything else under a configuration home — to one prof
 two accounts' live sources are disjoint: a child of a second account is absent from the
 coordinator's sessions files and from the coordinator's `claude agents --json`. The wave table
 names the profile directory every ticket runs under, and each ticket is read from its own
-account's home: its sessions files at `<account>/sessions/`, and its own shared fallback answer at
-`<account>/agentcrew/agents-cache.json`, fetched by a CLI spawned with that account as its
-`CLAUDE_CONFIG_DIR`. Without this a healthy child on another account is drawn `vanished` and
+account's home: its sessions files at `<account>/sessions/`, where `<account>` is the profile
+directory its row's account binding carries — the home that child was launched with, in either
+mode. Where the two modes differ is the fallback, because that one is a *login* rather than a
+directory: the CLI is spawned with `CLAUDE_CONFIG_DIR` set to the profile for a ticket that named
+an account, and in the tick's own environment untouched for a ticket that named none, which runs
+on the login the operator is signed into rather than under a default home spelled out explicitly.
+Its shared answer is filed under the account whose login gave it, at
+`<login>/agentcrew/agents-cache.json`, so no pane is ever served one account's list as the answer
+about another's. Without any of this a healthy child on another account is drawn `vanished` and
 toasts the operator about it. The primary path spawns nothing for the extra account — an account
 more is a directory listing more — and only an account whose sessions directory cannot be read
 falls back, so a run naming one account costs exactly what it cost before. A wave table with no

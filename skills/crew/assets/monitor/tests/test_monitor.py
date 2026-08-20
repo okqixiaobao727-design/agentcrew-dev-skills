@@ -22,6 +22,8 @@ import unittest
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 MONITOR = TESTS_DIR.parent / "monitor.py"
+# The sibling module the monitor reads an account binding through; part of every release of it.
+ACCOUNTS = TESTS_DIR.parents[1] / "accounts.py"
 # The review lane the dashboard's annotation is drawn from, written by this bridge and no fixture.
 REVIEW_BRIDGE = TESTS_DIR.parents[1] / "review" / "scripts" / "claude_review_bridge.py"
 
@@ -240,6 +242,10 @@ class Fixture:
         # elsewhere keeps its sessions and fallback answer in. Nothing resolves a registry here —
         # the wave table carries the profile directory itself, already resolved.
         self.claude_home_b = self.root / "claude-config-b"
+        # The login the dashboard process is started under. The coordinator's own, which is what
+        # a ticket bound to an inherited account is read in — a case that needs the two to differ
+        # moves this one.
+        self.caller_home = self.claude_home
 
         # The operator's own Claude Code wiring the installer edits: the settings file, the
         # statusline script it already points at, and the wrapper the installer writes. All three
@@ -285,9 +291,11 @@ class Fixture:
         """The approved wave table: every ticket of every wave, in the schema dispatch reads.
 
         `accounts` names the profile directory a ticket runs under, for the tickets that run
-        somewhere other than the coordinator's own. Every row carries an `account` either way:
-        the driver resolves the key for every ticket as it builds the table, so a table the
-        dashboard reads never has the question left open on it.
+        somewhere other than the coordinator's own. Every row carries an account binding either
+        way: the driver resolves the key for every ticket as it builds the table, so a table the
+        dashboard reads never has the question left open on it. A ticket named here named an
+        account, so its binding is explicit; every other row is the ordinary one — the
+        coordinator's own home, inherited (ADR-0014).
         """
         accounts = accounts or {}
         self.table_path.write_text(json.dumps({
@@ -309,6 +317,7 @@ class Fixture:
                             "model": MODELS[ticket],
                             "effort": "medium",
                             "account": str(accounts.get(ticket, self.claude_home)),
+                            "account_mode": "explicit" if ticket in accounts else "inherited",
                         }
                         for ticket in tickets
                     ],
@@ -318,7 +327,7 @@ class Fixture:
         }))
 
     def drop_accounts(self):
-        """Take the `account` key off every row — the table a release before accounts wrote.
+        """Take the account keys off every row — the table a release before accounts wrote.
 
         A run interrupted under that release and resumed under this one hands the dashboard such
         a table, and it is drawn from the configured home exactly as it was drawn then.
@@ -327,6 +336,7 @@ class Fixture:
         for wave in table["waves"]:
             for entry in wave["tickets"]:
                 entry.pop("account", None)
+                entry.pop("account_mode", None)
         self.table_path.write_text(json.dumps(table))
 
     def worktree(self, ticket, commits=1):
@@ -655,15 +665,21 @@ class Fixture:
         return path
 
     def release_copy(self, name):
-        """A second copy of this release's monitor under `name` — the upgrade simulation's X.
+        """A second copy of this release under `name` — the upgrade simulation's release X.
+
+        The asset tree's shape, not one file: the monitor reads its sibling account module for
+        what a row's account binding is, so a copy that was only `monitor.py` would be a release
+        no operator ever installed. `<name>/` is therefore the whole of that release, and taking
+        it away afterwards takes the release away.
 
         An install run from it records nothing about where it is, so the copy can be taken away
         afterwards and the pin a later release writes still draws.
         """
-        directory = self.root / name
+        directory = self.root / name / MONITOR.parent.name
         directory.mkdir(parents=True, exist_ok=True)
         copy = directory / MONITOR.name
         shutil.copy2(str(MONITOR), str(copy))
+        shutil.copy2(str(ACCOUNTS), str(directory.parent / ACCOUNTS.name))
         return copy
 
     def dead_pid(self):
@@ -695,7 +711,9 @@ class Fixture:
         # An operator who turned colour off everywhere is not what these frames are drawn under:
         # the one case that asks for it puts it back.
         environment.pop("NO_COLOR", None)
-        environment["CLAUDE_CONFIG_DIR"] = str(self.claude_home)
+        # The login the dashboard process itself was started under, which is what a ticket bound
+        # to an inherited account is read in. The coordinator's own home unless a case moves it.
+        environment["CLAUDE_CONFIG_DIR"] = str(self.caller_home)
         environment["CODEX_HOME"] = str(self.codex_home)
         # tmux exports its socket, its client pid and the session id into every session it runs,
         # which is where the pin reads the caller's own session from. Set here rather than
@@ -2742,6 +2760,32 @@ class MultiAccountTests(MonitorTestCase):
         self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "running", LIVE_ELAPSED),
                       result.stdout)
 
+    def test_an_inherited_bindings_fallback_asks_the_login_the_tick_was_started_under(self):
+        """A ticket that named no account is asked of the environment, not of a spelled-out home.
+
+        The two are pulled apart here: the tick is started on a third profile, and the inherited
+        ticket's fallback CLI is spawned there rather than under the directory its row carries.
+        That is what "inherited" means everywhere else in the run too — the child, the reviewer
+        and the repair session all take the login they were started with (#110). The primary
+        source is a directory rather than a login and is unmoved by any of it: the row's own
+        `<account>/sessions/`, which is why this case has to reach the fallback to see anything.
+        """
+        self.mixed_wave()
+        operators_own = self.fixture.root / "claude-config-c"
+        self.fixture.caller_home = operators_own
+        self.fixture.codex_state("07")
+        self.fixture.command_agents({"06": "busy"}, home=operators_own)
+        self.fixture.command_agents({"08": "waiting"}, home=self.fixture.claude_home_b)
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.claude_call_homes(),
+                         [str(operators_own), str(self.fixture.claude_home_b)])
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+                      result.stdout)
+
     def test_a_wave_table_from_before_accounts_is_drawn_from_the_configured_home(self):
         """A run interrupted under the release before this one is resumed, not broken."""
         self.mixed_wave()
@@ -4009,7 +4053,7 @@ class PinWrapperTests(MonitorTestCase):
         self.live_run()
         release_x = self.fixture.release_copy("release-x")
         self.install(monitor=release_x)
-        shutil.rmtree(release_x.parent)
+        shutil.rmtree(release_x.parents[1])
         self.fixture.window(
             "--config", self.fixture.config("pin"), "--coordinator-pid", os.getpid(),
         )

@@ -38,11 +38,37 @@ Reasons: …
 The line is optional, and it appears only on the tickets you asked for it on.
 
 From there the name travels the road every routing key travels. The ticket's section is advisory;
-the driver resolves the name to a profile directory as it builds the wave table, and from the
-validated table onward every row carries a concrete `account`
+the driver resolves the name as it builds the wave table, and from the validated table onward every
+row carries a concrete **account binding**
 ([ADR-0014](adr/0014-optional-routing-keys-are-resolved-at-the-wave-table-boundary.md)). A resumed
 run reads its assignment out of the table it already has, so a restart cannot split one ticket's
 spend across two subscriptions.
+
+## The binding: a directory, and whether it is set
+
+A binding is two facts, and both of them matter:
+
+| | The ticket named an account | The ticket named none |
+| --- | --- | --- |
+| Configuration home | the profile directory the registry maps that name to | the coordinator's own configuration home |
+| Execution mode | `explicit` | `inherited` |
+| Every Claude process of the ticket runs with | `CLAUDE_CONFIG_DIR` set to that directory | its environment untouched |
+
+Both halves are needed because a path alone cannot say the second thing. `CLAUDE_CONFIG_DIR` set to
+the default home and `CLAUDE_CONFIG_DIR` left unset reach the same directory and are **not** the
+same login: the explicit spelling can fail the credential lookup the inherited one succeeds at, and
+account-less reviewers and merge-repair sessions were told `Not logged in` on a machine whose
+operator was signed in the whole time (#110).
+
+The directory is carried on an inherited binding all the same, because it is what identifies the
+account for everything that only *observes* it: the child's transcript and session files, the cost
+rollup, and the `account` field of the machine log's `launch` line. Reading a directory is not
+selecting a login.
+
+One contract turns a binding into an environment —
+[`accounts.environment_delta`](../skills/crew/assets/accounts.py) — and every Claude process of the
+ticket goes through it: the implementer child's tmux window, the reviewer, the merge-repair session
+and the wake monitor that watches the child. No consumer works the rule out for itself.
 
 ## The registry: where a name becomes a directory
 
@@ -91,13 +117,13 @@ own terms, rather than discovered as a machine missing a profile.
 
 | The case | What the run does |
 | --- | --- |
-| No ticket names an account | Every ticket resolves to the coordinator's own configuration home, which the run section records. The registry is never opened. |
+| No ticket names an account | Every ticket is bound to the coordinator's own configuration home, inherited: its processes are started in the environment the run was started in, and nothing sets `CLAUDE_CONFIG_DIR` anywhere. The registry is never opened. |
 | No registry file, and no ticket names an account | Runs as it always did. The file is needed only once a ticket asks for an account, so there is nothing to create. |
 | No registry file, and a ticket names an account | Preflight stops the run, naming the account and the registry path it searched. |
 | A name this repo's config does not declare | Preflight stops the run, naming the config file and the names it expects. |
 | A name the registry does not hold | Preflight stops the run, naming the account and the registry to register it in. It never falls back to the coordinator's account — a silent fallback is the defect this feature removes. |
 | A registered name whose profile directory is not there | Preflight stops the run, naming the directory and the registry entry that points at it. |
-| A wave split across two accounts | Each child is launched in a tmux window whose own environment carries its account, so a `claude` you type into that window by hand stays on it too. Verification, the dashboard's liveness reads and the cost rollup each read the account that child's row names, and the machine log's `launch` line records it. The coordinator need not be logged into any account it dispatches into. |
+| A wave split across two accounts | Each child is launched in a tmux window whose own environment carries its account, so a `claude` you type into that window by hand stays on it too. Verification, the dashboard's liveness reads and the cost rollup each read the account that child's row names, and the machine log's `launch` line records it. One wake monitor is armed per account, each polling the live-agents list of the account its children actually run under — a list belongs to one login, and a child asked after in another account's list is a live child reported `vanished`. The coordinator need not be logged into any account it dispatches into. |
 | A `codex` ticket | Unaffected. It launches on its own vendor's credentials and its launch event records no account. |
 
 ## No login check is performed

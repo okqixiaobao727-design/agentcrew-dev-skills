@@ -43,6 +43,12 @@ import sys
 import time
 import tomllib
 
+# The account module beside this one: what a row's account binding is, and the one place a binding
+# becomes an environment. A dashboard that re-derived that rule would answer for one account with
+# another's login.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import accounts  # noqa: E402
+
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # The writer that owns the log's schema: a receipt this script verifies is appended through it
 # rather than formatted here, so the closed sets stay in one place.
@@ -249,11 +255,13 @@ TMUX_ENVIRONMENT_FIELDS = 3
 SESSION_PREFIX = "$"
 SESSION_TARGET_SUFFIX = ":"
 
-# The wave table's per-ticket account: the profile directory itself, resolved by the driver as it
-# built the table, never a name this end resolves (ADR-0014). A row without the key is a table
-# written before accounts existed, and its ticket is read from the configuration home this process
-# was started under, which is where that release's children were looked for.
-ACCOUNT_KEY = "account"
+# The wave table's per-ticket account binding: the profile directory itself, resolved by the
+# driver as it built the table, never a name this end resolves — and beside it whether that
+# ticket's Claude processes select that directory or inherit the environment they were started in
+# (ADR-0014). A row without it is a table written before accounts existed, and its ticket is read
+# from the configuration home this process was started under, which is where that release's
+# children were looked for. `accounts.row_binding` is what reads either shape.
+ACCOUNT_KEY = accounts.ACCOUNT_KEY
 
 # The Claude lane's primary live source (ADR-0012): the CLI's own per-session files, one JSON
 # object per live session, under the same configured home the pin registry hangs off. Reading them
@@ -433,19 +441,7 @@ def read_log(path):
     return records
 
 
-def account_environment(account):
-    """This process's environment with `account` as its Claude configuration home, or None.
-
-    None where no account was named, which is what leaves a spawn's environment exactly as it is
-    inherited — the single-account run, unchanged. Claude Code scopes a login to this one
-    variable, so setting it is the whole of asking a second account its own question.
-    """
-    if account is None:
-        return None
-    return dict(os.environ, **{CLAUDE_SESSIONS[0]: str(account)})
-
-
-def agent_states(claude_bin, timeout=None, account=None):
+def agent_states(claude_bin, timeout=None, binding=None):
     """Each live session's status by its `cwd`, or None when the agents list cannot be read.
 
     The fallback lane and nothing else (ADR-0012): every call here is a whole CLI start, which is
@@ -462,7 +458,11 @@ def agent_states(claude_bin, timeout=None, account=None):
         result = subprocess.run(
             [claude_bin, "agents", "--json"],
             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-            env=account_environment(account),
+            # The account module's answer for this binding: the named account's home, or None
+            # where the binding is inherited and this process's own environment is the question
+            # being asked. Spelling the default home out here would ask a login that is not the
+            # one the child was launched on (#110).
+            env=accounts.process_environment(binding),
         )
     except subprocess.TimeoutExpired:
         return None
@@ -657,7 +657,7 @@ def announce_fallback(run_dir, records, timeout=None, account=None, announced=No
         )
 
 
-def claude_states(claude_bin, run_dir=None, timeout=None, records=(), account=None,
+def claude_states(claude_bin, run_dir=None, timeout=None, records=(), binding=None,
                   announced=None):
     """What one account's Claude children are doing: its sessions files, or the command behind
     them.
@@ -668,43 +668,59 @@ def claude_states(claude_bin, run_dir=None, timeout=None, records=(), account=No
     before any pane spawns another (ADR-0012). Both halves are asked of the account's own home, so
     an account more costs a few directory listings on the path a tick actually takes, and a spawn
     only on the exceptional path that already spawns.
+
+    The binding's two halves answer two different questions here, and both are asked of the
+    account the child is actually on. Its files — the sessions directory — are at the directory
+    the row carries, in either mode: a child writes its session under the home it was launched
+    with and goes on running there, whatever login a later tick happens to be started under. The
+    command is a login, so it is spawned in the binding's own environment, which for an inherited
+    binding is this tick's, untouched: spelling a default home out is how an account-less process
+    came to be told it was not logged in (#110), and a fallback answered by a login that is not
+    the child's is a live child drawn `vanished`.
+
+    The shared answer is filed under the account whose login gave it (`accounts.login_home`), not
+    under the directory being read: caching one account's list in another's file would serve every
+    pane on the machine an answer about children it never had.
     """
-    states = session_states(timeout, account)
+    home = binding.directory if binding else None
+    states = session_states(timeout, home)
     if states is OUT_OF_TIME:
         return None
     if states is not None:
         return states
-    announce_fallback(run_dir, records, timeout, account, announced)
-    cached = read_agents_cache(time.time(), account)
+    announce_fallback(run_dir, records, timeout, home, announced)
+    answered_by = accounts.login_home(binding)
+    cached = read_agents_cache(time.time(), answered_by)
     if cached is not NO_CACHE:
         return cached
-    fetched = agent_states(claude_bin, timeout, account)
-    write_agents_cache(fetched, time.time(), account)
+    fetched = agent_states(claude_bin, timeout, binding)
+    write_agents_cache(fetched, time.time(), answered_by)
     return fetched
 
 
-def table_accounts(waves):
-    """Every account the wave table names, once each, in the order the table names them.
+def table_bindings(waves):
+    """Every account binding the wave table carries, once each, in the table's own order.
 
-    A row without the key is the table a release before accounts wrote, and its account is None —
+    A row without the key is the table a release before accounts wrote, and its binding is None —
     the configuration home this process was started under, which is where that release's children
-    were looked for and found.
+    were looked for and found. Two rows on the same directory in different modes are two
+    bindings, because the login one of them asks is not the login the other asks.
     """
     named = []
     for wave in waves:
         for entry in wave.get("tickets") or []:
-            account = entry.get(ACCOUNT_KEY)
-            if account not in named:
-                named.append(account)
+            binding = accounts.row_binding(entry)
+            if binding not in named:
+                named.append(binding)
     return named or [None]
 
 
-def live_sources(claude_bin, run_dir, timeout=None, records=(), accounts=(None,)):
-    """What each lane says about the children of each account the run touches.
+def live_sources(claude_bin, run_dir, timeout=None, records=(), bindings=(None,)):
+    """What each lane says about the children of each account binding the run touches.
 
-    Keyed by account and then by lane, because that is the order a row is read in: a ticket knows
+    Keyed by binding and then by lane, because that is the order a row is read in: a ticket knows
     which account it runs under before it knows anything about its lane's source. The Claude lane
-    is asked once per account — its per-session files and its login are the account's — and the
+    is asked once per binding — its per-session files and its login are the account's — and the
     Codex lane is asked once for the run and shared, because a Codex child's bridge state lives in
     the run directory and no Claude profile has anything to say about it.
     """
@@ -712,11 +728,11 @@ def live_sources(claude_bin, run_dir, timeout=None, records=(), accounts=(None,)
     # The one line a frame may record about falling back, shared by every account it reads.
     announced = []
     return {
-        account: {
-            CLAUDE: claude_states(claude_bin, run_dir, timeout, records, account, announced),
+        binding: {
+            CLAUDE: claude_states(claude_bin, run_dir, timeout, records, binding, announced),
             CODEX: codex,
         }
-        for account in accounts
+        for binding in bindings
     }
 
 
@@ -751,7 +767,7 @@ def account_homes(run_dir):
             if not isinstance(ticket, dict):
                 continue
             identifier = ticket.get("id")
-            account = ticket.get("account")
+            account = ticket.get(ACCOUNT_KEY)
             if identifier is not None and account:
                 homes[str(identifier)] = str(account)
     return homes
@@ -778,7 +794,7 @@ def settled(events):
     return None, None
 
 
-def reworking(events, settling, launch, sources, account=None):
+def reworking(events, settling, launch, sources, binding=None):
     """Whether this ticket's child is working on the conflict its escalated merge left behind.
 
     Three things make it true, and the order between the first two is the whole point: the last
@@ -796,7 +812,7 @@ def reworking(events, settling, launch, sources, account=None):
         return False
     if str(settling.get("result")) != MERGE_ESCALATED:
         return False
-    if not working(launch, sources, account):
+    if not working(launch, sources, binding):
         return False
     for record in events[index_of(events, settling) + 1:]:
         if record.get("event") != RULING_EVENT:
@@ -807,14 +823,14 @@ def reworking(events, settling, launch, sources, account=None):
     return False
 
 
-def working(launch, sources, account=None):
+def working(launch, sources, binding=None):
     """Whether this ticket's own lane can see a child of its own busy on it right now.
 
     Stricter than "the lane did not say `idle`": a reading that produced an anomaly answered about
     itself rather than about the child, and a state read off a source that could not be read is no
     evidence that anyone is working.
     """
-    state, anomaly, status = live_state(launch, sources, account)
+    state, anomaly, status = live_state(launch, sources, binding)
     return state == RUNNING and anomaly is None and status is not None
 
 
@@ -844,15 +860,15 @@ def settling_wave(settlements, records):
     return not over(records)
 
 
-def live_state(launch, sources, account=None):
+def live_state(launch, sources, binding=None):
     """What a launched, unsettled ticket is doing now: its state, its anomaly, and its raw status.
 
     Each lane is read from its own source, chosen by the executor its launch names, because the
     two do not overlap: a Claude child is in the agents list and a Codex child is in its bridge
-    state file, and asking either about the other's children answers `vanished`. The account the
-    wave table routed the ticket to chooses which copy of those sources is asked, on the same
-    reasoning: two accounts' live sources are disjoint, and asking one about the other's children
-    answers `vanished` too.
+    state file, and asking either about the other's children answers `vanished`. The account
+    binding the wave table routed the ticket to chooses which copy of those sources is asked, on
+    the same reasoning: two accounts' live sources are disjoint, and asking one about the other's
+    children answers `vanished` too.
 
     An anomaly is not a state: `duplicate` and `unknown` say what a reading did, not where the
     ticket got to, so the row keeps the state its own log line justifies and carries the anomaly
@@ -862,7 +878,7 @@ def live_state(launch, sources, account=None):
     executor = str(launch.get("executor", ""))
     if executor not in LIVE_STATES:
         return RUNNING, (UNKNOWN, f"the launch names executor {executor or '(none)'}"), None
-    states = sources.get(account, {}).get(executor)
+    states = sources.get(binding, {}).get(executor)
     if states is None:
         return RUNNING, (UNKNOWN, f"{LIVE_SOURCES[executor]} could not be read"), None
     status = states.get(worktree_key(launch.get("worktree")))
@@ -952,7 +968,7 @@ def build_rows(waves, records, moment, sources):
         merging = settling_wave([settling for settling, _ in wave_settled.values()], records)
         for entry in entries:
             ticket = str(entry.get("id", ""))
-            account = entry.get(ACCOUNT_KEY)
+            binding = accounts.row_binding(entry)
             events = wave_events[ticket]
             launch = launches.get(ticket)
             settling, settled_into = wave_settled[ticket]
@@ -964,12 +980,12 @@ def build_rows(waves, records, moment, sources):
                 started = parse_timestamp(launch.get("ts"))
                 if settling is not None:
                     state, end = settled_into, parse_timestamp(settling.get("ts"))
-                    if state == WAITING and reworking(events, settling, launch, sources, account):
+                    if state == WAITING and reworking(events, settling, launch, sources, binding):
                         state = REWORKING
                     elif state == LANDABLE and merging:
                         state = SETTLING
                 else:
-                    state, anomaly, status = live_state(launch, sources, account)
+                    state, anomaly, status = live_state(launch, sources, binding)
                     end = moment
             escalation_count = sum(record.get("event") == ESCALATION_EVENT for record in events)
             rows.append({
@@ -1280,7 +1296,7 @@ def draw(args, run_dir, moment):
     records = read_log(run_dir / MACHINE_LOG_NAME)
     rows = build_rows(
         waves, records, moment,
-        live_sources(args.claude_bin, run_dir, records=records, accounts=table_accounts(waves)),
+        live_sources(args.claude_bin, run_dir, records=records, bindings=table_bindings(waves)),
     )
     print(
         render(
@@ -1756,7 +1772,7 @@ def pin_frame_data(args, run_dir, moment):
         return None
     waves = read_table(run_dir)
     sources = live_sources(
-        args.claude_bin, run_dir, args.timeout, records, table_accounts(waves)
+        args.claude_bin, run_dir, args.timeout, records, table_bindings(waves)
     )
     rows = build_rows(waves, records, moment, sources)
     frame = render(

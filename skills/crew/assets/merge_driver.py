@@ -49,6 +49,8 @@ import sys
 # convention: the driver merges exactly what the renderer created.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
 import dispatch  # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import accounts  # noqa: E402
 
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent / "machine_log.py"
 
@@ -66,12 +68,13 @@ DEFAULT_REPAIR_ATTEMPTS = 2
 DEFAULT_REPAIR_TIMEOUT_SECONDS = 900.0
 REPAIR_PERMISSION_MODE = "acceptEdits"
 # The account the repair session spends on. Repairing a ticket's conflict is spend that ticket
-# caused, so the session runs on the ticket's own Claude login exactly as its child did — Claude
-# Code scopes login state to this variable, so setting it is what routes that spend. The value is
-# read off the ticket's row, already a profile directory: the wave table is where a ticket's
-# account name stopped being a name (ADR-0014), and this script reads no account registry.
-CONFIG_HOME_ENV_VAR = "CLAUDE_CONFIG_DIR"
-ACCOUNT_KEY = "account"
+# caused, so the session runs on the ticket's own Claude login exactly as its child did. The
+# binding is read off the ticket's row, already resolved: the wave table is where a ticket's
+# account name stopped being a name (ADR-0014), and this script reads no account registry. Which
+# environment that binding is — one variable set, or nothing touched — is the account module's
+# answer, not this script's.
+CONFIG_HOME_ENV_VAR = accounts.CONFIG_HOME_VARIABLE
+ACCOUNT_KEY = accounts.ACCOUNT_KEY
 
 # The conflict markers, in the style the merge is run under: `diff3` keeps the base section, and
 # whether that section is empty is the whole of the mechanical/semantic test.
@@ -375,19 +378,18 @@ def repair_command(model, budget, prompt):
     ]
 
 
-def repair_env(account):
-    """This script's environment with the ticket's account in it, for the session it launches."""
-    environment = dict(os.environ)
-    environment[CONFIG_HOME_ENV_VAR] = str(account)
-    return environment
+def run_repair(repo, command, timeout, binding):
+    """Whether the repair session exited cleanly; a session that overruns its time has not.
 
-
-def run_repair(repo, command, timeout, account):
-    """Whether the repair session exited cleanly; a session that overruns its time has not."""
+    The session is launched in the binding's own environment: the named account's configuration
+    home where the ticket named one, and this script's own environment untouched where it did not
+    — a default home spelled out explicitly is a login that may fail where the inherited one
+    works (#110).
+    """
     try:
         result = subprocess.run(
             command, cwd=str(repo), capture_output=True, text=True, timeout=timeout,
-            env=repair_env(account),
+            env=accounts.process_environment(binding),
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -428,7 +430,7 @@ def strayed_outside(before, after, allowed):
     )
 
 
-def repair_attempt(repo, paths, command, timeout, baseline, account):
+def repair_attempt(repo, paths, command, timeout, baseline, binding):
     """Run one repair session and stage what it left; returns None, or why it did not settle it.
 
     The session edits files and nothing else — staging is done here, so the session needs no
@@ -438,7 +440,7 @@ def repair_attempt(repo, paths, command, timeout, baseline, account):
     puts tracked files back but leaves a stray untracked file standing, and a second session must
     not inherit the first one's mess as the state it is measured against.
     """
-    if not run_repair(repo, command, timeout, account):
+    if not run_repair(repo, command, timeout, binding):
         return "the repair session did not finish"
     strays = strayed_outside(baseline, working_state(repo), set(paths))
     if strays:
@@ -525,8 +527,8 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
         record(RESOLVED, sha=sha, detail=f"kept both sides' insertions in {', '.join(paths)}")
         return f"{ticket['id']} {RESOLVED} {sha}", None
 
-    account = ticket.get(ACCOUNT_KEY)
-    if not account:
+    binding = accounts.row_binding(ticket)
+    if binding is None:
         # Every row of a validated wave table carries the account its ticket's processes run on,
         # so a row without one is a table this ladder cannot spend against. Falling back to
         # whichever account this script happens to be running under is forbidden: a repair billed
@@ -547,7 +549,7 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
             git_or_raise(repo, "merge", "--abort")
             start_merge(repo, branch)
         failure = repair_attempt(
-            repo, paths, command, options["repair_timeout"], baseline, account
+            repo, paths, command, options["repair_timeout"], baseline, binding
         )
         if failure is None:
             git_or_raise(repo, "commit", "--no-edit")
