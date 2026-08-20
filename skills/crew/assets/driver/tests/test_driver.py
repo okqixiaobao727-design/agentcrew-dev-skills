@@ -1417,6 +1417,84 @@ class LoopTests(DriverTestCase):
 
         self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
 
+    def test_a_reviewed_child_is_nudged_afresh_rather_than_failed_on_the_stale_nudge(self):
+        """A nudge addresses one silence, and a review lane's own lines are that silence breaking.
+
+        The child said nothing itself, but its review ran and came back — which the log carries,
+        and which is the ticket moving. The silence the nudge was sent into is over, so the next
+        one is a new silence and is owed its own nudge rather than the failure the first earned.
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "idle")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.goes("01", "busy")
+        self.fixture.reviews("01", "running")
+        self.fixture.reviews("01", "returned")
+        self.fixture.goes("01", "idle")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.instructions("01", "CREW NUDGE")) == 2),
+            "the later silence was never nudged afresh",
+        )
+        self.fixture.goes("01", "busy")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_ruling_that_resumed_the_work_leaves_no_nudge_for_a_later_silence_to_inherit(self):
+        """Ticket 104's own timeline, replayed: nudged, reviewed, asked, answered — then idle.
+
+        The observed run failed that ticket four seconds after the coordinator's answer put it
+        back to work, on a nudge sent before the question it had since asked. No review lane runs
+        here, so the ask and the answer are the whole of what closes the nudge — the review's own
+        line is the neighbouring test's subject. Everything between the two silences is in the
+        log, and a driver that adopted the run part-way through must read it there, so the
+        escalation's wake and the resume that carries the run on sit in the middle on purpose.
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "idle")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.goes("01", "busy")
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.fixture.answers("01", "Use the existing retention_audit table")
+        self.fixture.goes("01", "idle")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.instructions("01", "CREW NUDGE")) == 2),
+            "the silence after the ruling was never nudged afresh",
+        )
+        self.fixture.goes("01", "busy")
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_an_unanswered_nudge_still_settles_the_ticket_failed_after_an_adoption(self):
+        """The other half of reading the nudge off the log: a silence that never broke.
+
+        The driver that sent the nudge is gone, and the one that adopts the run has nothing but
+        the log to tell it whether the nudge was ever answered. Nothing followed it there, so the
+        terminal rung is still the terminal rung, and it fires once rather than nudging again.
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "idle")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        process.kill()
+        process.communicate()
+
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.wait_for_verdict("01", "failed")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
     def test_a_vanished_child_settles_the_ticket_failed(self):
         process = self.start(("01", ()))
 

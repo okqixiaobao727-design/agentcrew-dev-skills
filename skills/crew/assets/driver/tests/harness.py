@@ -78,6 +78,9 @@ LOOP_TIMEOUT = "20"
 # never nudged" an observation rather than a race won.
 QUIET_SECONDS = 3.0
 
+# The lane the fixture routing sends a review to, spelled the way the review bridge spells it.
+REVIEW_LANE = f"codex {CODEX_MODEL}"
+
 ROUTING = f"""## Routing
 
 Workflow: tdd
@@ -362,6 +365,16 @@ class Fixture:
                 sys.executable, str(MACHINE_LOG), "--log", str(self.run_dir / "log.jsonl"),
                 "message", "--role", "child", "--ticket", ticket,
                 "--to", COORDINATOR_NAME, "--message", message,
+            ],
+            check=True, capture_output=True,
+        )
+
+    def reviews(self, ticket, state, lane=REVIEW_LANE):
+        """Write the line that ticket's review bridge writes at one end of a lane's trip."""
+        subprocess.run(
+            [
+                sys.executable, str(MACHINE_LOG), "--log", str(self.run_dir / "log.jsonl"),
+                "review", "--ticket", ticket, "--lane", lane, "--state", state,
             ],
             check=True, capture_output=True,
         )

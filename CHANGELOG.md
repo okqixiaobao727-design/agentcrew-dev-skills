@@ -89,6 +89,21 @@ and this project uses [Semantic Versioning](https://semver.org/).
   failure ever appears.
 
 ### Fixed
+- A nudge now belongs to the one silence it was sent into, so a child that went
+  quiet, was nudged, got going again and fell quiet later is nudged afresh
+  instead of being failed on the old attempt. The driver asked whether a ticket
+  had *ever* been nudged, which is not the same question: in a live run, ticket
+  104 was nudged, then ran its review, escalated, and was answered by the
+  coordinator — and four seconds after that answer put it back to work it was
+  settled `failed` as "a nudged child went idle again", with its review still
+  running. The predicate now asks whether the nudge is still standing, and
+  anything the log shows the ticket moving by after it closes the attempt: the
+  child speaking or escalating, its review lane starting or returning, or a
+  coordinator ruling that answers the question. A child that is nudged and stays
+  silent still settles `failed` on the next idle observation, exactly as before,
+  and `RESEND`, `RECHECK` and `MERGE` are untouched. The answer is read off the
+  machine log's own ordering, so a driver that adopts a run part-way through
+  reaches the same verdict as the one that sent the nudge (#111).
 - An account-less ticket now means "the login this run was started on", not "the
   default configuration home, spelled out". The wave table's resolved account is
   a **binding** of two facts — the configuration home the ticket is identified,

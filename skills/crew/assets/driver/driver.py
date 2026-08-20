@@ -2251,6 +2251,45 @@ def awaiting_a_ruling(records, launches):
     return waiting
 
 
+def outstanding_nudges(records, launches):
+    """Every ticket whose nudge addressed a silence that has not broken since.
+
+    A nudge belongs to one continuous silence, not to the whole of a ticket's life. What breaks
+    that silence is anything the log shows the ticket moving by after the nudge went out: the
+    child speaking or escalating, its review lane starting or coming back, or a coordinator
+    ruling that answers the question and puts the ticket back to work. A ticket that moved and
+    fell silent again is at a new silence, owed the fresh nudge that silence earns rather than
+    the failure the first one did — which is why this asks whether the nudge is still standing
+    rather than whether one was ever sent. It is read off the log's own ordering, so a driver
+    that adopted the run part-way through reads the same answer as the one that sent the nudge.
+    """
+    outstanding = set()
+    for record in records:
+        ticket = record_ticket(record, launches)
+        if ticket is None:
+            continue
+        event = record.get("event")
+        message = record.get("message")
+        if event == "ruling" and isinstance(message, str):
+            if message.lstrip().startswith(NUDGE_MARKER):
+                outstanding.add(ticket)
+            elif not message.lstrip().startswith(HANDED_OVER_MARKER):
+                # Handing an escalation up is the run stepping aside, not the ticket moving; the
+                # answer that follows it is the work resuming, and everything else the run says
+                # to a child it says because the child said something first.
+                outstanding.discard(ticket)
+        elif event == "review":
+            outstanding.discard(ticket)
+        elif event in ("message", "escalation") and record.get("role") == CHILD_ROLE:
+            # The child's own word, which is the plainest thing a silence can break on. A ticket
+            # that spoke is held by other rules too — an unanswered word is settled before any
+            # status is read, and an escalation waits on its ruling — so this rarely decides a
+            # poll by itself. It is here so the predicate is true about the log rather than true
+            # only while those rules stand.
+            outstanding.discard(ticket)
+    return outstanding
+
+
 def current_wave(records):
     """The wave the run is working, as the log's own advance decisions leave it."""
     wave = 1
@@ -2876,7 +2915,12 @@ class Loop:
         return acted
 
     def rule_on_idle(self, ticket, launch, records):
-        """One nudge for an idle child with no receipt; a second silence settles it failed.
+        """One nudge per silence for an idle child; returns whether the rung acted.
+
+        A silence the nudge never broke settles the ticket failed — per silence rather than per
+        ticket, because the nudge stands only until the log shows the ticket moving again. A
+        child that spoke, was reviewed, or was ruled on and went quiet later is at a new silence
+        rather than at the one the old nudge failed to end.
 
         Nothing is asked of a child still owed a ruling. It is idle because it asked a question
         and is waiting for the answer, and a nudge there asks a child with nothing to report to
@@ -2894,7 +2938,7 @@ class Loop:
                 ticket, FAILED, "a bounced receipt was never resent and the child went idle"
             )
             return True
-        if instructions_sent(records, launches, ticket, NUDGE_MARKER):
+        if ticket in outstanding_nudges(records, launches):
             self.settle(ticket, FAILED, "a nudged child went idle again with no receipt sent")
             return True
         self.deliver(ticket, launch, NUDGE_TEMPLATE.format(marker=NUDGE_MARKER, ticket=ticket))
