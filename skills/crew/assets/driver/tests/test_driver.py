@@ -519,7 +519,7 @@ class WakeMonitorAccountTests(DriverTestCase):
         for ticket in tickets:
             self.assertTrue(
                 self.fixture.wait_for(
-                    lambda ticket=ticket: self.fixture.launch_record(ticket) is not None
+                    lambda ticket=ticket: self.fixture.verified_launch(ticket) is not None
                 ),
                 f"{ticket} never launched",
             )
@@ -679,7 +679,7 @@ class LaunchTests(DriverTestCase):
         process = self.fixture.launch(extra=extra, env_overrides=env_overrides)
         self.assertTrue(
             self.fixture.wait_for(
-                lambda: self.fixture.launch_record("01") is not None
+                lambda: self.fixture.verified_launch("01") is not None
                 and (self.fixture.run_dir / "parked-paths").exists()
             ),
             "wave 1 never launched",
@@ -879,7 +879,7 @@ class LoopTests(DriverTestCase):
             if not _:
                 self.assertTrue(
                     self.fixture.wait_for(
-                        lambda number=number: self.fixture.launch_record(number) is not None
+                        lambda number=number: self.fixture.verified_launch(number) is not None
                     ),
                     f"{number} never launched",
                 )
@@ -907,7 +907,7 @@ class LoopTests(DriverTestCase):
 
         self.fixture.completes("01")
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
             "the run never advanced to wave 2",
         )
         self.fixture.completes("02")
@@ -1066,9 +1066,7 @@ class LoopTests(DriverTestCase):
         self.feature(("01", ()))
         process = self.fixture.launch(extra=("--timeout", "5"))
         self.assertTrue(
-            self.fixture.wait_for(
-                lambda: (self.fixture.launch_record("01") or {}).get("child")
-            ),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
             "01 never finished launch verification",
         )
         records = [
@@ -1548,7 +1546,7 @@ class LoopTests(DriverTestCase):
 
         resumed = self.fixture.resume()
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.launch_record("01") is not None),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
             "the resumed run lost the wave it was carrying on",
         )
         self.fixture.completes("01")
@@ -1812,7 +1810,7 @@ class LoopTests(DriverTestCase):
 
         self.fixture.completes("01")
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
             "the run never advanced past the wave it closed a ticket in",
         )
         self.fixture.completes("02")
@@ -1877,7 +1875,7 @@ class DriverLifecycleTests(DriverTestCase):
                 continue
             self.assertTrue(
                 self.fixture.wait_for(
-                    lambda number=number: self.fixture.launch_record(number) is not None
+                    lambda number=number: self.fixture.verified_launch(number) is not None
                 ),
                 f"{number} never launched",
             )
@@ -2026,7 +2024,7 @@ class AnswerTests(DriverTestCase):
         self.fixture.commit_feature()
         process = self.fixture.launch()
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.launch_record("01") is not None),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
             "01 never launched",
         )
         return process
@@ -2282,7 +2280,7 @@ class AdoptionTests(DriverTestCase):
                 continue
             self.assertTrue(
                 self.fixture.wait_for(
-                    lambda number=number: self.fixture.launch_record(number) is not None
+                    lambda number=number: self.fixture.verified_launch(number) is not None
                 ),
                 f"{number} never launched",
             )
@@ -2318,7 +2316,7 @@ class AdoptionTests(DriverTestCase):
         line = adopted.stdout.readline()
         self.fixture.completes("01")
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
             "the adopted run never advanced to wave 2",
         )
         self.fixture.completes("02")
@@ -2407,7 +2405,7 @@ class AdoptionTests(DriverTestCase):
 
         adopted = self.fixture.launch()
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
             "the adopted run never carried the wave on",
         )
         self.fixture.completes("02")
@@ -2468,7 +2466,7 @@ class AdoptionTests(DriverTestCase):
         anchor = self.events("ruling", ticket="01")
         self.fixture.completes("01")
         self.assertTrue(
-            self.fixture.wait_for(lambda: self.fixture.launch_record("02") is not None),
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
             "the adopted run never advanced to wave 2",
         )
         self.fixture.completes("02")

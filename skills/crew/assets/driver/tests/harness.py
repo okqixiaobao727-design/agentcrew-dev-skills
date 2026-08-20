@@ -346,6 +346,21 @@ class Fixture:
                 return record
         return None
 
+    def verified_launch(self, ticket):
+        """That child's launch record, but only once dispatch has verified the child is up.
+
+        Dispatch records a launch twice: a provisional record with an empty `child` as soon as the
+        child is sent to its window, then a verified one carrying the real thread id once it has
+        found the child in its account's agents list. Between the two, dispatch is still polling
+        that list — so a test that returns on the provisional record and then mutates the list
+        (`vanishes`, `goes`) takes away the very entry verification is waiting for, and the
+        verified record never lands: the wave never advances and the ticket can never settle.
+
+        Every wait for a launched child waits on this rather than on `launch_record` alone.
+        """
+        record = self.launch_record(ticket)
+        return record if (record or {}).get("child") else None
+
     def worktree(self, ticket):
         return pathlib.Path(self.launch_record(ticket)["worktree"])
 
@@ -414,7 +429,10 @@ class Fixture:
         return (self.launch_record(ticket) or {}).get("account")
 
     def goes(self, ticket, status):
-        """Put that child into the status its own account's agents list reports it in."""
+        """Put that child into the status its own account's agents list reports it in.
+
+        Safe only once that child's launch is verified — see `verified_launch`.
+        """
         worktree = os.path.realpath(self.worktree(ticket))
         home = self.account_of(ticket)
         agents = self.agents(home)
@@ -424,7 +442,10 @@ class Fixture:
         self.set_agents(agents, home)
 
     def vanishes(self, ticket):
-        """Take that child's session off its account's list, as a session that died leaves it."""
+        """Take that child's session off its account's list, as a session that died leaves it.
+
+        Safe only once that child's launch is verified — see `verified_launch`.
+        """
         worktree = os.path.realpath(self.worktree(ticket))
         home = self.account_of(ticket)
         self.set_agents([
