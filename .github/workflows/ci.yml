@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# One run per ref, and only the newest. A content commit and the release commit behind it land a
+# minute apart, and the first run is obsolete before it is a third of the way through; without
+# this it finishes anyway. Cancelling reaches `main` too, so an intermediate commit's own run
+# reads `cancelled` rather than `passed` — the tree that matters is the one at the tip.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # A read-only token is all these checks need. Anything more would be handed to
 # workflow runs triggered by pull requests from forks.
 permissions:
