@@ -1519,6 +1519,78 @@ class LoopTests(DriverTestCase):
 
         self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
 
+    def test_a_malformed_receipt_is_bounced_once_and_the_bare_resend_settles(self):
+        """#105, verbatim: prose on the verb line left a finished ticket reading `waiting`."""
+        process = self.start(("01", ()))
+
+        # The incident's message, with the one substitution this fixture forces: the sha has to be
+        # a commit the run can verify, so the resend settles the way the real one did.
+        sha = self.fixture.commit_work("01")
+        incident = (
+            f"CREW COMPLETE {sha} — deferred gap carried forward: the parked checklist is"
+            " unwritten ts=1755594000"
+        )
+        self.fixture.says("01", incident)
+        instruction = self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.says("01", f"CREW COMPLETE {sha} ts=1755594600")
+        self.woken(process, "run-complete")
+
+        self.assertIn("01", instruction)
+        self.assertIn(incident, instruction)
+        self.assertEqual(len(self.instructions("01", "CREW RESEND")), 1)
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_second_malformed_receipt_settles_the_ticket_failed(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW COMPLETE not-a-sha")
+        self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.says("01", "CREW COMPLETE still-not-a-sha")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW RESEND")), 1)
+        failed = self.events("receipt", ticket="01", verdict="failed")
+        self.assertIn("still-not-a-sha", failed[-1]["detail"])
+
+    def test_a_bounced_child_that_then_goes_idle_settles_failed_without_a_second_re_ask(self):
+        """The bounce is the ticket's one re-ask; a nudge after it would ask twice."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW COMPLETE not-a-sha")
+        self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.goes("01", "idle")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.instructions("01", "CREW NUDGE"), [])
+        failed = self.events("receipt", ticket="01", verdict="failed")
+        self.assertIn("never resent", failed[-1]["detail"])
+
+    def test_a_malformed_ask_is_bounced_with_the_shape_an_ask_takes(self):
+        """A near miss is not always a receipt: the answer names every verb's shape, not three."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK")
+        instruction = self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertIn("CREW ASK", instruction)
+        self.assertEqual(self.events("escalation", ticket="01"), [])
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_message_that_speaks_no_verb_at_all_is_not_bounced(self):
+        """Conversation is still conversation; only a near miss is answered."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "The tests are green; the review is still running.")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.instructions("01", "CREW RESEND"), [])
+        self.assertEqual(self.verdict("01"), "completed")
+
     def test_a_parked_receipt_is_recorded_by_the_driver_and_its_worktree_listed(self):
         process = self.start(("01", ()))
 

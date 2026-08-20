@@ -687,6 +687,44 @@ class ReceiptChannelTests(DispatchTestCase):
         )
 
 
+
+class BareVerbLineTests(DispatchTestCase):
+    """The rule that decides whether a receipt parses is stated where the verbs are taught.
+
+    It used to live only in the machine log's own regex comment, so a child following its
+    instructions to the letter could still send a receipt the grammar refused (#105).
+    """
+
+    SENTENCE = (
+        "The verb line stands alone: it is the whole of that message's final line, and any prose"
+        "\nyou add goes on the lines above it, never on the line itself."
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = self.fixture.root / "run" / "log.jsonl"
+
+    def prompt_for(self, *extra, **overrides):
+        table = self.fixture.table([self.fixture.ticket("06", "receipted", **overrides)])
+        result = self.fixture.run_dispatch("render", table, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.fixture.turn("06")
+
+    def test_a_sendable_receipt_is_taught_the_bare_line(self):
+        self.assertIn(self.SENTENCE, self.prompt_for())
+
+    def test_a_recorded_receipt_is_taught_the_bare_line(self):
+        self.assertIn(self.SENTENCE, self.prompt_for("--log", str(self.machine_log)))
+
+    def test_a_parking_workflow_is_taught_the_bare_line_on_both_channels(self):
+        self.assertIn(
+            self.SENTENCE, self.prompt_for(workflow="acceptance", review=None)
+        )
+        self.assertIn(
+            self.SENTENCE,
+            self.prompt_for("--log", str(self.machine_log), workflow="acceptance", review=None),
+        )
+
 class ReReviewConditionTests(DispatchTestCase):
     """The re-review cap, stated as a condition on both review lanes."""
 

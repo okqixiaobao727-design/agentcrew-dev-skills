@@ -297,6 +297,13 @@ the last one is the word it sent: a final turn speaks once, and a child that wit
 finished anyway has said the thing it ended on. The driver's rule table reads a child's word
 through the same judgment, so the log and the run can never disagree about what was said.
 
+A line that opens at the margin with one of those verb words and then fails its own whole-line
+shape is a near miss rather than a silence, and the module names it separately
+(`malformed_receipt`) so the driver can answer it instead of dropping it — one scripted bounce
+quoting the line, then `failed` (ADR-0015). The grammar itself is unchanged: a near miss settles
+nothing, and prose that names a verb mid-line or quotes one indented is neither verb nor near
+miss.
+
 A child's own `CREW COMPLETE` is a claim about a sha, not a verified receipt, so it is copied in
 as a `message`. Only the script that checked the sha writes a `receipt`, and the log therefore
 carries exactly one per launched ticket.

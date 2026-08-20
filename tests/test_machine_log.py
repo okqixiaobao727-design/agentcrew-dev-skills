@@ -177,6 +177,108 @@ class SettlementStateTests(unittest.TestCase):
                 self.assertEqual(machine_log.settlement_state(records, "104"), outcome)
 
 
+class MalformedReceiptTests(unittest.TestCase):
+    """A near-miss is told from a silence, so a refusal can be answered rather than dropped.
+
+    The incident (#105): a child appended prose to its receipt line, the grammar refused the line,
+    and nothing anywhere said so — the run read a finished ticket as `waiting` for eight minutes.
+    The grammar is unchanged; what these pin is that the refusal is now legible.
+    """
+
+    # The message that stalled run `crewtask/64`, as its child sent it.
+    INCIDENT = (
+        f"CREW COMPLETE {SHA} — deferred gap carried forward: the parked checklist is unwritten"
+        " ts=1755594000"
+    )
+
+    def test_the_incident_s_receipt_speaks_no_verb_and_is_a_near_miss(self):
+        self.assertEqual(machine_log.final_verb(self.INCIDENT), (None, None))
+        self.assertEqual(machine_log.malformed_receipt(self.INCIDENT), self.INCIDENT)
+
+    def test_a_message_that_reaches_for_no_verb_at_all_is_silence_not_a_near_miss(self):
+        for message in (
+            "The tests are green and the review is under way.",
+            "",
+            None,
+            {"note": "a structured message carries no lines"},
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_a_message_carrying_a_valid_verb_line_is_never_a_near_miss(self):
+        for message in (
+            f"CREW COMPLETE {SHA}",
+            f"CREW COMPLETE {SHA} ts=1755594000",
+            f"The work is committed and reviewed clean.\nCREW COMPLETE {SHA} ts=1755594000",
+            "CREW PARKED features/demo/checklist.md ts=1755594000",
+            "CREW FAILED the fixture never came up ts=1755594000",
+            "CREW ASK 07 stuck — which table? ts=1755594000",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_a_valid_verb_line_covers_a_botched_one_beside_it(self):
+        """The message settled on a verb it spoke properly; there is nothing to bounce."""
+        message = (
+            f"CREW COMPLETE {SHA[:8]} — first attempt, wrong length\n"
+            f"CREW COMPLETE {SHA} ts=1755594000"
+        )
+
+        self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_prose_naming_a_verb_mid_line_is_neither_verb_nor_near_miss(self):
+        message = "My first turn says to send CREW COMPLETE <sha> when the work is committed."
+
+        self.assertEqual(machine_log.final_verb(message), (None, None))
+        self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_an_indented_line_is_quoting_rather_than_reaching_for_a_verb(self):
+        """The same exemption the grammar grants a quoted example, granted to a botched one."""
+        message = (
+            "My first turn tells me to end on this line:\n"
+            "\n"
+            f"    CREW COMPLETE {SHA[:8]}\n"
+            "\n"
+            "I have not finished, so I have not sent it."
+        )
+
+        self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_every_verb_is_recognised_when_its_own_shape_is_missed(self):
+        cases = (
+            f"CREW COMPLETE {SHA[:8]}",
+            "CREW COMPLETE",
+            f"CREW COMPLETE {SHA} — the review is still out",
+            "CREW PARKED",
+            "CREW FAILED",
+            "CREW ASK",
+        )
+        for line in cases:
+            with self.subTest(line=line):
+                self.assertEqual(machine_log.final_verb(line), (None, None))
+                self.assertEqual(machine_log.malformed_receipt(line), line)
+
+    def test_the_last_near_miss_is_the_one_reported(self):
+        """A final turn speaks once, so the line it ended on is the line to quote back."""
+        message = (
+            "CREW COMPLETE deadbeef\n"
+            "That was the short sha; the full one is\n"
+            f"CREW COMPLETE {SHA} — and the review is clean"
+        )
+
+        self.assertEqual(
+            machine_log.malformed_receipt(message),
+            f"CREW COMPLETE {SHA} — and the review is clean",
+        )
+
+    def test_trailing_padding_is_not_what_makes_a_line_a_near_miss(self):
+        """A stray space cost a receipt nowhere else, and it does not manufacture one here."""
+        self.assertIsNone(machine_log.malformed_receipt(f"CREW COMPLETE {SHA} \r"))
+        self.assertEqual(
+            machine_log.malformed_receipt("CREW COMPLETE  \r"), "CREW COMPLETE"
+        )
+
+
 class EventTests(MachineLogTestCase):
     """The four events a script appends."""
 

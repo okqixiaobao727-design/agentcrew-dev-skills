@@ -218,6 +218,34 @@ def final_verb(message):
     return None, None
 
 
+def malformed_receipt(message):
+    """The last line of `message` that reached for a verb and missed its shape, or None.
+
+    Two things `final_verb` cannot tell apart both come back from it as `(None, None)`: a message
+    that speaks no verb, and a message that tried to speak one and got the shape wrong. This is the
+    second of them, and it exists so a refusal can be answered rather than dropped — a receipt with
+    prose appended to its verb line once left a finished ticket reading `waiting` for eight minutes
+    with nothing anywhere saying why (ADR-0015).
+
+    Deliberately narrow. A line counts as a near miss only where it opens, at the margin, with a
+    verb word the grammar knows and then fails that verb's whole-line pattern: prose that names a
+    verb mid-line has not reached for one, an indented line is quoting rather than speaking — the
+    same exemption `final_verb` grants — and a message carrying any valid verb line has said its
+    word and is never a near miss whatever else stands in it. The grammar itself is untouched, so
+    nothing this recognises can settle anything.
+    """
+    if not isinstance(message, str):
+        return None
+    if final_verb(message)[0] is not None:
+        return None
+    for line in reversed(message.split("\n")):
+        line = line.rstrip()
+        for verb, _pattern in VERB_GRAMMAR:
+            if line == verb or line.startswith(verb + " "):
+                return line
+    return None
+
+
 def message_event(message, role):
     """The event name for an outgoing message: what the role sends, or a child's escalation.
 

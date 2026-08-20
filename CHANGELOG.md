@@ -25,6 +25,22 @@ and this project uses [Semantic Versioning](https://semver.org/).
   one semantic file among mechanical ones is semantic entire, as it always was.
 
 ### Fixed
+- A receipt that misses the verb grammar is answered instead of being dropped. A
+  child that appended prose to its `CREW COMPLETE` line once left a finished
+  ticket reading `waiting` for eight and a half minutes behind a live, polling
+  driver: the line failed the whole-line pattern, `final_verb` answered the same
+  "no verb here" it answers a message that never reached for one, and the driver
+  read a receipt attempt as conversation with nothing anywhere saying so. The
+  grammar is unchanged — prose about a receipt still cannot settle a ticket —
+  but the machine log now tells a near miss from a silence
+  (`malformed_receipt`), and the driver answers a near miss on the scripted rung:
+  one bounce quoting the offending line and naming the shape of every verb the
+  run knows, then `failed` if the next line misses too or the child goes idle
+  without resending, with no coordinator turn spent either way. The
+  first-turn templates and `references/triage.md` now state the rule
+  that decides it — the verb line is the message's whole final line, and prose
+  belongs above it — so neither a child following its instructions nor a
+  coordinator ruling on one can induce an unparseable receipt (#105, ADR-0015).
 - Resumed runs now read a ticket's settlement from one machine-log predicate, so a tracker-close
   `completed` outcome remains landed when advance, halt handling, and report rendering read it.
   Advance decisions account for those completed tickets as already landed, and the driver refuses

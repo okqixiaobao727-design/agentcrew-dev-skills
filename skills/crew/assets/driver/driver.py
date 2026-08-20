@@ -243,6 +243,7 @@ ESCALATION_VERB = machine_log.ESCALATION_VERB
 # reads its own history out of the log: a rung that has already fired for a ticket is a ruling of
 # that shape standing in the log, which is what makes every count survive a resume.
 RECHECK_MARKER = "CREW RECHECK"
+RESEND_MARKER = "CREW RESEND"
 NUDGE_MARKER = "CREW NUDGE"
 MERGE_MARKER = "CREW MERGE"
 ANCHOR_MARKER = "CREW ANCHOR"
@@ -266,6 +267,15 @@ RECHECK_TEMPLATE = (
     " worktree, commit it, and send a new CREW COMPLETE <sha>; if it cannot be finished, send"
     " CREW FAILED <reason>. This is the one re-ask — a second receipt that does not verify settles"
     " this ticket failed."
+)
+RESEND_TEMPLATE = (
+    "{marker} {ticket} — the line you ended on reached for one of this run's verbs and missed its"
+    " shape, so nothing settled and nobody was woken: {line}. Send it again with the verb line"
+    " bare — the message's final line, and nothing on it but the verb and its argument: exactly"
+    " `CREW COMPLETE <40-character sha> ts=<unix>`, or CREW PARKED <checklist path>, CREW FAILED"
+    " <reason>, or CREW ASK <ticket> <kind> — question in their own shapes. Anything you want to"
+    " say alongside it goes on the lines above. This is the one re-ask — a second line that misses"
+    " its shape settles this ticket failed."
 )
 NUDGE_TEMPLATE = (
     "{marker} {ticket} — your session is idle and this run holds no receipt from you. Send"
@@ -2076,7 +2086,7 @@ def awaiting_receipt(records, launches):
         message = record.get("message")
         if record.get("event") == "ruling" and isinstance(message, str) and any(
             message.lstrip().startswith(marker)
-            for marker in (RECHECK_MARKER, NUDGE_MARKER, MERGE_MARKER)
+            for marker in (RECHECK_MARKER, RESEND_MARKER, NUDGE_MARKER, MERGE_MARKER)
         ):
             waiting.add(ticket)
         elif record.get("event") == "receipt":
@@ -2633,11 +2643,30 @@ class Loop:
         if verb == COMPLETE_VERB:
             self.rule_on_completion(ticket, launch, line, records)
             return True
+        offending = machine_log.malformed_receipt(message)
+        if offending is not None:
+            self.rule_on_malformed(ticket, launch, offending, records)
+            return True
         # Anything else a child says is conversation, not a verdict: the run reads the grammar its
-        # first turn gave it and leaves everything outside it alone. A claim spelled outside that
-        # grammar — a short sha, a verb buried mid-line — is conversation too, and the idle rung
-        # below is what asks such a child for the receipt it thinks it sent.
+        # first turn gave it and leaves everything outside it alone. A message that reached for no
+        # verb at all is conversation, and nothing is owed back for it.
         return False
+
+    def rule_on_malformed(self, ticket, launch, line, records):
+        """Answer a near-miss receipt once; a second one settles the ticket failed. Returns nothing.
+
+        The grammar refuses the line either way — a receipt with prose on it settles nothing, and
+        that stays true. What changes is that the refusal is spoken: the child is told what it sent
+        and what shape the line has to take, on the scripted rung, so the coordinator is not woken
+        for mechanics (ADR-0004, ADR-0015).
+        """
+        launches = launch_records(records)
+        if instructions_sent(records, launches, ticket, RESEND_MARKER):
+            self.settle(ticket, FAILED, f"a second receipt missed the verb grammar: {line}")
+            return
+        self.deliver(ticket, launch, RESEND_TEMPLATE.format(
+            marker=RESEND_MARKER, ticket=ticket, line=line
+        ))
 
     def park(self, ticket, launch, message):
         """Record a parked receipt and put the child's worktree where the monitor reads it."""
@@ -2726,6 +2755,14 @@ class Loop:
         launches = launch_records(records)
         if ticket in awaiting_a_ruling(records, launches):
             return False
+        if instructions_sent(records, launches, ticket, RESEND_MARKER):
+            # The bounce was this ticket's one re-ask, and it named the shape of every verb a
+            # child can send back. Nudging now would ask the same question a second time under
+            # another marker; the ladder is one rung deep whichever way the line went wrong.
+            self.settle(
+                ticket, FAILED, "a bounced receipt was never resent and the child went idle"
+            )
+            return True
         if instructions_sent(records, launches, ticket, NUDGE_MARKER):
             self.settle(ticket, FAILED, "a nudged child went idle again with no receipt sent")
             return True

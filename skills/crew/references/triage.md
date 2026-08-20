@@ -15,6 +15,11 @@ Rule from the message as sent — pick an option, redirect the approach, or sket
 pseudocode; the child implements. When the ASK lacks the evidence to decide, ask the child on
 its channel for a distilled summary; the child's files stay unopened.
 
+When a ruling asks a child to carry information back in its receipt, say that the information goes
+on the lines *above* the verb line. The receipt verb is matched as a whole line; a ruling that has
+a child append prose to it produces a receipt the run refuses, which the driver bounces once and
+then settles `failed` (ADR-0015).
+
 ## Answer an ASK
 
 Reply to a Claude child by SendMessage to its recorded name, ending with `ts=<unix time>` —
