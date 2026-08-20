@@ -49,7 +49,7 @@ a merge that starts on top of somebody's work cannot be aborted back to where it
 
 ## The conflict classifier
 
-A conflicted merge is classified before any repair is attempted. The merge runs under
+A conflicted merge is classified before anything is rewritten or repaired. The merge runs under
 `merge.conflictStyle=diff3`, which keeps the merge base in each conflict hunk, and whether that
 base section is empty is the whole test:
 
@@ -70,9 +70,20 @@ semantic conflict is two children's designs meeting, and which one stands is a r
 
 ## The ladder
 
-1. **Script.** The merge itself. A clean merge is logged and nothing else happens.
-2. **Repair session.** A mechanical conflict is handed to a headless, budget-capped session the
-   driver launches itself, in the repository, on the conflict standing in it:
+1. **Script.** The merge itself, and the resolution of a conflict the classifier called mechanical.
+   A clean merge is logged and nothing else happens. A mechanical conflict is rewritten by the
+   driver: in every conflicted file, each hunk becomes ours' insertion followed by theirs', the
+   markers and the empty base section removed. The classification has already proved that keeps
+   everything both sides wrote and decides nothing, so no model is asked to do it — the merge is
+   staged, committed and logged `resolved`, and the wave carries on.
+
+   The driver refuses to rewrite a file whose markers do not open and close in order, or whose own
+   text carries a line that reads as a marker — `=======` is also how prose underlines a heading.
+   Nothing is written until every conflicted file has been rewritten, so a file it refuses leaves
+   the whole conflict standing exactly as git wrote it, and that conflict goes to rung 2.
+2. **Repair session.** A mechanical conflict the driver's own rewrite refused is handed to a
+   headless, budget-capped session the driver launches itself, in the repository, on the conflict
+   standing in it:
 
    ```sh
    claude --print <the conflict brief> --model <full model ID> \
@@ -110,9 +121,13 @@ One `merge` event per step, through the log's own writer, in the schema
 | Path through the ladder | Events |
 | --- | --- |
 | clean merge | `clean` |
-| mechanical conflict, repaired | `conflict`, `repaired` |
+| mechanical conflict, resolved by the driver | `conflict`, `resolved` |
+| mechanical conflict the driver would not rewrite, repaired | `conflict`, `repaired` |
 | mechanical conflict, repair exhausted | `conflict`, `escalated` |
 | semantic conflict | `conflict`, `escalated` |
+
+`resolved` and `repaired` are separate words on purpose: a merge the driver settled itself cost no
+model anything, and a log that spelled them alike could not say so.
 
 A skipped ticket writes no `merge` event: nothing was merged, and a log that records a merge that
 did not happen is a log a later agent cannot trust.
@@ -123,9 +138,10 @@ One line per ticket, which is the whole of what a caller reads:
 
 ```
 07 clean <sha>
-08 repaired <sha>
-09 escalated <reason>; ticket <path>; branch <branch>; conflicted <paths>
-10 skipped failed
+08 resolved <sha>
+09 repaired <sha>
+10 escalated <reason>; ticket <path>; branch <branch>; conflicted <paths>
+11 skipped failed
 ```
 
 Exit 0 when every landable branch landed, 1 when any ticket escalated or the wave could not be

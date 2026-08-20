@@ -43,6 +43,12 @@ import sys
 import time
 import tomllib
 
+# The account module beside this one: what a row's account binding is, and the one place a binding
+# becomes an environment. A dashboard that re-derived that rule would answer for one account with
+# another's login.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import accounts  # noqa: E402
+
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # The writer that owns the log's schema: a receipt this script verifies is appended through it
 # rather than formatted here, so the closed sets stay in one place.
@@ -136,7 +142,8 @@ SETTLED_STATES = {
     # queued to land either, so it leaves `landable` for the abnormal state that owes the operator
     # a line: "waiting its turn to merge" and "the merge blew up" are not the same row.
     "merge": ("result", {
-        "clean": MERGED, "repaired": MERGED, "conflict": WAITING, "escalated": WAITING,
+        "clean": MERGED, "repaired": MERGED, "resolved": MERGED, "conflict": WAITING,
+        "escalated": WAITING,
     }),
 }
 # Where a live child of each lane says how it is doing, and what its words mean to the operator.
@@ -188,6 +195,14 @@ HALTED_DECISIONS = ("escalated", "interrupted")
 # What the summary line says while the run is waiting on the operator, so a halted wave is never
 # mistaken for a frozen frame.
 AWAITING_RULING = "⚠ awaiting your ruling"
+# The run directory's record of the driver driving it: the pid its loop wrote on the way in, which
+# every deliberate exit takes away again and a kill cannot. A record naming a process that is not
+# running is therefore a killed driver by construction — the one thing the operator could not see
+# while the run stalled — and the summary line says so in the slot the ruling marker occupies,
+# painted red, carrying the command that puts the run back.
+DRIVER_RECORD_NAME = "driver.pid"
+DRIVER_DEAD = "✖ driver dead — /crew {run} to resume"
+DRIVER_DEAD_COLOUR = "31"
 
 COLUMNS = ("WAVE", "TICKET", "TITLE", "EXECUTOR", "STATE", "ELAPSED")
 # The one column that has no natural width — it is given whatever the window has left over — and
@@ -240,11 +255,13 @@ TMUX_ENVIRONMENT_FIELDS = 3
 SESSION_PREFIX = "$"
 SESSION_TARGET_SUFFIX = ":"
 
-# The wave table's per-ticket account: the profile directory itself, resolved by the driver as it
-# built the table, never a name this end resolves (ADR-0014). A row without the key is a table
-# written before accounts existed, and its ticket is read from the configuration home this process
-# was started under, which is where that release's children were looked for.
-ACCOUNT_KEY = "account"
+# The wave table's per-ticket account binding: the profile directory itself, resolved by the
+# driver as it built the table, never a name this end resolves — and beside it whether that
+# ticket's Claude processes select that directory or inherit the environment they were started in
+# (ADR-0014). A row without it is a table written before accounts existed, and its ticket is read
+# from the configuration home this process was started under, which is where that release's
+# children were looked for. `accounts.row_binding` is what reads either shape.
+ACCOUNT_KEY = accounts.ACCOUNT_KEY
 
 # The Claude lane's primary live source (ADR-0012): the CLI's own per-session files, one JSON
 # object per live session, under the same configured home the pin registry hangs off. Reading them
@@ -424,19 +441,7 @@ def read_log(path):
     return records
 
 
-def account_environment(account):
-    """This process's environment with `account` as its Claude configuration home, or None.
-
-    None where no account was named, which is what leaves a spawn's environment exactly as it is
-    inherited — the single-account run, unchanged. Claude Code scopes a login to this one
-    variable, so setting it is the whole of asking a second account its own question.
-    """
-    if account is None:
-        return None
-    return dict(os.environ, **{CLAUDE_SESSIONS[0]: str(account)})
-
-
-def agent_states(claude_bin, timeout=None, account=None):
+def agent_states(claude_bin, timeout=None, binding=None):
     """Each live session's status by its `cwd`, or None when the agents list cannot be read.
 
     The fallback lane and nothing else (ADR-0012): every call here is a whole CLI start, which is
@@ -453,7 +458,11 @@ def agent_states(claude_bin, timeout=None, account=None):
         result = subprocess.run(
             [claude_bin, "agents", "--json"],
             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-            env=account_environment(account),
+            # The account module's answer for this binding: the named account's home, or None
+            # where the binding is inherited and this process's own environment is the question
+            # being asked. Spelling the default home out here would ask a login that is not the
+            # one the child was launched on (#110).
+            env=accounts.process_environment(binding),
         )
     except subprocess.TimeoutExpired:
         return None
@@ -648,7 +657,7 @@ def announce_fallback(run_dir, records, timeout=None, account=None, announced=No
         )
 
 
-def claude_states(claude_bin, run_dir=None, timeout=None, records=(), account=None,
+def claude_states(claude_bin, run_dir=None, timeout=None, records=(), binding=None,
                   announced=None):
     """What one account's Claude children are doing: its sessions files, or the command behind
     them.
@@ -659,43 +668,59 @@ def claude_states(claude_bin, run_dir=None, timeout=None, records=(), account=No
     before any pane spawns another (ADR-0012). Both halves are asked of the account's own home, so
     an account more costs a few directory listings on the path a tick actually takes, and a spawn
     only on the exceptional path that already spawns.
+
+    The binding's two halves answer two different questions here, and both are asked of the
+    account the child is actually on. Its files — the sessions directory — are at the directory
+    the row carries, in either mode: a child writes its session under the home it was launched
+    with and goes on running there, whatever login a later tick happens to be started under. The
+    command is a login, so it is spawned in the binding's own environment, which for an inherited
+    binding is this tick's, untouched: spelling a default home out is how an account-less process
+    came to be told it was not logged in (#110), and a fallback answered by a login that is not
+    the child's is a live child drawn `vanished`.
+
+    The shared answer is filed under the account whose login gave it (`accounts.login_home`), not
+    under the directory being read: caching one account's list in another's file would serve every
+    pane on the machine an answer about children it never had.
     """
-    states = session_states(timeout, account)
+    home = binding.directory if binding else None
+    states = session_states(timeout, home)
     if states is OUT_OF_TIME:
         return None
     if states is not None:
         return states
-    announce_fallback(run_dir, records, timeout, account, announced)
-    cached = read_agents_cache(time.time(), account)
+    announce_fallback(run_dir, records, timeout, home, announced)
+    answered_by = accounts.login_home(binding)
+    cached = read_agents_cache(time.time(), answered_by)
     if cached is not NO_CACHE:
         return cached
-    fetched = agent_states(claude_bin, timeout, account)
-    write_agents_cache(fetched, time.time(), account)
+    fetched = agent_states(claude_bin, timeout, binding)
+    write_agents_cache(fetched, time.time(), answered_by)
     return fetched
 
 
-def table_accounts(waves):
-    """Every account the wave table names, once each, in the order the table names them.
+def table_bindings(waves):
+    """Every account binding the wave table carries, once each, in the table's own order.
 
-    A row without the key is the table a release before accounts wrote, and its account is None —
+    A row without the key is the table a release before accounts wrote, and its binding is None —
     the configuration home this process was started under, which is where that release's children
-    were looked for and found.
+    were looked for and found. Two rows on the same directory in different modes are two
+    bindings, because the login one of them asks is not the login the other asks.
     """
     named = []
     for wave in waves:
         for entry in wave.get("tickets") or []:
-            account = entry.get(ACCOUNT_KEY)
-            if account not in named:
-                named.append(account)
+            binding = accounts.row_binding(entry)
+            if binding not in named:
+                named.append(binding)
     return named or [None]
 
 
-def live_sources(claude_bin, run_dir, timeout=None, records=(), accounts=(None,)):
-    """What each lane says about the children of each account the run touches.
+def live_sources(claude_bin, run_dir, timeout=None, records=(), bindings=(None,)):
+    """What each lane says about the children of each account binding the run touches.
 
-    Keyed by account and then by lane, because that is the order a row is read in: a ticket knows
+    Keyed by binding and then by lane, because that is the order a row is read in: a ticket knows
     which account it runs under before it knows anything about its lane's source. The Claude lane
-    is asked once per account — its per-session files and its login are the account's — and the
+    is asked once per binding — its per-session files and its login are the account's — and the
     Codex lane is asked once for the run and shared, because a Codex child's bridge state lives in
     the run directory and no Claude profile has anything to say about it.
     """
@@ -703,11 +728,11 @@ def live_sources(claude_bin, run_dir, timeout=None, records=(), accounts=(None,)
     # The one line a frame may record about falling back, shared by every account it reads.
     announced = []
     return {
-        account: {
-            CLAUDE: claude_states(claude_bin, run_dir, timeout, records, account, announced),
+        binding: {
+            CLAUDE: claude_states(claude_bin, run_dir, timeout, records, binding, announced),
             CODEX: codex,
         }
-        for account in accounts
+        for binding in bindings
     }
 
 
@@ -742,7 +767,7 @@ def account_homes(run_dir):
             if not isinstance(ticket, dict):
                 continue
             identifier = ticket.get("id")
-            account = ticket.get("account")
+            account = ticket.get(ACCOUNT_KEY)
             if identifier is not None and account:
                 homes[str(identifier)] = str(account)
     return homes
@@ -769,7 +794,7 @@ def settled(events):
     return None, None
 
 
-def reworking(events, settling, launch, sources, account=None):
+def reworking(events, settling, launch, sources, binding=None):
     """Whether this ticket's child is working on the conflict its escalated merge left behind.
 
     Three things make it true, and the order between the first two is the whole point: the last
@@ -787,7 +812,7 @@ def reworking(events, settling, launch, sources, account=None):
         return False
     if str(settling.get("result")) != MERGE_ESCALATED:
         return False
-    if not working(launch, sources, account):
+    if not working(launch, sources, binding):
         return False
     for record in events[index_of(events, settling) + 1:]:
         if record.get("event") != RULING_EVENT:
@@ -798,14 +823,14 @@ def reworking(events, settling, launch, sources, account=None):
     return False
 
 
-def working(launch, sources, account=None):
+def working(launch, sources, binding=None):
     """Whether this ticket's own lane can see a child of its own busy on it right now.
 
     Stricter than "the lane did not say `idle`": a reading that produced an anomaly answered about
     itself rather than about the child, and a state read off a source that could not be read is no
     evidence that anyone is working.
     """
-    state, anomaly, status = live_state(launch, sources, account)
+    state, anomaly, status = live_state(launch, sources, binding)
     return state == RUNNING and anomaly is None and status is not None
 
 
@@ -835,15 +860,15 @@ def settling_wave(settlements, records):
     return not over(records)
 
 
-def live_state(launch, sources, account=None):
+def live_state(launch, sources, binding=None):
     """What a launched, unsettled ticket is doing now: its state, its anomaly, and its raw status.
 
     Each lane is read from its own source, chosen by the executor its launch names, because the
     two do not overlap: a Claude child is in the agents list and a Codex child is in its bridge
-    state file, and asking either about the other's children answers `vanished`. The account the
-    wave table routed the ticket to chooses which copy of those sources is asked, on the same
-    reasoning: two accounts' live sources are disjoint, and asking one about the other's children
-    answers `vanished` too.
+    state file, and asking either about the other's children answers `vanished`. The account
+    binding the wave table routed the ticket to chooses which copy of those sources is asked, on
+    the same reasoning: two accounts' live sources are disjoint, and asking one about the other's
+    children answers `vanished` too.
 
     An anomaly is not a state: `duplicate` and `unknown` say what a reading did, not where the
     ticket got to, so the row keeps the state its own log line justifies and carries the anomaly
@@ -853,7 +878,7 @@ def live_state(launch, sources, account=None):
     executor = str(launch.get("executor", ""))
     if executor not in LIVE_STATES:
         return RUNNING, (UNKNOWN, f"the launch names executor {executor or '(none)'}"), None
-    states = sources.get(account, {}).get(executor)
+    states = sources.get(binding, {}).get(executor)
     if states is None:
         return RUNNING, (UNKNOWN, f"{LIVE_SOURCES[executor]} could not be read"), None
     status = states.get(worktree_key(launch.get("worktree")))
@@ -943,7 +968,7 @@ def build_rows(waves, records, moment, sources):
         merging = settling_wave([settling for settling, _ in wave_settled.values()], records)
         for entry in entries:
             ticket = str(entry.get("id", ""))
-            account = entry.get(ACCOUNT_KEY)
+            binding = accounts.row_binding(entry)
             events = wave_events[ticket]
             launch = launches.get(ticket)
             settling, settled_into = wave_settled[ticket]
@@ -955,12 +980,12 @@ def build_rows(waves, records, moment, sources):
                 started = parse_timestamp(launch.get("ts"))
                 if settling is not None:
                     state, end = settled_into, parse_timestamp(settling.get("ts"))
-                    if state == WAITING and reworking(events, settling, launch, sources, account):
+                    if state == WAITING and reworking(events, settling, launch, sources, binding):
                         state = REWORKING
                     elif state == LANDABLE and merging:
                         state = SETTLING
                 else:
-                    state, anomaly, status = live_state(launch, sources, account)
+                    state, anomaly, status = live_state(launch, sources, binding)
                     end = moment
             escalation_count = sum(record.get("event") == ESCALATION_EVENT for record in events)
             rows.append({
@@ -1030,11 +1055,15 @@ def cut(text, width):
     return text[: width - 1].rstrip() + ELLIPSIS
 
 
-def summary(rows, run_id, waves, moment, awaiting_ruling=False):
+def summary(rows, run_id, waves, moment, awaiting_ruling=False, dead_driver=None):
     """The one line above the table: which run, how far through its waves, and how it stands.
 
     A run halted on a ruling says so between its counts and its clock: the frame is still being
     drawn, and what stopped moving is the run rather than the renderer.
+
+    A run whose driver was killed says that instead, in the same slot. The two are mutually
+    exclusive by the blanking rule — a driver that halted a wave on purpose released its record on
+    the way out — and the slot is written that way so that they can never both be believed.
     """
     counts = {state: 0 for state in STATE_ORDER}
     for row in rows:
@@ -1043,7 +1072,7 @@ def summary(rows, run_id, waves, moment, awaiting_ruling=False):
     parts = [
         f"wave {len({row['wave'] for row in rows if row['launched']})}/{waves}",
         " ".join(f"{state}={counts[state]}" for state in STATE_ORDER if counts[state]),
-        AWAITING_RULING if awaiting_ruling else "",
+        dead_driver or (AWAITING_RULING if awaiting_ruling else ""),
         f"elapsed {elapsed(min(started) if started else None, moment)}",
     ]
     return f"crew {run_id} — " + " · ".join(part for part in parts if part)
@@ -1053,6 +1082,18 @@ def paint(text, state, colour):
     """The state cell in its own colour, or exactly as it was when nothing can show one."""
     code = STATE_COLOURS.get(state) if colour else None
     return f"\x1b[{code}m{text}{COLOUR_RESET}" if code else text
+
+
+def paint_segment(line, segment, code, colour):
+    """That segment of an already-cut line in its own colour, or the line exactly as it was.
+
+    Applied after the cut and never before it: an escape sequence counts toward a line's length,
+    so colouring first would let a narrow window slice one in half and leave the operator's
+    prompt painted. A banner the window cut away is simply not painted.
+    """
+    if not colour or segment is None or segment not in line:
+        return line
+    return line.replace(segment, f"\x1b[{code}m{segment}{COLOUR_RESET}", 1)
 
 
 def fit_rows(rows, row_blocks, available, width):
@@ -1103,7 +1144,8 @@ def fit_rows(rows, row_blocks, available, width):
 
 
 def render(
-    rows, run_id, waves, moment, width=None, colour=False, max_lines=None, awaiting_ruling=False
+    rows, run_id, waves, moment, width=None, colour=False, max_lines=None, awaiting_ruling=False,
+    dead_driver=None,
 ):
     """The whole frame: the summary line, the header, and each row with its annotations."""
     width = width or terminal_width()
@@ -1129,7 +1171,10 @@ def render(
             ]
         return block_lines
 
-    lines = [cut(summary(rows, run_id, waves, moment, awaiting_ruling), width)]
+    lines = [paint_segment(
+        cut(summary(rows, run_id, waves, moment, awaiting_ruling, dead_driver), width),
+        dead_driver, DRIVER_DEAD_COLOUR, colour,
+    )]
     header_lines = block(0, cells[0])
     row_blocks = [block(index, values) for index, values in enumerate(cells[1:], 1)]
     if max_lines is None:
@@ -1251,12 +1296,13 @@ def draw(args, run_dir, moment):
     records = read_log(run_dir / MACHINE_LOG_NAME)
     rows = build_rows(
         waves, records, moment,
-        live_sources(args.claude_bin, run_dir, records=records, accounts=table_accounts(waves)),
+        live_sources(args.claude_bin, run_dir, records=records, bindings=table_bindings(waves)),
     )
     print(
         render(
             rows, run_dir.name, len(waves), moment,
             colour=colour_wanted(args), awaiting_ruling=halted(records),
+            dead_driver=dead_driver_banner(run_dir),
         ),
         flush=True,
     )
@@ -1599,6 +1645,71 @@ def alive(pid):
     return True
 
 
+def driver_record_path(run_dir):
+    """The file the run directory names its driver in, absolute (ADR-0007)."""
+    return pathlib.Path(run_dir).resolve() / DRIVER_RECORD_NAME
+
+
+def record_driver(run_dir, pid):
+    """Name the process driving this run; returns the file it was named in.
+
+    Written by rename, like the pin, because a launcher reading it half-written would read no pid
+    for a driver that is very much alive and start a second one.
+    """
+    path = driver_record_path(run_dir)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(f"{int(pid)}\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise MonitorError(f"the run's driver could not be recorded: {error}")
+    return path
+
+
+def release_driver(run_dir):
+    """Take that record away, which is what makes an exit a deliberate one; returns nothing.
+
+    Every way a driver ends on purpose passes through here — a wake handing judgment over, a
+    driver error, the run finishing, an operator's own interrupt in the driver's window — and no
+    kill does. A run with no record to take away has already been released.
+    """
+    with contextlib.suppress(OSError):
+        driver_record_path(run_dir).unlink(missing_ok=True)
+
+
+def recorded_driver(run_dir):
+    """The pid the run directory names as its driver, or None where it names none it can read.
+
+    A real pid or nothing: everything else this record could hold — a half-written file, a pid
+    with a sign, a zero — is a process id nobody can ask about, and `kill -0` on the last two asks
+    about somebody else's process group entirely.
+    """
+    try:
+        text = driver_record_path(run_dir).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return int(text) if text.isdigit() and int(text) > 0 else None
+
+
+def live_driver(run_dir):
+    """The pid of the driver still driving this run, or None where none is."""
+    pid = recorded_driver(run_dir)
+    return pid if pid is not None and alive(pid) else None
+
+
+def dead_driver_banner(run_dir):
+    """What the summary line says about a driver that was killed, or None where none was.
+
+    The run directory's parent is what the banner names, because that is the directory the
+    operator typed `/crew` with: the run directory itself is the `.crew` inside it.
+    """
+    pid = recorded_driver(run_dir)
+    if pid is None or alive(pid):
+        return None
+    return DRIVER_DEAD.format(run=pathlib.Path(run_dir).resolve().parent)
+
+
 def pin_directory(args):
     """The pin registry this tick reads, and the one the run writes its pin into.
 
@@ -1661,13 +1772,13 @@ def pin_frame_data(args, run_dir, moment):
         return None
     waves = read_table(run_dir)
     sources = live_sources(
-        args.claude_bin, run_dir, args.timeout, records, table_accounts(waves)
+        args.claude_bin, run_dir, args.timeout, records, table_bindings(waves)
     )
     rows = build_rows(waves, records, moment, sources)
     frame = render(
         rows, run_dir.name, len(waves), moment,
         colour=pin_colour(args), max_lines=pin_line_budget(args),
-        awaiting_ruling=halted(records),
+        awaiting_ruling=halted(records), dead_driver=dead_driver_banner(run_dir),
     )
     return frame, rows
 

@@ -88,6 +88,11 @@ TEMPLATES = pathlib.Path(__file__).resolve().parent / "templates" / "shapes.toml
 # The log's own writer: the event shape and its closed sets stay the log's alone.
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 
+# The account module beside it: the one place a row's account binding becomes an environment, so
+# this renderer decides neither what "inherit" means nor how an account is spelled into a process.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import accounts  # noqa: E402
+
 EXECUTORS = ("claude", "codex")
 REVIEW_VENDORS = ("claude", "codex")
 # Guard assets every Claude worktree carries before a child starts in it.
@@ -128,7 +133,7 @@ TICKET_KEYS = {
 # directory in: the variable that moves the configuration home, the home's own name under `~`, and
 # the fixed subdirectory inside it. Reading it through the shared shape rather than inline is what
 # lets one account's home be substituted for the environment's (ADR-0014).
-CONFIG_HOME_VARIABLE = "CLAUDE_CONFIG_DIR"
+CONFIG_HOME_VARIABLE = accounts.CONFIG_HOME_VARIABLE
 TRANSCRIPTS = (CONFIG_HOME_VARIABLE, ".claude", "projects")
 
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 90.0
@@ -235,6 +240,14 @@ def validate(table, templates):
             # ADR-0007: the child reads this path in its own worktree, where a relative spelling
             # names another directory — one profile written and another verified.
             faults.append(f"Account `{account}` is not an absolute path")
+        mode = ticket.get(accounts.ACCOUNT_MODE_KEY)
+        if mode is not None and mode not in accounts.ACCOUNT_MODES:
+            # The half of the binding that says whether this ticket's processes select the account
+            # or inherit it. A word that is neither would be read as one of them by every consumer
+            # downstream, which is a wave silently launched on the wrong login.
+            faults.append(
+                f"Account mode `{mode}` is outside {', '.join(accounts.ACCOUNT_MODES)}"
+            )
         if str(ticket.get("id")) in seen:
             faults.append("is listed twice")
         seen.add(str(ticket.get("id")))
@@ -327,17 +340,20 @@ def review_account_flag(ticket):
     where a ticket's account name stopped being a name (ADR-0014), and nothing here reads the
     account registry.
 
-    A row carrying none renders the command exactly as it rendered before accounts existed. That
-    is not the table's ordinary case — a validated wave table carries an account on every row —
-    but it is the candidate table the driver's preflight renders to ask this renderer whether a
-    ticket's routing is valid, which is asked before a ticket's account has been resolved.
+    A row bound to an inherited account renders the command exactly as it rendered before accounts
+    existed: the bridge sets `CLAUDE_CONFIG_DIR` for an account it is given and touches the
+    environment for no other, so a ticket that named no account reviews on the login the operator
+    is signed into rather than under an explicitly spelled default that fails to authenticate
+    (#110). A row carrying no account at all renders the same way, which is the candidate table
+    the driver's preflight renders to ask this renderer whether a ticket's routing is valid —
+    asked before a ticket's account has been resolved.
 
     Quoted, unlike every other path this renderer writes into the command: those are the run's own
     directories, and this one is whatever the operator registered the account against — a profile
     directory under a path with a space in it would otherwise reach the bridge as two arguments,
     and the review would be launched on an account nobody named.
     """
-    account = ticket.get("account")
+    account = accounts.environment_delta(accounts.row_binding(ticket)).get(CONFIG_HOME_VARIABLE)
     return f"  --account {shlex.quote(str(account))} \\\n" if account else ""
 
 
@@ -561,17 +577,24 @@ def tmux(*args):
 
 
 def new_window(run, ticket, worktree):
-    """The child's own window, detached and on the ticket's account.
+    """The child's own window, detached and carrying its ticket's account binding.
 
     Detached: a wave leaves the operator's focus where it was. On the account: a new window's
     environment otherwise comes from the multiplexer server as it was when that server started,
     and the launch line deliberately bypasses the window's interactive shell, so the window itself
-    is the only place the account can be set — which is also what keeps a `claude` the operator
-    types into this window by hand on the ticket's account.
+    is the only place a named account can be set — which is also what keeps a `claude` the
+    operator types into this window by hand on the ticket's account.
+
+    A ticket that named no account is bound to the login the run is already on, and its window is
+    given no `-e` pair at all: setting the default configuration home explicitly is not the same
+    as leaving it unset, and the explicit spelling fails the login the inherited one succeeds at
+    (#110). Which pairs those are is the account module's to decide, never this renderer's.
     """
+    delta = accounts.environment_delta(accounts.row_binding(ticket))
+    pairs = [argument for name, value in delta.items() for argument in ("-e", f"{name}={value}")]
     return tmux(
         "new-window", "-d", "-t", run["tmux_session"], "-n", ticket["id"],
-        "-c", str(worktree), "-e", f"{CONFIG_HOME_VARIABLE}={ticket['account']}",
+        "-c", str(worktree), *pairs,
         "-P", "-F", "#{window_id}",
     )
 
@@ -583,10 +606,11 @@ def launch_command(run, ticket, launch_json):
     launch JSON is read from its file so the line stays short enough for one send-keys.
 
     The project's launch-hook variables ride on this line, but the account is not among them
-    whatever the hook declares: the window itself is what carries it, and a project variable that
-    happens to be spelled the same must not be able to move a child off the account its ticket
-    routed it to — the child would then write its transcript into one profile while verification
-    read another.
+    whatever the hook declares: the ticket's binding is what decides this child's login — the
+    window's own environment where it names an account, and the environment the run was started
+    in where it names none — and a project variable that happens to be spelled the same must not
+    be able to move a child off either. The child would then write its transcript into one
+    profile while verification read another.
     """
     prefix = "".join(
         f"{name}={shlex.quote(value)} "
@@ -619,17 +643,16 @@ def harness_directory(spec, home=None):
     return pathlib.Path(configured or pathlib.Path.home() / default_home) / subdirectory
 
 
-def account_environment(account):
-    """This process's environment, moved onto that account: what a read of it is performed in."""
-    environment = dict(os.environ)
-    environment[CONFIG_HOME_VARIABLE] = str(account)
-    return environment
+def agents_list(binding):
+    """Every live session of that binding's account, as its own login answers for them.
 
-
-def agents_list(account):
+    Asked in the binding's environment, which for an inherited binding is this process's own,
+    untouched: a list asked for under an explicitly spelled default home is answered by a login
+    that may not be the one the child was launched on (#110).
+    """
     result = subprocess.run(
         ["claude", "agents", "--json"], capture_output=True, text=True,
-        env=account_environment(account),
+        env=accounts.process_environment(binding),
     )
     if result.returncode != 0:
         raise LaunchError(f"claude agents --json failed: {result.stderr.strip()}")
@@ -639,16 +662,21 @@ def agents_list(account):
         raise LaunchError(f"claude agents --json returned no JSON: {error}") from error
 
 
-def find_agent(worktree, account):
+def find_agent(worktree, binding):
     wanted = os.path.realpath(str(worktree))
-    for entry in agents_list(account):
+    for entry in agents_list(binding):
         if os.path.realpath(entry.get("cwd", "")) == wanted:
             return entry
     return None
 
 
-def transcript_model(session_id, account):
-    root = harness_directory(TRANSCRIPTS, account)
+def transcript_model(session_id, binding):
+    """The model that transcript says the child ran on, read at the binding's own directory.
+
+    The directory in either mode, because that is where the child wrote it: an inherited binding
+    carries the home this process is itself on, which is the home it just handed the child.
+    """
+    root = harness_directory(TRANSCRIPTS, binding.directory if binding else None)
     for transcript in root.glob(f"*/{session_id}.jsonl"):
         for line in transcript.read_text().splitlines():
             try:
@@ -668,17 +696,22 @@ def verify_child(ticket, worktree, timeout):
     Both reads are performed in the ticket's own account, which is where the child was launched:
     two profiles answer with two disjoint agents lists and keep two disjoint transcript roots, so
     a child looked for in the coordinator's account is a correctly launched child reported missing.
+    Both reads are asked of the account the child was launched on, through the two halves of its
+    binding: the agents list in the binding's own environment — untouched for an inherited
+    binding, which is the environment the child itself was handed — and the transcript at the
+    directory the binding carries, which is where that environment put it.
 
     No account is checked for a login anywhere in this feature — an unauthenticated profile
     answers the agents list with an empty list and exit code 0, which an authenticated profile
     with nothing running does too. This timeout is therefore the one surface such a profile
     appears on, so it names the account rather than the worktree.
     """
-    account = ticket["account"]
+    binding = accounts.row_binding(ticket)
+    account = binding.directory
     deadline = time.monotonic() + timeout
     entry = None
     while True:
-        entry = find_agent(worktree, account)
+        entry = find_agent(worktree, binding)
         if entry:
             break
         if time.monotonic() >= deadline:
@@ -697,7 +730,7 @@ def verify_child(ticket, worktree, timeout):
 
     model = None
     while True:
-        model = transcript_model(entry["sessionId"], account)
+        model = transcript_model(entry["sessionId"], binding)
         if model:
             break
         if time.monotonic() >= deadline:
@@ -718,22 +751,35 @@ def verify_child(ticket, worktree, timeout):
 # --- per-executor launches ---------------------------------------------------------------
 
 
-def launch_claude_child(run, ticket, artifacts, timeouts):
+def launch_claude_child(run, ticket, artifacts, timeouts, log=None):
     worktree = prepare_worktree(run, ticket)
     install_guard_assets(run, worktree)
     window_id = new_window(run, ticket, worktree)
     hook = run_launch_hook(run, worktree, window_id, timeouts["hook"])
     tmux("send-keys", "-t", window_id, launch_command(run, ticket, artifacts["launchJson"]), "Enter")
-    entry = verify_child(ticket, worktree, timeouts["verify"])
+    details = {
+        "child": "",
+        "window": window_id,
+        "worktree": str(worktree),
+        "account": ticket["account"],
+    }
+    started_note = log_note(log, ticket, details)
+    try:
+        entry = verify_child(ticket, worktree, timeouts["verify"])
+    except LaunchError as error:
+        failure_note = log_launch_failure_note(log, ticket, error)
+        if failure_note:
+            raise LaunchError(f"{error}; {failure_note}") from error
+        raise
+    details["child"] = entry["name"]
+    verified_note = log_note(log, ticket, details)
+    note = started_note or verified_note
     line = (
         f"{ticket['id']} launched {ticket['executor']} {ticket['model']} {ticket['effort']}"
         f" window={window_id} name={entry['name']} pid={entry['pid']}"
         f" session={entry['sessionId']}{hook_note(hook)}"
     )
-    return line, {
-        "child": entry["name"], "window": window_id, "worktree": str(worktree),
-        "account": ticket["account"],
-    }
+    return line, note
 
 
 def verify_codex_child(ticket, worktree, state_file):
@@ -805,9 +851,10 @@ def launch_codex_child(run, ticket, artifacts, timeouts, log=None):
         f" window={window_id} state={state_file}{hook_note(hook)}"
     )
     # A Codex child has no agents-list name; the thread the bridge pinned is what identifies it.
-    return line, {
+    details = {
         "child": state.get("threadId"), "window": window_id, "worktree": str(worktree),
     }
+    return line, log_note(log, ticket, details)
 
 
 # --- the launch event ------------------------------------------------------------------------
@@ -861,22 +908,37 @@ def log_note(log, ticket, details):
     return ""
 
 
+def log_launch_failure_note(log, ticket, error):
+    """Record why a live child failed verification; return any logging failure as a note."""
+    if not log:
+        return ""
+    arguments = [
+        sys.executable, str(MACHINE_LOG), "--log", str(log), "launch-failed",
+        "--ticket", str(ticket["id"]), "--detail", str(error),
+    ]
+    result = subprocess.run(arguments, capture_output=True, text=True)
+    if result.returncode != 0:
+        return f"log-failed={str(result.stderr or result.stdout).strip()}"
+    return ""
+
+
 def dispatch_wave(run, tickets, rendered, timeouts, log=None):
     lines = []
     failed = False
     for ticket, artifacts in zip(tickets, rendered):
         try:
             if ticket["executor"] == "claude":
-                line, details = launch_claude_child(run, ticket, artifacts, timeouts)
+                line, note = launch_claude_child(
+                    run, ticket, artifacts, timeouts, log=log
+                )
             else:
-                line, details = launch_codex_child(
+                line, note = launch_codex_child(
                     run, ticket, artifacts, timeouts, log=log
                 )
         except LaunchError as error:
             failed = True
             lines.append(f"{ticket['id']} FAILED {error}".replace("\n", " "))
             continue
-        note = log_note(log, ticket, details)
         failed = failed or bool(note)
         lines.append(line + note)
     return lines, failed

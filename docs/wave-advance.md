@@ -30,9 +30,9 @@ authority (ADR-0003). The repair flags are the merge driver's and are passed str
    driver refuses to start at all — a repository carrying uncommitted work of its own — is the
    same non-decision: the driver's reason is printed and nothing is recorded.
 4. **Read the wave back out of the log.** The wave is green when every ticket either settled
-   `landable` and merged `clean` or `repaired`, or settled `parked` and has no descendants in the
-   wave table. Both halves are read from the log rather than from the driver's output, so what
-   advances the run is what the run recorded.
+   `landable` and merged `clean`, `resolved` or `repaired`, or settled `parked` and has no
+   descendants in the wave table. Both halves are read from the log rather than from the driver's
+   output, so what advances the run is what the run recorded.
 5. **Launch the next wave**, when there is one and the wave was green, through
    [`dispatch.py dispatch`](../skills/crew/assets/dispatch/dispatch.py) — cut from what the wave
    just landed, not from where the run began. The driver reads the integration branch's head after

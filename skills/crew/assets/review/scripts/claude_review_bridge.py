@@ -211,8 +211,11 @@ def child_session_env(hook, account=None):
     `account` is the ticket's own profile directory, and it overrides whatever
     login the caller happens to be on: a child dispatched to a second account
     reviews on that account, and its reviewer is not a hole in the ticket's
-    spend. A call given none is every call made before accounts existed, and
-    inherits the caller's login untouched.
+    spend. A call given none inherits the caller's login untouched — which is
+    every call made before accounts existed, and is also what a ticket that
+    named no account asks for: the flag is rendered only for a ticket that
+    named one, because the default home spelled out explicitly is a login that
+    can fail where the inherited one works (#110).
     """
     env = hook.child_env()
     env.pop(REVIEWER_CONFIG_ENV_VAR, None)

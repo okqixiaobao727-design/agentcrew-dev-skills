@@ -90,6 +90,39 @@ crew crew-run-3 — wave 2/5 · pending=6 merged=4 · ⚠ awaiting your ruling �
 The log's newest `advance` decides it: `escalated` or `interrupted` puts the marker up, and the
 next `advance` — the wave carrying on once the coordinator has ruled — takes it away.
 
+### The driver's own liveness
+
+The same slot carries one other thing, in red, and the two never appear together:
+
+```
+crew crew-run-3 — wave 2/5 · pending=6 · ✖ driver dead — /crew feat/x to resume · elapsed 01:12:44
+```
+
+The driver runs detached from the coordinator's session now, in a tmux window of its own, so
+nothing the coordinator holds can report that it ended. The run directory does. Its loop writes
+its own pid into `<run-dir>/driver.pid` on the way in, and every exit it takes on purpose — a wake
+handing judgment to the coordinator, a driver error, the run finishing, an operator's Ctrl-C in
+the driver's own window — removes that file on the way out. A kill cannot, so a file naming a
+process that is not running is a killed driver by construction, and that is the whole protocol:
+one `kill -0`, the same judgment the pin sweep already makes, and no watchdog or heartbeat behind
+it. Because a deliberate exit blanks the record before it writes its wake, a run awaiting a ruling
+can never also be flagged as orphaned.
+
+The banner names the directory the operator typed `/crew` with — the run directory's parent — so
+recovery is one paste rather than a forensic session. Nothing acts on it: the render path is a
+reader, and it neither respawns the driver nor removes the record (#87).
+
+The same file is what makes `/crew` idempotent at the other end — a run whose driver is alive is
+attached to rather than started again, so no run is ever driven twice.
+
+Whose driver it is, nothing asks. A driver carries the coordinator it was started for for its
+whole life, which is the pid every child authenticates a ruling against, so a driver that outlived
+its session goes on answering to a session that has gone: the run keeps advancing, and rulings
+made from a new session are refused by children launched under the old one. Detaching the driver
+is what made that state reachable, and closing it means re-anchoring the run's children as well as
+its driver — tracked in #112. Until then a run whose coordinator has exited is cleared and
+restarted rather than adopted.
+
 ### States
 
 Every source state is mapped into the Ticket state vocabulary before it is drawn, so the operator
@@ -104,7 +137,7 @@ never reads an internal word:
 | `parked` | a `receipt` verdict or an `outcome` of `parked`, or its lane says so |
 | `landable` | a `receipt` verdict of `landable` |
 | `settling` | `landable`, in a wave every ticket of which has settled, in a run that is not over |
-| `merged` | a `merge` result of `clean` or `repaired`, or an `outcome` of `completed` |
+| `merged` | a `merge` result of `clean`, `resolved` or `repaired`, or an `outcome` of `completed` |
 | `failed` | a `receipt` verdict or an `outcome` of `failed` |
 | `vanished` | it was launched, nothing settled it, and its lane has no live entry for it |
 
@@ -375,9 +408,15 @@ fallback's answer and everything else under a configuration home — to one prof
 two accounts' live sources are disjoint: a child of a second account is absent from the
 coordinator's sessions files and from the coordinator's `claude agents --json`. The wave table
 names the profile directory every ticket runs under, and each ticket is read from its own
-account's home: its sessions files at `<account>/sessions/`, and its own shared fallback answer at
-`<account>/agentcrew/agents-cache.json`, fetched by a CLI spawned with that account as its
-`CLAUDE_CONFIG_DIR`. Without this a healthy child on another account is drawn `vanished` and
+account's home: its sessions files at `<account>/sessions/`, where `<account>` is the profile
+directory its row's account binding carries — the home that child was launched with, in either
+mode. Where the two modes differ is the fallback, because that one is a *login* rather than a
+directory: the CLI is spawned with `CLAUDE_CONFIG_DIR` set to the profile for a ticket that named
+an account, and in the tick's own environment untouched for a ticket that named none, which runs
+on the login the operator is signed into rather than under a default home spelled out explicitly.
+Its shared answer is filed under the account whose login gave it, at
+`<login>/agentcrew/agents-cache.json`, so no pane is ever served one account's list as the answer
+about another's. Without any of this a healthy child on another account is drawn `vanished` and
 toasts the operator about it. The primary path spawns nothing for the extra account — an account
 more is a directory listing more — and only an account whose sessions directory cannot be read
 falls back, so a run naming one account costs exactly what it cost before. A wave table with no
@@ -497,7 +536,9 @@ it, and this case is one the operator can act on
 
 Nothing is drawn, and the exit status is still 0, when there is no pin, when the run directory is
 gone or unreadable, when the coordinator's pid is not alive, or when the machine log carries an
-`advance` decision of `complete` or `stopped`. The last two are the whole liveness story: a dead
-pid is a crashed or killed run, either of those decisions is a run that is over, and there is no
-watchdog, no heartbeat and no separate liveness file behind either. A halted wave is none of these
-— the pin keeps drawing it, with the `⚠ awaiting your ruling` marker on its summary line.
+`advance` decision of `complete` or `stopped`. The last two are the whole liveness story for the
+*coordinator*: a dead pid is a crashed or killed session, either of those decisions is a run that
+is over, and there is no watchdog or heartbeat behind either. A halted wave is none of these — the
+pin keeps drawing it, with the `⚠ awaiting your ruling` marker on its summary line — and neither
+is a run whose *driver* died, which is drawn with [the dead-driver
+banner](#the-drivers-own-liveness) rather than not at all.

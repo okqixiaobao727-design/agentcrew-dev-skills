@@ -110,10 +110,23 @@ accounts.
 _Avoid_: profile (the directory an account resolves to, not the account), subscription (the billing
 plan behind the login, not the login)
 
+**Account binding** — What a ticket's account is once the wave table carries it: two facts, not
+one. The **resolved configuration home**, which identifies the account and is where that ticket's
+transcripts, session files and cost are read; and the **execution mode**, `explicit` for a ticket
+that named an account and `inherited` for a ticket that named none. Every Claude process of the
+ticket gets its environment from the binding through one shared contract — the one variable for an
+explicit binding, nothing at all for an inherited one. An account-less ticket therefore runs in
+the environment the run was started in rather than under a default home spelled out explicitly,
+which is not the same login
+([ADR-0014](adr/0014-optional-routing-keys-are-resolved-at-the-wave-table-boundary.md)).
+_Avoid_: "the ticket's account path" for the whole binding (a path cannot say whether it is set or
+inherited, which was the defect)
+
 **One ticket, one account** — The invariant that every Claude process belonging to a ticket runs
-on that ticket's account: the implementer child, the reviewer child, and the exception handler that
-repairs that ticket's merge conflict. The account is a property of the ticket, not of the process,
-so a ticket moved to another account takes all of its spend with it.
+on that ticket's account: the implementer child, the reviewer child, the exception handler that
+repairs that ticket's merge conflict, and the wake monitor that watches it. The account is a
+property of the ticket, not of the process, so a ticket moved to another account takes all of its
+spend — and everything asked about its liveness — with it.
 
 **Account registry** — The machine-level file mapping account names to Claude Code profile
 directories. It is deliberately not profile-scoped: a map *between* accounts cannot be stored per
@@ -183,8 +196,9 @@ that a run contains no other kind of coordinator turn.
 in the coordinator's opening context so a ruling never starts with a hunt. Contents are read on
 demand, and nothing but the coordinator itself puts them in the live context.
 
-**Driver** — The scripted state machine that runs everything else, as a background task of the
-coordinator's session: preflight, the validated wave table, the branch and run directory, dispatch,
+**Driver** — The scripted state machine that runs everything else, in a tmux window of its own,
+detached from the coordinator's session: preflight, the validated wave table, the branch and run
+directory, dispatch,
 receipt verification, the rule table's settlements, merges, tracker closes, wave advancement,
 monitor re-arming, and the report. It drives the existing scripts at their published command lines
 and holds no state of its own — every count it acts on is read back out of the machine log,
@@ -214,8 +228,9 @@ conflict verdict, or a scope decision.
 _Avoid_: decision (overloaded), answer
 
 **Escalation ladder** — The fixed order in which a mechanical failure is retried: script →
-budget-capped headless Sonnet repair → coordinator. Only a double failure or a semantic conflict
-reaches the top.
+budget-capped headless Sonnet repair → coordinator. The script rung resolves a mechanical merge
+conflict itself, so only what it will not rewrite reaches the repair session; only a double failure
+or a semantic conflict reaches the top.
 
 **Exception handler** — The budget-capped headless cheap-model session a script launches to fix a
 mechanical failure. It is not resident, and the coordinator learns it ran only when it fails.

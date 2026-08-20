@@ -62,9 +62,9 @@ and, where it holds, settled in silence; an invalid receipt earns one re-ask and
 the second; parked and failed receipts are recorded by the driver rather than by hand; an idle
 child earns one nudge and settles failed on the second silence, unless it is idle because it is
 owed a ruling nothing has answered yet; a vanished child settles failed; a settled wave is
-advanced, which lands its branches, hands a mechanical conflict to the budget-capped repair rung
-and launches the next wave; a semantic conflict is answered first by a
-templated instruction to the child that has to resolve it; a merged ticket is closed in the run's
+advanced, which lands its branches, resolves a mechanical conflict in the merge driver itself and
+launches the next wave; a semantic conflict is answered first by a templated instruction to the
+child that has to resolve it; a merged ticket is closed in the run's
 tracker with its exact undo written into the log; and each wave's monitors are re-armed without a
 coordinator turn.
 
@@ -92,7 +92,9 @@ Everything the driver does to the repository, the children and the log it does t
 scripts — the dispatch renderer, the machine log, the monitor and its wake monitors, the Codex
 bridge — at their published command lines; it reimplements none of them. The run directory holds
 what today's index names and nothing this module invents: the wave table, the machine log, the
-launch directory, the Codex state, and the parked paths.
+launch directory, the Codex state, and the parked paths — and, since the driver stopped being a
+task of the coordinator's session (#103), this process's own two records: the pid it drives under
+and the wake snapshot it leaves behind.
 """
 
 import argparse
@@ -119,6 +121,7 @@ MONITOR = ASSETS / "monitor" / "monitor.py"
 MONITOR_WAVE = ASSETS / "monitor-wave.sh"
 CODEX_BRIDGE = ASSETS / "codex" / "codex_bridge.py"
 ADVANCE = ASSETS / "advance.py"
+LAUNCH = ASSETS / "launch" / "launch.py"
 
 # The renderer owns two rules this module asks rather than restates: what counts as an alias, and
 # what a ticket's branch is called. Advance imports it the same way, from the same place.
@@ -126,6 +129,7 @@ sys.path.insert(0, str(DISPATCH.parent))
 import dispatch  # noqa: E402
 sys.path.insert(0, str(ASSETS))
 import machine_log  # noqa: E402
+import advance as wave_advance  # noqa: E402
 # And the account registry owns one more: what a named account resolves to on this machine. It is
 # the one documented way from an account name to a profile directory, and this driver is where the
 # ticket's name is turned into one, once, as the wave table is built (ADR-0014).
@@ -139,6 +143,10 @@ import monitor  # noqa: E402
 # The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
 RUN_DIR_NAME = ".crew"
 LOG_NAME = "log.jsonl"
+# The channel a woken coordinator reads. The driver runs detached in its own tmux window now, so
+# its stdout belongs to that pane and to the log beside it — the one JSON object the coordinator
+# rules on is left here instead, where the waiter `/crew` leaves behind blocks on it (#103).
+WAKE_NAME = "wake.json"
 TABLE_NAME = "wave-table.json"
 LAUNCH_DIR_NAME = "launch"
 CODEX_DIR_NAME = "codex"
@@ -200,6 +208,9 @@ UPSTREAM_UNREACHABLE = "unreachable"
 
 PREFLIGHT_EXIT = 1
 DRIVER_ERROR_EXIT = 2
+# What a shell reports for a process an interrupt ended, which is what this ends on when the
+# operator stops the driver in its own window.
+INTERRUPTED_EXIT = 130
 
 # A ticket file of a feature: its number, as written, and whatever slug follows it.
 TICKET_FILE = re.compile(r"^(\d+)(?:-.*)?\.md$")
@@ -215,9 +226,14 @@ ROUTING_KEYS = ("workflow", "executor", "model", "effort")
 REVIEW_KEY = "review"
 # The one routing key an operator names and `/route` never concludes, and the only one that is
 # optional in a ticket beside the review line. It is optional in the ticket alone: the table
-# carries it on every row, resolved to a concrete profile directory where the ticket named none
+# carries the profile directory on every row, the coordinator's own where the ticket named none
 # (ADR-0014).
-ACCOUNT_KEY = "account"
+ACCOUNT_KEY = accounts.ACCOUNT_KEY
+# Beside it on every row: how that ticket's Claude processes select the directory. A ticket that
+# named an account selects it explicitly; a ticket that named none inherits the environment the
+# run was started in, and the directory it carries is what identifies and observes it rather than
+# something to be set (ADR-0014, as amended by #110).
+ACCOUNT_MODE_KEY = accounts.ACCOUNT_MODE_KEY
 REVIEW_FIELDS = ("vendor", "model", "effort")
 
 CODEX = "codex"
@@ -236,11 +252,13 @@ COORDINATOR_ROLE = "coordinator"
 COMPLETE_VERB = machine_log.COMPLETE_VERB
 PARKED_VERB = machine_log.PARKED_VERB
 FAILED_VERB = machine_log.FAILED_VERB
+ESCALATION_VERB = machine_log.ESCALATION_VERB
 
 # What the driver says back. Each opens with its own marker, because the marker is how the loop
 # reads its own history out of the log: a rung that has already fired for a ticket is a ruling of
 # that shape standing in the log, which is what makes every count survive a resume.
 RECHECK_MARKER = "CREW RECHECK"
+RESEND_MARKER = "CREW RESEND"
 NUDGE_MARKER = "CREW NUDGE"
 MERGE_MARKER = "CREW MERGE"
 ANCHOR_MARKER = "CREW ANCHOR"
@@ -264,6 +282,15 @@ RECHECK_TEMPLATE = (
     " worktree, commit it, and send a new CREW COMPLETE <sha>; if it cannot be finished, send"
     " CREW FAILED <reason>. This is the one re-ask — a second receipt that does not verify settles"
     " this ticket failed."
+)
+RESEND_TEMPLATE = (
+    "{marker} {ticket} — the line you ended on reached for one of this run's verbs and missed its"
+    " shape, so nothing settled and nobody was woken: {line}. Send it again with the verb line"
+    " bare — the message's final line, and nothing on it but the verb and its argument: exactly"
+    " `CREW COMPLETE <40-character sha> ts=<unix>`, or CREW PARKED <checklist path>, CREW FAILED"
+    " <reason>, or CREW ASK <ticket> <kind> — question in their own shapes. Anything you want to"
+    " say alongside it goes on the lines above. This is the one re-ask — a second line that misses"
+    " its shape settles this ticket failed."
 )
 NUDGE_TEMPLATE = (
     "{marker} {ticket} — your session is idle and this run holds no receipt from you. Send"
@@ -289,16 +316,16 @@ MERGE_TEMPLATE = (
 )
 
 # The verdicts and events the loop reads back out of the log. The writer owns their spelling.
-LANDABLE = "landable"
-PARKED = "parked"
-FAILED = "failed"
-COMPLETED = "completed"
-BLOCKED = "blocked"
+LANDABLE = machine_log.LANDABLE
+PARKED = machine_log.PARKED
+FAILED = machine_log.FAILED
+COMPLETED = machine_log.COMPLETED
+BLOCKED = machine_log.BLOCKED
 LAUNCHED = "launched"
 # The advance decision this loop writes itself: the run ended because the chain stopped on reasons
 # the rule table had already settled, which no other decision in the log's vocabulary says.
 STOPPED = "stopped"
-LANDED_RESULTS = ("clean", "repaired")
+LANDED_RESULTS = machine_log.LANDED_MERGE_RESULTS
 ESCALATED = "escalated"
 SEMANTIC_PREFIX = "semantic: "
 
@@ -366,19 +393,84 @@ class Wake(Exception):
         self.fields = fields
 
 
+# --- the run this process is driving ------------------------------------------------------------
+
+# The run directory this driver has in hand, or None while it has none — before a fresh run has
+# made its directory, and in the commands that do not drive a run at all. Two things hang off it,
+# and both are a driver's word about its own life: the pid record the dashboard reads liveness
+# from, and the file the coordinator's waiter blocks on. Module state because it is one fact about
+# the process: a driver drives one run, from the moment it takes it up until it puts it down.
+_run_in_hand = None
+
+
+def take_up_run(run_dir):
+    """Take up that run: name this process as its driver, and open its wake channel.
+
+    A run directory that is not there yet is not taken up. That is the fresh start before it has
+    made one, and the start that fails preflight without ever making one — a run that does not
+    begin leaves no run directory behind, and the launcher that made one for its own log has
+    already put the directory there for every other case.
+    """
+    global _run_in_hand
+    if run_dir is None or not pathlib.Path(run_dir).is_dir():
+        return
+    _run_in_hand = pathlib.Path(run_dir)
+    try:
+        monitor.record_driver(_run_in_hand, os.getpid())
+    except monitor.MonitorError as error:
+        # A driver nothing can name is a driver nothing can tell from a killed one, and a second
+        # `/crew` would start another beside it. That is not a run to carry on quietly.
+        _run_in_hand = None
+        raise DriverError(f"this run could not be taken up: {error}", pointer=str(run_dir))
+
+
+def put_down_run():
+    """Put this run down: take the pid record away, which is what makes an exit deliberate.
+
+    Every ending this process reaches by running code passes through here, and no kill does — so
+    a record still naming a process that has gone is a killed driver, and the dashboard says so.
+    """
+    global _run_in_hand
+    if _run_in_hand is None:
+        return
+    monitor.release_driver(_run_in_hand)
+    _run_in_hand = None
+
+
 # --- the wake snapshot ----------------------------------------------------------------------
 
 
 def snapshot(reason, ticket=None, pointer=None, **fields):
-    """Print the run's wake snapshot: the one JSON object a woken coordinator reads.
+    """Print the run's wake snapshot, and leave it where the coordinator's waiter reads it.
 
     Flushed as it is written, like every other line this driver puts on that channel: stdout is a
     pipe here, and a lifecycle line held in a buffer until the process ends is not one line per
     lifecycle event.
+
+    Every call is this process's last act, so the run is put down first and the wake written
+    second: a coordinator that pastes the resume command the instant it is woken must not find a
+    pid that was about to stop and attach to a driver already on its way out. The file is put in
+    place by rename, because a waiter reading it half-written would read no wake at all.
     """
     record = {"reason": reason, "ticket": ticket, "pointer": pointer}
     record.update(fields)
-    print(json.dumps(record, ensure_ascii=False), flush=True)
+    line = json.dumps(record, ensure_ascii=False)
+    print(line, flush=True)
+    run_dir = _run_in_hand
+    put_down_run()
+    if run_dir is None:
+        return
+    path = run_dir / WAKE_NAME
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(line + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as error:
+        # The snapshot is on stdout either way, and the driver's own pane and log keep it. A wake
+        # channel that could not be written is said where a wake cannot be: on stderr.
+        temporary.unlink(missing_ok=True)
+        print(f"crew: the wake snapshot could not be left in {path}: {error}",
+              file=sys.stderr, flush=True)
 
 
 # --- git ----------------------------------------------------------------------------------
@@ -653,7 +745,7 @@ def accounted(tickets, run):
         return normalise_accounts(candidates, run)
     except accounts.AccountsError:
         for candidate in candidates:
-            candidate[ACCOUNT_KEY] = run["coordinator_config_home"]
+            bind(candidate, accounts.inherited(run["coordinator_config_home"]))
         return candidates
 
 
@@ -743,12 +835,18 @@ def account_problems(tickets, run):
 
 
 def normalise_accounts(tickets, run):
-    """Give every ticket the concrete account it runs on, in place.
+    """Give every ticket the concrete account binding it runs on, in place.
 
-    Where ambiguity ends (ADR-0014). A ticket that named an account carries the profile directory
-    that name resolves to; a ticket that named none carries the coordinator's own configuration
-    home. From the table onward the key is on every row with a value on it, so no consumer
-    downstream repeats the rule, and none can get it wrong on its own.
+    Where ambiguity ends (ADR-0014). A ticket that named an account is bound explicitly to the
+    profile directory that name resolves to; a ticket that named none is bound to the
+    coordinator's own configuration home, inherited. From the table onward both halves are on
+    every row, so no consumer downstream repeats the rule, and none can get it wrong on its own.
+
+    Concrete means *both* halves. Resolving an account-less ticket to a directory alone was the
+    first version of this rule, and it lost the one fact that separates the two cases: whether the
+    ticket's processes set `CLAUDE_CONFIG_DIR` at all. Setting it to the default home is not the
+    same as leaving it unset — the explicit spelling failed the login the inherited one succeeded
+    at, and account-less reviewers and repair sessions were told they were not logged in (#110).
 
     Every name here is known registered: `account_problems` is what says so, and preflight is what
     runs it before this. The registry is opened only where a ticket named an account, on the same
@@ -759,11 +857,16 @@ def normalise_accounts(tickets, run):
     registered = accounts.load_registry() if named else {}
     for ticket in tickets:
         name = ticket.get(ACCOUNT_KEY)
-        ticket[ACCOUNT_KEY] = (
-            accounts.profile_directory(name, registered) if name
-            else run["coordinator_config_home"]
-        )
+        bind(ticket, (
+            accounts.explicit(accounts.profile_directory(name, registered)) if name
+            else accounts.inherited(run["coordinator_config_home"])
+        ))
     return tickets
+
+
+def bind(ticket, binding):
+    """Write that account binding onto the row, both halves of it; returns nothing."""
+    ticket[ACCOUNT_KEY], ticket[ACCOUNT_MODE_KEY] = binding.directory, binding.mode
 
 
 def alias_problem(model):
@@ -1071,54 +1174,66 @@ def install_hook(log, settings, role, ticket=None):
 
 
 def launched_children(log):
-    """Every child this run's log records as launched: its ticket, worktree and executor."""
-    children = []
+    """The last launch record per child: its ticket, worktree and executor."""
+    children = {}
     for line in pathlib.Path(log).read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         record = json.loads(line)
-        if record.get("event") == "launch":
-            children.append(record)
-    return children
+        if record.get("event") == "launch" and record.get("ticket") is not None:
+            children[str(record["ticket"])] = record
+    return list(children.values())
 
 
-def arm_monitors(run_dir, log, children, bridge):
-    """Arm the wake monitors over this wave's live children, Claude and Codex each under theirs.
+def arm_monitors(run_dir, log, children, bridge, bindings):
+    """Arm the wake monitors over this wave's live children, one per watch lane.
 
     Each is a one-shot wake-up: armed while every child under it is busy, exiting with its snapshot
     as soon as one needs attention. They are this process's own children now rather than detached
     watchers — the driver is the loop their exit reports to, so a monitor outliving the driver would
     be a wake-up nobody is left to read.
 
-    Returns one armed monitor per lane, each carrying the process and the worktree paths it stands
-    over, so the lane a snapshot came from is never guessed from its shape.
+    The Claude lane is one monitor **per account binding**, not one per wave. Its whole reading is
+    `claude agents --json`, which lists the account the command runs under and no other, so a child
+    on a second account is missing from a list that could never have held it — and a monitor that
+    read one list for a mixed wave called that child `vanished` ten seconds after launching it,
+    while it was working (#110). Each group is therefore polled in its own binding's environment,
+    which for an inherited binding is this process's own, untouched.
+
+    Returns one armed monitor per lane, each carrying the process, the lane's account binding and
+    the paths or tickets it stands over, so the lane a snapshot came from is never guessed from
+    its shape, and a lane re-armed after firing is re-armed for its own group alone.
     """
     parked_paths = run_dir / PARKED_PATHS_NAME
     parked_paths.touch()
-    claude_worktrees = [
-        child["worktree"] for child in children
-        if child.get("executor") != CODEX and child.get("worktree")
-    ]
-    codex_states = {
-        str(run_dir / CODEX_DIR_NAME / f"{child['ticket']}.json"): str(child["ticket"])
-        for child in children if child.get("executor") == CODEX
-    }
+    claude_groups = {}
+    codex_states = {}
+    for child in children:
+        ticket = str(child.get("ticket"))
+        if child.get("executor") == CODEX:
+            codex_states[str(run_dir / CODEX_DIR_NAME / f"{ticket}.json")] = ticket
+        elif child.get("worktree"):
+            claude_groups.setdefault(bindings.get(ticket), []).append(child["worktree"])
     armed = []
-    if claude_worktrees:
+    for binding, worktrees in claude_groups.items():
         armed.append({
             "lane": CLAUDE,
+            "account": binding,
             "process": spawn([
                 str(MONITOR_WAVE), "--log", str(log),
                 # Its own pid, because the wake-up it holds is readable by this process and no
                 # other: a driver killed outright runs no `disarm`, and a monitor that outlived
                 # one polled for ever, spawning a CLI every poll for nobody.
                 "--driver-pid", str(os.getpid()),
-                str(parked_paths), *claude_worktrees,
-            ]),
+                str(parked_paths), *worktrees,
+            ], environment=accounts.process_environment(binding)),
         })
     if codex_states:
         armed.append({
             "lane": CODEX,
+            # A Codex child's liveness is a bridge state file in the run directory, which no Claude
+            # profile has anything to say about: this lane is account-agnostic and stays one watch.
+            "account": None,
             "tickets": codex_states,
             "process": spawn([sys.executable, str(bridge), "watch", *codex_states]),
         })
@@ -1130,12 +1245,27 @@ def lane_of(child):
     return CODEX if child.get("executor") == CODEX else CLAUDE
 
 
-def spawn(arguments):
-    """Start a wake monitor with its snapshot on a pipe; returns the process."""
+def watch_lane(child, binding):
+    """The identity of the monitor that watches this child: its lane, and the account behind it.
+
+    Two accounts' live sources are disjoint, so two Claude children on different bindings are
+    watched by different monitors — collapsing them to the lane alone would leave one group
+    unwatched every time the other was re-armed. The Codex lane carries no binding.
+    """
+    return (CODEX, None) if child.get("executor") == CODEX else (CLAUDE, binding)
+
+
+def spawn(arguments, environment=None):
+    """Start a wake monitor with its snapshot on a pipe; returns the process.
+
+    `environment` is what `accounts.process_environment` answered for the lane's binding: None
+    where the lane inherits this process's environment as it stands, which is every lane of a
+    single-account run.
+    """
     return subprocess.Popen(
         [str(argument) for argument in arguments],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        start_new_session=True,
+        start_new_session=True, env=environment,
     )
 
 
@@ -1213,8 +1343,8 @@ def clear_tickets(table, records):
 
 
 def clear_launches(records):
-    """The launch records whose paths and ids are authorized for this clear."""
-    launches = []
+    """The last launch per ticket whose paths and ids are authorized for this clear."""
+    launches = {}
     for record in records:
         if record.get("event") != "launch":
             continue
@@ -1223,8 +1353,8 @@ def clear_launches(records):
             raise ClearError(
                 "a launch record lacks " + ", ".join(missing) + "; refusing to guess an artefact"
             )
-        launches.append(record)
-    return launches
+        launches[str(record["ticket"])] = record
+    return list(launches.values())
 
 
 def clear_codex_state_files(run, launches):
@@ -1706,10 +1836,12 @@ def sweep_landed(run_dir):
 def sweep_dead_runs(repo, keep_run_dir):
     """Finish the cleanup every run abandoned in this repo never reached; returns its warnings.
 
-    A hook is dead when the run it writes for names no live coordinator — the same pid judgment
-    the pin registry's own sweep makes, asked of the pid that run recorded. Every problem either
-    step meets is returned as a warning rather than raised: the run about to start is not the place
-    to fail over a run that ended weeks ago.
+    A run is dead when neither of the two processes it can be alive through is: the coordinator it
+    recorded, and the driver it named in its own run directory. The second is why this asks twice
+    — a driver detached from its coordinator's session outlives it by design (#103), and sweeping
+    a run whose driver is still merging its waves would take that run's worktrees out from under
+    it. Every problem either step meets is returned as a warning rather than raised: the run about
+    to start is not the place to fail over a run that ended weeks ago.
 
     The landed artefacts go first, and the hook goes whether or not they went: a hook nobody reads
     costs a python interpreter on every message sent in this repo, which is the burn this sweep
@@ -1737,6 +1869,8 @@ def sweep_dead_runs(repo, keep_run_dir):
             continue
         pid = run_coordinator_pid(run_dir)
         if pid is not None and monitor.alive(pid):
+            continue
+        if monitor.live_driver(run_dir):
             continue
         repo_root = run_repo_root(run_dir)
         if repo_root is not None and repo_root != repo_key:
@@ -1795,6 +1929,11 @@ def run_start(args):
     feature_dir = pathlib.Path(args.feature_dir).resolve()
     if not feature_dir.is_dir():
         raise DriverError(f"{feature_dir} is not a feature directory", pointer=str(feature_dir))
+    run_dir = feature_dir / RUN_DIR_NAME
+    # Taken up before the first step that can fail, so that every way this start can end reaches
+    # the coordinator's waiter: a wake is only written into a run this process has in hand, and a
+    # repository root or a tmux session that cannot be resolved is as much a wake as any other.
+    take_up_run(run_dir)
     # Absolute at the boundary, whatever spelling the caller used: every path recorded here is read
     # again in a child's own worktree, where a relative one names another file or none.
     args.spec = resolved(args.spec)
@@ -1803,7 +1942,6 @@ def run_start(args):
     args.tmux_session = tmux_session(args.tmux_session)
     clear_notice(args.tmux_session)
 
-    run_dir = feature_dir / RUN_DIR_NAME
     # Before anything else this driver does in this repo, and before it can matter whether the run
     # is a fresh one or an adoption: what the runs abandoned here never cleaned up.
     for warning in sweep_dead_runs(repo, run_dir):
@@ -1842,6 +1980,7 @@ def run_start(args):
         repo, base_branch, integration_branch, pull=upstream[0] == UPSTREAM_PRESENT
     )
     run_dir.mkdir(parents=True, exist_ok=True)
+    take_up_run(run_dir)
     launch_dir = run_dir / LAUNCH_DIR_NAME
     log = run_dir / LOG_NAME
     run = run_section(
@@ -1861,7 +2000,6 @@ def run_start(args):
         install_hook(
             log, pathlib.Path(child["worktree"]) / SETTINGS_PATH, "child", child["ticket"]
         )
-    start_dashboard(args, repo, run_dir)
     print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table_path)
 
@@ -1921,7 +2059,12 @@ def dispatch_wave(table, log, launch_dir, run_dir):
 
 
 def start_dashboard(args, repo, run_dir):
-    """Point the operator's dashboard at the run, on whichever surface the repo chose."""
+    """Point the operator's dashboard at the run, on whichever surface the repo chose.
+
+    Idempotent, and run by every driver that takes the run up rather than only by the one that
+    started it: an adopted or resumed run has a live dashboard window and a pin naming it again,
+    which is what makes a recovered run indistinguishable from one that was never interrupted.
+    """
     arguments = [
         sys.executable, MONITOR, "window",
         "--run-dir", run_dir, "--session", args.tmux_session,
@@ -2009,7 +2152,7 @@ def record_ticket(record, launches):
     if not isinstance(recipient, str):
         return None
     for ticket, launch in launches.items():
-        if launch.get("child") == recipient:
+        if recipient and launch.get("child") == recipient:
             return ticket
     return None
 
@@ -2074,7 +2217,7 @@ def awaiting_receipt(records, launches):
         message = record.get("message")
         if record.get("event") == "ruling" and isinstance(message, str) and any(
             message.lstrip().startswith(marker)
-            for marker in (RECHECK_MARKER, NUDGE_MARKER, MERGE_MARKER)
+            for marker in (RECHECK_MARKER, RESEND_MARKER, NUDGE_MARKER, MERGE_MARKER)
         ):
             waiting.add(ticket)
         elif record.get("event") == "receipt":
@@ -2210,23 +2353,9 @@ def report_settlements(records, ticket):
 
 def report_outcome(records, ticket, launched):
     """The one report outcome a ticket settled into, or a clear error if the log has a hole."""
-    settlements = report_settlements(records, ticket)
-    for record in reversed(settlements):
-        if record.get("event") == "outcome" and record.get("outcome") in REPORT_OUTCOMES:
-            return record["outcome"]
-    for record in reversed(settlements):
-        verdict = record.get("verdict")
-        if verdict == PARKED:
-            return PARKED
-        if verdict == FAILED:
-            return FAILED
-        if verdict == LANDABLE and any(
-            record_for_ticket.get("event") == "merge"
-            and record_for_ticket.get("result") in LANDED_RESULTS
-            for record_for_ticket in records
-            if str(record_for_ticket.get("ticket")) == ticket
-        ):
-            return COMPLETED
+    state = machine_log.settlement_state(records, ticket)
+    if state in REPORT_OUTCOMES:
+        return state
     state = "launched" if launched else "not launched"
     raise DriverError(f"ticket {ticket} has no report outcome in the machine log ({state})")
 
@@ -2614,9 +2743,15 @@ class Loop:
         acted = False
         for ticket, (index, record) in sorted(unanswered(records, launches).items()):
             launch = launches.get(ticket)
-            if launch is None:
-                continue
             message = record.get("message") or ""
+            if launch is None:
+                verb, _ = machine_log.final_verb(message)
+                if verb in (COMPLETE_VERB, PARKED_VERB, FAILED_VERB, ESCALATION_VERB):
+                    raise DriverError(
+                        f"ticket {ticket} sent {verb} with no launch record",
+                        ticket=ticket, pointer=str(self.log),
+                    )
+                continue
             if record.get("event") == "escalation":
                 self.hand_over(ticket, launch, message)
             acted = self.rule_on_receipt(ticket, launch, message, records) or acted
@@ -2639,11 +2774,30 @@ class Loop:
         if verb == COMPLETE_VERB:
             self.rule_on_completion(ticket, launch, line, records)
             return True
+        offending = machine_log.malformed_receipt(message)
+        if offending is not None:
+            self.rule_on_malformed(ticket, launch, offending, records)
+            return True
         # Anything else a child says is conversation, not a verdict: the run reads the grammar its
-        # first turn gave it and leaves everything outside it alone. A claim spelled outside that
-        # grammar — a short sha, a verb buried mid-line — is conversation too, and the idle rung
-        # below is what asks such a child for the receipt it thinks it sent.
+        # first turn gave it and leaves everything outside it alone. A message that reached for no
+        # verb at all is conversation, and nothing is owed back for it.
         return False
+
+    def rule_on_malformed(self, ticket, launch, line, records):
+        """Answer a near-miss receipt once; a second one settles the ticket failed. Returns nothing.
+
+        The grammar refuses the line either way — a receipt with prose on it settles nothing, and
+        that stays true. What changes is that the refusal is spoken: the child is told what it sent
+        and what shape the line has to take, on the scripted rung, so the coordinator is not woken
+        for mechanics (ADR-0004, ADR-0015).
+        """
+        launches = launch_records(records)
+        if instructions_sent(records, launches, ticket, RESEND_MARKER):
+            self.settle(ticket, FAILED, f"a second receipt missed the verb grammar: {line}")
+            return
+        self.deliver(ticket, launch, RESEND_TEMPLATE.format(
+            marker=RESEND_MARKER, ticket=ticket, line=line
+        ))
 
     def park(self, ticket, launch, message):
         """Record a parked receipt and put the child's worktree where the monitor reads it."""
@@ -2732,6 +2886,14 @@ class Loop:
         launches = launch_records(records)
         if ticket in awaiting_a_ruling(records, launches):
             return False
+        if instructions_sent(records, launches, ticket, RESEND_MARKER):
+            # The bounce was this ticket's one re-ask, and it named the shape of every verb a
+            # child can send back. Nudging now would ask the same question a second time under
+            # another marker; the ladder is one rung deep whichever way the line went wrong.
+            self.settle(
+                ticket, FAILED, "a bounced receipt was never resent and the child went idle"
+            )
+            return True
         if instructions_sent(records, launches, ticket, NUDGE_MARKER):
             self.settle(ticket, FAILED, "a nudged child went idle again with no receipt sent")
             return True
@@ -2744,9 +2906,9 @@ class Loop:
         """Land the settled wave and launch the next; returns the wave to work, or None when done.
 
         Every rung below the coordinator lives inside this one call — the merge driver classifies a
-        conflict and hands a mechanical one to the budget-capped repair rung, and advance launches
-        the next wave and blocks what a stopped ticket stopped. What comes back is a decision, and
-        only two of them are this loop's to act on.
+        conflict and resolves a mechanical one itself, and advance launches the next wave and
+        blocks what a stopped ticket stopped. What comes back is a decision, and only two of them
+        are this loop's to act on.
         """
         result = subprocess.run(
             [
@@ -2820,10 +2982,10 @@ class Loop:
             )
         # Every reason the chain stopped on is one the rule table already settled, so there is
         # nothing left for this run to launch and nothing for anyone to rule on.
-        self.record_stopped(wave)
+        self.record_stopped(wave, records)
         return None
 
-    def record_stopped(self, wave):
+    def record_stopped(self, wave, records):
         """Put this run's ending into the log, where every surface reads it from; returns nothing.
 
         The `escalated` decision above it cannot carry that meaning: the same word is written when
@@ -2831,6 +2993,26 @@ class Loop:
         line reads as still going — a dashboard redrawing it forever, saying a ruling is owed that
         nobody is waiting for.
         """
+        tickets = wave_advance.every_ticket(self.table)
+        launches = set(launch_records(records))
+        states = {
+            number: machine_log.settlement_state(records, number) for number in tickets
+        }
+        stopping_roots = {
+            number for number, state in states.items() if state in (FAILED, PARKED)
+        }
+        stopped_descendants = set(wave_advance.descendants(tickets, stopping_roots))
+        for number in tickets:
+            if number in launches or states[number] != machine_log.LIVE:
+                continue
+            if number in stopped_descendants:
+                continue
+            raise DriverError(
+                f"stopped refused: ticket {number} is still launchable",
+                ticket=number,
+                pointer=str(self.log),
+            )
+
         run_command(
             [
                 sys.executable, MACHINE_LOG, "--log", self.log, "advance",
@@ -2848,12 +3030,10 @@ class Loop:
         the log says is `landable` and never landed is a merge the ladder could not finish, and
         that is nobody's but the coordinator's.
         """
-        states = settled_states(records)
-        merges = merge_results(records)
         return [
             str(ticket["id"]) for ticket in self.tickets_of(wave)
-            if states.get(str(ticket["id"])) not in (FAILED, PARKED)
-            and merges.get(str(ticket["id"])) not in LANDED_RESULTS
+            if machine_log.settlement_state(records, str(ticket["id"]))
+            not in (COMPLETED, FAILED, PARKED)
         ]
 
     def halt_detail(self, records, result):
@@ -2967,21 +3147,36 @@ class Loop:
     def arm(self, wave, records):
         """Arm a monitor over the wave's live children in every lane that has none; returns nothing.
 
-        Lane by lane, because the two exit independently: a Claude monitor that has fired and been
+        Lane by lane, because they exit independently: a Claude monitor that has fired and been
         settled must be re-armed while the Codex watch beside it is still standing, and re-arming
-        both would leave two watching the same session.
+        both would leave two watching the same session. A lane is its executor *and*, on the
+        Claude side, the account binding it polls under — one wave's two accounts are two lanes,
+        and one settling must not re-arm a second monitor over the other's children.
         """
-        armed = {monitor["lane"] for monitor in self.monitors}
+        bindings = self.bindings()
+        armed = {(monitor["lane"], monitor["account"]) for monitor in self.monitors}
         launches = launch_records(records)
         children = [
             launches[ticket] for ticket in self.live(wave, records)
             if ticket in launches and launches[ticket].get("worktree")
-            and lane_of(launches[ticket]) not in armed
+            and watch_lane(launches[ticket], bindings.get(ticket)) not in armed
         ]
         if children:
             self.monitors += arm_monitors(
-                self.run_dir, self.log, children, self.run["codex"]["bridge"]
+                self.run_dir, self.log, children, self.run["codex"]["bridge"], bindings
             )
+
+    def bindings(self):
+        """The account binding of every ticket of the run, by ticket, from the wave table.
+
+        Read from the table rather than from the launch record: the table is the run's sole
+        routing authority (ADR-0003), and the log's `launch` line records which account paid for
+        a child — an attribution, not the execution semantics a monitor has to reproduce.
+        """
+        return {
+            str(ticket["id"]): accounts.row_binding(ticket)
+            for ticket in dispatch.walk_tickets(self.table)
+        }
 
     def harvest(self):
         """What every monitor that has exited since the last poll reports the children doing.
@@ -3222,6 +3417,7 @@ def wave_loop(args, repo, run_dir, table_path, adopting=False):
     handling: a run that cannot be adopted wakes the coordinator with a snapshot exactly as one
     that cannot be carried on does.
     """
+    start_dashboard(args, repo, run_dir)
     loop = Loop(args, repo, run_dir, table_path)
     resume = resume_command(args)
     try:
@@ -3244,10 +3440,16 @@ def wave_loop(args, repo, run_dir, table_path, adopting=False):
 
 
 def resume_command(args):
-    """The one command that puts the loop back where it left off, for the snapshot to carry."""
+    """The one command that puts the loop back where it left off, for the snapshot to carry.
+
+    The launcher rather than this driver's own `resume`, because every driver of a run belongs in
+    a window of its own and not only the first: a coordinator that put the loop back as a task of
+    its own session would be handing the harness the very process this run must not lose (#103).
+    The pid is passed because it is already known for certain; the name and the mode are left to
+    be read off the harness again, because a mode switched mid-run has to be the current one.
+    """
     return shlex.join([
-        sys.executable, str(pathlib.Path(__file__).resolve()), "resume",
-        "--feature-dir", str(args.feature_dir), "--tmux-session", str(args.tmux_session),
+        sys.executable, str(LAUNCH), str(args.feature_dir),
         "--coordinator-pid", str(args.coordinator_pid),
     ])
 
@@ -3263,6 +3465,7 @@ def run_resume(args):
         )
     repo = repository_root(feature_dir, args.repo_root)
     args.tmux_session = tmux_session(args.tmux_session)
+    take_up_run(run_dir)
     print(f"crew resumed, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table)
 
@@ -3404,6 +3607,13 @@ def main(argv=None):
     except DriverError as error:
         snapshot(DRIVER_ERROR, ticket=error.ticket, pointer=error.pointer, detail=str(error))
         return DRIVER_ERROR_EXIT
+    except KeyboardInterrupt:
+        # The operator's own Ctrl-C in the driver's window: as deliberate an ending as any wake,
+        # so the run is put down and nothing on the dashboard flags it as a driver that was
+        # killed. No wake is written, because nobody asked the coordinator for a ruling.
+        put_down_run()
+        print("crew: the driver was stopped", file=sys.stderr, flush=True)
+        return INTERRUPTED_EXIT
 
 
 if __name__ == "__main__":

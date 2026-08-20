@@ -307,6 +307,31 @@ class WorktreeSweepTests(SweepTestCase):
         self.assertTrue(dead.landed_worktree.exists())
         self.assertIn("dead/landed", self.fixture.branches())
 
+    def test_a_run_whose_driver_outlived_its_coordinator_is_not_swept(self):
+        """Detachment's own consequence (#103): a driver goes on running after the session that
+        started it has gone, and a run it is still merging is as live as any other."""
+        orphaned = SeededRun(self.fixture, "orphaned", dead_pid())
+        (orphaned.run_dir / "driver.pid").write_text(f"{os.getpid()}\n")
+
+        result = self.start_and_end()
+
+        self.assertIn(str(orphaned.log_path), self.hook_logs())
+        self.assertTrue(orphaned.landed_worktree.exists())
+        self.assertIn("orphaned/landed", self.fixture.branches())
+        self.assertNotIn(str(orphaned.run_dir), result.stderr)
+
+    def test_a_run_whose_driver_is_gone_too_is_swept(self):
+        """The record is not a reprieve of its own: it names a process that is not running."""
+        abandoned = SeededRun(self.fixture, "abandoned", dead_pid())
+        (abandoned.run_dir / "driver.pid").write_text(f"{dead_pid()}\n")
+
+        self.start_a_run()
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: str(abandoned.log_path) not in self.hook_logs()),
+            f"the abandoned run's hook was not swept: {self.hook_commands()}",
+        )
+
     def test_a_live_runs_landed_worktree_is_left_where_it_is(self):
         live = SeededRun(self.fixture, "live", os.getpid())
 

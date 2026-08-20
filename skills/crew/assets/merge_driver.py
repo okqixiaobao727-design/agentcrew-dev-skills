@@ -9,25 +9,29 @@ conflicts is classified before anything else happens (ADR-0004):
 
     mechanical  every conflicted path is a content conflict whose every hunk has an empty base
                 section — both sides only inserted at the same point, and neither touched a line
-                the other touched. Nothing about the two designs disagrees, so a budget-capped
-                headless repair session this script launches itself is enough.
+                the other touched. Nothing about the two designs disagrees, so the driver
+                keeps both sides' insertions itself — ours, then theirs, markers removed.
     semantic    anything else: a hunk whose base section is not empty (both sides rewrote the
                 same existing lines), a file both sides created, a file one side deleted and the
                 other changed, or a conflict with no readable markers at all. Two children's
                 designs disagree, and only a ruling settles which one stands.
 
-A mechanical conflict is handed to the repair rung and retried on a second session if the first
-leaves it unresolved. A semantic conflict skips that rung, and a repair double failure exhausts
-it; both abort the merge and record one `escalated` event for the coordinator, carrying the
-pointers a ruling starts from — the ticket's path, its branch, and the conflicted files.
+A mechanical conflict costs no model anything. The budget-capped headless repair session this
+script launches itself is left for the mechanical conflict its own rewrite refuses — a file whose
+markers do not open and close in order, or whose text carries a line that reads as one — and is
+retried on a second session if the first leaves it unresolved. A semantic conflict skips that rung,
+and a repair double failure exhausts it; both abort the merge and record one `escalated` event for
+the coordinator, carrying the pointers a ruling starts from — the ticket's path, its branch, and
+the conflicted files.
 
 The receipts are read from the machine log, and every step is written back to it, so the log is
 both the driver's input and its account of itself. One line per ticket is printed:
 
     07 clean <sha>
-    08 repaired <sha>
-    09 escalated <why>
-    10 skipped failed
+    08 resolved <sha>
+    09 repaired <sha>
+    10 escalated <why>
+    11 skipped failed
 
 Exit 0 when every landable branch landed, 1 when any ticket escalated or the wave could not be
 started.
@@ -45,6 +49,8 @@ import sys
 # convention: the driver merges exactly what the renderer created.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
 import dispatch  # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import accounts  # noqa: E402
 
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent / "machine_log.py"
 
@@ -62,12 +68,13 @@ DEFAULT_REPAIR_ATTEMPTS = 2
 DEFAULT_REPAIR_TIMEOUT_SECONDS = 900.0
 REPAIR_PERMISSION_MODE = "acceptEdits"
 # The account the repair session spends on. Repairing a ticket's conflict is spend that ticket
-# caused, so the session runs on the ticket's own Claude login exactly as its child did — Claude
-# Code scopes login state to this variable, so setting it is what routes that spend. The value is
-# read off the ticket's row, already a profile directory: the wave table is where a ticket's
-# account name stopped being a name (ADR-0014), and this script reads no account registry.
-CONFIG_HOME_ENV_VAR = "CLAUDE_CONFIG_DIR"
-ACCOUNT_KEY = "account"
+# caused, so the session runs on the ticket's own Claude login exactly as its child did. The
+# binding is read off the ticket's row, already resolved: the wave table is where a ticket's
+# account name stopped being a name (ADR-0014), and this script reads no account registry. Which
+# environment that binding is — one variable set, or nothing touched — is the account module's
+# answer, not this script's.
+CONFIG_HOME_ENV_VAR = accounts.CONFIG_HOME_VARIABLE
+ACCOUNT_KEY = accounts.ACCOUNT_KEY
 
 # The conflict markers, in the style the merge is run under: `diff3` keeps the base section, and
 # whether that section is empty is the whole of the mechanical/semantic test.
@@ -79,6 +86,12 @@ THEIRS_MARKER = ">>>>>>>"
 
 MECHANICAL = "mechanical"
 SEMANTIC = "semantic"
+
+# The merge results this script writes, in the machine log's closed vocabulary. `resolved` is the
+# driver's own deterministic resolution and `repaired` a session's, and they are separate words
+# because a log that spells them alike cannot say which merges cost a model anything.
+RESOLVED = "resolved"
+REPAIRED = "repaired"
 
 
 class WaveError(Exception):
@@ -246,6 +259,89 @@ def classify(repo, stages):
     return MECHANICAL, "both sides only inserted at the same point"
 
 
+# --- the driver's own resolution ---------------------------------------------------------------
+
+
+def resolve_insertions(text):
+    """`text` with every hunk rewritten as ours then theirs, or None where it cannot be.
+
+    This is the resolution a mechanical classification already proved correct: both sides only
+    inserted at the same point, so keeping both insertions in a fixed order loses nothing and
+    decides nothing. The base section is dropped, which on a mechanical conflict is empty anyway.
+
+    None is a file this cannot rewrite: markers that do not open and close in order, a file with no
+    hunk at all, or one whose own text carries a line that reads as a marker — the same ambiguity
+    the driver already refuses to commit through, since `=======` is also how prose underlines a
+    heading. That is a stricter reading than the classifier's, which is why this scans the file
+    again rather than sharing that one: a conflict can be mechanical and still be one this will not
+    rewrite, and the rung below exists for exactly that file.
+    """
+    kept, ours, theirs = [], [], []
+    # Which section of a hunk this line is in: None outside a hunk at all, and the base section's
+    # lines are the ones nothing keeps.
+    section = None
+    saw_hunk = False
+    # `split` rather than `splitlines`: the final element is whatever followed the last newline,
+    # so joining it back restores the file's ending exactly as it was.
+    for line in text.split("\n"):
+        found = marker(line)
+        if section is None:
+            if found == OURS_MARKER:
+                section, saw_hunk = "ours", True
+                ours, theirs = [], []
+            else:
+                kept.append(line)
+            continue
+        if found == OURS_MARKER:
+            return None
+        if found == BASE_MARKER:
+            if section != "ours":
+                return None
+            section = "base"
+        elif found == SPLIT_MARKER:
+            if section == "theirs":
+                return None
+            section = "theirs"
+        elif found == THEIRS_MARKER:
+            if section != "theirs":
+                return None
+            kept.extend(ours)
+            kept.extend(theirs)
+            section = None
+        elif section == "ours":
+            ours.append(line)
+        elif section == "theirs":
+            theirs.append(line)
+    if section is not None or not saw_hunk:
+        return None
+    settled = "\n".join(kept)
+    return None if markers_standing(settled) else settled
+
+
+def keep_both_insertions(repo, paths):
+    """Rewrite and stage every conflicted path as ours then theirs; returns whether it did.
+
+    All or nothing: nothing is written until every path has been rewritten, so a file this cannot
+    rewrite leaves the whole conflict standing exactly as git wrote it, which is what the rung
+    below has to be handed.
+    """
+    rewritten = {}
+    for path in paths:
+        file = pathlib.Path(repo) / path
+        try:
+            text = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        settled = resolve_insertions(text)
+        if settled is None:
+            return False
+        rewritten[file] = settled
+    for file, settled in rewritten.items():
+        file.write_text(settled, encoding="utf-8")
+    git_or_raise(repo, "add", "--", *paths)
+    return True
+
+
 # --- the repair rung ---------------------------------------------------------------------------
 
 
@@ -282,19 +378,18 @@ def repair_command(model, budget, prompt):
     ]
 
 
-def repair_env(account):
-    """This script's environment with the ticket's account in it, for the session it launches."""
-    environment = dict(os.environ)
-    environment[CONFIG_HOME_ENV_VAR] = str(account)
-    return environment
+def run_repair(repo, command, timeout, binding):
+    """Whether the repair session exited cleanly; a session that overruns its time has not.
 
-
-def run_repair(repo, command, timeout, account):
-    """Whether the repair session exited cleanly; a session that overruns its time has not."""
+    The session is launched in the binding's own environment: the named account's configuration
+    home where the ticket named one, and this script's own environment untouched where it did not
+    — a default home spelled out explicitly is a login that may fail where the inherited one
+    works (#110).
+    """
     try:
         result = subprocess.run(
             command, cwd=str(repo), capture_output=True, text=True, timeout=timeout,
-            env=repair_env(account),
+            env=accounts.process_environment(binding),
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -335,7 +430,7 @@ def strayed_outside(before, after, allowed):
     )
 
 
-def repair_attempt(repo, paths, command, timeout, baseline, account):
+def repair_attempt(repo, paths, command, timeout, baseline, binding):
     """Run one repair session and stage what it left; returns None, or why it did not settle it.
 
     The session edits files and nothing else — staging is done here, so the session needs no
@@ -345,7 +440,7 @@ def repair_attempt(repo, paths, command, timeout, baseline, account):
     puts tracked files back but leaves a stray untracked file standing, and a second session must
     not inherit the first one's mess as the state it is measured against.
     """
-    if not run_repair(repo, command, timeout, account):
+    if not run_repair(repo, command, timeout, binding):
         return "the repair session did not finish"
     strays = strayed_outside(baseline, working_state(repo), set(paths))
     if strays:
@@ -421,8 +516,19 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
     if classification == SEMANTIC:
         return None, reason
 
-    account = ticket.get(ACCOUNT_KEY)
-    if not account:
+    # The classification has already proved both sides only inserted, which is the whole of what
+    # the repair brief used to ask a model to do. Doing it here spends nothing and cannot wander,
+    # so the session below is left for the conflict this cannot rewrite.
+    if keep_both_insertions(repo, paths):
+        # The commit refuses while any path is still unmerged, so it is also the check that every
+        # conflict this claims to have settled really is settled.
+        git_or_raise(repo, "commit", "--no-edit")
+        sha = git_or_raise(repo, "rev-parse", "HEAD")
+        record(RESOLVED, sha=sha, detail=f"kept both sides' insertions in {', '.join(paths)}")
+        return f"{ticket['id']} {RESOLVED} {sha}", None
+
+    binding = accounts.row_binding(ticket)
+    if binding is None:
         # Every row of a validated wave table carries the account its ticket's processes run on,
         # so a row without one is a table this ladder cannot spend against. Falling back to
         # whichever account this script happens to be running under is forbidden: a repair billed
@@ -443,16 +549,16 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
             git_or_raise(repo, "merge", "--abort")
             start_merge(repo, branch)
         failure = repair_attempt(
-            repo, paths, command, options["repair_timeout"], baseline, account
+            repo, paths, command, options["repair_timeout"], baseline, binding
         )
         if failure is None:
             git_or_raise(repo, "commit", "--no-edit")
             sha = git_or_raise(repo, "rev-parse", "HEAD")
             record(
-                "repaired", sha=sha,
+                REPAIRED, sha=sha,
                 detail=f"repair session {attempt} of {attempts} resolved {', '.join(paths)}",
             )
-            return f"{ticket['id']} repaired {sha}", None
+            return f"{ticket['id']} {REPAIRED} {sha}", None
     return None, f"{attempts} repair sessions left the conflict standing: {failure}"
 
 
