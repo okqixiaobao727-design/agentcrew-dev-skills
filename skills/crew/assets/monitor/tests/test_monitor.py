@@ -22,6 +22,8 @@ import unittest
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 MONITOR = TESTS_DIR.parent / "monitor.py"
+# The sibling module the monitor reads an account binding through; part of every release of it.
+ACCOUNTS = TESTS_DIR.parents[1] / "accounts.py"
 # The review lane the dashboard's annotation is drawn from, written by this bridge and no fixture.
 REVIEW_BRIDGE = TESTS_DIR.parents[1] / "review" / "scripts" / "claude_review_bridge.py"
 
@@ -43,6 +45,12 @@ RULED_ELAPSED = "00:47:53"
 BLOCKED_DETAIL = "semantic: both sides rewrote the same lines of driver.py"
 # The marker the summary line carries while a wave is halted on the coordinator's ruling.
 AWAITING_RULING = "⚠ awaiting your ruling"
+# What the same slot carries instead when the run's driver was killed rather than exiting: the
+# run directory's own parent, which is what the operator typed `/crew` with.
+DRIVER_DEAD = "✖ driver dead — /crew {run} to resume"
+# The SGR red the dead-driver segment is painted in, and the reset that ends it.
+RED = "\x1b[31m"
+RESET = "\x1b[0m"
 # The rework instruction the driver sends a child whose merge escalated on a semantic conflict,
 # opening with the marker the driver's merge rung is read back out of the log by. A child holding
 # this is working, not stuck, which is what the `reworking` state says.
@@ -58,6 +66,10 @@ SETTLING_WIDTH = len("settling")
 # A window wide enough to hold that summary line and the blocked row's annotation whole, so a
 # halted frame is read rather than measured.
 HALTED_COLUMNS = 120
+# Wider still, because the dead-driver banner names a run directory and a temporary one is long;
+# and a window too narrow to hold that banner at all, which is where it is cut away.
+BANNER_COLUMNS = 240
+NARROW_COLUMNS = 60
 
 # The refresh the tests that watch the dashboard's loop run it at, and how they wait on it. One
 # frame of this fixture costs a quarter of a second or more — every draw spawns the stub `claude`
@@ -104,6 +116,9 @@ WINDOW_RECORD = "dashboard-window"
 COORDINATOR_PID = 4242
 # The file the dashboard and the pin both dedup toasts through, in the run directory.
 TOAST_STATE = "toasts.json"
+# The run directory's record of the driver driving it: written when its loop starts, removed by
+# every deliberate exit, and left standing by a kill.
+DRIVER_RECORD = "driver.pid"
 
 # What the executor column shows for each lane of this run, and what a row with no clock shows.
 CLAUDE_LANE = f"claude/{MODEL}"
@@ -227,6 +242,10 @@ class Fixture:
         # elsewhere keeps its sessions and fallback answer in. Nothing resolves a registry here —
         # the wave table carries the profile directory itself, already resolved.
         self.claude_home_b = self.root / "claude-config-b"
+        # The login the dashboard process is started under. The coordinator's own, which is what
+        # a ticket bound to an inherited account is read in — a case that needs the two to differ
+        # moves this one.
+        self.caller_home = self.claude_home
 
         # The operator's own Claude Code wiring the installer edits: the settings file, the
         # statusline script it already points at, and the wrapper the installer writes. All three
@@ -272,9 +291,11 @@ class Fixture:
         """The approved wave table: every ticket of every wave, in the schema dispatch reads.
 
         `accounts` names the profile directory a ticket runs under, for the tickets that run
-        somewhere other than the coordinator's own. Every row carries an `account` either way:
-        the driver resolves the key for every ticket as it builds the table, so a table the
-        dashboard reads never has the question left open on it.
+        somewhere other than the coordinator's own. Every row carries an account binding either
+        way: the driver resolves the key for every ticket as it builds the table, so a table the
+        dashboard reads never has the question left open on it. A ticket named here named an
+        account, so its binding is explicit; every other row is the ordinary one — the
+        coordinator's own home, inherited (ADR-0014).
         """
         accounts = accounts or {}
         self.table_path.write_text(json.dumps({
@@ -296,6 +317,7 @@ class Fixture:
                             "model": MODELS[ticket],
                             "effort": "medium",
                             "account": str(accounts.get(ticket, self.claude_home)),
+                            "account_mode": "explicit" if ticket in accounts else "inherited",
                         }
                         for ticket in tickets
                     ],
@@ -305,7 +327,7 @@ class Fixture:
         }))
 
     def drop_accounts(self):
-        """Take the `account` key off every row — the table a release before accounts wrote.
+        """Take the account keys off every row — the table a release before accounts wrote.
 
         A run interrupted under that release and resumed under this one hands the dashboard such
         a table, and it is drawn from the configured home exactly as it was drawn then.
@@ -314,6 +336,7 @@ class Fixture:
         for wave in table["waves"]:
             for entry in wave["tickets"]:
                 entry.pop("account", None)
+                entry.pop("account_mode", None)
         self.table_path.write_text(json.dumps(table))
 
     def worktree(self, ticket, commits=1):
@@ -630,16 +653,33 @@ class Fixture:
         path.write_text(json.dumps(pin))
         return path
 
+    def driver_record(self, pid=None, run_dir=None):
+        """The run directory's record of the driver driving it, as the driver writes its own.
+
+        A pid given as `None` is this process's, which is the live driver every ordinary frame is
+        drawn under; a run whose driver exited deliberately has no record at all.
+        """
+        run_dir = self.run_dir if run_dir is None else pathlib.Path(run_dir)
+        path = run_dir / DRIVER_RECORD
+        path.write_text(f"{os.getpid() if pid is None else pid}\n")
+        return path
+
     def release_copy(self, name):
-        """A second copy of this release's monitor under `name` — the upgrade simulation's X.
+        """A second copy of this release under `name` — the upgrade simulation's release X.
+
+        The asset tree's shape, not one file: the monitor reads its sibling account module for
+        what a row's account binding is, so a copy that was only `monitor.py` would be a release
+        no operator ever installed. `<name>/` is therefore the whole of that release, and taking
+        it away afterwards takes the release away.
 
         An install run from it records nothing about where it is, so the copy can be taken away
         afterwards and the pin a later release writes still draws.
         """
-        directory = self.root / name
+        directory = self.root / name / MONITOR.parent.name
         directory.mkdir(parents=True, exist_ok=True)
         copy = directory / MONITOR.name
         shutil.copy2(str(MONITOR), str(copy))
+        shutil.copy2(str(ACCOUNTS), str(directory.parent / ACCOUNTS.name))
         return copy
 
     def dead_pid(self):
@@ -671,7 +711,9 @@ class Fixture:
         # An operator who turned colour off everywhere is not what these frames are drawn under:
         # the one case that asks for it puts it back.
         environment.pop("NO_COLOR", None)
-        environment["CLAUDE_CONFIG_DIR"] = str(self.claude_home)
+        # The login the dashboard process itself was started under, which is what a ticket bound
+        # to an inherited account is read in. The coordinator's own home unless a case moves it.
+        environment["CLAUDE_CONFIG_DIR"] = str(self.caller_home)
         environment["CODEX_HOME"] = str(self.codex_home)
         # tmux exports its socket, its client pid and the session id into every session it runs,
         # which is where the pin reads the caller's own session from. Set here rather than
@@ -1753,6 +1795,141 @@ class AliasedPathTests(MonitorTestCase):
         self.assertIn("↳ anomaly: duplicate", result.stdout)
 
 
+class DriverLivenessTests(MonitorTestCase):
+    """What the frame says about the process that is supposed to be advancing the run.
+
+    The driver runs detached from the coordinator's session now, so nothing the coordinator sees
+    can tell that it died — and a run whose driver is gone renders `waiting` forever unless the
+    frame says otherwise. The whole protocol is the run directory's `driver.pid`: a deliberate
+    exit removes it, a kill cannot, so a record naming a process that is not running is a killed
+    driver by construction.
+    """
+
+    def live_run(self):
+        """A run of two launched, busy children and one wave nobody has reached yet.
+
+        Drawn in a window wide enough to hold the banner whole, because the banner names a
+        directory and a temporary one is long: what these tests read is the sentence, never the
+        width it happened to be cut to.
+        """
+        self.fixture.columns = BANNER_COLUMNS
+        self.fixture.table()
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+    def banner(self):
+        """The segment the operator is meant to paste back, for this fixture's run.
+
+        The directory is the one the run directory resolves under (ADR-0007), which on this
+        platform is not always the one a temporary directory was handed out as.
+        """
+        return DRIVER_DEAD.format(run=self.fixture.run_dir.resolve().parent)
+
+    def summary_line(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return frame(result.stdout).splitlines()[0]
+
+    def test_a_record_naming_a_process_that_is_gone_says_the_driver_is_dead(self):
+        """The stall this exists for: the pid was never blanked, so the driver was killed."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    def test_the_dead_driver_banner_carries_the_command_that_resumes_the_run(self):
+        """Recovery is one paste: the directory the operator typed `/crew` with, absolutely."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(f"/crew {self.fixture.run_dir.resolve().parent} to resume", line)
+
+    def test_a_blanked_record_says_nothing_at_all(self):
+        """Every deliberate exit removes the record, so an awaited ruling is not a disaster."""
+        self.live_run()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("driver dead", line)
+
+    def test_a_record_naming_a_live_process_says_nothing_at_all(self):
+        self.live_run()
+        self.fixture.driver_record()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("driver dead", line)
+
+    def test_a_record_that_is_not_a_pid_says_nothing_at_all(self):
+        """A file nothing can be judged from is not a judgment: the frame stays as it was."""
+        self.live_run()
+        (self.fixture.run_dir / DRIVER_RECORD).write_text("not a pid\n")
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("driver dead", line)
+
+    def test_a_halted_wave_and_a_dead_driver_never_render_together(self):
+        """One slot, and the dead driver owns it: an orphaned run is not an awaited ruling."""
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+        self.assertNotIn(AWAITING_RULING, line)
+
+    def test_the_statusline_tick_carries_the_same_banner(self):
+        """The dashboard the operator actually watches during a stall is the pinned one."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        line = self.summary_line(self.fixture.pin_frame("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    def test_the_banner_is_painted_red_where_a_terminal_can_show_it(self):
+        """The one segment of the summary line that is coloured, and only ever whole."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{RED}{self.banner()}{RESET}", result.stdout.splitlines()[0])
+
+    def test_a_banner_the_window_cut_leaves_no_escape_behind(self):
+        """A frame narrower than the banner drops it rather than painting half of one."""
+        self.live_run()
+        self.fixture.columns = NARROW_COLUMNS
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(RED, result.stdout.splitlines()[0])
+
+    def test_the_tick_does_nothing_about_a_dead_driver_but_say_so(self):
+        """#87: the render path is a reader. Nothing here respawns, cleans up or repins."""
+        self.live_run()
+        record = self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        self.fixture.pin_frame("--no-color")
+
+        self.assertTrue(record.exists(), "the tick removed the run's driver record")
+
+
 class PinTests(MonitorTestCase):
     """One statusline tick: find the live run through the pin registry, and draw it or nothing.
 
@@ -2581,6 +2758,32 @@ class MultiAccountTests(MonitorTestCase):
 
         self.assertEqual(self.fixture.claude_call_homes(), [str(self.fixture.claude_home_b)])
         self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+
+    def test_an_inherited_bindings_fallback_asks_the_login_the_tick_was_started_under(self):
+        """A ticket that named no account is asked of the environment, not of a spelled-out home.
+
+        The two are pulled apart here: the tick is started on a third profile, and the inherited
+        ticket's fallback CLI is spawned there rather than under the directory its row carries.
+        That is what "inherited" means everywhere else in the run too — the child, the reviewer
+        and the repair session all take the login they were started with (#110). The primary
+        source is a directory rather than a login and is unmoved by any of it: the row's own
+        `<account>/sessions/`, which is why this case has to reach the fallback to see anything.
+        """
+        self.mixed_wave()
+        operators_own = self.fixture.root / "claude-config-c"
+        self.fixture.caller_home = operators_own
+        self.fixture.codex_state("07")
+        self.fixture.command_agents({"06": "busy"}, home=operators_own)
+        self.fixture.command_agents({"08": "waiting"}, home=self.fixture.claude_home_b)
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.claude_call_homes(),
+                         [str(operators_own), str(self.fixture.claude_home_b)])
+        self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+                      result.stdout)
+        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
                       result.stdout)
 
     def test_a_wave_table_from_before_accounts_is_drawn_from_the_configured_home(self):
@@ -3850,7 +4053,7 @@ class PinWrapperTests(MonitorTestCase):
         self.live_run()
         release_x = self.fixture.release_copy("release-x")
         self.install(monitor=release_x)
-        shutil.rmtree(release_x.parent)
+        shutil.rmtree(release_x.parents[1])
         self.fixture.window(
             "--config", self.fixture.config("pin"), "--coordinator-pid", os.getpid(),
         )

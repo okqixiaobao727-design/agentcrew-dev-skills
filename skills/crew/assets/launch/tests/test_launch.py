@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Drive the launch script from its command line against a stand-in harness home and driver.
+"""Drive the launch script from its command line against a stand-in harness home, tmux and driver.
 
 The fixture is the harness's own two records and nothing else: a per-pid session registry entry
 under `sessions/`, and a session transcript under `projects/`, both inside a temporary directory
 the script is pointed at through `CLAUDE_CONFIG_DIR` — the environment override the driver and
-monitor suites already inject their harness home with. Assertions are on external behavior only:
-the exit code, stdout and stderr, and the command line the stub driver recorded.
+monitor suites already inject their harness home with. The stub tmux really runs the window it is
+asked for, in a session of its own, because a driver that outlives the process that launched it is
+the whole of what this script now does. Assertions are on external behavior only: the exit code,
+stdout and stderr, the command line the stub driver recorded, and the files the run directory
+holds.
 """
 
 import json
@@ -15,13 +18,26 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 LAUNCH = TESTS_DIR.parent / "launch.py"
 STUB_DRIVER = TESTS_DIR / "stub_driver.py"
+STUB_TMUX = TESTS_DIR / "stub_tmux.py"
 STUB_STDOUT = "stub driver ran\n"
+# The window the driver is put in, and the tmux session the stub server answers with.
+DRIVER_WINDOW = "crew-driver"
+TMUX_SESSION = "$9"
+# The three files this end of the run reads and writes in the run directory.
+DRIVER_RECORD = "driver.pid"
+WAKE_NAME = "wake.json"
+DRIVER_LOG = "driver.log"
+# The wake the stub driver ends on unless a test names another, and how long a launch is given
+# before it is called hung.
+DEFAULT_WAKE = {"reason": "run-complete", "ticket": None, "pointer": "report.md"}
+LAUNCH_TIMEOUT = 60.0
 
 # What the harness's records hold for the coordinator this fixture stands for.
 COORDINATOR_NAME = "crew-coordinator-1f"
@@ -50,9 +66,75 @@ class Fixture:
         self.stub_dir.mkdir()
         self.run_dir = self.root / "crewtask" / "7"
         self.run_dir.mkdir(parents=True)
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self._link_stub("tmux", STUB_TMUX)
+        (self.stub_dir / "tmux-session").write_text(TMUX_SESSION)
+        self.started = []
+
+    def _link_stub(self, name, script):
+        target = self.bin_dir / name
+        target.write_text("#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, script))
+        target.chmod(0o755)
 
     def close(self):
+        for process in self.started:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
         shutil.rmtree(self.root, ignore_errors=True)
+
+    # --- what the run directory holds -----------------------------------------------------
+
+    @property
+    def crew_dir(self):
+        """The run's own directory inside the feature, which the launcher makes."""
+        return self.run_dir / ".crew"
+
+    def recorded_driver(self):
+        """The pid the run directory names as its driver, or None where it names none."""
+        path = self.crew_dir / DRIVER_RECORD
+        return int(path.read_text().strip()) if path.exists() else None
+
+    def wake(self, snapshot):
+        """Leave a wake snapshot in the run directory, as a driver's deliberate exit does.
+
+        Put in place by rename, as the driver puts it, so a waiter polling for it never reads
+        half of one.
+        """
+        self.crew_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.crew_dir / f"{WAKE_NAME}.tmp"
+        temporary.write_text(json.dumps(snapshot) + "\n")
+        os.replace(temporary, self.crew_dir / WAKE_NAME)
+
+    def record_driver(self, pid):
+        """Name a process as this run's driver, as a driver's loop names itself."""
+        self.crew_dir.mkdir(parents=True, exist_ok=True)
+        (self.crew_dir / DRIVER_RECORD).write_text(f"{pid}\n")
+
+    def dead_pid(self):
+        """A pid that has certainly gone: a process this fixture started and then reaped."""
+        process = subprocess.Popen([sys.executable, "-c", ""])
+        process.wait()
+        return process.pid
+
+    def wait_for(self, condition, timeout=LAUNCH_TIMEOUT):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def tmux_calls(self):
+        path = self.stub_dir / "tmux-calls.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+    def windows(self):
+        """Every window the stub tmux server was asked to open."""
+        return [call for call in self.tmux_calls() if call["argv"][:1] == ["new-window"]]
 
     # --- the harness's own records --------------------------------------------------------
 
@@ -99,9 +181,12 @@ class Fixture:
 
     def environment(self, overrides=None):
         environment = dict(os.environ)
+        environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["CLAUDE_CONFIG_DIR"] = str(self.config_dir)
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
-        environment.pop("AGENTCREW_STUB_DRIVER_EXIT", None)
+        for name in list(environment):
+            if name.startswith("AGENTCREW_STUB_DRIVER_"):
+                del environment[name]
         environment.update(overrides or {})
         return environment
 
@@ -114,9 +199,18 @@ class Fixture:
     def launch(self, extra=(), env_overrides=None):
         """Run the launcher as a direct child, so this process is the invoking shell's stand-in."""
         return subprocess.run(
-            self.argv(extra), capture_output=True, text=True,
+            self.argv(extra), capture_output=True, text=True, timeout=LAUNCH_TIMEOUT,
             env=self.environment(env_overrides), cwd=str(self.root),
         )
+
+    def start_launch(self, extra=(), env_overrides=None):
+        """Start the launcher and leave it waiting; returns the waiter still blocked on its run."""
+        process = subprocess.Popen(
+            self.argv(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.environment(env_overrides), cwd=str(self.root),
+        )
+        self.started.append(process)
+        return process
 
     def launch_below_a_shell(self, extra=()):
         """Run the launcher one process further down, as a real shell puts it below the session.
@@ -157,6 +251,12 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(len(calls), 1, calls)
         return calls[0]
 
+    def one_window(self):
+        """The single tmux window this launch opened, which is the driver's own."""
+        windows = self.fixture.windows()
+        self.assertEqual(len(windows), 1, windows)
+        return windows[0]["argv"]
+
     # --- the three resolved values --------------------------------------------------------
 
     def test_the_composed_command_line_carries_the_resolved_pid_name_and_mode(self):
@@ -172,8 +272,8 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(flag(call["argv"], "--coordinator-pid"), str(os.getpid()))
         self.assertEqual(flag(call["argv"], "--coordinator-name"), COORDINATOR_NAME)
         self.assertEqual(flag(call["argv"], "--permission-mode"), PERMISSION_MODE)
-        # The driver's own output is what the coordinator reads, and this launch adds nothing to it.
-        self.assertEqual(result.stdout, STUB_STDOUT)
+        # The driver's own wake is what the coordinator reads, and this waiter adds nothing to it.
+        self.assertEqual(json.loads(result.stdout), DEFAULT_WAKE)
 
     def test_the_coordinator_is_found_above_the_shell_the_command_ran_in(self):
         """The pid is the session's, not the shell's: a walk up the ancestry finds the entry."""
@@ -320,15 +420,237 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(flag(call["argv"], "--feature-dir"), str(self.fixture.run_dir))
         self.assertEqual(table.read_bytes(), recorded)
 
-    def test_the_drivers_exit_code_is_the_launchers(self):
-        """The coordinator reads the driver's outcome, so nothing may swallow or rewrite it."""
+    def test_a_driver_that_failed_still_wakes_the_coordinator_with_its_own_snapshot(self):
+        """The outcome is the snapshot's own, not an exit code: the driver's exit is its window's.
+
+        A waiter that reported the driver's status instead would be reporting the status of a
+        process it does not have and cannot wait on.
+        """
+        self.fixture.registry(os.getpid())
+        self.fixture.transcript([PERMISSION_MODE])
+        failed = {"reason": "driver-error", "ticket": "01", "detail": "something outside the table"}
+
+        result = self.fixture.launch(env_overrides={
+            "AGENTCREW_STUB_DRIVER_EXIT": "2",
+            "AGENTCREW_STUB_DRIVER_WAKE": json.dumps(failed),
+        })
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), failed)
+
+
+class DetachmentTests(unittest.TestCase):
+    """The driver belongs to its own window, and this process is a waiter that costs nothing.
+
+    A driver held as a background task of the coordinator's session was killed by the harness's
+    own task management 45 minutes into a live run, with no user input and no model turn, and the
+    run stalled for forty minutes (#103). Nothing here may depend on the launching process, or on
+    the session it was launched from, living any longer than it happens to.
+    """
+
+    def setUp(self):
+        self.fixture = Fixture()
+        self.addCleanup(self.fixture.close)
         self.fixture.registry(os.getpid())
         self.fixture.transcript([PERMISSION_MODE])
 
-        result = self.fixture.launch(env_overrides={"AGENTCREW_STUB_DRIVER_EXIT": "1"})
+    def wake(self, process, timeout=LAUNCH_TIMEOUT):
+        """The snapshot that waiter printed, once it has ended of its own accord."""
+        out, err = process.communicate(timeout=timeout)
+        self.assertEqual(process.returncode, 0, err)
+        return json.loads(out)
 
-        self.assertEqual(result.returncode, 1)
+    # --- the window the driver runs in ----------------------------------------------------
+
+    def test_the_driver_runs_in_a_detached_window_of_the_callers_own_session(self):
+        result = self.fixture.launch()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        windows = self.fixture.windows()
+        self.assertEqual(len(windows), 1, windows)
+        argv = windows[0]["argv"]
+        self.assertIn("-d", argv)
+        self.assertEqual(flag(argv, "-n"), DRIVER_WINDOW)
+        self.assertEqual(flag(argv, "-t"), TMUX_SESSION)
+
+    def test_the_driver_is_told_the_session_its_own_window_is_in(self):
+        """One session holds the driver's window, the dashboard's, and every child's."""
+        result = self.fixture.launch()
+
+        call = self.fixture.driver_calls()[0]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(flag(call["argv"], "--tmux-session"), TMUX_SESSION)
+
+    def test_the_drivers_output_is_kept_in_the_run_directory(self):
+        """No task output file collects it any more, so a driver that dies leaves a trail."""
+        result = self.fixture.launch()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            self.fixture.wait_for(lambda: (self.fixture.crew_dir / DRIVER_LOG).exists()),
+            "the driver's window kept no log",
+        )
+        self.assertIn(STUB_STDOUT.strip(), (self.fixture.crew_dir / DRIVER_LOG).read_text())
+
+    def test_a_session_tmux_cannot_name_is_a_launch_failure_and_nothing_is_started(self):
+        (self.fixture.stub_dir / "tmux-no-session").write_text("")
+
+        result = self.fixture.launch()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tmux session", result.stderr)
+        self.assertEqual(self.fixture.driver_calls(), [])
+
+    def test_a_window_tmux_refuses_is_a_launch_failure(self):
+        (self.fixture.stub_dir / "tmux-new-window-fails").write_text("")
+
+        result = self.fixture.launch()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("window", result.stderr)
+
+    def test_a_driver_that_never_names_itself_is_a_failure_pointing_at_its_log(self):
+        """A launch is only over when the run has a driver, and the log is where to read why."""
+        inert = self.fixture.root / "inert.py"
+        inert.write_text("raise SystemExit(1)\n")
+
+        result = self.fixture.launch(
+            extra=["--driver", str(inert)],
+            env_overrides={"CREW_LAUNCH_HANDSHAKE_SECONDS": "1"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the driver never started", result.stderr)
+        self.assertIn(DRIVER_LOG, result.stderr)
+
+    # --- the driver outliving what launched it ---------------------------------------------
+
+    def test_the_driver_survives_the_process_that_launched_it(self):
+        """The whole ticket in one test: kill the launcher, and the run carries on to its end."""
+        waiter = self.fixture.start_launch(env_overrides={"AGENTCREW_STUB_DRIVER_HOLD": "3"})
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.recorded_driver() is not None),
+            "the driver never named itself",
+        )
+
+        waiter.kill()
+        waiter.communicate()
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: (self.fixture.crew_dir / WAKE_NAME).exists()),
+            "the driver died with the process that launched it",
+        )
+
+    def test_a_waiter_killed_and_re_created_loses_nothing(self):
+        """A waiter is stateless, so re-typing the command is the whole of the recovery."""
+        first = self.fixture.start_launch(env_overrides={"AGENTCREW_STUB_DRIVER_HOLD": "3"})
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.recorded_driver() is not None),
+            "the driver never named itself",
+        )
+        first.kill()
+        first.communicate()
+
+        second = self.fixture.start_launch()
+
+        self.assertEqual(self.wake(second), DEFAULT_WAKE)
+        self.assertEqual(len(self.fixture.driver_calls()), 1, "a second driver was started")
+
+    def test_a_waiter_surfaces_a_snapshot_written_after_it_started(self):
+        self.fixture.record_driver(os.getpid())
+
+        waiter = self.fixture.start_launch()
+        self.assertFalse(
+            self.fixture.wait_for(lambda: waiter.poll() is not None, timeout=2.0),
+            "the waiter ended before the run had anything to say",
+        )
+        self.fixture.wake({"reason": "judgment-needed", "ticket": "04"})
+
+        self.assertEqual(self.wake(waiter)["ticket"], "04")
+
+    # --- adopt: one run, one driver ---------------------------------------------------------
+
+    def test_a_second_command_on_a_live_run_attaches_without_starting_a_second_driver(self):
+        """`/crew` stays safe to type at any moment, which is what adopt has always meant."""
+        self.fixture.record_driver(os.getpid())
+
+        waiter = self.fixture.start_launch()
+        self.fixture.wake(DEFAULT_WAKE)
+
+        self.assertEqual(self.wake(waiter), DEFAULT_WAKE)
+        self.assertEqual(self.fixture.driver_calls(), [], "a live run was driven twice")
+        self.assertEqual(self.fixture.windows(), [])
+
+    def test_a_run_whose_driver_has_gone_is_driven_again(self):
+        """The record names a process that is not running, which is a run with no driver."""
+        self.fixture.record_driver(self.fixture.dead_pid())
+
+        result = self.fixture.launch()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.fixture.driver_calls()), 1)
+
+    def test_the_wake_of_the_cycle_just_ended_is_not_answered_as_this_ones(self):
+        """A snapshot already ruled on would send the coordinator round the same loop again."""
+        self.fixture.wake({"reason": "judgment-needed", "ticket": "99"})
+
+        result = self.fixture.launch()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), DEFAULT_WAKE)
+
+    def test_a_wake_already_standing_on_a_live_run_is_answered_rather_than_thrown_away(self):
+        """Nothing is cleared on the attach path: the driver alive there is still writing it."""
+        self.fixture.record_driver(os.getpid())
+        self.fixture.wake({"reason": "judgment-needed", "ticket": "04"})
+
+        result = self.fixture.launch()
+
+        self.assertEqual(json.loads(result.stdout)["ticket"], "04")
+
+    # --- the two endings that are not snapshots ---------------------------------------------
+
+    def test_a_driver_killed_under_the_waiter_is_said_rather_than_waited_on_forever(self):
+        """The stall this ticket is about, seen from the coordinator's end: a driver that was
+        killed left no wake, and a waiter that blocked on one would be the old forty minutes.
+
+        The driver here is a process that does nothing but exist, named as this run's — attached
+        to, because it is alive, and then killed under the waiter with nothing run on its way out.
+        """
+        standing = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        self.addCleanup(standing.wait)
+        self.addCleanup(standing.kill)
+        self.fixture.record_driver(standing.pid)
+        waiter = self.fixture.start_launch()
+        self.assertFalse(
+            self.fixture.wait_for(lambda: waiter.poll() is not None, timeout=2.0),
+            "the waiter ended while its driver was still running",
+        )
+
+        standing.kill()
+        # Reaped, because a killed process this fixture is the parent of stays in the process
+        # table until it is — and a `kill -0` cannot tell a zombie from a running driver.
+        standing.wait()
+        out, err = waiter.communicate(timeout=LAUNCH_TIMEOUT)
+
+        self.assertEqual(waiter.returncode, 0, err)
+        self.assertIn("was killed", out)
+        self.assertIn(f"/crew {self.fixture.run_dir}", out)
+        self.assertEqual(self.fixture.driver_calls(), [], "a live run was driven twice")
+
+    # --- the driver stopped by hand ---------------------------------------------------------
+
+    def test_a_driver_that_left_no_wake_is_said_in_one_line(self):
+        """The operator's own Ctrl-C, or a wake that could not be written: either way no ruling
+        was asked for, so no snapshot is invented and the log is named as what tells them apart."""
+        result = self.fixture.launch(env_overrides={
+            "AGENTCREW_STUB_DRIVER_STOPPED": "1", "AGENTCREW_STUB_DRIVER_HOLD": "1",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("without leaving a wake snapshot", result.stdout)
+        self.assertIn(DRIVER_LOG, result.stdout)
+        self.assertIn(f"/crew {self.fixture.run_dir}", result.stdout)
 
 
 if __name__ == "__main__":

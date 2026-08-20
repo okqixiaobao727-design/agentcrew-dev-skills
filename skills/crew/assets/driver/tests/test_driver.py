@@ -14,6 +14,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,10 +23,17 @@ import unittest
 
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(TESTS_DIR))
+# The stub CLI itself, for the one rule the fixture and the stub have to agree on: which file an
+# account's agents list lives in. Imported rather than restated, so they cannot drift apart.
+import stub_claude  # noqa: E402
 DRIVER = TESTS_DIR.parent / "driver.py"
 MACHINE_LOG = DRIVER.parent.parent / "machine_log.py"
 TRIAGE = DRIVER.parent.parent.parent / "references" / "triage.md"
 MONITOR = DRIVER.parent.parent / "monitor" / "monitor.py"
+# The script every snapshot's `resume` names, because a driver put back belongs in a window of its
+# own exactly as the first one did. Its own suite drives it; here it is only what is named.
+LAUNCH = DRIVER.parent.parent / "launch" / "launch.py"
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -40,11 +48,27 @@ PREFLIGHT_WINDOW = "crew-preflight"
 DASHBOARD_WINDOW = "crew-dashboard"
 REPORT_NAME = "report.md"
 RUN_DIR_NAME = ".crew"
+# The two files the run directory gains: the driver's own pid while its loop runs, and the wake
+# snapshot the coordinator's waiter reads instead of the driver's stdout.
+DRIVER_RECORD = "driver.pid"
+# The file every armed wake monitor carries the path of, which is how one is told from another
+# run's on the process table, and the script's own name beside it.
+PARKED_PATHS = "parked-paths"
+# The two halves of a row's account binding: a ticket that named an account selects that
+# configuration home explicitly, and a ticket that named none inherits the environment the run
+# was started in (ADR-0014).
+INHERITED = "inherited"
+EXPLICIT = "explicit"
+MONITOR_WAVE_NAME = "monitor-wave.sh"
+WAKE_NAME = "wake.json"
 FEATURE_NAME = "demo"
 INTEGRATION_BRANCH = "crew/demo"
 BASE_BRANCH = "main"
 # The two decisions the project's config carries, which the driver records into the run.
 REPAIR_MODEL = "claude-sonnet-5"
+# A file carrying a line that reads as an opening conflict marker: the merge driver will not
+# rewrite a conflict in it, so this is the shape that still climbs to the repair rung.
+UNREWRITABLE = "one\n<<<<<<< left over from an earlier merge\nthree\n"
 TRACKER = "local"
 # The loop's dials, wound down so a test drives a run in seconds rather than in poll intervals.
 POLL_SECONDS = "0.2"
@@ -276,7 +300,7 @@ class Fixture:
         self.running.append(process)
         return process
 
-    def resume(self, extra=()):
+    def resume(self, extra=(), env_overrides=None):
         """Put the loop back where a ruling stopped it, and leave it running."""
         process = subprocess.Popen(
             [
@@ -289,7 +313,7 @@ class Fixture:
                 *extra,
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env=self.environment(), cwd=str(self.repo),
+            env=self.environment(env_overrides), cwd=str(self.repo),
         )
         self.running.append(process)
         return process
@@ -355,29 +379,44 @@ class Fixture:
             check=True, capture_output=True, env=self.environment(), cwd=str(self.repo),
         )
 
-    def agents(self):
-        path = self.stub_dir / "agents.json"
+    def agents_path(self, home=None):
+        """The file the stub CLI answers one account's agents list out of.
+
+        One per account, as two logged-in profiles keep two disjoint lists. The coordinator's own
+        home unless a caller names another, which is what every child of a single-account run is
+        launched and looked for under.
+        """
+        return stub_claude.agents_path(self.stub_dir, home or self.config_dir)
+
+    def agents(self, home=None):
+        path = self.agents_path(home)
         return json.loads(path.read_text()) if path.exists() else []
 
-    def set_agents(self, agents):
-        (self.stub_dir / "agents.json").write_text(json.dumps(agents))
+    def set_agents(self, agents, home=None):
+        self.agents_path(home).write_text(json.dumps(agents))
+
+    def account_of(self, ticket):
+        """The profile directory that child launched under, as its own launch line records it."""
+        return (self.launch_record(ticket) or {}).get("account")
 
     def goes(self, ticket, status):
-        """Put that child into the status the agents list reports it in."""
+        """Put that child into the status its own account's agents list reports it in."""
         worktree = os.path.realpath(self.worktree(ticket))
-        agents = self.agents()
+        home = self.account_of(ticket)
+        agents = self.agents(home)
         for agent in agents:
             if os.path.realpath(agent.get("cwd", "")) == worktree:
                 agent["status"] = status
-        self.set_agents(agents)
+        self.set_agents(agents, home)
 
     def vanishes(self, ticket):
-        """Take that child's session off the agents list, as a session that died leaves it."""
+        """Take that child's session off its account's list, as a session that died leaves it."""
         worktree = os.path.realpath(self.worktree(ticket))
+        home = self.account_of(ticket)
         self.set_agents([
-            agent for agent in self.agents()
+            agent for agent in self.agents(home)
             if os.path.realpath(agent.get("cwd", "")) != worktree
-        ])
+        ], home)
 
     # --- what the run left behind -----------------------------------------------------------
 
@@ -453,8 +492,12 @@ class Fixture:
         return json.loads(path.read_text()) if path.exists() else {}
 
     def stop_monitors(self):
-        """Let every armed wake monitor exit: a run with no live children is one they leave."""
-        (self.stub_dir / "agents.json").write_text("[]")
+        """Let every armed wake monitor exit: a run with no live children is one they leave.
+
+        Every account's list, because a mixed wave's monitors each poll their own.
+        """
+        for path in self.stub_dir.glob("agents-*.json"):
+            path.write_text("[]")
 
     def wait_for(self, condition, timeout=30.0):
         """Wait for a monitor armed to outlive the driver to do the thing it was armed to do."""
@@ -518,10 +561,13 @@ class DriverTestCase(unittest.TestCase):
         preflight looks like is a run directory with a table in it, not an exit code.
         """
         process = self.fixture.launch(extra=extra)
-        self.assertTrue(
-            self.fixture.wait_for(lambda: (self.fixture.run_dir / "wave-table.json").exists()),
-            f"the run never started:\n{self.fixture.ended(process, timeout=60).stdout}",
-        )
+        # The diagnosis waits for the driver to end, so it is composed only where it is needed:
+        # as an `assertTrue` message it was evaluated on every call, and every passing test that
+        # starts a run this way waited out the loop's whole idle timeout to be told nothing.
+        if not self.fixture.wait_for(
+            lambda: (self.fixture.run_dir / "wave-table.json").exists()
+        ):
+            self.fail(f"the run never started:\n{self.fixture.ended(process, timeout=60).stdout}")
         self.assertEqual(self.fixture.windows_named(PREFLIGHT_WINDOW), {})
         return process
 
@@ -864,7 +910,13 @@ class AccountTests(DriverTestCase):
             for wave in self.fixture.table()["waves"] for ticket in wave["tickets"]
         }
 
-    def test_a_ticket_naming_no_account_carries_the_coordinators_own_configuration_home(self):
+    def test_a_ticket_naming_no_account_is_bound_to_the_coordinators_home_inherited(self):
+        """Both halves of the binding: the home it is observed at, and that nothing sets it.
+
+        The directory is still carried — it is what a child's transcript, cost and session files
+        are read at — but the mode says the ticket's processes inherit the environment the run was
+        started in rather than spelling that home out, which is not the same login (#110).
+        """
         self.fixture.ticket("01", "first thing")
         self.fixture.ticket("02", "second thing")
         self.fixture.commit_feature()
@@ -876,7 +928,11 @@ class AccountTests(DriverTestCase):
             table["run"]["coordinator_config_home"], str(self.fixture.config_dir)
         )
         for number, row in self.rows().items():
-            self.assertEqual(row["account"], str(self.fixture.config_dir), number)
+            self.assertEqual(
+                (row["account"], row["account_mode"]),
+                (str(self.fixture.config_dir), INHERITED),
+                number,
+            )
 
     def test_a_ticket_naming_a_registered_account_carries_that_accounts_profile_directory(self):
         profile = self.fixture.profile("second")
@@ -888,8 +944,10 @@ class AccountTests(DriverTestCase):
         self.started()
 
         rows = self.rows()
-        self.assertEqual(rows["01"]["account"], str(profile))
-        self.assertEqual(rows["02"]["account"], str(self.fixture.config_dir))
+        self.assertEqual((rows["01"]["account"], rows["01"]["account_mode"]),
+                         (str(profile), EXPLICIT))
+        self.assertEqual((rows["02"]["account"], rows["02"]["account_mode"]),
+                         (str(self.fixture.config_dir), INHERITED))
 
     def test_a_registry_nothing_asks_for_is_never_read(self):
         """No ticket names an account, so no registry is opened — broken or otherwise.
@@ -904,7 +962,8 @@ class AccountTests(DriverTestCase):
         self.started()
 
         self.assertEqual(
-            self.rows()["01"]["account"], str(self.fixture.config_dir)
+            (self.rows()["01"]["account"], self.rows()["01"]["account_mode"]),
+            (str(self.fixture.config_dir), INHERITED),
         )
 
     def test_a_registry_override_that_is_not_an_absolute_path_stops_the_run(self):
@@ -985,6 +1044,176 @@ class AccountTests(DriverTestCase):
         notice = self.assert_preflight_failed(result, 1)
         self.assertIn("second", notice)
         self.assertIn(str(missing), notice)
+
+
+class WakeMonitorAccountTests(DriverTestCase):
+    """Every Claude child's liveness is asked of the account that child actually runs under.
+
+    `claude agents --json` answers for the profile it is invoked under and for no other, so one
+    monitor over a mixed wave asks a list that could not contain half of it. That is how ticket
+    109 of a real run was settled `failed` — "the child's session vanished with no receipt sent" —
+    ten seconds after launch, while its child was working and about to escalate (#110). The wake
+    monitor is therefore armed one per account binding, and the stub CLI here answers each account
+    out of its own list exactly as two logged-in profiles do.
+    """
+
+    def routed(self, name="second"):
+        """A wave over two accounts: ticket 01 names one, 02 names none; returns 01's profile."""
+        profile = self.fixture.profile(name)
+        self.fixture.register(**{name: profile})
+        self.fixture.ticket("01", "first thing", routing=routing_naming(name))
+        self.fixture.ticket("02", "second thing")
+        self.fixture.commit_feature()
+        return profile
+
+    def single_account(self):
+        """A wave nobody named an account on: two Claude children on the run's own login."""
+        self.fixture.ticket("01", "first thing")
+        self.fixture.ticket("02", "second thing")
+        self.fixture.commit_feature()
+
+    def launched(self, *tickets):
+        """Start the run and wait until every one of those tickets has a child of its own."""
+        self.fixture.launch()
+        for ticket in tickets:
+            self.assertTrue(
+                self.fixture.wait_for(
+                    lambda ticket=ticket: self.fixture.launch_record(ticket) is not None
+                ),
+                f"{ticket} never launched",
+            )
+
+    def monitors(self):
+        """Every wake monitor over this run, as the paths each one was armed to watch.
+
+        Read off the process table because the grouping is the thing under test: which worktrees
+        one monitor stands over is written down nowhere else. `-A`, not `-e`: a monitor is started
+        in a session of its own, and BSD `ps` leaves a process with no controlling terminal out of
+        its default listing.
+        """
+        listed = subprocess.run(
+            ["ps", "-A", "-o", "args="], capture_output=True, text=True
+        ).stdout
+        marker = str(self.fixture.run_dir / PARKED_PATHS)
+        watched = []
+        for line in listed.splitlines():
+            if MONITOR_WAVE_NAME not in line or marker not in line:
+                continue
+            arguments = shlex.split(line)
+            watched.append(sorted(
+                os.path.realpath(path) for path in arguments[arguments.index(marker) + 1:]
+            ))
+        return sorted(watched)
+
+    def wait_for_monitors(self, count):
+        """The worktrees each armed monitor stands over, once there are `count` of them.
+
+        A monitor forks a subshell of its own around each poll, so the same command line can
+        appear twice for one monitor for as long as that poll takes; the wait is for the count
+        the arming produced, which is the state the fork passes through and returns to.
+        """
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.monitors()) == count),
+            f"the run armed {len(self.monitors())} wake monitors, not {count}",
+        )
+        return self.monitors()
+
+    def snapshot_homes(self):
+        """The configuration home every agents-list read of this run was made under."""
+        return [
+            call["configHome"] for call in self.fixture.claude_calls()
+            if call["argv"][:2] == ["agents", "--json"]
+        ]
+
+    def worktrees(self, *tickets):
+        return sorted(os.path.realpath(self.fixture.worktree(ticket)) for ticket in tickets)
+
+    def rows(self):
+        """Every ticket of the built table, by its number."""
+        return {
+            ticket["id"]: ticket
+            for wave in self.fixture.table()["waves"] for ticket in wave["tickets"]
+        }
+
+    def test_a_mixed_wave_arms_one_monitor_per_account_over_its_own_children(self):
+        profile = self.routed()
+
+        self.launched("01", "02")
+
+        self.assertEqual(
+            self.wait_for_monitors(2), sorted([self.worktrees("01"), self.worktrees("02")])
+        )
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: {str(profile), str(self.fixture.config_dir)} <= set(self.snapshot_homes())
+            ),
+            f"the two accounts were not both asked: {self.snapshot_homes()}",
+        )
+
+    def test_a_child_alive_on_its_own_account_is_not_settled_failed(self):
+        """The crewtask/65 shape, replayed: the child is listed, under its own account alone."""
+        self.routed()
+
+        self.launched("01", "02")
+        # Long enough for the monitors to have polled many times over, so a child still unsettled
+        # is an observation rather than a race won.
+        time.sleep(QUIET_SECONDS)
+
+        self.assertEqual([self.verdict("01"), self.verdict("02")], [None, None])
+        self.assertEqual(self.events("receipt"), [])
+
+    def test_a_single_account_wave_arms_one_monitor_in_the_environment_it_inherited(self):
+        """The default path, unmoved: one monitor over the wave, on the run's own login."""
+        self.single_account()
+
+        self.launched("01", "02")
+
+        self.assertEqual(self.wait_for_monitors(1), [self.worktrees("01", "02")])
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.snapshot_homes()),
+            "no snapshot of the agents list was ever taken",
+        )
+        self.assertEqual(set(self.snapshot_homes()), {str(self.fixture.config_dir)})
+
+    def test_an_inherited_lane_is_armed_with_no_configuration_home_of_its_own(self):
+        """Nothing is injected: the monitor polls whatever login its driver was started on.
+
+        The table's rows and the driver's environment name the same home on a first start, so
+        "inherited" and "set to that same directory" are indistinguishable there. A resume pulls
+        them apart — the table already carries the home the run began on, and this driver is
+        started on another — and the account the monitor then asks is the whole assertion. An
+        arming that spelled the row's directory into the environment would ask the old one.
+        """
+        self.single_account()
+        self.launched("01", "02")
+        elsewhere = self.fixture.profile("operators-own-login")
+        first = self.fixture.running[0]
+        first.kill()
+        first.communicate()
+        before = len(self.snapshot_homes())
+
+        self.fixture.resume(env_overrides={"CLAUDE_CONFIG_DIR": str(elsewhere)})
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.snapshot_homes()) > before),
+            "the resumed run never re-armed a monitor",
+        )
+        self.assertEqual(set(self.snapshot_homes()[before:]), {str(elsewhere)})
+        self.assertEqual(
+            self.rows()["01"]["account"], str(self.fixture.config_dir),
+            "the table still carries the home the run began on",
+        )
+
+    def test_a_child_that_has_gone_from_its_own_account_still_settles_failed(self):
+        """The word keeps meaning what it means: a genuinely vanished child is a failed ticket."""
+        self.routed()
+        self.launched("01", "02")
+
+        self.fixture.vanishes("01")
+
+        self.wait_for_verdict("01", "failed")
+        self.assertIn("vanished", self.events("receipt", ticket="01")[-1]["detail"])
+        self.assertEqual(self.verdict("02"), None)
 
 
 class LaunchTests(DriverTestCase):
@@ -1077,21 +1306,26 @@ class LaunchTests(DriverTestCase):
         self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
         self.assertEqual(self.fixture.current_branch(), INTEGRATION_BRANCH)
 
-    def test_only_wave_one_is_dispatched_and_every_launch_is_logged(self):
+    def test_only_wave_one_is_dispatched_and_its_launch_amendment_is_logged(self):
         self.start_a_run()
 
         launched = [
             record for record in self.fixture.log_records() if record["event"] == "launch"
         ]
-        self.assertEqual([record["ticket"] for record in launched], ["01"])
+        self.assertEqual([record["ticket"] for record in launched], ["01", "01"])
+        self.assertEqual(launched[0]["child"], "")
+        self.assertEqual(launched[1]["child"], "stub-child-1")
         self.assertEqual(len(self.fixture.launches()), 1)
         self.assertEqual(
-            launched[0]["worktree"],
+            launched[1]["worktree"],
             str(self.fixture.repo / ".claude" / "worktrees" / "01-01"),
         )
-        self.assertEqual(launched[0]["model"], CLAUDE_MODEL)
+        self.assertEqual(launched[1]["model"], CLAUDE_MODEL)
 
     def test_the_run_directory_holds_the_layout_the_index_names(self):
+        """What a run in flight holds. Two more files belong to its ending rather than its life —
+        the wake snapshot, written as the driver exits — and one to the launcher, which opens the
+        driver's log before this driver runs at all."""
         self.start_a_run()
 
         self.assertEqual(
@@ -1099,6 +1333,7 @@ class LaunchTests(DriverTestCase):
             sorted([
                 "wave-table.json", "log.jsonl", "launch", "parked-paths",
                 "dashboard-window", "dashboard-window.lock", "machine_log.py",
+                DRIVER_RECORD,
             ]),
         )
 
@@ -1386,6 +1621,53 @@ class LoopTests(DriverTestCase):
         self.assertEqual(len(landable), 1, self.fixture.log_records())
         self.assertEqual(self.events("ruling", ticket="01"), [])
 
+    def missing_launch_snapshot(self, message):
+        self.feature(("01", ()))
+        process = self.fixture.launch(extra=("--timeout", "5"))
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: (self.fixture.launch_record("01") or {}).get("child")
+            ),
+            "01 never finished launch verification",
+        )
+        records = [
+            record for record in self.fixture.log_records()
+            if record.get("event") != "launch"
+        ]
+        (self.fixture.run_dir / "log.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+        self.fixture.says("01", message)
+        return self.woken(process, "driver-error")
+
+    def test_a_completion_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW COMPLETE " + "0" * 40)
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW COMPLETE", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
+
+    def test_a_parked_receipt_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW PARKED features/demo/checklist.md")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW PARKED", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
+
+    def test_a_failure_receipt_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW FAILED the approach does not work")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW FAILED", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
+
+    def test_an_escalation_without_a_launch_record_is_a_driver_error(self):
+        snapshot = self.missing_launch_snapshot("CREW ASK 01 scope — which table? ts=1")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("CREW ASK", snapshot["detail"])
+        self.assertIn("no launch record", snapshot["detail"])
+
     def test_no_row_of_the_rule_table_wakes_the_coordinator(self):
         """The wake surface, stated as what is not on it.
 
@@ -1467,6 +1749,78 @@ class LoopTests(DriverTestCase):
 
         self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
 
+    def test_a_malformed_receipt_is_bounced_once_and_the_bare_resend_settles(self):
+        """#105, verbatim: prose on the verb line left a finished ticket reading `waiting`."""
+        process = self.start(("01", ()))
+
+        # The incident's message, with the one substitution this fixture forces: the sha has to be
+        # a commit the run can verify, so the resend settles the way the real one did.
+        sha = self.fixture.commit_work("01")
+        incident = (
+            f"CREW COMPLETE {sha} — deferred gap carried forward: the parked checklist is"
+            " unwritten ts=1755594000"
+        )
+        self.fixture.says("01", incident)
+        instruction = self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.says("01", f"CREW COMPLETE {sha} ts=1755594600")
+        self.woken(process, "run-complete")
+
+        self.assertIn("01", instruction)
+        self.assertIn(incident, instruction)
+        self.assertEqual(len(self.instructions("01", "CREW RESEND")), 1)
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_second_malformed_receipt_settles_the_ticket_failed(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW COMPLETE not-a-sha")
+        self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.says("01", "CREW COMPLETE still-not-a-sha")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW RESEND")), 1)
+        failed = self.events("receipt", ticket="01", verdict="failed")
+        self.assertIn("still-not-a-sha", failed[-1]["detail"])
+
+    def test_a_bounced_child_that_then_goes_idle_settles_failed_without_a_second_re_ask(self):
+        """The bounce is the ticket's one re-ask; a nudge after it would ask twice."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW COMPLETE not-a-sha")
+        self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.goes("01", "idle")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.instructions("01", "CREW NUDGE"), [])
+        failed = self.events("receipt", ticket="01", verdict="failed")
+        self.assertIn("never resent", failed[-1]["detail"])
+
+    def test_a_malformed_ask_is_bounced_with_the_shape_an_ask_takes(self):
+        """A near miss is not always a receipt: the answer names every verb's shape, not three."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK")
+        instruction = self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertIn("CREW ASK", instruction)
+        self.assertEqual(self.events("escalation", ticket="01"), [])
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_message_that_speaks_no_verb_at_all_is_not_bounced(self):
+        """Conversation is still conversation; only a near miss is answered."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "The tests are green; the review is still running.")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.instructions("01", "CREW RESEND"), [])
+        self.assertEqual(self.verdict("01"), "completed")
+
     def test_a_parked_receipt_is_recorded_by_the_driver_and_its_worktree_listed(self):
         process = self.start(("01", ()))
 
@@ -1538,6 +1892,23 @@ class LoopTests(DriverTestCase):
             [record["decision"] for record in self.events("advance")], ["escalated", "stopped"]
         )
         self.assertEqual(self.events("advance", decision="stopped")[0]["wave"], "1")
+
+    def test_stopped_refuses_an_unlaunched_ticket_the_halt_did_not_block(self):
+        process = self.start(("01", ()), ("02", ("01",)))
+        process.kill()
+        process.communicate()
+        table_path = self.fixture.run_dir / "wave-table.json"
+        table = json.loads(table_path.read_text())
+        table["waves"][1]["tickets"][0]["blocked_by"] = []
+        table_path.write_text(json.dumps(table))
+
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.fixture.says("01", "CREW FAILED the approach does not work")
+        snapshot = self.woken(resumed, "driver-error")
+
+        self.assertIn("stopped refused: ticket 02 is still launchable", snapshot["detail"])
+        self.assertEqual(self.events("advance", decision="stopped"), [])
 
     def test_a_failure_receipt_is_recorded_by_the_driver(self):
         process = self.start(("01", ()))
@@ -1637,15 +2008,26 @@ class LoopTests(DriverTestCase):
         self.assertIn("nothing", snapshot["detail"])
         self.assertIn("resume", snapshot, "a stopped run's snapshot did not say how it goes on")
 
-    def test_the_command_a_driver_error_names_puts_the_same_run_back_on_its_feet(self):
-        """A driver error is recovered exactly as a ruling is: by the command the snapshot names."""
+    def test_the_command_a_snapshot_names_puts_the_driver_back_in_a_window_of_its_own(self):
+        """The launcher, never this driver's own `resume`: a coordinator that put the loop back
+        as a task of its own session would be handing the harness the one process a run cannot
+        lose. What that command does with the run is its own suite's; what it is, is this."""
         self.feature(("01", ()))
         stopped = self.fixture.ended(self.fixture.launch(extra=("--timeout", "3")))
         snapshot = json.loads(
             [line for line in stopped.stdout.splitlines() if line.strip()][-1]
         )
 
-        resumed = self.fixture.run_command(snapshot["resume"])
+        self.assertIn(str(LAUNCH), snapshot["resume"])
+        self.assertIn(str(self.fixture.feature_dir), snapshot["resume"])
+        self.assertIn(f"--coordinator-pid {COORDINATOR_PID}", snapshot["resume"])
+
+    def test_the_run_a_driver_error_stopped_is_carried_on_from_where_it_stopped(self):
+        """A driver error is recovered exactly as a ruling is: the same seam, the same run."""
+        self.feature(("01", ()))
+        self.fixture.ended(self.fixture.launch(extra=("--timeout", "3")))
+
+        resumed = self.fixture.resume()
         self.assertTrue(
             self.fixture.wait_for(lambda: self.fixture.launch_record("01") is not None),
             "the resumed run lost the wave it was carrying on",
@@ -1762,11 +2144,30 @@ class LoopTests(DriverTestCase):
         self.assertIn("second time", snapshot["detail"])
         self.assertEqual(len(self.instructions("02", "CREW MERGE")), 1)
 
-    def test_a_mechanical_conflict_goes_to_the_repair_rung_on_the_configured_model(self):
+    def test_a_mechanical_conflict_is_resolved_by_the_driver_without_a_repair_session(self):
+        """Both children only inserted, so the run lands the wave itself and ends on its own."""
         process = self.start(("01", ()), ("02", ()), shared="one\n")
 
         self.fixture.completes("01", "one\nfrom 01\n", name="shared.txt")
         self.fixture.completes("02", "one\nfrom 02\n", name="shared.txt")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(
+            [call for call in self.fixture.claude_calls() if "--print" in call["argv"]], [],
+            "a proven-mechanical conflict wakes neither the repair rung nor the coordinator",
+        )
+        self.assertIn(
+            "mechanical", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
+        )
+        self.assertEqual(len(self.events("merge", ticket="02", result="resolved")), 1)
+        self.assertEqual(self.instructions("02", "CREW MERGE"), [])
+
+    def test_the_conflict_the_driver_will_not_rewrite_reaches_the_configured_repair_model(self):
+        """A file whose own text reads as an opening conflict marker is still the rung's work."""
+        process = self.start(("01", ()), ("02", ()), shared=UNREWRITABLE)
+
+        self.fixture.completes("01", UNREWRITABLE + "from 01\n", name="shared.txt")
+        self.fixture.completes("02", UNREWRITABLE + "from 02\n", name="shared.txt")
         self.woken(process, "judgment-needed")
 
         repairs = [
@@ -1934,6 +2335,172 @@ class LoopTests(DriverTestCase):
             self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.repo))
 
 
+class DriverLifecycleTests(DriverTestCase):
+    """What the run directory says about the process driving it, and when it stops saying it.
+
+    The driver no longer runs as a background task of the coordinator's session, so nothing the
+    coordinator holds can report that it ended. The run directory does: its loop names its own pid
+    on the way in, and every exit it takes on purpose takes that name away again. A kill cannot,
+    which is the whole of how a killed driver is told from one that handed judgment over.
+    """
+
+    def feature(self, *tickets, routing=ROUTING):
+        for number, blockers in tickets:
+            self.fixture.ticket(number, f"thing {number}", routing=routing, blocked_by=blockers)
+        self.fixture.commit_feature()
+
+    def start(self, *tickets, routing=ROUTING):
+        """A run with its first wave up and its loop running."""
+        self.feature(*tickets, routing=routing)
+        process = self.fixture.launch()
+        for number, blockers in tickets:
+            if blockers:
+                continue
+            self.assertTrue(
+                self.fixture.wait_for(
+                    lambda number=number: self.fixture.launch_record(number) is not None
+                ),
+                f"{number} never launched",
+            )
+        return process
+
+    def record(self):
+        """The pid the run directory names as its driver, or None where it names none."""
+        path = self.fixture.run_dir / DRIVER_RECORD
+        if not path.exists():
+            return None
+        text = path.read_text().strip()
+        return int(text) if text.isdigit() else text
+
+    def wake_file(self):
+        """The wake snapshot the run directory holds, or None before one is written."""
+        path = self.fixture.run_dir / WAKE_NAME
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def assertReleased(self):
+        self.assertIsNone(self.record(), "a deliberate exit left the driver's pid standing")
+
+    # --- the record while the loop runs -----------------------------------------------------
+
+    def test_a_running_loop_names_its_own_process_in_the_run_directory(self):
+        process = self.start(("01", ()))
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.record() == process.pid),
+            f"the run directory names {self.record()}, not the driver {process.pid}",
+        )
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+    def test_a_resumed_run_is_named_after_the_driver_now_driving_it(self):
+        """A run is driven by whichever process holds it, and the record says which."""
+        process = self.start(("01", ()))
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.record() == resumed.pid),
+            f"the run directory names {self.record()}, not the driver {resumed.pid}",
+        )
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+    # --- the three deliberate exits ---------------------------------------------------------
+
+    def test_a_wake_handing_judgment_over_releases_the_run(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertReleased()
+
+    def test_a_driver_error_releases_the_run(self):
+        """A state the rule table has no row for still ends the driver on its own terms."""
+        process = self.start(("01", ()))
+        # A receipt whose child the log has no launch record for, which is a driver error rather
+        # than anything a rule settles: the launch lines are taken back out from under it.
+        records = [
+            record for record in self.fixture.log_records()
+            if record.get("event") != "launch"
+        ]
+        (self.fixture.run_dir / "log.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+        self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
+        self.woken(process, "driver-error")
+
+        self.assertReleased()
+
+    def test_a_finished_run_releases_the_run(self):
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertReleased()
+
+    def test_an_interrupt_in_the_drivers_own_window_releases_the_run(self):
+        """The operator's own Ctrl-C is deliberate, so it must not raise the dead-driver flag."""
+        process = self.start(("01", ()))
+        self.assertTrue(self.fixture.wait_for(lambda: self.record() == process.pid))
+
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=30)
+
+        self.assertReleased()
+
+    # --- the one exit that is not deliberate -------------------------------------------------
+
+    def test_a_killed_driver_leaves_its_pid_standing(self):
+        """The stall this ticket is about: nothing runs on the way out of a SIGKILL, so the
+        record is the only thing left that can say the run was orphaned."""
+        process = self.start(("01", ()))
+        self.assertTrue(self.fixture.wait_for(lambda: self.record() == process.pid))
+
+        process.kill()
+        process.communicate()
+
+        self.assertEqual(self.record(), process.pid)
+
+    # --- the wake channel -------------------------------------------------------------------
+
+    def test_the_wake_snapshot_is_left_in_the_run_directory_as_well_as_printed(self):
+        """The coordinator's waiter reads a file now: the driver's stdout is its own pane's."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.wake_file(), snapshot)
+
+    def test_a_run_that_finishes_leaves_its_final_snapshot_in_the_run_directory(self):
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        snapshot = self.woken(process, "run-complete")
+
+        self.assertEqual(self.wake_file(), snapshot)
+
+    def test_the_record_is_released_before_the_wake_is_written(self):
+        """Ordering, so a coordinator that pastes the resume command the instant it is woken
+        cannot find a pid that is about to stop and attach to a driver that is already leaving."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.wake_file() is not None),
+            "the driver never wrote its wake snapshot",
+        )
+        self.assertReleased()
+
+        self.woken(process, "judgment-needed")
+
+
 class AnswerTests(DriverTestCase):
     def start(self, routing=ROUTING):
         self.fixture.ticket("01", "first thing", routing=routing)
@@ -2028,7 +2595,11 @@ class AnswerTests(DriverTestCase):
     def test_missing_recorded_window_reports_unreachable_and_writes_no_ruling(self):
         self.start()
         records = self.fixture.log_records()
-        launch = next(record for record in records if record.get("event") == "launch")
+        launch = next(
+            record
+            for record in reversed(records)
+            if record.get("event") == "launch" and record.get("ticket") == "01"
+        )
         launch["window"] = None
         (self.fixture.run_dir / "log.jsonl").write_text(
             "\n".join(json.dumps(record) for record in records) + "\n"
@@ -2238,7 +2809,7 @@ class AdoptionTests(DriverTestCase):
         # A start that began again would have cut its integration branch afresh and recorded the
         # commit it cut it from; the run the adoption carried on is the one already on the ground.
         self.assertEqual(self.fixture.table()["run"], run, "the adopted run was started afresh")
-        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
 
     def test_a_settled_ticket_is_not_dispatched_again_by_the_run_that_adopts_it(self):
@@ -2250,8 +2821,8 @@ class AdoptionTests(DriverTestCase):
         self.fixture.completes("02")
         self.woken(adopted, "run-complete")
 
-        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
-        self.assertEqual(len(self.events("launch", ticket="02")), 1, "02 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="02")), 2, "02 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
 
     def test_a_run_whose_wave_escalated_is_unfinished_and_is_adopted(self):
@@ -2267,7 +2838,7 @@ class AdoptionTests(DriverTestCase):
         self.fixture.completes("01")
         self.woken(adopted, "run-complete")
 
-        self.assertEqual(len(self.events("launch", ticket="01")), 1, "01 was dispatched twice")
+        self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
         self.assertEqual(self.verdict("01"), "completed")
         self.assertEqual(
             [record["decision"] for record in self.events("advance")], ["escalated", "complete"]
@@ -2330,9 +2901,10 @@ class AdoptionTests(DriverTestCase):
         self.fixture.vanishes("01")
 
         adopted = self.fixture.launch()
-        self.wait_for_verdict("01", "failed")
         self.woken(adopted, "run-complete")
 
+        # `run-complete` means every ticket is settled, so this assertion needs no clock.
+        self.assertEqual(self.verdict("01"), "failed")
         self.assertIn("vanished", self.events("receipt", ticket="01")[-1]["detail"])
         self.assertEqual(self.events("ruling", ticket="01"), [])
 
@@ -2435,10 +3007,15 @@ class AdoptionTests(DriverTestCase):
         adopted = self.fixture.launch(
             extra=("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
         )
-        self.wait_for_verdict("01", "failed")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.events("ruling", ticket="02")),
+            "the adopted run never re-anchored its live child",
+        )
         self.fixture.completes("02")
         self.woken(adopted, "run-complete")
 
+        # `run-complete` means every ticket is settled, so this assertion needs no clock.
+        self.assertEqual(self.verdict("01"), "failed")
         self.assertEqual(self.events("ruling", ticket="01"), [])
         anchor = self.events("ruling", ticket="02")
         self.assertEqual(len(anchor), 1, f"02 was not re-anchored once: {anchor}")

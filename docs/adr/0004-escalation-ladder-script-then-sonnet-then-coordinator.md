@@ -4,12 +4,13 @@ status: accepted
 
 # Mechanical failures climb a fixed ladder: script → budget-capped headless Sonnet → coordinator
 
-Clean merges and routine outcomes are handled by scripts alone. A mechanical failure a
-script cannot resolve (canonical case: a textual merge conflict with no design
-disagreement) is handed to a headless, budget-capped, cheap-model repair session that the
-*script* launches — the coordinator is not woken and pays nothing. Only a double failure,
-or a conflict the rules classify as semantic (two children's designs disagree), escalates
-to the coordinator.
+Clean merges and routine outcomes are handled by scripts alone. A textual merge conflict
+with no design disagreement is resolved by the script itself, which keeps both sides'
+insertions and costs nothing. A mechanical failure a script cannot resolve — that conflict
+where the file's own markers defeat the rewrite — is handed to a headless, budget-capped,
+cheap-model repair session that the *script* launches — the coordinator is not woken and
+pays nothing. Only a double failure, or a conflict the rules classify as semantic (two
+children's designs disagree), escalates to the coordinator.
 
 ## Considered Options
 

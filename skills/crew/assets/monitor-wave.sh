@@ -77,6 +77,12 @@ if [ "$log_option_given" -eq 0 ]; then
 fi
 poll_seconds=${CREW_POLL_SECONDS:-20}
 claude_bin=${CREW_CLAUDE_BIN:-claude}
+# The account this monitor watches under is the environment it was armed in, and nothing here
+# names it. `claude agents --json` answers for the profile `CLAUDE_CONFIG_DIR` points at and for
+# no other, so a monitor over children of a second account is spawned with that account's
+# configuration home already in its environment — and a monitor over children whose ticket named
+# no account is spawned with the driver's own environment untouched, which is the same login the
+# children themselves inherited (#110). One monitor stands over one account's children only.
 
 record_error() {
   local reason=$1

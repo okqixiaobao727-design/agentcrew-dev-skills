@@ -21,6 +21,8 @@ import unittest
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "skills" / "crew" / "assets" / "machine_log.py"
+sys.path.insert(0, str(SCRIPT.parent))
+import machine_log  # noqa: E402
 
 # The run's one timestamp format: `date -u +%Y-%m-%dT%H:%M:%SZ`, as the crew skill reads it.
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -128,6 +130,155 @@ class MachineLogTestCase(unittest.TestCase):
         self.assertLess(drift, 120, "the stamp is UTC, not local time")
 
 
+class SettlementStateTests(unittest.TestCase):
+    """The one public predicate every settlement-quality reader shares."""
+
+    def test_a_ticket_with_no_settling_event_is_live(self):
+        records = [{"event": "launch", "ticket": "104"}]
+
+        self.assertEqual(machine_log.settlement_state(records, "104"), "live")
+
+    def test_the_latest_receipt_maps_through_the_merge_result(self):
+        cases = (
+            ("landable without a merge", [{"event": "receipt", "ticket": "104",
+                                            "verdict": "landable"}], "landable"),
+            ("landable merged clean", [
+                {"event": "receipt", "ticket": "104", "verdict": "landable"},
+                {"event": "merge", "ticket": "104", "result": "clean"},
+            ], "completed"),
+            ("landable merged after repair", [
+                {"event": "receipt", "ticket": "104", "verdict": "landable"},
+                {"event": "merge", "ticket": "104", "result": "repaired"},
+            ], "completed"),
+            ("failed", [{"event": "receipt", "ticket": "104",
+                          "verdict": "failed"}], "failed"),
+            ("parked", [{"event": "receipt", "ticket": "104",
+                          "verdict": "parked"}], "parked"),
+        )
+        for label, records, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(machine_log.settlement_state(records, "104"), expected)
+
+    def test_the_latest_outcome_wins_even_without_or_after_a_receipt(self):
+        self.assertEqual(
+            machine_log.settlement_state(
+                [{"event": "outcome", "ticket": "104", "outcome": "completed"}], "104"
+            ),
+            "completed",
+        )
+        for outcome in ("completed", "failed", "parked", "blocked"):
+            records = [
+                {"event": "outcome", "ticket": "104", "outcome": "failed"},
+                {"event": "outcome", "ticket": "104", "outcome": outcome},
+                {"event": "receipt", "ticket": "104", "verdict": "landable"},
+                {"event": "merge", "ticket": "104", "result": "clean"},
+            ]
+            with self.subTest(outcome):
+                self.assertEqual(machine_log.settlement_state(records, "104"), outcome)
+
+
+class MalformedReceiptTests(unittest.TestCase):
+    """A near-miss is told from a silence, so a refusal can be answered rather than dropped.
+
+    The incident (#105): a child appended prose to its receipt line, the grammar refused the line,
+    and nothing anywhere said so — the run read a finished ticket as `waiting` for eight minutes.
+    The grammar is unchanged; what these pin is that the refusal is now legible.
+    """
+
+    # The message that stalled run `crewtask/64`, as its child sent it.
+    INCIDENT = (
+        f"CREW COMPLETE {SHA} — deferred gap carried forward: the parked checklist is unwritten"
+        " ts=1755594000"
+    )
+
+    def test_the_incident_s_receipt_speaks_no_verb_and_is_a_near_miss(self):
+        self.assertEqual(machine_log.final_verb(self.INCIDENT), (None, None))
+        self.assertEqual(machine_log.malformed_receipt(self.INCIDENT), self.INCIDENT)
+
+    def test_a_message_that_reaches_for_no_verb_at_all_is_silence_not_a_near_miss(self):
+        for message in (
+            "The tests are green and the review is under way.",
+            "",
+            None,
+            {"note": "a structured message carries no lines"},
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_a_message_carrying_a_valid_verb_line_is_never_a_near_miss(self):
+        for message in (
+            f"CREW COMPLETE {SHA}",
+            f"CREW COMPLETE {SHA} ts=1755594000",
+            f"The work is committed and reviewed clean.\nCREW COMPLETE {SHA} ts=1755594000",
+            "CREW PARKED features/demo/checklist.md ts=1755594000",
+            "CREW FAILED the fixture never came up ts=1755594000",
+            "CREW ASK 07 stuck — which table? ts=1755594000",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_a_valid_verb_line_covers_a_botched_one_beside_it(self):
+        """The message settled on a verb it spoke properly; there is nothing to bounce."""
+        message = (
+            f"CREW COMPLETE {SHA[:8]} — first attempt, wrong length\n"
+            f"CREW COMPLETE {SHA} ts=1755594000"
+        )
+
+        self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_prose_naming_a_verb_mid_line_is_neither_verb_nor_near_miss(self):
+        message = "My first turn says to send CREW COMPLETE <sha> when the work is committed."
+
+        self.assertEqual(machine_log.final_verb(message), (None, None))
+        self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_an_indented_line_is_quoting_rather_than_reaching_for_a_verb(self):
+        """The same exemption the grammar grants a quoted example, granted to a botched one."""
+        message = (
+            "My first turn tells me to end on this line:\n"
+            "\n"
+            f"    CREW COMPLETE {SHA[:8]}\n"
+            "\n"
+            "I have not finished, so I have not sent it."
+        )
+
+        self.assertIsNone(machine_log.malformed_receipt(message))
+
+    def test_every_verb_is_recognised_when_its_own_shape_is_missed(self):
+        cases = (
+            f"CREW COMPLETE {SHA[:8]}",
+            "CREW COMPLETE",
+            f"CREW COMPLETE {SHA} — the review is still out",
+            "CREW PARKED",
+            "CREW FAILED",
+            "CREW ASK",
+        )
+        for line in cases:
+            with self.subTest(line=line):
+                self.assertEqual(machine_log.final_verb(line), (None, None))
+                self.assertEqual(machine_log.malformed_receipt(line), line)
+
+    def test_the_last_near_miss_is_the_one_reported(self):
+        """A final turn speaks once, so the line it ended on is the line to quote back."""
+        message = (
+            "CREW COMPLETE deadbeef\n"
+            "That was the short sha; the full one is\n"
+            f"CREW COMPLETE {SHA} — and the review is clean"
+        )
+
+        self.assertEqual(
+            machine_log.malformed_receipt(message),
+            f"CREW COMPLETE {SHA} — and the review is clean",
+        )
+
+    def test_trailing_padding_is_not_what_makes_a_line_a_near_miss(self):
+        """A stray space cost a receipt nowhere else, and it does not manufacture one here."""
+        self.assertIsNone(machine_log.malformed_receipt(f"CREW COMPLETE {SHA} \r"))
+        self.assertEqual(
+            machine_log.malformed_receipt("CREW COMPLETE  \r"), "CREW COMPLETE"
+        )
+
+
 class EventTests(MachineLogTestCase):
     """The four events a script appends."""
 
@@ -159,6 +310,21 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["branch"], "worktree-07-machine-log")
         self.assertEqual(entry["worktree"], "/repo/.claude/worktrees/07-machine-log")
         self.assertEqual(entry["window"], "crew:07")
+
+    def test_a_launch_failure_records_why_verification_failed(self):
+        result = run_cli(
+            "launch-failed",
+            "--ticket", "07",
+            "--detail", "no entry for this child in the live agents list",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "launch-failed")
+        self.assertEqual(entry["ticket"], "07")
+        self.assertEqual(entry["detail"], "no entry for this child in the live agents list")
 
     def test_a_receipt_records_the_verified_verdict(self):
         result = run_cli(
@@ -483,13 +649,13 @@ class EventTests(MachineLogTestCase):
                 run_cli("outcome", "--ticket", "07", "--outcome", outcome, log=self.log).returncode,
                 0,
             )
-        for result in ("clean", "conflict", "repaired", "escalated"):
+        for result in ("clean", "conflict", "repaired", "resolved", "escalated"):
             self.assertEqual(
                 run_cli("merge", "--ticket", "07", "--result", result, log=self.log).returncode,
                 0,
             )
 
-        self.assertEqual(len(self.lines()), 11)
+        self.assertEqual(len(self.lines()), 12)
 
     def test_a_value_outside_a_closed_set_is_refused_and_appends_nothing(self):
         result = run_cli("receipt", "--ticket", "07", "--verdict", "landed", log=self.log)

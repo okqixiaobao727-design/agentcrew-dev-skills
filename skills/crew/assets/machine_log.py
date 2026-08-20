@@ -12,8 +12,8 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|receipt|merge|outcome|review|advance|live-source|
-                                  monitor-error|session-cost|message ...
+    machine_log.py --log <path> launch|launch-failed|receipt|merge|outcome|review|advance|
+                                  live-source|monitor-error|session-cost|message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
     machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
@@ -81,10 +81,23 @@ VERB_GRAMMAR = (
     (ESCALATION_VERB, re.compile(rf"{ESCALATION_VERB} \S.*")),
 )
 
+LIVE = "live"
+LANDABLE = "landable"
+COMPLETED = "completed"
+FAILED = "failed"
+PARKED = "parked"
+BLOCKED = "blocked"
+CLEAN = "clean"
+CONFLICT = "conflict"
+REPAIRED = "repaired"
+RESOLVED = "resolved"
+ESCALATED = "escalated"
+
 # The closed sets. A log that accepts an unknown verdict is a log a later agent cannot trust.
-VERDICTS = ("landable", "parked", "failed")
-OUTCOMES = ("completed", "failed", "parked", "blocked")
-MERGE_RESULTS = ("clean", "conflict", "repaired", "escalated")
+VERDICTS = (LANDABLE, PARKED, FAILED)
+OUTCOMES = (COMPLETED, FAILED, PARKED, BLOCKED)
+MERGE_RESULTS = (CLEAN, CONFLICT, REPAIRED, RESOLVED, ESCALATED)
+LANDED_MERGE_RESULTS = (CLEAN, REPAIRED, RESOLVED)
 # The two ends of one review. A review that started and never came back is a row the dashboard
 # would leave standing, so the vocabulary is closed at "it is running" and "it is not".
 REVIEW_STATES = ("running", "returned")
@@ -108,6 +121,46 @@ COST_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_cr
 COST_TOTAL = "total_tokens"
 
 LOG_FILE_MODE = 0o644
+
+
+def settlement_state(records, ticket):
+    """Return one of live, landable, completed, failed, parked, or blocked.
+
+    Precedence, from highest to lowest:
+
+    ================  ==============================================================
+    Log evidence      State
+    ================  ==============================================================
+    latest outcome    that outcome; it refines a receipt and never un-settles it
+    latest receipt    its verdict, except landable plus a landed merge is completed
+    neither           live
+    ================  ==============================================================
+
+    A completed outcome needs no receipt or merge lookup here: the tracker close that writes it
+    only happens after a landed merge. For a landable receipt, the latest merge result must be
+    clean or repaired; a conflict or escalation leaves the ticket landable rather than done.
+    """
+    ticket = str(ticket)
+    latest_outcome = None
+    latest_receipt = None
+    latest_merge = None
+    for record in records:
+        if str(record.get("ticket")) != ticket:
+            continue
+        event = record.get("event")
+        if event == "outcome" and record.get("outcome") in OUTCOMES:
+            latest_outcome = str(record["outcome"])
+        elif event == "receipt" and record.get("verdict") in VERDICTS:
+            latest_receipt = str(record["verdict"])
+        elif event == "merge" and record.get("result") in MERGE_RESULTS:
+            latest_merge = str(record["result"])
+    if latest_outcome is not None:
+        return latest_outcome
+    if latest_receipt == LANDABLE and latest_merge in LANDED_MERGE_RESULTS:
+        return COMPLETED
+    if latest_receipt is not None:
+        return latest_receipt
+    return LIVE
 
 
 def now():
@@ -163,6 +216,34 @@ def final_verb(message):
             if pattern.fullmatch(line):
                 return verb, line
     return None, None
+
+
+def malformed_receipt(message):
+    """The last line of `message` that reached for a verb and missed its shape, or None.
+
+    Two things `final_verb` cannot tell apart both come back from it as `(None, None)`: a message
+    that speaks no verb, and a message that tried to speak one and got the shape wrong. This is the
+    second of them, and it exists so a refusal can be answered rather than dropped — a receipt with
+    prose appended to its verb line once left a finished ticket reading `waiting` for eight minutes
+    with nothing anywhere saying why (ADR-0015).
+
+    Deliberately narrow. A line counts as a near miss only where it opens, at the margin, with a
+    verb word the grammar knows and then fails that verb's whole-line pattern: prose that names a
+    verb mid-line has not reached for one, an indented line is quoting rather than speaking — the
+    same exemption `final_verb` grants — and a message carrying any valid verb line has said its
+    word and is never a near miss whatever else stands in it. The grammar itself is untouched, so
+    nothing this recognises can settle anything.
+    """
+    if not isinstance(message, str):
+        return None
+    if final_verb(message)[0] is not None:
+        return None
+    for line in reversed(message.split("\n")):
+        line = line.rstrip()
+        for verb, _pattern in VERB_GRAMMAR:
+            if line == verb or line.startswith(verb + " "):
+                return line
+    return None
 
 
 def message_event(message, role):
@@ -596,6 +677,11 @@ def build_parser():
                           " is what makes a run's spend attributable after the fact; a Claude"
                           " child's alone, a Codex child running on its own vendor's credentials",
     )
+
+    launch_failed = event_command(
+        "launch-failed", "a live child failed post-launch verification"
+    )
+    launch_failed.add_argument("--detail", required=True)
 
     receipt = event_command("receipt", "a child's final word, as verified by script")
     receipt.add_argument("--verdict", required=True, choices=VERDICTS)

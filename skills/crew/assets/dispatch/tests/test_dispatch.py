@@ -30,6 +30,12 @@ COORDINATOR_PID = 1504
 BASE_COMMIT = "b614ec84712aa8c351fe30ec69000e2e12518aeb"
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
+# The two halves of a row's account binding, spelled as the wave table spells them: a ticket that
+# named an account selects that configuration home explicitly, and a ticket that named none
+# inherits the environment the run was started in (ADR-0014).
+INHERITED = "inherited"
+EXPLICIT = "explicit"
+CONFIG_HOME_VARIABLE = "CLAUDE_CONFIG_DIR"
 
 
 def run_git(repo, *args):
@@ -93,10 +99,13 @@ class Fixture:
             "executor": "claude",
             "model": CLAUDE_MODEL,
             "effort": CLAUDE_EFFORT,
-            # Every row of a validated wave table carries the account its ticket's processes run
-            # on, resolved from the ticket's own name or from the coordinator's own configuration
-            # home where it named none (ADR-0014). This fixture's rows are on the coordinator's.
+            # Every row of a validated wave table carries the account binding its ticket's
+            # processes run under: the resolved configuration home, and whether that home is
+            # selected explicitly or inherited from the environment the run was started in
+            # (ADR-0014). This fixture's rows are the ordinary case — a ticket that named no
+            # account, bound to the coordinator's own home, inherited.
             "account": str(self.config_dir),
+            "account_mode": INHERITED,
             "review": {"vendor": "codex", "model": CODEX_MODEL, "effort": CODEX_EFFORT},
         }
         ticket.update(overrides)
@@ -488,11 +497,16 @@ class ReviewEventRenderTests(DispatchTestCase):
         )
 
     def claude_lane(self, account=None, **overrides):
-        """A ticket whose reviewer is the Claude lane, on the account the caller names."""
+        """A ticket whose reviewer is the Claude lane, on the account the caller names.
+
+        An account named here is a ticket that named one, so its binding is explicit; naming none
+        is the ordinary row, inherited on the coordinator's own home.
+        """
         return dict(
             workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
             account=str(account or self.fixture.config_dir),
+            account_mode=EXPLICIT if account else INHERITED,
             **overrides,
         )
 
@@ -502,14 +516,12 @@ class ReviewEventRenderTests(DispatchTestCase):
         self.assertIn(
             "python3 %s/assets/review/scripts/claude_review_bridge.py \\\n"
             "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
-            "  --account %s \\\n"
             "  --base %s \\\n"
             "  --verification '<the commands you ran to verify this work, and that they"
             " passed>' \\\n"
             "  'the changes in this worktree since %s'"
             % (CREW_SKILL_DIR, self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT,
-               self.machine_log, self.fixture.config_dir, self.fixture.base_commit,
-               self.fixture.base_commit),
+               self.machine_log, self.fixture.base_commit, self.fixture.base_commit),
             prompt,
         )
 
@@ -558,11 +570,17 @@ class ReviewAccountTests(ReviewEventRenderTests):
 
         self.assertIn(f"--account {second} \\\n", prompt)
 
-    def test_a_ticket_on_the_coordinators_account_names_it_just_the_same(self):
-        """A ticket that named no account was resolved to the coordinator's, and says so."""
+    def test_a_ticket_that_named_no_account_hands_the_bridge_none(self):
+        """An inherited binding reviews on the login the operator is signed into.
+
+        The bridge sets `CLAUDE_CONFIG_DIR` for an account it is given and touches the environment
+        for no other, so handing it the default home explicitly is how an account-less reviewer
+        came to be told it was not logged in (#110). It is handed nothing instead.
+        """
         prompt = self.prompt_for(**self.claude_lane())
 
-        self.assertIn(f"--account {self.fixture.config_dir} \\\n", prompt)
+        self.assertIn("claude_review_bridge.py", prompt)
+        self.assertNotIn("--account", prompt)
 
     def test_the_codex_review_lane_is_handed_no_account(self):
         prompt = self.prompt_for(account=str(self.fixture.config_dir))
@@ -686,6 +704,44 @@ class ReceiptChannelTests(DispatchTestCase):
             prompt,
         )
 
+
+
+class BareVerbLineTests(DispatchTestCase):
+    """The rule that decides whether a receipt parses is stated where the verbs are taught.
+
+    It used to live only in the machine log's own regex comment, so a child following its
+    instructions to the letter could still send a receipt the grammar refused (#105).
+    """
+
+    SENTENCE = (
+        "The verb line stands alone: it is the whole of that message's final line, and any prose"
+        "\nyou add goes on the lines above it, never on the line itself."
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = self.fixture.root / "run" / "log.jsonl"
+
+    def prompt_for(self, *extra, **overrides):
+        table = self.fixture.table([self.fixture.ticket("06", "receipted", **overrides)])
+        result = self.fixture.run_dispatch("render", table, extra=extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.fixture.turn("06")
+
+    def test_a_sendable_receipt_is_taught_the_bare_line(self):
+        self.assertIn(self.SENTENCE, self.prompt_for())
+
+    def test_a_recorded_receipt_is_taught_the_bare_line(self):
+        self.assertIn(self.SENTENCE, self.prompt_for("--log", str(self.machine_log)))
+
+    def test_a_parking_workflow_is_taught_the_bare_line_on_both_channels(self):
+        self.assertIn(
+            self.SENTENCE, self.prompt_for(workflow="acceptance", review=None)
+        )
+        self.assertIn(
+            self.SENTENCE,
+            self.prompt_for("--log", str(self.machine_log), workflow="acceptance", review=None),
+        )
 
 class ReReviewConditionTests(DispatchTestCase):
     """The re-review cap, stated as a condition on both review lanes."""
@@ -1090,7 +1146,7 @@ class LaunchEventTests(DispatchTestCase):
         return [record for record in self.fixture.log_records(self.log)
                 if record["event"] == "launch"]
 
-    def test_each_launched_child_earns_one_launch_event(self):
+    def test_a_claude_launch_is_recorded_before_and_after_verification(self):
         tickets = [
             self.fixture.ticket("06", "claude-child"),
             self.fixture.ticket(
@@ -1106,19 +1162,21 @@ class LaunchEventTests(DispatchTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         events = self.launch_events()
-        self.assertEqual([event["ticket"] for event in events], ["06", "07"], events)
-        claude, codex = events
-        self.assertEqual(claude["executor"], "claude")
-        self.assertEqual(claude["model"], CLAUDE_MODEL)
-        self.assertEqual(claude["effort"], CLAUDE_EFFORT)
-        self.assertEqual(claude["workflow"], "tdd")
-        self.assertEqual(claude["child"], "stub-child-1")
-        self.assertEqual(claude["branch"], "worktree-06-claude-child")
+        self.assertEqual([event["ticket"] for event in events], ["06", "06", "07"], events)
+        started, verified, codex = events
+        self.assertEqual(started["child"], "")
+        self.assertEqual(verified["executor"], "claude")
+        self.assertEqual(verified["model"], CLAUDE_MODEL)
+        self.assertEqual(verified["effort"], CLAUDE_EFFORT)
+        self.assertEqual(verified["workflow"], "tdd")
+        self.assertEqual(verified["child"], "stub-child-1")
+        self.assertEqual(verified["branch"], "worktree-06-claude-child")
         self.assertEqual(
-            claude["worktree"],
+            verified["worktree"],
             str(self.fixture.repo / ".claude" / "worktrees" / "06-claude-child"),
         )
-        self.assertTrue(claude["window"].startswith("@"), claude)
+        self.assertEqual(started["window"], verified["window"])
+        self.assertTrue(verified["window"].startswith("@"), verified)
         self.assertEqual(codex["executor"], "codex")
         self.assertEqual(codex["model"], CODEX_MODEL)
         self.assertEqual(codex["effort"], CODEX_EFFORT)
@@ -1137,6 +1195,36 @@ class LaunchEventTests(DispatchTestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertEqual(self.launch_events(), [])
+
+    def test_a_live_child_that_fails_verification_is_recorded_for_adoption(self):
+        table = self.fixture.table([self.fixture.ticket("06", "dispatch-renderer")])
+        (self.fixture.bin_dir / "claude").write_text(
+            "#!/bin/sh\nif [ \"$1\" = agents ]; then echo '[]'; fi\nexit 0\n"
+        )
+        (self.fixture.bin_dir / "claude").chmod(0o755)
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table,
+            extra=("--log", str(self.log), "--verify-timeout", "1"),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        records = self.fixture.log_records(self.log)
+        self.assertEqual(records[0]["event"], "launch", records)
+        launch = self.launch_events()[0]
+        self.assertEqual(launch["ticket"], "06")
+        self.assertEqual(launch["branch"], "worktree-06-dispatch-renderer")
+        self.assertEqual(launch["worktree"], str(
+            self.fixture.repo / ".claude" / "worktrees" / "06-dispatch-renderer"
+        ))
+        self.assertTrue(launch["window"].startswith("@"), launch)
+        failures = [
+            record for record in records
+            if record.get("event") != "launch" and record.get("ticket") == "06"
+        ]
+        self.assertEqual(len(failures), 1, records)
+        self.assertEqual(failures[0]["event"], "launch-failed")
+        self.assertIn("no entry for this child", failures[0].get("detail", ""))
 
     def test_a_launch_the_log_could_not_record_fails_the_dispatch(self):
         """A child the log never heard of is a child wave advancement cannot see, so a wave that
@@ -1209,6 +1297,10 @@ class AccountRoutingTests(DispatchTestCase):
         self.other = str(self.fixture.other_account)
         self.coordinator_account = str(self.fixture.config_dir)
 
+    def routed(self, number, slug):
+        """A ticket that named an account: bound to the second profile, explicitly."""
+        return self.fixture.ticket(number, slug, account=self.other, account_mode=EXPLICIT)
+
     def window_environment(self, name):
         """The `NAME=VALUE` pairs the window for that ticket was created with."""
         for call in self.fixture.tmux_calls():
@@ -1235,9 +1327,7 @@ class AccountRoutingTests(DispatchTestCase):
         self.assertEqual(self.fixture.tmux_calls(), [])
 
     def test_a_child_runs_under_the_account_its_ticket_names(self):
-        table = self.fixture.table(
-            [self.fixture.ticket("06", "routed", account=self.other)]
-        )
+        table = self.fixture.table([self.routed("06", "routed")])
 
         result = self.fixture.run_dispatch("dispatch", table)
 
@@ -1252,9 +1342,7 @@ class AccountRoutingTests(DispatchTestCase):
 
     def test_a_shell_in_that_window_sees_the_account_too(self):
         """The window itself is put on the account, so a `claude` typed by hand stays on it."""
-        table = self.fixture.table(
-            [self.fixture.ticket("06", "routed", account=self.other)]
-        )
+        table = self.fixture.table([self.routed("06", "routed")])
 
         result = self.fixture.run_dispatch("dispatch", table)
 
@@ -1263,8 +1351,13 @@ class AccountRoutingTests(DispatchTestCase):
             self.window_environment("06"), {"CLAUDE_CONFIG_DIR": self.other}
         )
 
-    def test_a_ticket_naming_no_account_runs_under_the_coordinators(self):
-        """Which the table spells as the coordinator's own configuration home."""
+    def test_a_ticket_naming_no_account_runs_on_the_login_the_run_was_started_from(self):
+        """An inherited binding sets nothing: the window is given no configuration home at all.
+
+        The child still lands in the coordinator's profile, because that is the login the run is
+        already on — but it lands there by inheriting it, not by having the default home spelled
+        out for it, which is a login that can fail where the inherited one works (#110).
+        """
         table = self.fixture.table([self.fixture.ticket("06", "unnamed")])
 
         result = self.fixture.run_dispatch("dispatch", table)
@@ -1276,14 +1369,26 @@ class AccountRoutingTests(DispatchTestCase):
             self.fixture.transcripts(self.coordinator_account), [launches[0]["sessionId"]]
         )
         self.assertEqual(self.fixture.transcripts(self.other), [])
-        self.assertEqual(
-            self.window_environment("06"), {"CLAUDE_CONFIG_DIR": self.coordinator_account}
+        self.assertEqual(self.window_environment("06"), {})
+
+    def test_an_account_mode_the_table_cannot_mean_is_refused_before_any_launch(self):
+        """The half of the binding that says whether the account is set or inherited."""
+        table = self.fixture.table(
+            [self.fixture.ticket("06", "routed", account=self.other, account_mode="maybe")]
         )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        offence = [line for line in result.stderr.splitlines() if line.startswith("06")]
+        self.assertTrue(offence, result.stderr)
+        self.assertIn("Account mode `maybe`", offence[0])
+        self.assertEqual(self.fixture.launches(), [])
 
     def test_a_wave_mixing_two_accounts_launches_every_child_under_its_own(self):
         table = self.fixture.table([
             self.fixture.ticket("06", "on-the-coordinators"),
-            self.fixture.ticket("07", "on-the-other", account=self.other),
+            self.routed("07", "on-the-other"),
         ])
 
         result = self.fixture.run_dispatch("dispatch", table)
@@ -1305,9 +1410,7 @@ class AccountRoutingTests(DispatchTestCase):
 
     def test_a_child_present_only_in_its_own_accounts_list_is_still_found(self):
         """Two profiles answer `agents --json` with two disjoint lists; the routed one is read."""
-        table = self.fixture.table(
-            [self.fixture.ticket("06", "routed", account=self.other)]
-        )
+        table = self.fixture.table([self.routed("06", "routed")])
 
         result = self.fixture.run_dispatch("dispatch", table)
 
@@ -1317,9 +1420,7 @@ class AccountRoutingTests(DispatchTestCase):
 
     def test_the_transcript_read_that_asserts_the_model_reads_the_childs_account(self):
         """A downgrade written into the routed profile is still caught, so that profile was read."""
-        table = self.fixture.table(
-            [self.fixture.ticket("06", "routed", account=self.other)]
-        )
+        table = self.fixture.table([self.routed("06", "routed")])
 
         result = self.fixture.run_dispatch(
             "dispatch", table, extra=("--verify-timeout", "5"),
@@ -1336,7 +1437,7 @@ class AccountRoutingTests(DispatchTestCase):
         log = self.fixture.root / "log.jsonl"
         table = self.fixture.table([
             self.fixture.ticket("06", "on-the-coordinators"),
-            self.fixture.ticket("07", "on-the-other", account=self.other),
+            self.fixture.ticket("07", "on-the-other", account=self.other, account_mode=EXPLICIT),
         ])
 
         result = self.fixture.run_dispatch(
@@ -1348,14 +1449,19 @@ class AccountRoutingTests(DispatchTestCase):
                   if record["event"] == "launch"]
         self.assertEqual(
             [(event["ticket"], event["account"]) for event in events],
-            [("06", self.coordinator_account), ("07", self.other)],
+            [
+                ("06", self.coordinator_account),
+                ("06", self.coordinator_account),
+                ("07", self.other),
+                ("07", self.other),
+            ],
             events,
         )
 
     def test_the_verification_timeout_names_the_tickets_account(self):
         """With no login check anywhere, this timeout is where an unauthenticated profile shows."""
         table = self.fixture.table(
-            [self.fixture.ticket("06", "routed", account=self.other)]
+            [self.fixture.ticket("06", "routed", account=self.other, account_mode=EXPLICIT)]
         )
         # A CLI that starts nothing: the routed account's list stays empty, as an unauthenticated
         # profile's does.
@@ -1374,7 +1480,7 @@ class AccountRoutingTests(DispatchTestCase):
     def test_a_hook_variable_cannot_move_a_child_off_its_tickets_account(self):
         """The window carries the account; the launch line's hook variables never overrule it."""
         table = self.fixture.table(
-            [self.fixture.ticket("06", "routed", account=self.other)],
+            [self.fixture.ticket("06", "routed", account=self.other, account_mode=EXPLICIT)],
             launch_hook={
                 "command": "true",
                 "env": {"CLAUDE_CONFIG_DIR": self.coordinator_account},
@@ -1411,9 +1517,9 @@ class AccountRoutingTests(DispatchTestCase):
         """A Codex child launches on its own vendor's credentials, not on a Claude profile."""
         log = self.fixture.root / "log.jsonl"
         table = self.fixture.table([
-            self.fixture.ticket("06", "claude-child", account=self.other),
+            self.fixture.ticket("06", "claude-child", account=self.other, account_mode=EXPLICIT),
             self.fixture.ticket(
-                "07", "codex-child", account=self.other,
+                "07", "codex-child", account=self.other, account_mode=EXPLICIT,
                 executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
                 review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
             ),
@@ -1431,9 +1537,9 @@ class AccountRoutingTests(DispatchTestCase):
 
     def test_a_codex_ticket_in_the_same_wave_is_unaffected(self):
         table = self.fixture.table([
-            self.fixture.ticket("06", "claude-child", account=self.other),
+            self.fixture.ticket("06", "claude-child", account=self.other, account_mode=EXPLICIT),
             self.fixture.ticket(
-                "07", "codex-child", account=self.other,
+                "07", "codex-child", account=self.other, account_mode=EXPLICIT,
                 executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
                 review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
             ),

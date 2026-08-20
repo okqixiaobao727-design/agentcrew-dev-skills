@@ -58,6 +58,8 @@ its output:
 CREW COMPLETE <sha> ts=<unix time>
 If you cannot complete the ticket, send:
 CREW FAILED <reason> ts=<unix time>
+The verb line stands alone: it is the whole of that message's final line, and any prose
+you add goes on the lines above it, never on the line itself.
 '''
 
 # The Claude lane's receipt: written straight to the run's machine log, which is where the driver
@@ -72,6 +74,8 @@ python3 <machine log script> --log <machine log path> message \
 
 If you cannot complete the ticket, record the same way with:
 CREW FAILED <reason> ts=<unix time>
+The verb line stands alone: it is the whole of that message's final line, and any prose
+you add goes on the lines above it, never on the line itself.
 Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is woken for.
 '''
 
@@ -161,6 +165,8 @@ CREW PARKED <absolute checklist path> ts=<unix time>
 and stop — the checklist is the human's to run.
 If you cannot reach that point, send:
 CREW FAILED <reason> ts=<unix time>
+The verb line stands alone: it is the whole of that message's final line, and any prose
+you add goes on the lines above it, never on the line itself.
 '''
 # The same park, recorded rather than sent, for a Claude child on a run with a machine log.
 completion_claude = '''
@@ -173,6 +179,8 @@ python3 <machine log script> --log <machine log path> message \
 and stop — the checklist is the human's to run.
 If you cannot reach that point, record the same way with:
 CREW FAILED <reason> ts=<unix time>
+The verb line stands alone: it is the whole of that message's final line, and any prose
+you add goes on the lines above it, never on the line itself.
 Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is woken for.
 '''
 

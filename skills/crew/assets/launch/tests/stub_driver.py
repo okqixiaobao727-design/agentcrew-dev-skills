@@ -1,29 +1,57 @@
 #!/usr/bin/env python3
-"""A driver stand-in for the launch tests: it records the command line it was launched with.
+"""A driver stand-in for the launch tests: it lives the life of a driver without being one.
 
 Every call is appended to `AGENTCREW_STUB_DIR/driver-calls.jsonl` with the directory it was made
 in, because the composed command line and the directory it runs in are the whole of what the
-launch script hands the driver. It prints one line on stdout, so a test can assert that the
-launcher passes the driver's own output through untouched, and exits with
-`AGENTCREW_STUB_DRIVER_EXIT` (default 0), so a test can assert the driver's exit code is the
-launcher's.
+launch script hands the driver. Beyond that it keeps the two records a real driver keeps, which
+are the whole of what the launcher and the dashboard read it by:
+
+- it names itself in `<feature-dir>/.crew/driver.pid` on the way in, as a driver's loop does;
+- it takes that record away and leaves one wake snapshot in `<feature-dir>/.crew/wake.json` on the
+  way out, as every deliberate exit of a driver does.
+
+`AGENTCREW_STUB_DRIVER_HOLD` holds it that many seconds before it wakes, so a test can catch a run
+while its driver is still driving it. `AGENTCREW_STUB_DRIVER_WAKE` is the snapshot it wakes with.
+`AGENTCREW_STUB_DRIVER_STOPPED` makes it release the run and end without a wake at all, which is
+what an operator's Ctrl-C in the driver's own window leaves behind.
 """
 
 import json
 import os
 import pathlib
 import sys
+import time
 
 
 STDOUT_LINE = "stub driver ran"
+DEFAULT_WAKE = {"reason": "run-complete", "ticket": None, "pointer": "report.md"}
+
+
+def flag(argv, name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def run_dir(argv):
+    feature = flag(argv, "--feature-dir")
+    return pathlib.Path(feature).resolve() / ".crew" if feature else None
 
 
 def main():
     argv = sys.argv[1:]
     state_dir = pathlib.Path(os.environ["AGENTCREW_STUB_DIR"])
     with (state_dir / "driver-calls.jsonl").open("a") as handle:
-        handle.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
-    print(STDOUT_LINE)
+        handle.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "pid": os.getpid()}) + "\n")
+    print(STDOUT_LINE, flush=True)
+
+    directory = run_dir(argv)
+    if directory is None or not directory.is_dir():
+        return int(os.environ.get("AGENTCREW_STUB_DRIVER_EXIT") or 0)
+    (directory / "driver.pid").write_text(f"{os.getpid()}\n")
+    time.sleep(float(os.environ.get("AGENTCREW_STUB_DRIVER_HOLD") or 0))
+    (directory / "driver.pid").unlink(missing_ok=True)
+    if not os.environ.get("AGENTCREW_STUB_DRIVER_STOPPED"):
+        wake = os.environ.get("AGENTCREW_STUB_DRIVER_WAKE") or json.dumps(DEFAULT_WAKE)
+        (directory / "wake.json").write_text(wake + "\n")
     return int(os.environ.get("AGENTCREW_STUB_DRIVER_EXIT") or 0)
 
 

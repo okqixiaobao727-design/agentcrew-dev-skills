@@ -7,9 +7,10 @@ driver with a stub `claude` on PATH. What is asserted is external only: the git 
 left behind, the lines the machine log gained, the command the repair session was launched with,
 and the exit code.
 
-The three paths down the ladder (ADR-0004) are the three conflict fixtures: a mechanical conflict
-repaired without waking anyone, a mechanical conflict the repair session fails twice, and a
-semantic conflict that skips the repair rung.
+The paths down the ladder (ADR-0004) are the conflict fixtures: a mechanical conflict the driver
+resolves itself, a mechanical conflict whose file the driver will not rewrite and a session repairs
+instead, that same conflict with the session failing twice, and a semantic conflict that skips the
+repair rung altogether.
 """
 
 import json
@@ -32,6 +33,11 @@ MACHINE_LOG = ASSETS / "machine_log.py"
 # The repair rung's routing, as the caller supplies it: a full model ID, never an alias
 # (ADR-0003), and the hard budget cap ADR-0004 defaults to two US dollars.
 REPAIR_MODEL = "claude-sonnet-4-5-20250929"
+# The two halves of a row's account binding: a ticket that named an account selects that
+# configuration home explicitly, and a ticket that named none inherits the environment the run was
+# started in (ADR-0014).
+INHERITED = "inherited"
+EXPLICIT = "explicit"
 DEFAULT_BUDGET_USD = "2"
 
 INTEGRATION_BRANCH = "crew/crew-v2"
@@ -40,6 +46,17 @@ FEATURE = "features/demo"
 # The shared file every conflict fixture is built in, and the line each side writes into it.
 SHARED = "notes.md"
 SHARED_BASE = "one\ntwo\nthree\n"
+
+# A second ordinary file, for the merge that conflicts in two files at once.
+OTHER = "other.md"
+OTHER_BASE = "alpha\nbeta\ngamma\n"
+
+# A file whose own text carries a line that reads as an opening conflict marker. Its markers no
+# longer balance, so the driver's deterministic pass refuses to rewrite it and the conflict climbs
+# to the repair rung — which is what keeps that rung under test now that a conflict the driver can
+# rewrite never reaches it.
+MARKED = "marked.md"
+MARKED_BASE = "one\n<<<<<<< left over from an earlier merge\nthree\n"
 
 
 def run_git(repo, *args, check=True):
@@ -64,6 +81,8 @@ class Fixture:
         run_git(self.repo, "config", "user.name", "Crew Test")
         (self.repo / FEATURE).mkdir(parents=True)
         (self.repo / SHARED).write_text(SHARED_BASE)
+        (self.repo / OTHER).write_text(OTHER_BASE)
+        (self.repo / MARKED).write_text(MARKED_BASE)
         run_git(self.repo, "add", "-A")
         run_git(self.repo, "commit", "-m", "base")
         self.base_commit = git_out(self.repo, "rev-parse", "HEAD")
@@ -116,9 +135,12 @@ class Fixture:
             "executor": "claude",
             "model": "claude-opus-4-5-20251101",
             "effort": "medium",
-            # Every row of a validated wave table carries the account its ticket's processes run
-            # on, the coordinator's own where the ticket named none.
+            # Every row of a validated wave table carries the account binding its ticket's
+            # processes run under (ADR-0014): a named account is selected explicitly, and a ticket
+            # that named none is bound to the coordinator's own home, inherited — its processes
+            # run in the environment the run was started in, with nothing set.
             "account": str(account or self.coordinator_account),
+            "account_mode": EXPLICIT if account else INHERITED,
         })
         return branch
 
@@ -155,7 +177,10 @@ class Fixture:
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
-        environment.update(env or {})
+        # A None here takes the variable out of the caller's environment altogether, which is the
+        # only way to fixture "the operator set nothing" on a machine where it may be set.
+        for name, value in (env or {}).items():
+            environment.pop(name, None) if value is None else environment.update({name: value})
         return subprocess.run(
             [
                 sys.executable, str(DRIVER), "land",
@@ -321,13 +346,123 @@ class CleanMergeTests(MergeDriverTestCase):
         self.assertEqual(self.fixture.events("merge"), [])
 
 
-class MechanicalConflictTests(MergeDriverTestCase):
-    """Both sides inserted at the same point: a textual conflict with no design disagreement."""
+class MechanicalSelfResolutionTests(MergeDriverTestCase):
+    """Both sides only inserted at the same point: the driver keeps both, with no session at all.
+
+    The classifier already proves nothing about the two designs disagrees, so the resolution is the
+    deterministic one the repair brief used to ask a model for: ours, then theirs, markers gone.
+    """
 
     def conflict(self):
         branch = self.fixture.ticket("07", "alpha", {SHARED: SHARED_BASE + "from the ticket\n"})
         self.fixture.commit_on_integration(
             SHARED, SHARED_BASE + "from the integration branch\n", "integration adds a line"
+        )
+        return branch
+
+    def test_the_driver_keeps_both_insertions_and_launches_no_repair_session(self):
+        branch = self.conflict()
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.fixture.merged(branch))
+        # Ours is the integration branch, theirs the ticket's: both insertions, in that order.
+        self.assertEqual(
+            (self.fixture.repo / SHARED).read_text(),
+            SHARED_BASE + "from the integration branch\nfrom the ticket\n",
+        )
+        self.assertEqual(
+            self.fixture.repairs(), [], "a proven-mechanical conflict costs no repair session"
+        )
+        self.assertOnIntegrationBranch()
+
+    def test_the_self_resolved_merge_is_distinguishable_from_a_repaired_one(self):
+        self.conflict()
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        logged = self.fixture.events("merge")
+        self.assertEqual([entry["result"] for entry in logged], ["conflict", "resolved"])
+        self.assertEqual(
+            logged[-1]["sha"], git_out(self.fixture.repo, "rev-parse", "HEAD"),
+            "the resolution is the merge commit the wave landed",
+        )
+        self.assertEqual(logged[-1]["branch"], "worktree-07-alpha")
+        self.assertEqual(logged[-1]["into"], INTEGRATION_BRANCH)
+        self.assertIn(f"07 resolved {logged[-1]['sha']}", result.stdout)
+
+    def test_two_files_that_both_only_gained_insertions_are_both_resolved(self):
+        branch = self.fixture.ticket("07", "alpha", {
+            SHARED: SHARED_BASE + "from the ticket\n",
+            OTHER: OTHER_BASE + "the ticket's line\n",
+        })
+        self.fixture.commit_on_integration(
+            SHARED, SHARED_BASE + "from the integration branch\n", "integration adds a line"
+        )
+        self.fixture.commit_on_integration(
+            OTHER, OTHER_BASE + "the integration branch's line\n", "integration adds another"
+        )
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.fixture.merged(branch))
+        self.assertEqual(
+            (self.fixture.repo / SHARED).read_text(),
+            SHARED_BASE + "from the integration branch\nfrom the ticket\n",
+        )
+        self.assertEqual(
+            (self.fixture.repo / OTHER).read_text(),
+            OTHER_BASE + "the integration branch's line\nthe ticket's line\n",
+        )
+        self.assertEqual(self.fixture.repairs(), [])
+        self.assertEqual(
+            [entry["result"] for entry in self.fixture.events("merge")], ["conflict", "resolved"]
+        )
+
+
+class MixedConflictTests(MergeDriverTestCase):
+    """One file mechanical, another semantic, in one merge: the existing all-hunks rule governs."""
+
+    def test_a_merge_carrying_one_semantic_file_is_not_self_resolved(self):
+        branch = self.fixture.ticket("07", "alpha", {
+            SHARED: SHARED_BASE + "from the ticket\n",
+            OTHER: "alpha\nthe ticket's beta\ngamma\n",
+        })
+        self.fixture.commit_on_integration(
+            SHARED, SHARED_BASE + "from the integration branch\n", "integration adds a line"
+        )
+        self.fixture.commit_on_integration(
+            OTHER, "alpha\nthe integration branch's beta\ngamma\n", "integration rewrites a line"
+        )
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertFalse(self.fixture.merged(branch))
+        results = [entry["result"] for entry in self.fixture.events("merge")]
+        self.assertEqual(results.count("resolved"), 0, "one semantic file makes the merge semantic")
+        self.assertEqual(results.count("escalated"), 1)
+        self.assertEqual(self.fixture.repairs(), [])
+        # The mechanical file was left as git wrote it rather than half-landed on its own.
+        self.assertOnIntegrationBranch()
+
+
+class RepairRungTests(MergeDriverTestCase):
+    """A mechanical conflict the driver's own rewrite refuses still climbs to the repair rung.
+
+    The conflict is in a file whose text already carries a line that reads as an opening conflict
+    marker, so its markers no longer balance and the deterministic pass will not touch it. Both
+    sides still only inserted at the same point, so the classification is mechanical and the ladder
+    goes on to the budget-capped session.
+    """
+
+    def conflict(self):
+        branch = self.fixture.ticket("07", "alpha", {MARKED: MARKED_BASE + "from the ticket\n"})
+        self.fixture.commit_on_integration(
+            MARKED, MARKED_BASE + "from the integration branch\n", "integration adds a line"
         )
         return branch
 
@@ -355,9 +490,11 @@ class MechanicalConflictTests(MergeDriverTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.fixture.merged(branch))
+        # Both sides' lines, and the marker-looking line gone with the real markers: the stub
+        # session strips every line that reads as one, which is exactly what the driver would not.
         self.assertEqual(
-            (self.fixture.repo / SHARED).read_text(),
-            SHARED_BASE + "from the integration branch\nfrom the ticket\n",
+            (self.fixture.repo / MARKED).read_text(),
+            "one\nthree\nfrom the integration branch\nfrom the ticket\n",
         )
         results = [entry["result"] for entry in self.fixture.events("merge")]
         self.assertEqual(results, ["conflict", "repaired"])
@@ -394,7 +531,7 @@ class MechanicalConflictTests(MergeDriverTestCase):
         # An escalation carries its own pointers, so a ruling never starts with a hunt.
         detail = escalations[0]["detail"]
         self.assertIn(str(self.fixture.repo / FEATURE / "07-alpha.md"), detail)
-        self.assertIn(SHARED, detail)
+        self.assertIn(MARKED, detail)
         self.assertOnIntegrationBranch()
 
     def test_a_repair_session_that_exits_nonzero_is_a_failed_attempt(self):
@@ -481,10 +618,10 @@ class RepairAccountTests(MergeDriverTestCase):
 
     def conflict(self, account=None):
         branch = self.fixture.ticket(
-            "07", "alpha", {SHARED: SHARED_BASE + "from the ticket\n"}, account=account
+            "07", "alpha", {MARKED: MARKED_BASE + "from the ticket\n"}, account=account
         )
         self.fixture.commit_on_integration(
-            SHARED, SHARED_BASE + "from the integration branch\n",
+            MARKED, MARKED_BASE + "from the integration branch\n",
             "integration adds a line",
         )
         return branch
@@ -501,17 +638,29 @@ class RepairAccountTests(MergeDriverTestCase):
         self.assertEqual(len(repairs), 1, repairs)
         self.assertEqual(repairs[0]["env"][self.CONFIG_HOME], str(routed))
 
-    def test_a_ticket_on_the_coordinators_account_repairs_there(self):
-        """A ticket that named no account repairs where every ticket repairs today."""
-        self.conflict()
+    def test_a_ticket_that_named_no_account_repairs_on_the_login_it_was_started_from(self):
+        """An inherited binding sets nothing: the session gets the caller's environment as it is.
 
-        result = self.fixture.land()
+        Asserted against a configuration home the *caller* carries and the row does not, so the
+        session provably took the one it inherited rather than the one the row names. Spelling the
+        row's directory out here is what left account-less sessions unable to log in (#110).
+        """
+        self.conflict()
+        operators_own = str(self.fixture.account("operators-own-login"))
+
+        result = self.fixture.land(env={self.CONFIG_HOME: operators_own})
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.fixture.repairs()[0]["env"][self.CONFIG_HOME],
-            str(self.fixture.coordinator_account),
-        )
+        self.assertEqual(self.fixture.repairs()[0]["env"][self.CONFIG_HOME], operators_own)
+
+    def test_an_inherited_binding_sets_no_configuration_home_where_the_caller_has_none(self):
+        """The whole of an inherited binding's delta: nothing, including nothing to unset."""
+        self.conflict()
+
+        result = self.fixture.land(env={self.CONFIG_HOME: None})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.fixture.repairs()[0]["env"][self.CONFIG_HOME])
 
     def test_a_row_carrying_no_account_escalates_rather_than_repairing_on_the_coordinators(self):
         """No fallback: a repair that quietly bills the wrong account is what this key removes."""
@@ -554,6 +703,7 @@ class SemanticConflictTests(MergeDriverTestCase):
         results = [entry["result"] for entry in self.fixture.events("merge")]
         self.assertEqual(results.count("escalated"), 1)
         self.assertEqual(results.count("repaired"), 0)
+        self.assertEqual(results.count("resolved"), 0, "the driver resolves no design disagreement")
         self.assertOnIntegrationBranch()
 
     def test_a_file_both_sides_created_is_semantic(self):

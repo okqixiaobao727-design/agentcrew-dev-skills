@@ -4,12 +4,14 @@
 Every invocation is appended to `AGENTCREW_STUB_DIR/claude-calls.jsonl`, so a test can see both
 the launches the renderer made and the snapshots an armed wake monitor asked for.
 
-`agents --json` prints the sessions this stub has been asked to start, from `agents.json` there —
-a file a test rewrites to make a child go idle or vanish under the monitor watching it. Any other
-invocation is an interactive launch: it records its argv and working directory in `launches.jsonl`,
-adds itself to the agents list as `busy`, and writes a transcript under
-`CLAUDE_CONFIG_DIR/projects/` carrying the model it ran on, which is the surface post-launch
-verification reads.
+`agents --json` prints the sessions this stub has been asked to start **in the configuration home
+it is called under**, from `agents-<home>.json` there — one file per account, because the real CLI
+answers this question out of the profile `CLAUDE_CONFIG_DIR` names and two accounts return disjoint
+lists. A test rewrites that file to make a child go idle or vanish under the monitor watching it.
+Any other invocation is an interactive launch: it records its argv, working directory and
+configuration home in `launches.jsonl`, adds itself to that home's agents list as `busy`, and
+writes a transcript under `CLAUDE_CONFIG_DIR/projects/` carrying the model it ran on, which is the
+surface post-launch verification reads.
 
 `AGENTCREW_STUB_TRANSCRIPT_MODEL` writes a different model into that transcript than the launch
 named, which is the silent-downgrade case the renderer has to catch.
@@ -22,12 +24,28 @@ import sys
 import uuid
 
 
+# What a call made under no configuration home at all reads its list from.
+NO_CONFIG_HOME = "default"
+
+
 def state_dir():
     return pathlib.Path(os.environ["AGENTCREW_STUB_DIR"])
 
 
-def agents_path():
-    return state_dir() / "agents.json"
+def config_home():
+    """The profile directory this call was made under, which is to say its account."""
+    return os.environ.get("CLAUDE_CONFIG_DIR", "")
+
+
+def agents_path(state=None, home=None):
+    """The file holding one account's agents list; the caller's own account by default.
+
+    One file per account, as the real CLI has one list per profile. Taken as a function of the
+    home rather than of this process, so the fixture that seeds a list and the stub that answers
+    from it agree on the name without either of them restating the rule.
+    """
+    name = pathlib.Path(home if home is not None else config_home()).name or NO_CONFIG_HOME
+    return pathlib.Path(state if state is not None else state_dir()) / f"agents-{name}.json"
 
 
 def read_agents():
@@ -43,7 +61,7 @@ def flag(argv, name):
 
 
 def write_transcript(session_id, cwd, model):
-    root = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects"
+    root = pathlib.Path(config_home() or pathlib.Path.home() / ".claude") / "projects"
     project = root / cwd.replace("/", "-").replace(".", "-")
     project.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -58,7 +76,7 @@ def write_transcript(session_id, cwd, model):
 def main():
     argv = sys.argv[1:]
     with (state_dir() / "claude-calls.jsonl").open("a") as handle:
-        handle.write(json.dumps({"argv": argv}) + "\n")
+        handle.write(json.dumps({"argv": argv, "configHome": config_home()}) + "\n")
 
     if argv[:2] == ["agents", "--json"]:
         print(json.dumps(read_agents()))
@@ -68,7 +86,9 @@ def main():
     session_id = str(uuid.uuid4())
     model = flag(argv, "--model")
     with (state_dir() / "launches.jsonl").open("a") as handle:
-        handle.write(json.dumps({"argv": argv, "cwd": cwd, "sessionId": session_id}) + "\n")
+        handle.write(json.dumps({
+            "argv": argv, "cwd": cwd, "sessionId": session_id, "configHome": config_home(),
+        }) + "\n")
 
     agents = read_agents()
     agents.append(

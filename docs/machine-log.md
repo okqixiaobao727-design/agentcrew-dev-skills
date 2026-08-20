@@ -37,9 +37,18 @@ fact, and a Claude child's alone — a Codex child launches on its own vendor's 
 records no account.
 
 The dispatch renderer writes this one itself, as each child comes up, given `--log`: the launched
-set is what wave advancement and the dashboard read, and it costs the coordinator no turn. `child`
-is the agent name a Claude child took in the live agents list, and the thread the bridge pinned for
-a Codex child.
+set is what wave advancement and the dashboard read, and it costs the coordinator no turn. A
+Claude launch first records the known window, worktree and branch with an empty `child`, before
+post-launch verification can fail; successful verification appends the amended launch with the
+agent name. Consumers take the last launch per ticket. A Codex launch records the thread the
+bridge pinned.
+
+### `launch-failed` — a live child failed post-launch verification
+
+`ticket`, `detail`. Dispatch writes this after the corresponding `launch` when the child window
+has started but the agents list or transcript verification fails. The `launch` remains the
+adoption record; `detail` preserves the verification failure instead of leaving it only on the
+driver's transient stderr surface.
 
 ### `receipt` — a child's final word, as verified by script
 
@@ -49,14 +58,18 @@ the ones the crew skill's watch step settles a launched ticket into.
 ### `merge` — one ticket branch's trip into the integration branch
 
 `ticket`, `branch`, `into`, `result`, `sha`, `detail`. `result` is one of the escalation
-ladder's four stops ([ADR-0004](adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md)):
+ladder's stops ([ADR-0004](adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md)):
 
 | `result` | Meaning |
 | --- | --- |
 | `clean` | the scripted merge succeeded, no model involved |
 | `conflict` | the merge conflicted and was handed down the ladder |
+| `resolved` | the driver kept both sides' insertions itself, no model involved |
 | `repaired` | the budget-capped repair session resolved it |
 | `escalated` | a semantic conflict or a repair double failure went to the coordinator |
+
+`resolved` and `repaired` are two words rather than one because a log that spells them alike
+cannot say which merges cost a model anything.
 
 ### `outcome` — a ticket's one report outcome
 
@@ -179,9 +192,11 @@ reformatting, no summary. A structured message is recorded as the object it was.
 machine_log.py --log <path> launch  --ticket NN --child NAME --workflow W --executor E \
                                     --model ID --effort E \
                                     [--branch B] [--worktree P] [--window W] [--account DIR]
+machine_log.py --log <path> launch-failed --ticket NN --detail TEXT
 machine_log.py --log <path> receipt --ticket NN --verdict landable|parked|failed \
                                     [--sha SHA] [--detail TEXT]
-machine_log.py --log <path> merge   --ticket NN --result clean|conflict|repaired|escalated \
+machine_log.py --log <path> merge   --ticket NN \
+                                    --result clean|conflict|resolved|repaired|escalated \
                                     [--branch B] [--into B] [--sha SHA] [--detail TEXT]
 machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parked|blocked \
                                     [--detail TEXT]
@@ -281,6 +296,13 @@ prose, as they are in the instructions that taught them. Where a message carries
 the last one is the word it sent: a final turn speaks once, and a child that withdrew an ask and
 finished anyway has said the thing it ended on. The driver's rule table reads a child's word
 through the same judgment, so the log and the run can never disagree about what was said.
+
+A line that opens at the margin with one of those verb words and then fails its own whole-line
+shape is a near miss rather than a silence, and the module names it separately
+(`malformed_receipt`) so the driver can answer it instead of dropping it — one scripted bounce
+quoting the line, then `failed` (ADR-0015). The grammar itself is unchanged: a near miss settles
+nothing, and prose that names a verb mid-line or quotes one indented is neither verb nor near
+miss.
 
 A child's own `CREW COMPLETE` is a claim about a sha, not a verified receipt, so it is copied in
 as a `message`. Only the script that checked the sha writes a `receipt`, and the log therefore

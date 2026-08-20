@@ -7,6 +7,112 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The driver runs detached from the coordinator's session, in a tmux window of
+  its own opened through the same windowing path every child is launched
+  through, and `/crew` leaves behind only a waiter. A live run stalled for forty
+  minutes showing `waiting` on a ticket whose child had already sent a valid
+  receipt: the driver — the only process that reads the machine log, verifies
+  receipts and advances waves — had been killed 45 minutes in by Claude Code's
+  own background-task termination path, with no user input and no model turn in
+  the coordinator's session, and nothing on the dashboard said it was gone. The
+  fix is to stop depending on a coordinator-session background task being
+  allowed to live. The coordinator's one background task is now a stateless
+  waiter that blocks on the run's wake snapshot and prints it; killing it costs
+  nothing, because the driver is untouched and re-typing `/crew <run-dir>` puts
+  another waiter back. The run directory gains three files for this: `wake.json`
+  (the snapshot the waiter reads — the driver's stdout now belongs to its own
+  pane), `driver.log` (the driver's output, since no task output file collects
+  it any more), and `driver.pid` (below). A run resumed from a release older
+  than this one is started by a launcher that expects those files and a driver
+  that writes them, so upgrade both ends together — an older driver leaves no
+  wake, and the waiter will block until the operator reads the driver's window.
+  Do not upgrade across a live run: an older release's driver keeps no pid
+  record, so `/crew` reads the run as undriven and starts a second driver beside
+  it. Stop the run's driver before upgrading. (Nothing in the run directory can
+  tell an older release's live run from one that ended properly, so there is no
+  loud failure to raise; a run-format marker would be its own change.)
+  One consequence of detachment is deliberately left open and tracked in #112: a
+  driver now outlives the coordinator it was started for, and it carries that
+  coordinator for its whole life — the pid every child authenticates a ruling
+  against. So a run adopted from a session that has since exited keeps answering
+  to the old one, and rulings made in the new session are refused by children
+  launched under the old. Closing it means re-anchoring the run's children as
+  well as its driver, which is its own piece of work. Until then, a run whose
+  coordinator session has exited should be cleared and restarted rather than
+  adopted.
+- The dashboard says when the run's driver is dead. The run directory names its
+  driver in `driver.pid` while its loop runs, and every deliberate exit — a wake
+  handing judgment to the coordinator, a driver error, the run finishing, an
+  operator's Ctrl-C in the driver's own window — takes that name away on the way
+  out. A kill cannot, so a record naming a process that no longer runs is a
+  killed driver by construction. Both the window dashboard and the statusline
+  frame carry a red segment in the slot the awaiting-ruling banner uses,
+  `✖ driver dead — /crew <run-dir> to resume`; the two never render together,
+  and the render path stays a pure reader that respawns nothing (#87). `/crew`
+  reads the same record: a run whose driver is alive is attached to rather than
+  started again, so the command stays safe to type at any moment and no run is
+  ever driven twice.
+- The merge driver resolves a conflict it has already classified as mechanical
+  itself, instead of paying a repair session to do it. Every hunk with an empty
+  base section is both sides inserting at the same point, which the classifier
+  already proves; the driver now keeps both insertions — ours, then theirs, with
+  the markers and the empty base removed — stages, commits, and records the merge
+  `resolved`, a new word in the machine log's closed vocabulary that says the
+  merge cost no model anything where `repaired` says a session ran. With every
+  ticket appending a `CHANGELOG.md` entry, this conflict shape recurs on
+  essentially every multi-ticket wave, and it was costing a session each time —
+  or two, plus an escalation, when the session wandered. The repair rung is
+  unchanged and still reached by the mechanical conflict the rewrite refuses: a
+  file whose markers do not open and close in order, or whose own text carries a
+  line that reads as one, since `=======` is also how prose underlines a heading.
+  A semantic conflict still skips that rung for the coordinator, and a merge with
+  one semantic file among mechanical ones is semantic entire, as it always was.
+
+### Fixed
+- An account-less ticket now means "the login this run was started on", not "the
+  default configuration home, spelled out". The wave table's resolved account is
+  a **binding** of two facts — the configuration home the ticket is identified,
+  observed and attributed by, and whether that home is selected explicitly or
+  inherited — and one shared contract turns a binding into the environment every
+  Claude process of the ticket is started in: the implementer child's window, the
+  reviewer, the merge-repair session and the wake monitor. Two live failures
+  close with it. Reviewers and repair sessions for account-less tickets were
+  being told `Not logged in` on a machine whose operator was signed in, because
+  `CLAUDE_CONFIG_DIR` set to the default home fails the credential lookup that
+  leaving it unset succeeds at. And a Claude wake monitor, the one part of the
+  stack the account feature never reached, polled a single live-agents list for a
+  whole wave: a child launched on a second account is missing from a list that
+  could not contain it, so it was reported `vanished` on the monitor's first poll
+  and settled `failed` ten seconds after launch — while it was working, and about
+  to escalate. Monitors are now armed one per account binding, each polling under
+  the account its children run on, and a lane is re-armed per group so no two
+  monitors watch one session. A genuinely exited child still settles `failed`
+  under either mode, and a single-account run's monitor, window, reviewer and
+  repair session are byte-for-byte what they were: no `CLAUDE_CONFIG_DIR` delta
+  anywhere. Wave tables written before this release carry an account with no
+  mode, and are read as the explicit selection that release made.
+- A receipt that misses the verb grammar is answered instead of being dropped. A
+  child that appended prose to its `CREW COMPLETE` line once left a finished
+  ticket reading `waiting` for eight and a half minutes behind a live, polling
+  driver: the line failed the whole-line pattern, `final_verb` answered the same
+  "no verb here" it answers a message that never reached for one, and the driver
+  read a receipt attempt as conversation with nothing anywhere saying so. The
+  grammar is unchanged — prose about a receipt still cannot settle a ticket —
+  but the machine log now tells a near miss from a silence
+  (`malformed_receipt`), and the driver answers a near miss on the scripted rung:
+  one bounce quoting the offending line and naming the shape of every verb the
+  run knows, then `failed` if the next line misses too or the child goes idle
+  without resending, with no coordinator turn spent either way. The
+  first-turn templates and `references/triage.md` now state the rule
+  that decides it — the verb line is the message's whole final line, and prose
+  belongs above it — so neither a child following its instructions nor a
+  coordinator ruling on one can induce an unparseable receipt (#105, ADR-0015).
+- Resumed runs now read a ticket's settlement from one machine-log predicate, so a tracker-close
+  `completed` outcome remains landed when advance, halt handling, and report rendering read it.
+  Advance decisions account for those completed tickets as already landed, and the driver refuses
+  to record the run as `stopped` while unrelated launchable work remains (#104, #108).
+
 ## [0.8.3] - 2026-08-19
 
 ### Fixed
