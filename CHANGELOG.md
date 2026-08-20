@@ -8,6 +8,51 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- The driver runs detached from the coordinator's session, in a tmux window of
+  its own opened through the same windowing path every child is launched
+  through, and `/crew` leaves behind only a waiter. A live run stalled for forty
+  minutes showing `waiting` on a ticket whose child had already sent a valid
+  receipt: the driver — the only process that reads the machine log, verifies
+  receipts and advances waves — had been killed 45 minutes in by Claude Code's
+  own background-task termination path, with no user input and no model turn in
+  the coordinator's session, and nothing on the dashboard said it was gone. The
+  fix is to stop depending on a coordinator-session background task being
+  allowed to live. The coordinator's one background task is now a stateless
+  waiter that blocks on the run's wake snapshot and prints it; killing it costs
+  nothing, because the driver is untouched and re-typing `/crew <run-dir>` puts
+  another waiter back. The run directory gains three files for this: `wake.json`
+  (the snapshot the waiter reads — the driver's stdout now belongs to its own
+  pane), `driver.log` (the driver's output, since no task output file collects
+  it any more), and `driver.pid` (below). A run resumed from a release older
+  than this one is started by a launcher that expects those files and a driver
+  that writes them, so upgrade both ends together — an older driver leaves no
+  wake, and the waiter will block until the operator reads the driver's window.
+  Do not upgrade across a live run: an older release's driver keeps no pid
+  record, so `/crew` reads the run as undriven and starts a second driver beside
+  it. Stop the run's driver before upgrading. (Nothing in the run directory can
+  tell an older release's live run from one that ended properly, so there is no
+  loud failure to raise; a run-format marker would be its own change.)
+  One consequence of detachment is deliberately left open and tracked in #112: a
+  driver now outlives the coordinator it was started for, and it carries that
+  coordinator for its whole life — the pid every child authenticates a ruling
+  against. So a run adopted from a session that has since exited keeps answering
+  to the old one, and rulings made in the new session are refused by children
+  launched under the old. Closing it means re-anchoring the run's children as
+  well as its driver, which is its own piece of work. Until then, a run whose
+  coordinator session has exited should be cleared and restarted rather than
+  adopted.
+- The dashboard says when the run's driver is dead. The run directory names its
+  driver in `driver.pid` while its loop runs, and every deliberate exit — a wake
+  handing judgment to the coordinator, a driver error, the run finishing, an
+  operator's Ctrl-C in the driver's own window — takes that name away on the way
+  out. A kill cannot, so a record naming a process that no longer runs is a
+  killed driver by construction. Both the window dashboard and the statusline
+  frame carry a red segment in the slot the awaiting-ruling banner uses,
+  `✖ driver dead — /crew <run-dir> to resume`; the two never render together,
+  and the render path stays a pure reader that respawns nothing (#87). `/crew`
+  reads the same record: a run whose driver is alive is attached to rather than
+  started again, so the command stays safe to type at any moment and no run is
+  ever driven twice.
 - The merge driver resolves a conflict it has already classified as mechanical
   itself, instead of paying a repair session to do it. Every hunk with an empty
   base section is both sides inserting at the same point, which the classifier

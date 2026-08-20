@@ -42,6 +42,15 @@ last line before every exit is one JSON wake snapshot, which is the whole of wha
 coordinator reads: it never opens a run file, so its rulings rest only on what a message shows it.
 Children's ASKs keep arriving by cross-session messaging, authenticated as before.
 
+> **Amended (#103).** The driver is no longer a background task of the coordinator's session: the
+> harness killed one silently 45 minutes into a live run, and the run stalled for forty minutes.
+> The driver now runs in a tmux window of its own, writes its wake snapshot into the run directory,
+> and the coordinator's background task is a stateless waiter that blocks on that file and prints
+> it. Everything above about the snapshot itself stands — one JSON object, read without opening a
+> run file. What changed is only which process carries it back, and that a killed waiter now costs
+> the run nothing. See
+> [`docs/monitor-dashboard.md`](../monitor-dashboard.md#the-drivers-own-liveness).
+
 **The rule table settles everything a written rule already decides.** It is a transcription of the
 predecessor skill document's settlement prose, not a new invention: verify on `CREW COMPLETE` and
 settle in silence; one re-ask on an invalid receipt and failed on the second; parked and failed

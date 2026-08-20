@@ -183,8 +183,9 @@ that a run contains no other kind of coordinator turn.
 in the coordinator's opening context so a ruling never starts with a hunt. Contents are read on
 demand, and nothing but the coordinator itself puts them in the live context.
 
-**Driver** — The scripted state machine that runs everything else, as a background task of the
-coordinator's session: preflight, the validated wave table, the branch and run directory, dispatch,
+**Driver** — The scripted state machine that runs everything else, in a tmux window of its own,
+detached from the coordinator's session: preflight, the validated wave table, the branch and run
+directory, dispatch,
 receipt verification, the rule table's settlements, merges, tracker closes, wave advancement,
 monitor re-arming, and the report. It drives the existing scripts at their published command lines
 and holds no state of its own — every count it acts on is read back out of the machine log,

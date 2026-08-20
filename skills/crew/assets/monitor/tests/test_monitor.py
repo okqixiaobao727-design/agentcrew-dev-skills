@@ -43,6 +43,12 @@ RULED_ELAPSED = "00:47:53"
 BLOCKED_DETAIL = "semantic: both sides rewrote the same lines of driver.py"
 # The marker the summary line carries while a wave is halted on the coordinator's ruling.
 AWAITING_RULING = "⚠ awaiting your ruling"
+# What the same slot carries instead when the run's driver was killed rather than exiting: the
+# run directory's own parent, which is what the operator typed `/crew` with.
+DRIVER_DEAD = "✖ driver dead — /crew {run} to resume"
+# The SGR red the dead-driver segment is painted in, and the reset that ends it.
+RED = "\x1b[31m"
+RESET = "\x1b[0m"
 # The rework instruction the driver sends a child whose merge escalated on a semantic conflict,
 # opening with the marker the driver's merge rung is read back out of the log by. A child holding
 # this is working, not stuck, which is what the `reworking` state says.
@@ -58,6 +64,10 @@ SETTLING_WIDTH = len("settling")
 # A window wide enough to hold that summary line and the blocked row's annotation whole, so a
 # halted frame is read rather than measured.
 HALTED_COLUMNS = 120
+# Wider still, because the dead-driver banner names a run directory and a temporary one is long;
+# and a window too narrow to hold that banner at all, which is where it is cut away.
+BANNER_COLUMNS = 240
+NARROW_COLUMNS = 60
 
 # The refresh the tests that watch the dashboard's loop run it at, and how they wait on it. One
 # frame of this fixture costs a quarter of a second or more — every draw spawns the stub `claude`
@@ -104,6 +114,9 @@ WINDOW_RECORD = "dashboard-window"
 COORDINATOR_PID = 4242
 # The file the dashboard and the pin both dedup toasts through, in the run directory.
 TOAST_STATE = "toasts.json"
+# The run directory's record of the driver driving it: written when its loop starts, removed by
+# every deliberate exit, and left standing by a kill.
+DRIVER_RECORD = "driver.pid"
 
 # What the executor column shows for each lane of this run, and what a row with no clock shows.
 CLAUDE_LANE = f"claude/{MODEL}"
@@ -628,6 +641,17 @@ class Fixture:
         if interpreter is not None:
             pin["interpreter"] = str(interpreter)
         path.write_text(json.dumps(pin))
+        return path
+
+    def driver_record(self, pid=None, run_dir=None):
+        """The run directory's record of the driver driving it, as the driver writes its own.
+
+        A pid given as `None` is this process's, which is the live driver every ordinary frame is
+        drawn under; a run whose driver exited deliberately has no record at all.
+        """
+        run_dir = self.run_dir if run_dir is None else pathlib.Path(run_dir)
+        path = run_dir / DRIVER_RECORD
+        path.write_text(f"{os.getpid() if pid is None else pid}\n")
         return path
 
     def release_copy(self, name):
@@ -1751,6 +1775,141 @@ class AliasedPathTests(MonitorTestCase):
         result = self.fixture.dashboard()
 
         self.assertIn("↳ anomaly: duplicate", result.stdout)
+
+
+class DriverLivenessTests(MonitorTestCase):
+    """What the frame says about the process that is supposed to be advancing the run.
+
+    The driver runs detached from the coordinator's session now, so nothing the coordinator sees
+    can tell that it died — and a run whose driver is gone renders `waiting` forever unless the
+    frame says otherwise. The whole protocol is the run directory's `driver.pid`: a deliberate
+    exit removes it, a kill cannot, so a record naming a process that is not running is a killed
+    driver by construction.
+    """
+
+    def live_run(self):
+        """A run of two launched, busy children and one wave nobody has reached yet.
+
+        Drawn in a window wide enough to hold the banner whole, because the banner names a
+        directory and a temporary one is long: what these tests read is the sentence, never the
+        width it happened to be cut to.
+        """
+        self.fixture.columns = BANNER_COLUMNS
+        self.fixture.table()
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+    def banner(self):
+        """The segment the operator is meant to paste back, for this fixture's run.
+
+        The directory is the one the run directory resolves under (ADR-0007), which on this
+        platform is not always the one a temporary directory was handed out as.
+        """
+        return DRIVER_DEAD.format(run=self.fixture.run_dir.resolve().parent)
+
+    def summary_line(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return frame(result.stdout).splitlines()[0]
+
+    def test_a_record_naming_a_process_that_is_gone_says_the_driver_is_dead(self):
+        """The stall this exists for: the pid was never blanked, so the driver was killed."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    def test_the_dead_driver_banner_carries_the_command_that_resumes_the_run(self):
+        """Recovery is one paste: the directory the operator typed `/crew` with, absolutely."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(f"/crew {self.fixture.run_dir.resolve().parent} to resume", line)
+
+    def test_a_blanked_record_says_nothing_at_all(self):
+        """Every deliberate exit removes the record, so an awaited ruling is not a disaster."""
+        self.live_run()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("driver dead", line)
+
+    def test_a_record_naming_a_live_process_says_nothing_at_all(self):
+        self.live_run()
+        self.fixture.driver_record()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("driver dead", line)
+
+    def test_a_record_that_is_not_a_pid_says_nothing_at_all(self):
+        """A file nothing can be judged from is not a judgment: the frame stays as it was."""
+        self.live_run()
+        (self.fixture.run_dir / DRIVER_RECORD).write_text("not a pid\n")
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("driver dead", line)
+
+    def test_a_halted_wave_and_a_dead_driver_never_render_together(self):
+        """One slot, and the dead driver owns it: an orphaned run is not an awaited ruling."""
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+        self.assertNotIn(AWAITING_RULING, line)
+
+    def test_the_statusline_tick_carries_the_same_banner(self):
+        """The dashboard the operator actually watches during a stall is the pinned one."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        line = self.summary_line(self.fixture.pin_frame("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    def test_the_banner_is_painted_red_where_a_terminal_can_show_it(self):
+        """The one segment of the summary line that is coloured, and only ever whole."""
+        self.live_run()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{RED}{self.banner()}{RESET}", result.stdout.splitlines()[0])
+
+    def test_a_banner_the_window_cut_leaves_no_escape_behind(self):
+        """A frame narrower than the banner drops it rather than painting half of one."""
+        self.live_run()
+        self.fixture.columns = NARROW_COLUMNS
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(RED, result.stdout.splitlines()[0])
+
+    def test_the_tick_does_nothing_about_a_dead_driver_but_say_so(self):
+        """#87: the render path is a reader. Nothing here respawns, cleans up or repins."""
+        self.live_run()
+        record = self.fixture.driver_record(pid=self.fixture.dead_pid())
+        self.fixture.pin()
+
+        self.fixture.pin_frame("--no-color")
+
+        self.assertTrue(record.exists(), "the tick removed the run's driver record")
 
 
 class PinTests(MonitorTestCase):

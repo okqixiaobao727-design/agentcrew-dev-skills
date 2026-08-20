@@ -90,6 +90,39 @@ crew crew-run-3 — wave 2/5 · pending=6 merged=4 · ⚠ awaiting your ruling �
 The log's newest `advance` decides it: `escalated` or `interrupted` puts the marker up, and the
 next `advance` — the wave carrying on once the coordinator has ruled — takes it away.
 
+### The driver's own liveness
+
+The same slot carries one other thing, in red, and the two never appear together:
+
+```
+crew crew-run-3 — wave 2/5 · pending=6 · ✖ driver dead — /crew feat/x to resume · elapsed 01:12:44
+```
+
+The driver runs detached from the coordinator's session now, in a tmux window of its own, so
+nothing the coordinator holds can report that it ended. The run directory does. Its loop writes
+its own pid into `<run-dir>/driver.pid` on the way in, and every exit it takes on purpose — a wake
+handing judgment to the coordinator, a driver error, the run finishing, an operator's Ctrl-C in
+the driver's own window — removes that file on the way out. A kill cannot, so a file naming a
+process that is not running is a killed driver by construction, and that is the whole protocol:
+one `kill -0`, the same judgment the pin sweep already makes, and no watchdog or heartbeat behind
+it. Because a deliberate exit blanks the record before it writes its wake, a run awaiting a ruling
+can never also be flagged as orphaned.
+
+The banner names the directory the operator typed `/crew` with — the run directory's parent — so
+recovery is one paste rather than a forensic session. Nothing acts on it: the render path is a
+reader, and it neither respawns the driver nor removes the record (#87).
+
+The same file is what makes `/crew` idempotent at the other end — a run whose driver is alive is
+attached to rather than started again, so no run is ever driven twice.
+
+Whose driver it is, nothing asks. A driver carries the coordinator it was started for for its
+whole life, which is the pid every child authenticates a ruling against, so a driver that outlived
+its session goes on answering to a session that has gone: the run keeps advancing, and rulings
+made from a new session are refused by children launched under the old one. Detaching the driver
+is what made that state reachable, and closing it means re-anchoring the run's children as well as
+its driver — tracked in #112. Until then a run whose coordinator has exited is cleared and
+restarted rather than adopted.
+
 ### States
 
 Every source state is mapped into the Ticket state vocabulary before it is drawn, so the operator
@@ -497,7 +530,9 @@ it, and this case is one the operator can act on
 
 Nothing is drawn, and the exit status is still 0, when there is no pin, when the run directory is
 gone or unreadable, when the coordinator's pid is not alive, or when the machine log carries an
-`advance` decision of `complete` or `stopped`. The last two are the whole liveness story: a dead
-pid is a crashed or killed run, either of those decisions is a run that is over, and there is no
-watchdog, no heartbeat and no separate liveness file behind either. A halted wave is none of these
-— the pin keeps drawing it, with the `⚠ awaiting your ruling` marker on its summary line.
+`advance` decision of `complete` or `stopped`. The last two are the whole liveness story for the
+*coordinator*: a dead pid is a crashed or killed session, either of those decisions is a run that
+is over, and there is no watchdog or heartbeat behind either. A halted wave is none of these — the
+pin keeps drawing it, with the `⚠ awaiting your ruling` marker on its summary line — and neither
+is a run whose *driver* died, which is drawn with [the dead-driver
+banner](#the-drivers-own-liveness) rather than not at all.

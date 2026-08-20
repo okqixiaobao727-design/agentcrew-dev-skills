@@ -92,7 +92,9 @@ Everything the driver does to the repository, the children and the log it does t
 scripts — the dispatch renderer, the machine log, the monitor and its wake monitors, the Codex
 bridge — at their published command lines; it reimplements none of them. The run directory holds
 what today's index names and nothing this module invents: the wave table, the machine log, the
-launch directory, the Codex state, and the parked paths.
+launch directory, the Codex state, and the parked paths — and, since the driver stopped being a
+task of the coordinator's session (#103), this process's own two records: the pid it drives under
+and the wake snapshot it leaves behind.
 """
 
 import argparse
@@ -119,6 +121,7 @@ MONITOR = ASSETS / "monitor" / "monitor.py"
 MONITOR_WAVE = ASSETS / "monitor-wave.sh"
 CODEX_BRIDGE = ASSETS / "codex" / "codex_bridge.py"
 ADVANCE = ASSETS / "advance.py"
+LAUNCH = ASSETS / "launch" / "launch.py"
 
 # The renderer owns two rules this module asks rather than restates: what counts as an alias, and
 # what a ticket's branch is called. Advance imports it the same way, from the same place.
@@ -140,6 +143,10 @@ import monitor  # noqa: E402
 # The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
 RUN_DIR_NAME = ".crew"
 LOG_NAME = "log.jsonl"
+# The channel a woken coordinator reads. The driver runs detached in its own tmux window now, so
+# its stdout belongs to that pane and to the log beside it — the one JSON object the coordinator
+# rules on is left here instead, where the waiter `/crew` leaves behind blocks on it (#103).
+WAKE_NAME = "wake.json"
 TABLE_NAME = "wave-table.json"
 LAUNCH_DIR_NAME = "launch"
 CODEX_DIR_NAME = "codex"
@@ -201,6 +208,9 @@ UPSTREAM_UNREACHABLE = "unreachable"
 
 PREFLIGHT_EXIT = 1
 DRIVER_ERROR_EXIT = 2
+# What a shell reports for a process an interrupt ended, which is what this ends on when the
+# operator stops the driver in its own window.
+INTERRUPTED_EXIT = 130
 
 # A ticket file of a feature: its number, as written, and whatever slug follows it.
 TICKET_FILE = re.compile(r"^(\d+)(?:-.*)?\.md$")
@@ -378,19 +388,84 @@ class Wake(Exception):
         self.fields = fields
 
 
+# --- the run this process is driving ------------------------------------------------------------
+
+# The run directory this driver has in hand, or None while it has none — before a fresh run has
+# made its directory, and in the commands that do not drive a run at all. Two things hang off it,
+# and both are a driver's word about its own life: the pid record the dashboard reads liveness
+# from, and the file the coordinator's waiter blocks on. Module state because it is one fact about
+# the process: a driver drives one run, from the moment it takes it up until it puts it down.
+_run_in_hand = None
+
+
+def take_up_run(run_dir):
+    """Take up that run: name this process as its driver, and open its wake channel.
+
+    A run directory that is not there yet is not taken up. That is the fresh start before it has
+    made one, and the start that fails preflight without ever making one — a run that does not
+    begin leaves no run directory behind, and the launcher that made one for its own log has
+    already put the directory there for every other case.
+    """
+    global _run_in_hand
+    if run_dir is None or not pathlib.Path(run_dir).is_dir():
+        return
+    _run_in_hand = pathlib.Path(run_dir)
+    try:
+        monitor.record_driver(_run_in_hand, os.getpid())
+    except monitor.MonitorError as error:
+        # A driver nothing can name is a driver nothing can tell from a killed one, and a second
+        # `/crew` would start another beside it. That is not a run to carry on quietly.
+        _run_in_hand = None
+        raise DriverError(f"this run could not be taken up: {error}", pointer=str(run_dir))
+
+
+def put_down_run():
+    """Put this run down: take the pid record away, which is what makes an exit deliberate.
+
+    Every ending this process reaches by running code passes through here, and no kill does — so
+    a record still naming a process that has gone is a killed driver, and the dashboard says so.
+    """
+    global _run_in_hand
+    if _run_in_hand is None:
+        return
+    monitor.release_driver(_run_in_hand)
+    _run_in_hand = None
+
+
 # --- the wake snapshot ----------------------------------------------------------------------
 
 
 def snapshot(reason, ticket=None, pointer=None, **fields):
-    """Print the run's wake snapshot: the one JSON object a woken coordinator reads.
+    """Print the run's wake snapshot, and leave it where the coordinator's waiter reads it.
 
     Flushed as it is written, like every other line this driver puts on that channel: stdout is a
     pipe here, and a lifecycle line held in a buffer until the process ends is not one line per
     lifecycle event.
+
+    Every call is this process's last act, so the run is put down first and the wake written
+    second: a coordinator that pastes the resume command the instant it is woken must not find a
+    pid that was about to stop and attach to a driver already on its way out. The file is put in
+    place by rename, because a waiter reading it half-written would read no wake at all.
     """
     record = {"reason": reason, "ticket": ticket, "pointer": pointer}
     record.update(fields)
-    print(json.dumps(record, ensure_ascii=False), flush=True)
+    line = json.dumps(record, ensure_ascii=False)
+    print(line, flush=True)
+    run_dir = _run_in_hand
+    put_down_run()
+    if run_dir is None:
+        return
+    path = run_dir / WAKE_NAME
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(line + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as error:
+        # The snapshot is on stdout either way, and the driver's own pane and log keep it. A wake
+        # channel that could not be written is said where a wake cannot be: on stderr.
+        temporary.unlink(missing_ok=True)
+        print(f"crew: the wake snapshot could not be left in {path}: {error}",
+              file=sys.stderr, flush=True)
 
 
 # --- git ----------------------------------------------------------------------------------
@@ -1718,10 +1793,12 @@ def sweep_landed(run_dir):
 def sweep_dead_runs(repo, keep_run_dir):
     """Finish the cleanup every run abandoned in this repo never reached; returns its warnings.
 
-    A hook is dead when the run it writes for names no live coordinator — the same pid judgment
-    the pin registry's own sweep makes, asked of the pid that run recorded. Every problem either
-    step meets is returned as a warning rather than raised: the run about to start is not the place
-    to fail over a run that ended weeks ago.
+    A run is dead when neither of the two processes it can be alive through is: the coordinator it
+    recorded, and the driver it named in its own run directory. The second is why this asks twice
+    — a driver detached from its coordinator's session outlives it by design (#103), and sweeping
+    a run whose driver is still merging its waves would take that run's worktrees out from under
+    it. Every problem either step meets is returned as a warning rather than raised: the run about
+    to start is not the place to fail over a run that ended weeks ago.
 
     The landed artefacts go first, and the hook goes whether or not they went: a hook nobody reads
     costs a python interpreter on every message sent in this repo, which is the burn this sweep
@@ -1749,6 +1826,8 @@ def sweep_dead_runs(repo, keep_run_dir):
             continue
         pid = run_coordinator_pid(run_dir)
         if pid is not None and monitor.alive(pid):
+            continue
+        if monitor.live_driver(run_dir):
             continue
         repo_root = run_repo_root(run_dir)
         if repo_root is not None and repo_root != repo_key:
@@ -1807,6 +1886,11 @@ def run_start(args):
     feature_dir = pathlib.Path(args.feature_dir).resolve()
     if not feature_dir.is_dir():
         raise DriverError(f"{feature_dir} is not a feature directory", pointer=str(feature_dir))
+    run_dir = feature_dir / RUN_DIR_NAME
+    # Taken up before the first step that can fail, so that every way this start can end reaches
+    # the coordinator's waiter: a wake is only written into a run this process has in hand, and a
+    # repository root or a tmux session that cannot be resolved is as much a wake as any other.
+    take_up_run(run_dir)
     # Absolute at the boundary, whatever spelling the caller used: every path recorded here is read
     # again in a child's own worktree, where a relative one names another file or none.
     args.spec = resolved(args.spec)
@@ -1815,7 +1899,6 @@ def run_start(args):
     args.tmux_session = tmux_session(args.tmux_session)
     clear_notice(args.tmux_session)
 
-    run_dir = feature_dir / RUN_DIR_NAME
     # Before anything else this driver does in this repo, and before it can matter whether the run
     # is a fresh one or an adoption: what the runs abandoned here never cleaned up.
     for warning in sweep_dead_runs(repo, run_dir):
@@ -1854,6 +1937,7 @@ def run_start(args):
         repo, base_branch, integration_branch, pull=upstream[0] == UPSTREAM_PRESENT
     )
     run_dir.mkdir(parents=True, exist_ok=True)
+    take_up_run(run_dir)
     launch_dir = run_dir / LAUNCH_DIR_NAME
     log = run_dir / LOG_NAME
     run = run_section(
@@ -1873,7 +1957,6 @@ def run_start(args):
         install_hook(
             log, pathlib.Path(child["worktree"]) / SETTINGS_PATH, "child", child["ticket"]
         )
-    start_dashboard(args, repo, run_dir)
     print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table_path)
 
@@ -1933,7 +2016,12 @@ def dispatch_wave(table, log, launch_dir, run_dir):
 
 
 def start_dashboard(args, repo, run_dir):
-    """Point the operator's dashboard at the run, on whichever surface the repo chose."""
+    """Point the operator's dashboard at the run, on whichever surface the repo chose.
+
+    Idempotent, and run by every driver that takes the run up rather than only by the one that
+    started it: an adopted or resumed run has a live dashboard window and a pin naming it again,
+    which is what makes a recovered run indistinguishable from one that was never interrupted.
+    """
     arguments = [
         sys.executable, MONITOR, "window",
         "--run-dir", run_dir, "--session", args.tmux_session,
@@ -3271,6 +3359,7 @@ def wave_loop(args, repo, run_dir, table_path, adopting=False):
     handling: a run that cannot be adopted wakes the coordinator with a snapshot exactly as one
     that cannot be carried on does.
     """
+    start_dashboard(args, repo, run_dir)
     loop = Loop(args, repo, run_dir, table_path)
     resume = resume_command(args)
     try:
@@ -3293,10 +3382,16 @@ def wave_loop(args, repo, run_dir, table_path, adopting=False):
 
 
 def resume_command(args):
-    """The one command that puts the loop back where it left off, for the snapshot to carry."""
+    """The one command that puts the loop back where it left off, for the snapshot to carry.
+
+    The launcher rather than this driver's own `resume`, because every driver of a run belongs in
+    a window of its own and not only the first: a coordinator that put the loop back as a task of
+    its own session would be handing the harness the very process this run must not lose (#103).
+    The pid is passed because it is already known for certain; the name and the mode are left to
+    be read off the harness again, because a mode switched mid-run has to be the current one.
+    """
     return shlex.join([
-        sys.executable, str(pathlib.Path(__file__).resolve()), "resume",
-        "--feature-dir", str(args.feature_dir), "--tmux-session", str(args.tmux_session),
+        sys.executable, str(LAUNCH), str(args.feature_dir),
         "--coordinator-pid", str(args.coordinator_pid),
     ])
 
@@ -3312,6 +3407,7 @@ def run_resume(args):
         )
     repo = repository_root(feature_dir, args.repo_root)
     args.tmux_session = tmux_session(args.tmux_session)
+    take_up_run(run_dir)
     print(f"crew resumed, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table)
 
@@ -3453,6 +3549,13 @@ def main(argv=None):
     except DriverError as error:
         snapshot(DRIVER_ERROR, ticket=error.ticket, pointer=error.pointer, detail=str(error))
         return DRIVER_ERROR_EXIT
+    except KeyboardInterrupt:
+        # The operator's own Ctrl-C in the driver's window: as deliberate an ending as any wake,
+        # so the run is put down and nothing on the dashboard flags it as a driver that was
+        # killed. No wake is written, because nobody asked the coordinator for a ruling.
+        put_down_run()
+        print("crew: the driver was stopped", file=sys.stderr, flush=True)
+        return INTERRUPTED_EXIT
 
 
 if __name__ == "__main__":

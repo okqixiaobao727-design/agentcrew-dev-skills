@@ -189,6 +189,14 @@ HALTED_DECISIONS = ("escalated", "interrupted")
 # What the summary line says while the run is waiting on the operator, so a halted wave is never
 # mistaken for a frozen frame.
 AWAITING_RULING = "⚠ awaiting your ruling"
+# The run directory's record of the driver driving it: the pid its loop wrote on the way in, which
+# every deliberate exit takes away again and a kill cannot. A record naming a process that is not
+# running is therefore a killed driver by construction — the one thing the operator could not see
+# while the run stalled — and the summary line says so in the slot the ruling marker occupies,
+# painted red, carrying the command that puts the run back.
+DRIVER_RECORD_NAME = "driver.pid"
+DRIVER_DEAD = "✖ driver dead — /crew {run} to resume"
+DRIVER_DEAD_COLOUR = "31"
 
 COLUMNS = ("WAVE", "TICKET", "TITLE", "EXECUTOR", "STATE", "ELAPSED")
 # The one column that has no natural width — it is given whatever the window has left over — and
@@ -1031,11 +1039,15 @@ def cut(text, width):
     return text[: width - 1].rstrip() + ELLIPSIS
 
 
-def summary(rows, run_id, waves, moment, awaiting_ruling=False):
+def summary(rows, run_id, waves, moment, awaiting_ruling=False, dead_driver=None):
     """The one line above the table: which run, how far through its waves, and how it stands.
 
     A run halted on a ruling says so between its counts and its clock: the frame is still being
     drawn, and what stopped moving is the run rather than the renderer.
+
+    A run whose driver was killed says that instead, in the same slot. The two are mutually
+    exclusive by the blanking rule — a driver that halted a wave on purpose released its record on
+    the way out — and the slot is written that way so that they can never both be believed.
     """
     counts = {state: 0 for state in STATE_ORDER}
     for row in rows:
@@ -1044,7 +1056,7 @@ def summary(rows, run_id, waves, moment, awaiting_ruling=False):
     parts = [
         f"wave {len({row['wave'] for row in rows if row['launched']})}/{waves}",
         " ".join(f"{state}={counts[state]}" for state in STATE_ORDER if counts[state]),
-        AWAITING_RULING if awaiting_ruling else "",
+        dead_driver or (AWAITING_RULING if awaiting_ruling else ""),
         f"elapsed {elapsed(min(started) if started else None, moment)}",
     ]
     return f"crew {run_id} — " + " · ".join(part for part in parts if part)
@@ -1054,6 +1066,18 @@ def paint(text, state, colour):
     """The state cell in its own colour, or exactly as it was when nothing can show one."""
     code = STATE_COLOURS.get(state) if colour else None
     return f"\x1b[{code}m{text}{COLOUR_RESET}" if code else text
+
+
+def paint_segment(line, segment, code, colour):
+    """That segment of an already-cut line in its own colour, or the line exactly as it was.
+
+    Applied after the cut and never before it: an escape sequence counts toward a line's length,
+    so colouring first would let a narrow window slice one in half and leave the operator's
+    prompt painted. A banner the window cut away is simply not painted.
+    """
+    if not colour or segment is None or segment not in line:
+        return line
+    return line.replace(segment, f"\x1b[{code}m{segment}{COLOUR_RESET}", 1)
 
 
 def fit_rows(rows, row_blocks, available, width):
@@ -1104,7 +1128,8 @@ def fit_rows(rows, row_blocks, available, width):
 
 
 def render(
-    rows, run_id, waves, moment, width=None, colour=False, max_lines=None, awaiting_ruling=False
+    rows, run_id, waves, moment, width=None, colour=False, max_lines=None, awaiting_ruling=False,
+    dead_driver=None,
 ):
     """The whole frame: the summary line, the header, and each row with its annotations."""
     width = width or terminal_width()
@@ -1130,7 +1155,10 @@ def render(
             ]
         return block_lines
 
-    lines = [cut(summary(rows, run_id, waves, moment, awaiting_ruling), width)]
+    lines = [paint_segment(
+        cut(summary(rows, run_id, waves, moment, awaiting_ruling, dead_driver), width),
+        dead_driver, DRIVER_DEAD_COLOUR, colour,
+    )]
     header_lines = block(0, cells[0])
     row_blocks = [block(index, values) for index, values in enumerate(cells[1:], 1)]
     if max_lines is None:
@@ -1258,6 +1286,7 @@ def draw(args, run_dir, moment):
         render(
             rows, run_dir.name, len(waves), moment,
             colour=colour_wanted(args), awaiting_ruling=halted(records),
+            dead_driver=dead_driver_banner(run_dir),
         ),
         flush=True,
     )
@@ -1600,6 +1629,71 @@ def alive(pid):
     return True
 
 
+def driver_record_path(run_dir):
+    """The file the run directory names its driver in, absolute (ADR-0007)."""
+    return pathlib.Path(run_dir).resolve() / DRIVER_RECORD_NAME
+
+
+def record_driver(run_dir, pid):
+    """Name the process driving this run; returns the file it was named in.
+
+    Written by rename, like the pin, because a launcher reading it half-written would read no pid
+    for a driver that is very much alive and start a second one.
+    """
+    path = driver_record_path(run_dir)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(f"{int(pid)}\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise MonitorError(f"the run's driver could not be recorded: {error}")
+    return path
+
+
+def release_driver(run_dir):
+    """Take that record away, which is what makes an exit a deliberate one; returns nothing.
+
+    Every way a driver ends on purpose passes through here — a wake handing judgment over, a
+    driver error, the run finishing, an operator's own interrupt in the driver's window — and no
+    kill does. A run with no record to take away has already been released.
+    """
+    with contextlib.suppress(OSError):
+        driver_record_path(run_dir).unlink(missing_ok=True)
+
+
+def recorded_driver(run_dir):
+    """The pid the run directory names as its driver, or None where it names none it can read.
+
+    A real pid or nothing: everything else this record could hold — a half-written file, a pid
+    with a sign, a zero — is a process id nobody can ask about, and `kill -0` on the last two asks
+    about somebody else's process group entirely.
+    """
+    try:
+        text = driver_record_path(run_dir).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return int(text) if text.isdigit() and int(text) > 0 else None
+
+
+def live_driver(run_dir):
+    """The pid of the driver still driving this run, or None where none is."""
+    pid = recorded_driver(run_dir)
+    return pid if pid is not None and alive(pid) else None
+
+
+def dead_driver_banner(run_dir):
+    """What the summary line says about a driver that was killed, or None where none was.
+
+    The run directory's parent is what the banner names, because that is the directory the
+    operator typed `/crew` with: the run directory itself is the `.crew` inside it.
+    """
+    pid = recorded_driver(run_dir)
+    if pid is None or alive(pid):
+        return None
+    return DRIVER_DEAD.format(run=pathlib.Path(run_dir).resolve().parent)
+
+
 def pin_directory(args):
     """The pin registry this tick reads, and the one the run writes its pin into.
 
@@ -1668,7 +1762,7 @@ def pin_frame_data(args, run_dir, moment):
     frame = render(
         rows, run_dir.name, len(waves), moment,
         colour=pin_colour(args), max_lines=pin_line_budget(args),
-        awaiting_ruling=halted(records),
+        awaiting_ruling=halted(records), dead_driver=dead_driver_banner(run_dir),
     )
     return frame, rows
 

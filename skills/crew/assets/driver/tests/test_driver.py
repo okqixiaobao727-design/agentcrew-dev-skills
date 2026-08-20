@@ -14,6 +14,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,9 @@ DRIVER = TESTS_DIR.parent / "driver.py"
 MACHINE_LOG = DRIVER.parent.parent / "machine_log.py"
 TRIAGE = DRIVER.parent.parent.parent / "references" / "triage.md"
 MONITOR = DRIVER.parent.parent / "monitor" / "monitor.py"
+# The script every snapshot's `resume` names, because a driver put back belongs in a window of its
+# own exactly as the first one did. Its own suite drives it; here it is only what is named.
+LAUNCH = DRIVER.parent.parent / "launch" / "launch.py"
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -40,6 +44,10 @@ PREFLIGHT_WINDOW = "crew-preflight"
 DASHBOARD_WINDOW = "crew-dashboard"
 REPORT_NAME = "report.md"
 RUN_DIR_NAME = ".crew"
+# The two files the run directory gains: the driver's own pid while its loop runs, and the wake
+# snapshot the coordinator's waiter reads instead of the driver's stdout.
+DRIVER_RECORD = "driver.pid"
+WAKE_NAME = "wake.json"
 FEATURE_NAME = "demo"
 INTEGRATION_BRANCH = "crew/demo"
 BASE_BRANCH = "main"
@@ -1097,6 +1105,9 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(launched[1]["model"], CLAUDE_MODEL)
 
     def test_the_run_directory_holds_the_layout_the_index_names(self):
+        """What a run in flight holds. Two more files belong to its ending rather than its life —
+        the wake snapshot, written as the driver exits — and one to the launcher, which opens the
+        driver's log before this driver runs at all."""
         self.start_a_run()
 
         self.assertEqual(
@@ -1104,6 +1115,7 @@ class LaunchTests(DriverTestCase):
             sorted([
                 "wave-table.json", "log.jsonl", "launch", "parked-paths",
                 "dashboard-window", "dashboard-window.lock", "machine_log.py",
+                DRIVER_RECORD,
             ]),
         )
 
@@ -1778,15 +1790,26 @@ class LoopTests(DriverTestCase):
         self.assertIn("nothing", snapshot["detail"])
         self.assertIn("resume", snapshot, "a stopped run's snapshot did not say how it goes on")
 
-    def test_the_command_a_driver_error_names_puts_the_same_run_back_on_its_feet(self):
-        """A driver error is recovered exactly as a ruling is: by the command the snapshot names."""
+    def test_the_command_a_snapshot_names_puts_the_driver_back_in_a_window_of_its_own(self):
+        """The launcher, never this driver's own `resume`: a coordinator that put the loop back
+        as a task of its own session would be handing the harness the one process a run cannot
+        lose. What that command does with the run is its own suite's; what it is, is this."""
         self.feature(("01", ()))
         stopped = self.fixture.ended(self.fixture.launch(extra=("--timeout", "3")))
         snapshot = json.loads(
             [line for line in stopped.stdout.splitlines() if line.strip()][-1]
         )
 
-        resumed = self.fixture.run_command(snapshot["resume"])
+        self.assertIn(str(LAUNCH), snapshot["resume"])
+        self.assertIn(str(self.fixture.feature_dir), snapshot["resume"])
+        self.assertIn(f"--coordinator-pid {COORDINATOR_PID}", snapshot["resume"])
+
+    def test_the_run_a_driver_error_stopped_is_carried_on_from_where_it_stopped(self):
+        """A driver error is recovered exactly as a ruling is: the same seam, the same run."""
+        self.feature(("01", ()))
+        self.fixture.ended(self.fixture.launch(extra=("--timeout", "3")))
+
+        resumed = self.fixture.resume()
         self.assertTrue(
             self.fixture.wait_for(lambda: self.fixture.launch_record("01") is not None),
             "the resumed run lost the wave it was carrying on",
@@ -2092,6 +2115,172 @@ class LoopTests(DriverTestCase):
         for call in calls:
             self.assertNotIn("--repo", call["argv"], f"gh was handed a repository: {call['argv']}")
             self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.repo))
+
+
+class DriverLifecycleTests(DriverTestCase):
+    """What the run directory says about the process driving it, and when it stops saying it.
+
+    The driver no longer runs as a background task of the coordinator's session, so nothing the
+    coordinator holds can report that it ended. The run directory does: its loop names its own pid
+    on the way in, and every exit it takes on purpose takes that name away again. A kill cannot,
+    which is the whole of how a killed driver is told from one that handed judgment over.
+    """
+
+    def feature(self, *tickets, routing=ROUTING):
+        for number, blockers in tickets:
+            self.fixture.ticket(number, f"thing {number}", routing=routing, blocked_by=blockers)
+        self.fixture.commit_feature()
+
+    def start(self, *tickets, routing=ROUTING):
+        """A run with its first wave up and its loop running."""
+        self.feature(*tickets, routing=routing)
+        process = self.fixture.launch()
+        for number, blockers in tickets:
+            if blockers:
+                continue
+            self.assertTrue(
+                self.fixture.wait_for(
+                    lambda number=number: self.fixture.launch_record(number) is not None
+                ),
+                f"{number} never launched",
+            )
+        return process
+
+    def record(self):
+        """The pid the run directory names as its driver, or None where it names none."""
+        path = self.fixture.run_dir / DRIVER_RECORD
+        if not path.exists():
+            return None
+        text = path.read_text().strip()
+        return int(text) if text.isdigit() else text
+
+    def wake_file(self):
+        """The wake snapshot the run directory holds, or None before one is written."""
+        path = self.fixture.run_dir / WAKE_NAME
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def assertReleased(self):
+        self.assertIsNone(self.record(), "a deliberate exit left the driver's pid standing")
+
+    # --- the record while the loop runs -----------------------------------------------------
+
+    def test_a_running_loop_names_its_own_process_in_the_run_directory(self):
+        process = self.start(("01", ()))
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.record() == process.pid),
+            f"the run directory names {self.record()}, not the driver {process.pid}",
+        )
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+    def test_a_resumed_run_is_named_after_the_driver_now_driving_it(self):
+        """A run is driven by whichever process holds it, and the record says which."""
+        process = self.start(("01", ()))
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.record() == resumed.pid),
+            f"the run directory names {self.record()}, not the driver {resumed.pid}",
+        )
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+    # --- the three deliberate exits ---------------------------------------------------------
+
+    def test_a_wake_handing_judgment_over_releases_the_run(self):
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertReleased()
+
+    def test_a_driver_error_releases_the_run(self):
+        """A state the rule table has no row for still ends the driver on its own terms."""
+        process = self.start(("01", ()))
+        # A receipt whose child the log has no launch record for, which is a driver error rather
+        # than anything a rule settles: the launch lines are taken back out from under it.
+        records = [
+            record for record in self.fixture.log_records()
+            if record.get("event") != "launch"
+        ]
+        (self.fixture.run_dir / "log.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+        self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
+        self.woken(process, "driver-error")
+
+        self.assertReleased()
+
+    def test_a_finished_run_releases_the_run(self):
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertReleased()
+
+    def test_an_interrupt_in_the_drivers_own_window_releases_the_run(self):
+        """The operator's own Ctrl-C is deliberate, so it must not raise the dead-driver flag."""
+        process = self.start(("01", ()))
+        self.assertTrue(self.fixture.wait_for(lambda: self.record() == process.pid))
+
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=30)
+
+        self.assertReleased()
+
+    # --- the one exit that is not deliberate -------------------------------------------------
+
+    def test_a_killed_driver_leaves_its_pid_standing(self):
+        """The stall this ticket is about: nothing runs on the way out of a SIGKILL, so the
+        record is the only thing left that can say the run was orphaned."""
+        process = self.start(("01", ()))
+        self.assertTrue(self.fixture.wait_for(lambda: self.record() == process.pid))
+
+        process.kill()
+        process.communicate()
+
+        self.assertEqual(self.record(), process.pid)
+
+    # --- the wake channel -------------------------------------------------------------------
+
+    def test_the_wake_snapshot_is_left_in_the_run_directory_as_well_as_printed(self):
+        """The coordinator's waiter reads a file now: the driver's stdout is its own pane's."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.wake_file(), snapshot)
+
+    def test_a_run_that_finishes_leaves_its_final_snapshot_in_the_run_directory(self):
+        process = self.start(("01", ()))
+
+        self.fixture.completes("01")
+        snapshot = self.woken(process, "run-complete")
+
+        self.assertEqual(self.wake_file(), snapshot)
+
+    def test_the_record_is_released_before_the_wake_is_written(self):
+        """Ordering, so a coordinator that pastes the resume command the instant it is woken
+        cannot find a pid that is about to stop and attach to a driver that is already leaving."""
+        process = self.start(("01", ()))
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.wake_file() is not None),
+            "the driver never wrote its wake snapshot",
+        )
+        self.assertReleased()
+
+        self.woken(process, "judgment-needed")
 
 
 class AnswerTests(DriverTestCase):
