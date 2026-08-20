@@ -39,6 +39,64 @@ class Fails(unittest.TestCase):
 """
 
 
+# A pair of suites that only pass if they are running at the same time: each announces itself and
+# then waits for the other. Run one after another, the first waits out the whole deadline and
+# fails, which is what makes this an observation of concurrency rather than of wall time.
+RENDEZVOUS_TEST = """
+import pathlib
+import time
+import unittest
+
+SHARED = pathlib.Path({shared!r})
+NAME = {name!r}
+PARTNER = {partner!r}
+
+
+class Rendezvous(unittest.TestCase):
+    def test_the_other_suite_is_running_too(self):
+        SHARED.mkdir(parents=True, exist_ok=True)
+        (SHARED / NAME).write_text("here")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if (SHARED / PARTNER).exists():
+                return
+            time.sleep(0.02)
+        self.fail("%s never started; the suites did not overlap" % PARTNER)
+"""
+
+# Two suites, each with a helper module of the same name — the shape the real tree already has,
+# where four asset suites ship a `stub_claude.py`. A suite that imported its neighbour's copy
+# would read the wrong constant.
+HELPER = """
+VALUE = {value!r}
+"""
+
+HELPER_TEST = """
+import unittest
+
+import helper
+
+
+class ItsOwnHelper(unittest.TestCase):
+    def test_the_helper_is_this_suite_s_own(self):
+        assert helper.VALUE == {value!r}, helper.VALUE
+"""
+
+
+# A suite that writes bytes no locale can decode, straight at the descriptor its own subprocesses
+# would inherit. It stands in for the real thing: git and the tmux stubs emit whatever a branch
+# name or a terminal happened to hold, which is not always valid UTF-8.
+UNDECODABLE_TEST = """
+import os
+import unittest
+
+
+class Undecodable(unittest.TestCase):
+    def test_it_writes_bytes_no_locale_can_decode(self):
+        os.write(2, b"\\xff\\xfe raw bytes at the descriptor\\n")
+"""
+
+
 def load_runner():
     """`scripts/test.py` as a module, under a name that cannot shadow the stdlib's `test`."""
     spec = importlib.util.spec_from_file_location("agentcrew_test_runner", SCRIPT)
@@ -174,6 +232,95 @@ class RunnerCLITests(unittest.TestCase):
 
         self.assertEqual(run.returncode, 2)
         self.assertIn("skills/*/assets/**/tests", run.stderr)
+
+
+class ParallelGateTests(unittest.TestCase):
+    """The gate runs its suites at once, and keeps each one's process and output to itself."""
+
+    def setUp(self):
+        self.tree = TreeFixture()
+        self.addCleanup(self.tree.close)
+        self.tree.suite("tests", test_root=PASSING_TEST)
+
+    def rendezvous_pair(self):
+        shared = str(self.tree.root / "rendezvous")
+        for name, partner in (("first", "second"), ("second", "first")):
+            self.tree.suite(
+                f"skills/crew/assets/{name}/tests",
+                **{
+                    f"test_{name}": RENDEZVOUS_TEST.format(
+                        shared=shared, name=name, partner=partner
+                    )
+                },
+            )
+
+    def test_the_gate_runs_its_suites_at_the_same_time(self):
+        self.rendezvous_pair()
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("total: 3 tests in", run.stderr)
+
+    def test_jobs_one_runs_them_one_after_another(self):
+        """The escape hatch: the same inventory, serially, for bisecting a suite that only fails
+        beside its neighbours."""
+        self.rendezvous_pair()
+
+        run = self.tree.run("--jobs", "1")
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("did not overlap", run.stderr)
+
+    def test_each_suite_imports_its_own_helper_of_a_shared_name(self):
+        """Suites share module names, so they cannot share an interpreter.
+
+        Asserted at one suite at a time as well as at all of them, because that is the arrangement
+        that would reuse a worker: with a worker per suite, a pool that never replaced its workers
+        would pass this anyway. One at a time, the same worker takes both suites or the run fails.
+        """
+        for name, value in (("alpha", "alpha's own"), ("beta", "beta's own")):
+            self.tree.suite(
+                f"skills/crew/assets/{name}/tests",
+                helper=HELPER.format(value=value),
+                **{f"test_{name}": HELPER_TEST.format(value=value)},
+            )
+
+        for jobs in ((), ("--jobs", "1")):
+            with self.subTest(jobs=jobs or "all"):
+                run = self.tree.run(*jobs)
+
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertIn("total: 3 tests in", run.stderr)
+
+    def test_asking_for_no_jobs_at_all_is_refused_rather_than_run(self):
+        run = self.tree.run("--jobs", "0")
+
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("--jobs", run.stderr)
+        self.assertNotIn("tests in", run.stderr)
+
+    def test_a_suite_writing_undecodable_bytes_is_still_reported(self):
+        """Captured output is replayed, not decoded strictly: a suite that emits bytes the locale
+        cannot read should cost its own output's legibility, never the whole gate's exit."""
+        self.tree.suite("skills/crew/assets/alpha/tests", test_alpha=PASSING_TEST)
+        self.tree.suite("skills/crew/assets/noisy/tests", test_noisy=UNDECODABLE_TEST)
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("noisy: 1 tests in", run.stderr)
+        self.assertIn("total: 3 tests in", run.stderr)
+
+    def test_one_suite_failing_beside_the_others_fails_the_run(self):
+        self.tree.suite("skills/crew/assets/alpha/tests", test_alpha=PASSING_TEST)
+        self.tree.suite("skills/crew/assets/broken/tests", test_broken=FAILING_TEST)
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("as the fixture intends", run.stderr)
+        self.assertIn("alpha: 1 tests in", run.stderr)
 
 
 class InventoryTests(unittest.TestCase):

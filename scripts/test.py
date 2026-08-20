@@ -14,11 +14,17 @@ Usage:
 Selection is declared, never inferred: nothing here reads `git diff` to guess what changed, because
 an inference that guesses wrong skips tests silently. The caller states what it touched. Each
 suite's size and wall time go to stderr, so the next slowdown arrives as a number with a name on it.
+
+The gate runs its suites at once, one worker interpreter each, so its total is the slowest
+suite's wall time rather than the sum of them all. `--jobs 1` runs them one at a time.
 """
 
 import argparse
+import concurrent.futures
+import os
 import pathlib
 import sys
+import tempfile
 import time
 import unittest
 
@@ -88,6 +94,62 @@ def run_suite(name, directory, root):
     return result.wasSuccessful(), count
 
 
+def run_suite_apart(entry):
+    """One suite in a worker interpreter; return whether it passed, its size, and its output.
+
+    Suites share module names — four asset suites ship a `stub_claude.py` — so the first one
+    to import it would leave it in `sys.modules` for the next, which would then be testing
+    against its neighbour's copy. One worker per suite is what keeps that from happening.
+
+    The output is captured at the file descriptors rather than at `sys.stderr`, because a suite's
+    own subprocesses inherit the descriptors and would otherwise write straight past the capture,
+    into the middle of whatever another worker is writing.
+    """
+    name, directory, root = entry
+    # Replayed rather than decoded strictly: a suite's subprocesses write whatever a branch name
+    # or a terminal held, and one undecodable byte must cost that suite's legibility, not the run.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as held:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        saved = os.dup(1), os.dup(2)
+        os.dup2(held.fileno(), 1)
+        os.dup2(held.fileno(), 2)
+        try:
+            passed, count = run_suite(name, directory, root)
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved[0], 1)
+            os.dup2(saved[1], 2)
+            os.close(saved[0])
+            os.close(saved[1])
+        held.seek(0)
+        return passed, count, held.read()
+
+
+def run_together(chosen, root, jobs):
+    """Run the suites in worker interpreters; return their (passed, size) pairs.
+
+    ADR-0016 measured the suites near-perfectly parallel across processes: their time is spent
+    waiting on subprocesses rather than computing, so the gate costs its slowest suite rather
+    than the sum of them all. Each suite's output is written whole, as that suite lands.
+
+    `jobs` bounds how many run at once, not how many interpreters they run in: one worker takes
+    one suite and is then replaced, so running them one at a time still isolates them.
+    """
+    work = [(name, directory, root) for name, directory in chosen]
+    results = []
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=jobs or len(work), max_tasks_per_child=1
+    ) as pool:
+        pending = [pool.submit(run_suite_apart, item) for item in work]
+        for done in concurrent.futures.as_completed(pending):
+            passed, count, output = done.result()
+            sys.stderr.write(output)
+            results.append((passed, count))
+    return results
+
+
 def die(message):
     print(f"error: {message}", file=sys.stderr)
     return 2
@@ -102,12 +164,19 @@ def main(argv=None):
         help=f"run only this suite: an asset directory's name, or {ROOT_SUITE!r} for tests/",
     )
     parser.add_argument(
+        "--jobs",
+        type=int,
+        help="run this many suites at once (default: all of them; 1 runs them one after another)",
+    )
+    parser.add_argument(
         "--root",
         type=pathlib.Path,
         default=ROOT,
         help="the repository to test (default: the one this script ships in)",
     )
     args = parser.parse_args(argv)
+    if args.jobs is not None and args.jobs < 1:
+        return die(f"--jobs takes a positive number of suites at once, not {args.jobs}")
 
     root = args.root.resolve()
     inventory = suites(root)
@@ -122,7 +191,10 @@ def main(argv=None):
         return die(unselectable)
 
     started = time.monotonic()
-    results = [run_suite(name, directory, root) for name, directory in chosen]
+    if len(chosen) > 1:
+        results = run_together(chosen, root, args.jobs)
+    else:
+        results = [run_suite(name, directory, root) for name, directory in chosen]
     if len(results) > 1:
         total = sum(count for _, count in results)
         report(f"total: {total} tests in {time.monotonic() - started:.1f}s")
