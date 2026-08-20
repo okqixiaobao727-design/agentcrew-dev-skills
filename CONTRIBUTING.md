@@ -39,39 +39,40 @@ Grep/Glob/Read, which AGENTS.md already allows. Nothing else in the repo depends
 
 ## Running the checks
 
-`scripts/test.py` is the whole of the test gate, and it has exactly two uses:
+`scripts/test.py` is the whole of the test gate, and it takes one argument:
 
 ```sh
-python3 scripts/test.py --asset driver   # while you work: the suite of the asset you changed
-python3 scripts/test.py                  # the full gate: every suite, once, before you push
+python3 scripts/test.py --asset driver   # while you work: the suite that tests what you changed
+python3 scripts/test.py                  # every suite at once
+python3 scripts/validate_plugin_tree.py  # manifest, skill slots, config, residue lint
 ```
 
-The focused run costs that suite alone — seconds to a few minutes. The full run costs everything
-the repository has, currently around fifteen minutes, which is why it is worth running once rather
-than after every edit. Each suite reports its size and wall time on stderr, so a slowdown arrives
-with a name attached.
-
-An asset's suite answers to the name of its directory — `dispatch`, `driver`, `launch`, `monitor`,
-`review`, `stage` — because a skill asset's tests live next to the asset, in a `tests/` directory
-beside it: the stub PATH and fixture repository they need belong with the script they stand in for.
-The repository's own suite, `tests/`, answers to `root`. Selection is declared, never inferred: the
-script does not read `git diff` to guess what you touched
+An asset's suite answers to the name of its directory, because a skill asset's tests live next to
+the asset, in a `tests/` directory beside it: the stub PATH and fixture repository they need belong
+with the script they stand in for. The repository's own suite, `tests/`, answers to `root`, and a
+name the script does not know prints the list. Selection is declared, never inferred: nothing reads
+`git diff` to guess what you touched
 ([ADR-0016](docs/adr/0016-one-validation-entry-point-with-focused-and-full-intents.md)).
 
-The plugin-tree validator runs beside it, and is the other half of the gate:
+**Which of them to run is in [AGENTS.md](AGENTS.md#validating-your-work)** — the rule turns on
+whether your change reaches the shared spine, and it is written down in one place so it cannot
+drift. In short: the focused suite while you work, the validator every time, and the full gate
+when you touched something more than one suite imports.
 
-```sh
-python3 scripts/validate_plugin_tree.py   # manifest, skill slots, config, residue lint
-```
+Each suite reports its size and wall time on stderr, so read the total there rather than expecting
+a figure from this file; the gate runs its suites at once, so that total is its slowest suite and
+not the sum of them. Give it a fifteen-minute timeout — a ceiling to allocate, not an estimate.
 
-CI runs both on every pull request, on Python 3.11 and 3.14.
+CI runs the tests and the validator on every push and pull request to `main`, on Python 3.11 and
+3.14 — the only place they meet the floor version, Linux, and a clean checkout. A newer run on the
+same ref cancels the one it supersedes.
 
 ### One thing that will surprise you
 
 The validator's residue lint rejects **personal identifiers**: machine nicknames and account names
 that have no business in a public repo. It cannot guess yours, so it reads them from
-`.agentcrew-local-identifiers` at the tree root — a gitignored file, so your list stays yours — or
-from `AGENTCREW_LOCAL_IDENTIFIERS` as a comma-separated list.
+`.agentcrew-local-identifiers` at the tree root — a gitignored file, so your list stays yours —
+or from `AGENTCREW_LOCAL_IDENTIFIERS` as a comma-separated list.
 
 If you create that file, the test suite starts checking the real working tree against it. That is
 deliberate: it is what stops your hostname reaching a release. If it reports a hit in a file you
@@ -95,7 +96,8 @@ tests pass" is not evidence about a skill's behaviour.
 1. Branch off `main`. Name it for what it does — `fix/...`, `feat/...`, `docs/...`.
 2. **One concern per pull request.** Two unrelated fixes are two pull requests; it makes each one
    reviewable and either one revertable without taking the other with it.
-3. Run the full gate locally, once, at the end: `python3 scripts/test.py` and the validator.
+3. Run what your change reaches, once, at the end — see
+   [AGENTS.md](AGENTS.md#validating-your-work). The validator runs whatever you touched.
 4. Open the pull request against `main`. Describe the problem, then the fix, then how you verified
    it. If it closes an issue, write `Closes #<n>` in the body.
 5. Say what you changed beyond the ticket, if anything. A widened fix is often the right call — it
