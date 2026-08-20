@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-21
+
 ### Changed
 - The driver runs detached from the coordinator's session, in a tmux window of
   its own opened through the same windowing path every child is launched
