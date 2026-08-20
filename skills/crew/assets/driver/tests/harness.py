@@ -468,6 +468,26 @@ class Fixture:
             return []
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
+    def edit_log(self, edit):
+        """Rewrite the run log through `edit(records) -> records`, next to the read it edits.
+
+        The log is append-only and its writers share it through a single `O_APPEND` write each,
+        which no rewrite can join: a test that reads every record, does something else, and only
+        then writes the file back drops whatever a live driver appended in between — the run's
+        own record of a launch or a receipt, gone, and the test then asserting against a log the
+        driver no longer agrees with (#113, #117).
+
+        So the read, the edit and the write happen here with no test logic between them, and
+        whatever landed after the read is carried onto the end of what is written rather than
+        dropped. What is left is the truncate-and-write itself, two adjacent calls wide; a test
+        that cannot afford even that must doctor the log with no driver running.
+        """
+        path = self.run_dir / "log.jsonl"
+        before = path.read_bytes()
+        records = [json.loads(line) for line in before.decode().splitlines() if line.strip()]
+        kept = "".join(json.dumps(record) + "\n" for record in edit(records)).encode("utf-8")
+        path.write_bytes(kept + path.read_bytes()[len(before):])
+
     def records(self, path):
         path = pathlib.Path(path)
         if not path.exists():

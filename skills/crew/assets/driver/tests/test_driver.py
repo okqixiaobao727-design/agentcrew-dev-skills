@@ -975,11 +975,11 @@ class LoopTests(DriverTestCase):
         pin_dir = self.fixture.config_dir / "agentcrew" / "pins"
         self.assertTrue(self.fixture.wait_for(lambda: list(pin_dir.glob("*.json"))))
 
-        records = self.fixture.log_records()
-        records[0]["ts"] = "not-a-machine-log-timestamp"
-        (self.fixture.run_dir / "log.jsonl").write_text(
-            "\n".join(json.dumps(record) for record in records) + "\n"
-        )
+        def corrupt_the_first_timestamp(records):
+            records[0]["ts"] = "not-a-machine-log-timestamp"
+            return records
+
+        self.fixture.edit_log(corrupt_the_first_timestamp)
         self.fixture.completes("01")
 
         self.woken(process, "driver-error")
@@ -1069,13 +1069,9 @@ class LoopTests(DriverTestCase):
             self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
             "01 never finished launch verification",
         )
-        records = [
-            record for record in self.fixture.log_records()
-            if record.get("event") != "launch"
-        ]
-        (self.fixture.run_dir / "log.jsonl").write_text(
-            "\n".join(json.dumps(record) for record in records) + "\n"
-        )
+        self.fixture.edit_log(lambda records: [
+            record for record in records if record.get("event") != "launch"
+        ])
         self.fixture.says("01", message)
         return self.woken(process, "driver-error")
 
@@ -1941,13 +1937,9 @@ class DriverLifecycleTests(DriverTestCase):
         process = self.start(("01", ()))
         # A receipt whose child the log has no launch record for, which is a driver error rather
         # than anything a rule settles: the launch lines are taken back out from under it.
-        records = [
-            record for record in self.fixture.log_records()
-            if record.get("event") != "launch"
-        ]
-        (self.fixture.run_dir / "log.jsonl").write_text(
-            "\n".join(json.dumps(record) for record in records) + "\n"
-        )
+        self.fixture.edit_log(lambda records: [
+            record for record in records if record.get("event") != "launch"
+        ])
         self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
         self.woken(process, "driver-error")
 
@@ -2111,16 +2103,17 @@ class AnswerTests(DriverTestCase):
 
     def test_missing_recorded_window_reports_unreachable_and_writes_no_ruling(self):
         self.start()
-        records = self.fixture.log_records()
-        launch = next(
-            record
-            for record in reversed(records)
-            if record.get("event") == "launch" and record.get("ticket") == "01"
-        )
-        launch["window"] = None
-        (self.fixture.run_dir / "log.jsonl").write_text(
-            "\n".join(json.dumps(record) for record in records) + "\n"
-        )
+
+        def forget_where_that_child_is(records):
+            launch = next(
+                record
+                for record in reversed(records)
+                if record.get("event") == "launch" and record.get("ticket") == "01"
+            )
+            launch["window"] = None
+            return records
+
+        self.fixture.edit_log(forget_where_that_child_is)
 
         result = self.answer("--text", "Use the existing retention_audit table")
 
