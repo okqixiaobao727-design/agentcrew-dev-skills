@@ -2,33 +2,35 @@
 
 ## Validating your work
 
-This repository has one test entry point, `scripts/test.py`, and two situations to use it in. Run
-the command that matches your situation; do not substitute another.
+`scripts/test.py` is the only test command; a name it doesn't know prints the list of suites.
 
-**While you are working — run the suite of the asset you changed, and only that one:**
+**While you work — the suite that tests what you changed, plus the validator:**
 
 ```sh
 python3 scripts/test.py --asset driver
-```
-
-The name is the asset's directory name: `dispatch`, `driver`, `launch`, `monitor`, `review`,
-`stage`. Anything outside `skills/*/assets/` — `scripts/`, hooks, the merge driver — is the `root`
-suite: `python3 scripts/test.py --asset root`. Changed two assets? Run the two focused commands.
-
-**At the end of the ticket, exactly once — run the full gate:**
-
-```sh
-python3 scripts/test.py
 python3 scripts/validate_plugin_tree.py
 ```
 
-The full run takes around fifteen minutes. Run it once, when the work is finished, and not again
-after each edit; that is the whole reason the focused run exists. Never run
-`python3 -m unittest discover` — it is no longer an interface, and it costs the full fifteen
-minutes with none of the per-suite timing.
+A file inside `skills/*/assets/<asset>/` is tested by that asset's suite. Everything else is
+tested by `root`: `scripts/`, `config/`, hooks, and the **spine** — the files under
+`skills/crew/assets/` that sit outside any asset (`accounts.py`, `advance.py`, `machine_log.py`,
+`merge_driver.py`, `codex/`).
 
-Report what you ran, verbatim, alongside the result. If you skipped the full gate, say so; a
-skipped gate reported as a pass is worse than a red one (ADR-0016).
+**Before you hand the work back — the full gate, if you touched the spine:**
+
+```sh
+python3 scripts/test.py   # every suite; give it a fifteen-minute timeout
+```
+
+Six of the seven suites import the spine, so a focused run cannot see what a spine change broke.
+A change contained to one asset needs no local gate: CI runs the full gate on every push and pull
+request to `main`.
+
+Run the validator every time — it costs a second, and its residue lint reads your gitignored
+`.agentcrew-local-identifiers`, which CI has no copy of.
+
+Report what you ran, verbatim, beside the result. A skipped gate reported as a pass is worse than
+a red one (ADR-0016).
 
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph
