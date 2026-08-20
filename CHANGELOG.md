@@ -7,6 +7,27 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Validation has one entry point with two intents**: `scripts/test.py`
+  (ADR-0016). It owns the suite inventory — `tests/` plus every
+  `skills/*/assets/*/tests` directory — so `--asset driver` runs one suite while
+  you work and no argument runs the whole gate; each suite's size and wall time
+  are reported on stderr. Selection is declared, never inferred: the script does
+  not read `git diff` to guess what changed, because an inference that guesses
+  wrong skips tests silently. CONTRIBUTING.md, AGENTS.md, CI and
+  `scripts/release.py` all invoke it, and the raw `unittest discover`
+  incantation is no longer an interface. The full gate is unchanged in what it
+  runs, and the two guards it always had still hold: every suite in the
+  inventory must contribute tests, and walking the asset suites leaves the root
+  walk alone. The suite that grew from 59 tests in 4.6 seconds to 940 in 872 had
+  no way to run less; a change to one asset now costs that asset's suite.
+- **CI runs the matrix endpoints only**, Python 3.11 and 3.14, instead of all
+  four interior versions. These tests exercise `git`, `tmux` stubs and process
+  lifecycles, not version-sensitive language surface, so four identical full
+  runs bought almost nothing over two — and halving them halves the cost of
+  every pull request. A row is one line to restore if an interior-version
+  failure ever appears.
+
 ## [0.8.3] - 2026-08-19
 
 ### Fixed

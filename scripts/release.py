@@ -119,7 +119,7 @@ def main():
 
     print("Running the test suite and plugin-tree validator (same as CI)...")
     run("python3", "scripts/validate_plugin_tree.py")
-    run("python3", "-m", "unittest", "discover", "-s", "tests")
+    run("python3", "scripts/test.py")
 
     bump_json_version(PLUGIN_MANIFEST, args.version)
     bump_json_version(MARKETPLACE, args.version)

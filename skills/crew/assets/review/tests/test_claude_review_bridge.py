@@ -922,7 +922,7 @@ class ScopedContextTests(ScopedRoundOneTestCase):
 class VerificationReuseTests(ScopedRoundOneTestCase):
     """The reviewer is handed what the author already ran, and told not to run it again."""
 
-    VERIFICATION = "python3 -m unittest discover -s tests — passed; validator — passed"
+    VERIFICATION = "python3 scripts/test.py — passed; validator — passed"
 
     def test_the_recorded_verification_reaches_the_round_one_prompt(self):
         run = self.run_scoped("--verification", self.VERIFICATION)

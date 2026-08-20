@@ -39,19 +39,32 @@ Grep/Glob/Read, which AGENTS.md already allows. Nothing else in the repo depends
 
 ## Running the checks
 
-These are the two commands CI runs, and they are the whole of the automated gate:
+`scripts/test.py` is the whole of the test gate, and it has exactly two uses:
 
 ```sh
-python3 scripts/validate_plugin_tree.py       # manifest, skill slots, config, residue lint
-python3 -m unittest discover -s tests -v      # the test suite
+python3 scripts/test.py --asset driver   # while you work: the suite of the asset you changed
+python3 scripts/test.py                  # the full gate: every suite, once, before you push
 ```
 
-CI runs both on every pull request against 3.11, 3.12, 3.13 and 3.14. Run them locally first — they
-take a few seconds.
+The focused run costs that suite alone — seconds to a few minutes. The full run costs everything
+the repository has, currently around fifteen minutes, which is why it is worth running once rather
+than after every edit. Each suite reports its size and wall time on stderr, so a slowdown arrives
+with a name attached.
 
-A skill asset's tests live next to the asset, in a `tests/` directory beside it, because the stub
-PATH and fixture repository they need belong with the script they stand in for. The second command
-still runs them: `tests/test_asset_suites.py` loads every one of those directories into the suite.
+An asset's suite answers to the name of its directory — `dispatch`, `driver`, `launch`, `monitor`,
+`review`, `stage` — because a skill asset's tests live next to the asset, in a `tests/` directory
+beside it: the stub PATH and fixture repository they need belong with the script they stand in for.
+The repository's own suite, `tests/`, answers to `root`. Selection is declared, never inferred: the
+script does not read `git diff` to guess what you touched
+([ADR-0016](docs/adr/0016-one-validation-entry-point-with-focused-and-full-intents.md)).
+
+The plugin-tree validator runs beside it, and is the other half of the gate:
+
+```sh
+python3 scripts/validate_plugin_tree.py   # manifest, skill slots, config, residue lint
+```
+
+CI runs both on every pull request, on Python 3.11 and 3.14.
 
 ### One thing that will surprise you
 
@@ -82,7 +95,7 @@ tests pass" is not evidence about a skill's behaviour.
 1. Branch off `main`. Name it for what it does — `fix/...`, `feat/...`, `docs/...`.
 2. **One concern per pull request.** Two unrelated fixes are two pull requests; it makes each one
    reviewable and either one revertable without taking the other with it.
-3. Run both checks locally.
+3. Run the full gate locally, once, at the end: `python3 scripts/test.py` and the validator.
 4. Open the pull request against `main`. Describe the problem, then the fix, then how you verified
    it. If it closes an issue, write `Closes #<n>` in the body.
 5. Say what you changed beyond the ticket, if anything. A widened fix is often the right call — it

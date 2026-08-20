@@ -1,3 +1,35 @@
+# AGENTS.md
+
+## Validating your work
+
+This repository has one test entry point, `scripts/test.py`, and two situations to use it in. Run
+the command that matches your situation; do not substitute another.
+
+**While you are working — run the suite of the asset you changed, and only that one:**
+
+```sh
+python3 scripts/test.py --asset driver
+```
+
+The name is the asset's directory name: `dispatch`, `driver`, `launch`, `monitor`, `review`,
+`stage`. Anything outside `skills/*/assets/` — `scripts/`, hooks, the merge driver — is the `root`
+suite: `python3 scripts/test.py --asset root`. Changed two assets? Run the two focused commands.
+
+**At the end of the ticket, exactly once — run the full gate:**
+
+```sh
+python3 scripts/test.py
+python3 scripts/validate_plugin_tree.py
+```
+
+The full run takes around fifteen minutes. Run it once, when the work is finished, and not again
+after each edit; that is the whole reason the focused run exists. Never run
+`python3 -m unittest discover` — it is no longer an interface, and it costs the full fifteen
+minutes with none of the per-suite timing.
+
+Report what you ran, verbatim, alongside the result. If you skipped the full gate, say so; a
+skipped gate reported as a pass is worse than a red one (ADR-0016).
+
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph
 
