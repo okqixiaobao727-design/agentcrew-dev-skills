@@ -7,6 +7,24 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- `scripts/test.py` splits every suite across worker interpreters instead of
+  giving each suite one. ADR-0016 made the gate cost its slowest suite rather
+  than the sum of them all, and that worked so well it became the next problem:
+  the gate measured 417.7s and the driver suite alone measured 417.5s, so the
+  driver suite *was* the gate, and no single test in it was slow enough to be
+  worth deleting. A work item is now one shard of one suite: the child discovers
+  its own suite, sorts by test id and takes every Nth test, so the parent never
+  imports a suite's modules and the isolation one worker per item exists for is
+  untouched. The shard count and the worker count both derive from
+  `os.cpu_count()` — no new flag. `--jobs` keeps its name and its role as the
+  escape hatch, but now counts worker processes rather than suites; `--jobs 1`
+  still runs the whole inventory one item at a time, and asking for more workers
+  than the machine has cores is capped at the core count and said out loud. Reporting is unchanged in
+  shape: one line per suite, with the suite's whole test count and its slowest
+  shard's time. On a ten-core machine `--asset driver` went from 402s to 71.1s
+  and the full gate from 417.7s to 135.2s, every run green. (#119)
+
 ## [0.9.0] - 2026-08-21
 
 ### Changed

@@ -10,6 +10,7 @@ script exists to avoid.
 """
 
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -64,6 +65,35 @@ class Rendezvous(unittest.TestCase):
         self.fail("%s never started; the suites did not overlap" % PARTNER)
 """
 
+# A pair of test methods inside a *single* suite that only pass if they are running at the same
+# time. The suite-level rendezvous above cannot see this: it is satisfied by one worker per suite.
+# This one can only pass if that one suite's tests were split across interpreters.
+RENDEZVOUS_WITHIN_A_SUITE = """
+import pathlib
+import time
+import unittest
+
+SHARED = pathlib.Path({shared!r})
+
+
+class Rendezvous(unittest.TestCase):
+    def meet(self, name, partner):
+        SHARED.mkdir(parents=True, exist_ok=True)
+        (SHARED / name).write_text("here")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if (SHARED / partner).exists():
+                return
+            time.sleep(0.02)
+        self.fail("%s never started; the suite's own tests did not overlap" % partner)
+
+    def test_the_other_test_in_this_suite_is_running_too(self):
+        self.meet("first", "second")
+
+    def test_this_suite_s_other_test_is_running_too(self):
+        self.meet("second", "first")
+"""
+
 # Two suites, each with a helper module of the same name — the shape the real tree already has,
 # where four asset suites ship a `stub_claude.py`. A suite that imported its neighbour's copy
 # would read the wrong constant.
@@ -79,6 +109,9 @@ import helper
 
 class ItsOwnHelper(unittest.TestCase):
     def test_the_helper_is_this_suite_s_own(self):
+        assert helper.VALUE == {value!r}, helper.VALUE
+
+    def test_the_helper_is_still_this_suite_s_own_beside_its_neighbour(self):
         assert helper.VALUE == {value!r}, helper.VALUE
 """
 
@@ -278,6 +311,10 @@ class ParallelGateTests(unittest.TestCase):
         Asserted at one suite at a time as well as at all of them, because that is the arrangement
         that would reuse a worker: with a worker per suite, a pool that never replaced its workers
         would pass this anyway. One at a time, the same worker takes both suites or the run fails.
+
+        Each suite holds two tests, so this also covers the shards: two tests of one suite land in
+        different interpreters, and each must still see its own suite's helper rather than the
+        one whichever shard imported first.
         """
         for name, value in (("alpha", "alpha's own"), ("beta", "beta's own")):
             self.tree.suite(
@@ -291,7 +328,19 @@ class ParallelGateTests(unittest.TestCase):
                 run = self.tree.run(*jobs)
 
                 self.assertEqual(run.returncode, 0, run.stderr)
-                self.assertIn("total: 3 tests in", run.stderr)
+                self.assertIn("total: 5 tests in", run.stderr)
+
+    def test_asking_for_more_workers_than_the_machine_has_cores_is_bounded_and_said_out_loud(self):
+        """These tests wait on absolute timeouts, so oversubscribing fails tests rather than
+        slowing them; a flag that will not be obeyed as asked has to say so."""
+        cores = os.cpu_count() or 1
+        self.tree.suite("skills/crew/assets/alpha/tests", test_alpha=PASSING_TEST)
+
+        run = self.tree.run("--jobs", str(cores + 1))
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"--jobs {cores + 1}", run.stderr)
+        self.assertIn(f"{cores} cores", run.stderr)
 
     def test_asking_for_no_jobs_at_all_is_refused_rather_than_run(self):
         run = self.tree.run("--jobs", "0")
@@ -321,6 +370,83 @@ class ParallelGateTests(unittest.TestCase):
         self.assertEqual(run.returncode, 1)
         self.assertIn("as the fixture intends", run.stderr)
         self.assertIn("alpha: 1 tests in", run.stderr)
+
+
+class ShardedSuiteTests(unittest.TestCase):
+    """One suite is more than one work item: its own tests run in interpreters of their own."""
+
+    def setUp(self):
+        self.tree = TreeFixture()
+        self.addCleanup(self.tree.close)
+        self.tree.suite("tests", test_root=PASSING_TEST)
+
+    def rendezvous_within_one_suite(self):
+        self.tree.suite(
+            "skills/crew/assets/paired/tests",
+            test_paired=RENDEZVOUS_WITHIN_A_SUITE.format(
+                shared=str(self.tree.root / "rendezvous")
+            ),
+        )
+
+    def test_one_suite_s_own_tests_run_at_the_same_time(self):
+        """The heart of the change: a suite is no longer bounded by one interpreter."""
+        if (os.cpu_count() or 1) < 2:
+            self.skipTest("a machine with one core has nothing to shard across")
+        self.rendezvous_within_one_suite()
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("paired: 2 tests in", run.stderr)
+
+    def test_jobs_one_still_runs_one_work_item_at_a_time(self):
+        """The escape hatch survives sharding: the pair that needs two interpreters now fails."""
+        self.rendezvous_within_one_suite()
+
+        run = self.tree.run("--jobs", "1")
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("did not overlap", run.stderr)
+
+    def test_a_suite_with_fewer_tests_than_shards_still_reports_all_of_them(self):
+        """A shard that legitimately receives nothing is ordinary, not the empty-suite failure."""
+        self.tree.suite("skills/crew/assets/small/tests", test_small=PASSING_TEST)
+
+        run = self.tree.run("--asset", "small")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("small: 1 tests in", run.stderr)
+        self.assertNotIn("no tests", run.stderr)
+
+    def test_a_failing_test_in_one_shard_fails_the_whole_run(self):
+        self.tree.suite(
+            "skills/crew/assets/mixed/tests",
+            test_passes=PASSING_TEST,
+            test_fails=FAILING_TEST,
+        )
+
+        run = self.tree.run("--asset", "mixed")
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("as the fixture intends", run.stderr)
+        self.assertIn("mixed: 2 tests in", run.stderr)
+
+    def test_every_suite_is_still_reported_by_name_with_its_whole_count(self):
+        """A sharded suite reports one line, summed — not one line per shard."""
+        for name in ("alpha", "beta"):
+            self.tree.suite(
+                f"skills/crew/assets/{name}/tests",
+                test_one=PASSING_TEST,
+                test_two=PASSING_TEST.replace("Passes", "AlsoPasses"),
+            )
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        for name in ("alpha", "beta"):
+            self.assertEqual(run.stderr.count(f"{name}: "), 1, run.stderr)
+            self.assertIn(f"{name}: 2 tests in", run.stderr)
+        self.assertIn("total: 5 tests in", run.stderr)
 
 
 class InventoryTests(unittest.TestCase):
