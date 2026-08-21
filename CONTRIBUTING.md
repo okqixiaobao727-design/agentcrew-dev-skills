@@ -60,8 +60,9 @@ drift. In short: the focused suite while you work, the validator every time, and
 when you touched something more than one suite imports.
 
 Each suite reports its size and wall time on stderr, so read the total there rather than expecting
-a figure from this file; the gate runs its suites at once, so that total is its slowest suite and
-not the sum of them. Give it a fifteen-minute timeout — a ceiling to allocate, not an estimate.
+a figure from this file; the gate cuts every suite into shards and runs them at once, so that
+total is its slowest shard and not the sum of them, and a suite's own line is its slowest shard
+too. Give it a fifteen-minute timeout — a ceiling to allocate, not an estimate.
 
 CI runs the tests and the validator on every push and pull request to `main`, on Python 3.11 and
 3.14 — the only place they meet the floor version, Linux, and a clean checkout. A newer run on the
