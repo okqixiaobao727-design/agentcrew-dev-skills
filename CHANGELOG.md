@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-21
+
 ### Changed
 - `scripts/test.py` splits every suite across worker interpreters instead of
   giving each suite one. ADR-0016 made the gate cost its slowest suite rather
