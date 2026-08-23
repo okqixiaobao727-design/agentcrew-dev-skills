@@ -24,6 +24,8 @@ that already happened must not be reported as a failure and an audit log must no
 """
 
 import argparse
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 import datetime
 import json
 import os
@@ -32,6 +34,7 @@ import re
 import shlex
 import sys
 import tempfile
+from types import MappingProxyType
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -65,6 +68,17 @@ ESCALATION_VERB = "CREW ASK"
 COMPLETE_VERB = "CREW COMPLETE"
 PARKED_VERB = "CREW PARKED"
 FAILED_VERB = "CREW FAILED"
+
+# The instructions the Driver records as rulings. Their markers are Machine-log protocol because
+# the projection reads them back to reconstruct persistent episodes across Driver restarts.
+RECHECK_MARKER = "CREW RECHECK"
+RESEND_MARKER = "CREW RESEND"
+NUDGE_MARKER = "CREW NUDGE"
+MERGE_MARKER = "CREW MERGE"
+ANCHOR_MARKER = "CREW ANCHOR"
+HANDED_OVER_MARKER = "CREW RULED"
+RECEIPT_WAIT_MARKERS = (RECHECK_MARKER, RESEND_MARKER, NUDGE_MARKER, MERGE_MARKER)
+SEMANTIC_PREFIX = "semantic: "
 
 # The optional stamp every message a child sends ends on, which is deduplication for the message
 # bus rather than part of what the verb says.
@@ -107,6 +121,8 @@ REVIEW_STATES = ("running", "returned")
 # ruling will undo — and every surface that asks whether a run is over asks for exactly those two:
 # `escalated` alone cannot say, because it is also the word for a wave awaiting a ruling.
 DECISIONS = ("launched", "escalated", "complete", "interrupted", "stopped")
+FINAL_DECISIONS = ("complete", "stopped")
+HALTED_DECISIONS = ("escalated", "interrupted")
 # The two lanes a child runs in. A usage figure is only readable against the executor that wrote
 # it, so an executor this log does not know is an executor whose figures nobody can check.
 EXECUTORS = ("claude", "codex")
@@ -121,6 +137,238 @@ COST_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_cr
 COST_TOTAL = "total_tokens"
 
 LOG_FILE_MODE = 0o644
+
+
+@dataclass(frozen=True)
+class TicketFacts:
+    """The immutable Machine-log facts about one ticket."""
+
+    ticket: str
+    events: tuple = ()
+    first_launch: Mapping | None = None
+    launch: Mapping | None = None
+    receipt: Mapping | None = None
+    latest_settling_event: Mapping | None = None
+    progress_event: Mapping | None = None
+    settlement_state: str = LIVE
+    unanswered_child_message: Mapping | None = None
+    awaiting_receipt: bool = False
+    awaiting_ruling: bool = False
+    outstanding_nudge: bool = False
+    merge_result: str | None = None
+    merge_landed: bool = False
+    semantic_conflict_detail: str | None = None
+    merge_rework_requested: bool = False
+    _instruction_messages: tuple = field(default=(), repr=False, compare=False)
+
+    def instruction_count(self, marker):
+        """Return how many correlated rulings start with `marker`."""
+        return sum(message.lstrip().startswith(marker) for message in self._instruction_messages)
+
+
+@dataclass(frozen=True)
+class RunProjection:
+    """The immutable current facts derived from one physically ordered Machine log."""
+
+    tickets: Mapping
+    current_wave: int = 1
+    ended: bool = False
+    halted: bool = False
+
+    def ticket(self, ticket_id):
+        """Return the facts for `ticket_id`, or immutable empty facts when it is unknown."""
+        ticket = str(ticket_id)
+        return self.tickets.get(ticket, TicketFacts(ticket))
+
+
+def _freeze(value):
+    """Return an immutable copy of one JSON-compatible value."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def project(records):
+    """Return an immutable factual projection of physically ordered `records`."""
+    frozen_records = tuple(
+        _freeze(record) for record in records if isinstance(record, Mapping)
+    )
+    events_by_ticket = {}
+    launches_by_ticket = {}
+    for record in frozen_records:
+        if record.get("ticket") is None:
+            continue
+        ticket = str(record["ticket"])
+        events_by_ticket.setdefault(ticket, []).append(record)
+        if record.get("event") == "launch":
+            launches_by_ticket[ticket] = record
+
+    ticket_by_child = {}
+    for ticket, launch in launches_by_ticket.items():
+        child = launch.get("child")
+        if isinstance(child, str) and child:
+            ticket_by_child.setdefault(child, ticket)
+
+    def correlated_ticket(record):
+        if record.get("ticket") is not None:
+            return str(record["ticket"])
+        recipient = record.get("to")
+        if not isinstance(recipient, str):
+            return None
+        return ticket_by_child.get(recipient)
+
+    current_wave = 1
+    ended = False
+    latest_advance = None
+    episodes = {}
+    for record in frozen_records:
+        if record.get("event") == "advance":
+            latest_advance = record
+            decision = record.get("decision")
+            if decision in FINAL_DECISIONS:
+                ended = True
+            if decision == "launched":
+                try:
+                    current_wave = int(record.get("wave"))
+                except (TypeError, ValueError):
+                    pass
+
+        ticket = correlated_ticket(record)
+        if ticket is None:
+            continue
+        episode = episodes.setdefault(
+            ticket,
+            {
+                "unanswered_child_message": None,
+                "awaiting_receipt": False,
+                "awaiting_ruling": False,
+                "outstanding_nudge": False,
+                "instruction_messages": [],
+            },
+        )
+        event = record.get("event")
+        message = record.get("message")
+        child_message = event in ("message", "escalation") and record.get("role") == CHILD
+        if child_message:
+            episode["unanswered_child_message"] = record
+            episode["awaiting_ruling"] = False
+            episode["outstanding_nudge"] = False
+        elif event in ("receipt", "ruling", "outcome"):
+            episode["unanswered_child_message"] = None
+
+        if event == "ruling" and isinstance(message, str):
+            episode["instruction_messages"].append(message)
+            if any(message.lstrip().startswith(marker) for marker in RECEIPT_WAIT_MARKERS):
+                episode["awaiting_receipt"] = True
+            episode["awaiting_ruling"] = message.lstrip().startswith(HANDED_OVER_MARKER)
+            if message.lstrip().startswith(NUDGE_MARKER):
+                episode["outstanding_nudge"] = True
+            elif not message.lstrip().startswith(HANDED_OVER_MARKER):
+                episode["outstanding_nudge"] = False
+        elif event == "receipt":
+            episode["awaiting_receipt"] = False
+        elif event == "review":
+            episode["outstanding_nudge"] = False
+
+    tickets = {}
+    for ticket, events in events_by_ticket.items():
+        launches = [record for record in events if record.get("event") == "launch"]
+        receipts = [record for record in events if record.get("event") == "receipt"]
+        latest_settling_event = None
+        progress_event = None
+        merge_result = None
+        classified_conflict = None
+        for record in events:
+            event = record.get("event")
+            if event in ("receipt", "outcome") and (
+                record.get("verdict") or record.get("outcome")
+            ):
+                latest_settling_event = record
+            if event == "receipt":
+                if record.get("verdict") in VERDICTS:
+                    progress_event = record
+            elif event == "outcome":
+                if record.get("outcome") in OUTCOMES:
+                    progress_event = record
+            elif event == "merge":
+                if record.get("result"):
+                    merge_result = str(record["result"])
+                if record.get("result") in MERGE_RESULTS:
+                    progress_event = record
+                detail = record.get("detail")
+                if record.get("result") == CONFLICT and isinstance(detail, str):
+                    classified_conflict = detail
+
+        semantic_conflict_detail = None
+        if (
+            merge_result == ESCALATED
+            and isinstance(classified_conflict, str)
+            and classified_conflict.startswith(SEMANTIC_PREFIX)
+        ):
+            semantic_conflict_detail = classified_conflict[len(SEMANTIC_PREFIX):]
+        merge_rework_requested = False
+        if progress_event is not None and (
+            progress_event.get("event") == "merge"
+            and progress_event.get("result") == ESCALATED
+        ):
+            progress_index = next(
+                index for index, record in enumerate(events) if record is progress_event
+            )
+            merge_rework_requested = any(
+                record.get("event") == "ruling"
+                and isinstance(record.get("message"), str)
+                and record["message"].lstrip().startswith(MERGE_MARKER)
+                for record in events[progress_index + 1:]
+            )
+
+        episode = episodes.get(ticket, {})
+        tickets[ticket] = TicketFacts(
+            ticket=ticket,
+            events=tuple(events),
+            first_launch=launches[0] if launches else None,
+            launch=launches[-1] if launches else None,
+            receipt=receipts[-1] if receipts else None,
+            latest_settling_event=latest_settling_event,
+            progress_event=progress_event,
+            settlement_state=settlement_state(events, ticket),
+            unanswered_child_message=episode.get("unanswered_child_message"),
+            awaiting_receipt=episode.get("awaiting_receipt", False),
+            awaiting_ruling=episode.get("awaiting_ruling", False),
+            outstanding_nudge=episode.get("outstanding_nudge", False),
+            merge_result=merge_result,
+            merge_landed=merge_result in LANDED_MERGE_RESULTS,
+            semantic_conflict_detail=semantic_conflict_detail,
+            merge_rework_requested=merge_rework_requested,
+            _instruction_messages=tuple(episode.get("instruction_messages", ())),
+        )
+    return RunProjection(
+        tickets=MappingProxyType(tickets),
+        current_wave=current_wave,
+        ended=ended,
+        halted=(
+            latest_advance is not None
+            and latest_advance.get("decision") in HALTED_DECISIONS
+        ),
+    )
+
+
+def read_records(path):
+    """Return the normal runtime records in physical order, skipping incomplete lines."""
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ()
+    records = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return tuple(records)
 
 
 def settlement_state(records, ticket):

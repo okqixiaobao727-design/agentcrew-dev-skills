@@ -134,9 +134,8 @@ import advance as wave_advance  # noqa: E402
 # the one documented way from an account name to a profile directory, and this driver is where the
 # ticket's name is turned into one, once, as the wave table is built (ADR-0014).
 import accounts  # noqa: E402
-# The monitor owns one more: whether a log says the run is over. The operator's surfaces and this
-# loop have to agree on that word — a second implementation here is how they came to disagree —
-# so it is asked for, in the same way and from the same place.
+# The monitor still owns process liveness, the driver pid record and every operator-facing surface;
+# Machine-log interpretation itself comes from the projection above.
 sys.path.insert(0, str(MONITOR.parent))
 import monitor  # noqa: E402
 
@@ -257,12 +256,12 @@ ESCALATION_VERB = machine_log.ESCALATION_VERB
 # What the driver says back. Each opens with its own marker, because the marker is how the loop
 # reads its own history out of the log: a rung that has already fired for a ticket is a ruling of
 # that shape standing in the log, which is what makes every count survive a resume.
-RECHECK_MARKER = "CREW RECHECK"
-RESEND_MARKER = "CREW RESEND"
-NUDGE_MARKER = "CREW NUDGE"
-MERGE_MARKER = "CREW MERGE"
-ANCHOR_MARKER = "CREW ANCHOR"
-HANDED_OVER_MARKER = "CREW RULED"
+RECHECK_MARKER = machine_log.RECHECK_MARKER
+RESEND_MARKER = machine_log.RESEND_MARKER
+NUDGE_MARKER = machine_log.NUDGE_MARKER
+MERGE_MARKER = machine_log.MERGE_MARKER
+ANCHOR_MARKER = machine_log.ANCHOR_MARKER
+HANDED_OVER_MARKER = machine_log.HANDED_OVER_MARKER
 
 # The tmux key names the permission-prompt command accepts, kept narrow so an answer cannot
 # accidentally become an unsupported tmux key sequence.
@@ -325,9 +324,7 @@ LAUNCHED = "launched"
 # The advance decision this loop writes itself: the run ended because the chain stopped on reasons
 # the rule table had already settled, which no other decision in the log's vocabulary says.
 STOPPED = "stopped"
-LANDED_RESULTS = machine_log.LANDED_MERGE_RESULTS
 ESCALATED = "escalated"
-SEMANTIC_PREFIX = "semantic: "
 
 # What a wake monitor says a child is doing. `busy` is the only one the loop lets stand.
 STATUS_BUSY = "busy"
@@ -1691,7 +1688,9 @@ def epilogue(run_dir, run, table, records, log_path):
     plan's to touch, so none of them is in it.
     """
     _, plan = clear_inventory(run_dir, table, run, records, log_path)
-    plan = epilogue_plan(plan, set(merged_tickets(records)))
+    projection = machine_log.project(records)
+    landed = {ticket for ticket, facts in projection.tickets.items() if facts.merge_landed}
+    plan = epilogue_plan(plan, landed)
     clear_stop_codex_sessions(run, plan.launches)
     clear_kill_windows(plan)
     clear_worktrees_and_branches(pathlib.Path(run["repo_root"]), plan.rows)
@@ -1829,7 +1828,9 @@ def sweep_landed(run_dir):
     """
     table, run, records, log_path = clear_run_data(run_dir)
     _, plan = clear_inventory(run_dir, table, run, records, log_path)
-    plan = epilogue_plan(plan, set(merged_tickets(records)))
+    projection = machine_log.project(records)
+    landed = {ticket for ticket, facts in projection.tickets.items() if facts.merge_landed}
+    plan = epilogue_plan(plan, landed)
     clear_worktrees_and_branches(pathlib.Path(run["repo_root"]), plan.rows, trust_inventory=True)
 
 
@@ -2023,15 +2024,16 @@ def adopt(args, repo, run_dir, table_path):
     had it never stopped.
     """
     log = run_dir / LOG_NAME
-    records = read_records(log)
-    if monitor.over(records):
+    records = machine_log.read_records(log)
+    projection = machine_log.project(records)
+    if projection.ended:
         table = json.loads(table_path.read_text(encoding="utf-8"))
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
         report = report_path(run_dir, table.get("run") or {})
         snapshot(RUN_COMPLETE, pointer=str(report), report=str(report))
         return 0
-    print(f"crew adopted wave {current_wave(records)}, run directory {run_dir}", flush=True)
+    print(f"crew adopted wave {projection.current_wave}, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table_path, adopting=True)
 
 
@@ -2091,257 +2093,6 @@ def start_dashboard(args, repo, run_dir):
 # and an incremental reader would start to earn its own complexity.
 
 
-def read_records(log):
-    """Every record in the run's log, oldest first; a half-written line is skipped.
-
-    A line is skipped rather than raised on because the log is appended to by one hook per child,
-    the monitor and the merge driver at once, and a reader that met a torn line by stopping would
-    turn another writer's timing into this run's failure.
-    """
-    path = pathlib.Path(log)
-    if not path.exists():
-        return []
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
-
-
-def launch_records(records):
-    """{ticket: the last launch the log recorded for it} — its child, worktree, window, executor."""
-    launches = {}
-    for record in records:
-        if record.get("event") == "launch" and record.get("ticket") is not None:
-            launches[str(record["ticket"])] = record
-    return launches
-
-
-def settled_states(records):
-    """{ticket: the word its last settling event settled it into}.
-
-    A receipt's verdict or an outcome, whichever came last; a ticket the log holds neither for is
-    still live and is absent here. The same rule advance settles a wave by, read from the same
-    events, so the loop and the advance it calls can never disagree about what has settled.
-    """
-    states = {}
-    for record in records:
-        if record.get("event") not in ("receipt", "outcome"):
-            continue
-        for key in ("verdict", "outcome"):
-            if record.get(key):
-                states[str(record.get("ticket"))] = str(record[key])
-                break
-    return states
-
-
-def record_ticket(record, launches):
-    """The ticket a record belongs to, through the child it was addressed to where it names none.
-
-    The coordinator's ruling hook is installed for a session rather than for a ticket, so the
-    rulings it copies in carry the child's name and no ticket number. Reading the number back off
-    that name is what lets an answered escalation be told from an unanswered one.
-    """
-    if record.get("ticket") is not None:
-        return str(record["ticket"])
-    recipient = record.get("to")
-    if not isinstance(recipient, str):
-        return None
-    for ticket, launch in launches.items():
-        if recipient and launch.get("child") == recipient:
-            return ticket
-    return None
-
-
-def instructions_sent(records, launches, ticket, marker):
-    """How many times the loop has already sent that ticket that rung's instruction.
-
-    Counted off the log, so a rung fires exactly once however many times the driver is restarted.
-    """
-    sent = 0
-    for record in records:
-        if record.get("event") != "ruling":
-            continue
-        message = record.get("message")
-        if not isinstance(message, str) or not message.lstrip().startswith(marker):
-            continue
-        if record_ticket(record, launches) == ticket:
-            sent += 1
-    return sent
-
-
-def unanswered(records, launches):
-    """{ticket: (where it sits in the log, the last thing its child said that nothing answered)}.
-
-    Answered means the log carries something the run wrote for that ticket after the message: a
-    receipt, a ruling, or an outcome. Anything else would have the loop act twice on one message —
-    re-verify a receipt it has already settled, or wake the coordinator a second time for an
-    escalation it has already ruled on. The position comes back with the record because that is
-    what identifies one message rather than a ticket: a ticket that escalates twice does so at two
-    positions, and a resume must carry on past the first without swallowing the second.
-    """
-    latest = {}
-    answered = {}
-    for index, record in enumerate(records):
-        ticket = record_ticket(record, launches)
-        if ticket is None:
-            continue
-        event = record.get("event")
-        if event in ("message", "escalation") and record.get("role") == CHILD_ROLE:
-            latest[ticket] = (index, record)
-        elif event in ("receipt", "ruling", "outcome"):
-            answered[ticket] = index
-    return {
-        ticket: (index, record) for ticket, (index, record) in latest.items()
-        if answered.get(ticket, -1) < index
-    }
-
-
-def awaiting_receipt(records, launches):
-    """Every ticket the loop has sent an instruction to and had no receipt back from since.
-
-    A ticket whose branch would not merge carries a `landable` receipt already, so nothing in the
-    wave's settled states says the run is still waiting on it. This does: the instruction stands in
-    the log with no receipt after it, and until one arrives the ticket is live whatever its last
-    verdict was.
-    """
-    waiting = set()
-    for index, record in enumerate(records):
-        ticket = record_ticket(record, launches)
-        if ticket is None:
-            continue
-        message = record.get("message")
-        if record.get("event") == "ruling" and isinstance(message, str) and any(
-            message.lstrip().startswith(marker)
-            for marker in (RECHECK_MARKER, RESEND_MARKER, NUDGE_MARKER, MERGE_MARKER)
-        ):
-            waiting.add(ticket)
-        elif record.get("event") == "receipt":
-            waiting.discard(ticket)
-    return waiting
-
-
-def awaiting_a_ruling(records, launches):
-    """Every ticket whose handed-over escalation nothing has answered yet.
-
-    The handed-over line is the log's record that a child asked and the run stepped aside. Two
-    things end that wait and both are in the log: the coordinator's own answer, which `answer`
-    records as the ruling it delivered, and the child speaking again, which it does once it has
-    been answered by any channel at all. Until one of them lands, the child is idle because it is
-    waiting — and that is not a silence any rung of the table should read as one.
-    """
-    waiting = set()
-    for record in records:
-        ticket = record_ticket(record, launches)
-        if ticket is None:
-            continue
-        event = record.get("event")
-        message = record.get("message")
-        if event == "ruling" and isinstance(message, str):
-            if message.lstrip().startswith(HANDED_OVER_MARKER):
-                waiting.add(ticket)
-            else:
-                waiting.discard(ticket)
-        elif event in ("message", "escalation") and record.get("role") == CHILD_ROLE:
-            waiting.discard(ticket)
-    return waiting
-
-
-def outstanding_nudges(records, launches):
-    """Every ticket whose nudge addressed a silence that has not broken since.
-
-    A nudge belongs to one continuous silence, not to the whole of a ticket's life. What breaks
-    that silence is anything the log shows the ticket moving by after the nudge went out: the
-    child speaking or escalating, its review lane starting or coming back, or a coordinator
-    ruling that answers the question and puts the ticket back to work. A ticket that moved and
-    fell silent again is at a new silence, owed the fresh nudge that silence earns rather than
-    the failure the first one did — which is why this asks whether the nudge is still standing
-    rather than whether one was ever sent. It is read off the log's own ordering, so a driver
-    that adopted the run part-way through reads the same answer as the one that sent the nudge.
-    """
-    outstanding = set()
-    for record in records:
-        ticket = record_ticket(record, launches)
-        if ticket is None:
-            continue
-        event = record.get("event")
-        message = record.get("message")
-        if event == "ruling" and isinstance(message, str):
-            if message.lstrip().startswith(NUDGE_MARKER):
-                outstanding.add(ticket)
-            elif not message.lstrip().startswith(HANDED_OVER_MARKER):
-                # Handing an escalation up is the run stepping aside, not the ticket moving; the
-                # answer that follows it is the work resuming, and everything else the run says
-                # to a child it says because the child said something first.
-                outstanding.discard(ticket)
-        elif event == "review":
-            outstanding.discard(ticket)
-        elif event in ("message", "escalation") and record.get("role") == CHILD_ROLE:
-            # The child's own word, which is the plainest thing a silence can break on. A ticket
-            # that spoke is held by other rules too — an unanswered word is settled before any
-            # status is read, and an escalation waits on its ruling — so this rarely decides a
-            # poll by itself. It is here so the predicate is true about the log rather than true
-            # only while those rules stand.
-            outstanding.discard(ticket)
-    return outstanding
-
-
-def current_wave(records):
-    """The wave the run is working, as the log's own advance decisions leave it."""
-    wave = 1
-    for record in records:
-        if record.get("event") == "advance" and record.get("decision") == LAUNCHED:
-            with contextlib.suppress(TypeError, ValueError):
-                wave = int(record.get("wave"))
-    return wave
-
-
-def merge_results(records):
-    """{ticket: how its branch's last trip into the integration branch ended}."""
-    results = {}
-    for record in records:
-        if record.get("event") == "merge" and record.get("result"):
-            results[str(record.get("ticket"))] = str(record["result"])
-    return results
-
-
-def merged_tickets(records):
-    """Every ticket whose branch the log says reached the integration branch."""
-    return sorted(
-        ticket for ticket, result in merge_results(records).items()
-        if result in LANDED_RESULTS
-    )
-
-
-def semantic_conflicts(records):
-    """Every ticket whose last merge ended in a semantic conflict rather than a mechanical one.
-
-    The merge driver classifies before it does anything else and records the classification on the
-    `conflict` event; the `escalated` event after it says the ladder was exhausted. Only the pair
-    means the rung below the coordinator had nothing to offer because the two sides disagree.
-    """
-    classified = {}
-    for record in records:
-        if record.get("event") != "merge":
-            continue
-        detail = record.get("detail")
-        if record.get("result") == "conflict" and isinstance(detail, str):
-            classified[str(record.get("ticket"))] = detail
-    latest = merge_results(records)
-    # The last trip is the only one that counts: a ticket that escalated once and landed on the
-    # instruction it was sent has no conflict standing, and re-answering it would be the loop
-    # arguing with a merge that is already in the integration branch.
-    return {
-        ticket: classified[ticket][len(SEMANTIC_PREFIX):]
-        for ticket, result in latest.items()
-        if result == ESCALATED and classified.get(ticket, "").startswith(SEMANTIC_PREFIX)
-    }
-
-
 # --- the report and wind-down -----------------------------------------------------------------
 
 
@@ -2363,24 +2114,6 @@ def report_tickets(table):
     }
 
 
-def report_launches(records):
-    """The last launch for each ticket, matching the cost table's replacement-child row."""
-    launches = {}
-    for record in records:
-        if record.get("event") == "launch" and record.get("ticket") is not None:
-            launches[str(record["ticket"])] = record
-    return launches
-
-
-def report_starts(records):
-    """The first launch for each ticket, which starts the full duration span."""
-    starts = {}
-    for record in records:
-        if record.get("event") == "launch" and record.get("ticket") is not None:
-            starts.setdefault(str(record["ticket"]), record)
-    return starts
-
-
 def report_settlements(records, ticket):
     """The ticket's receipt/outcome events, in log order."""
     return [
@@ -2390,9 +2123,9 @@ def report_settlements(records, ticket):
     ]
 
 
-def report_outcome(records, ticket, launched):
+def report_outcome(projection, ticket, launched):
     """The one report outcome a ticket settled into, or a clear error if the log has a hole."""
-    state = machine_log.settlement_state(records, ticket)
+    state = projection.ticket(ticket).settlement_state
     if state in REPORT_OUTCOMES:
         return state
     state = "launched" if launched else "not launched"
@@ -2453,10 +2186,17 @@ def report_undo_effects(records):
 def render_report(run, tickets, records, cost_output):
     """Render the complete human report from the table, machine log and cost-pass output."""
     ticket_ids = sorted(tickets, key=report_ticket_sort_key)
-    launches = report_launches(records)
-    starts = report_starts(records)
+    projection = machine_log.project(records)
+    launches = {
+        ticket: facts.launch for ticket, facts in projection.tickets.items()
+        if facts.launch is not None
+    }
+    starts = {
+        ticket: facts.first_launch for ticket, facts in projection.tickets.items()
+        if facts.first_launch is not None
+    }
     outcomes = {
-        ticket: report_outcome(records, ticket, ticket in launches)
+        ticket: report_outcome(projection, ticket, ticket in launches)
         for ticket in ticket_ids
     }
     lines = ["# Crew run report", "", "## Outcomes", "", "| Ticket | Title | Outcome |"]
@@ -2632,7 +2372,7 @@ class Loop:
     # --- what it reads --------------------------------------------------------------------
 
     def records(self):
-        return read_records(self.log)
+        return machine_log.read_records(self.log)
 
     def tickets_of(self, wave):
         for entry in self.table.get("waves") or []:
@@ -2640,14 +2380,14 @@ class Loop:
                 return [dict(ticket) for ticket in entry.get("tickets") or []]
         raise DriverError(f"the wave table holds no wave {wave}", pointer=str(self.table_path))
 
-    def live(self, wave, records):
+    def live(self, wave, projection):
         """The tickets of that wave the run is still waiting on."""
-        launches = launch_records(records)
-        states = settled_states(records)
-        waiting = awaiting_receipt(records, launches)
         return [
             str(ticket["id"]) for ticket in self.tickets_of(wave)
-            if str(ticket["id"]) not in states or str(ticket["id"]) in waiting
+            if (
+                projection.ticket(ticket["id"]).latest_settling_event is None
+                or projection.ticket(ticket["id"]).awaiting_receipt
+            )
         ]
 
     # --- what it says ---------------------------------------------------------------------
@@ -2772,16 +2512,20 @@ class Loop:
             detail=message, child=launch.get("child"), window=launch.get("window"),
         )
 
-    def rule_on_messages(self, records):
+    def rule_on_messages(self, projection):
         """Settle everything the wave's children have said and nothing has answered.
 
         Returns whether anything was settled, so a poll that changed the run is followed by another
         read rather than by a wait.
         """
-        launches = launch_records(records)
         acted = False
-        for ticket, (index, record) in sorted(unanswered(records, launches).items()):
-            launch = launches.get(ticket)
+        pending = [
+            (ticket, facts) for ticket, facts in projection.tickets.items()
+            if facts.unanswered_child_message is not None
+        ]
+        for ticket, facts in sorted(pending):
+            record = facts.unanswered_child_message
+            launch = facts.launch
             message = record.get("message") or ""
             if launch is None:
                 verb, _ = machine_log.final_verb(message)
@@ -2793,10 +2537,10 @@ class Loop:
                 continue
             if record.get("event") == "escalation":
                 self.hand_over(ticket, launch, message)
-            acted = self.rule_on_receipt(ticket, launch, message, records) or acted
+            acted = self.rule_on_receipt(ticket, launch, message, projection) or acted
         return acted
 
-    def rule_on_receipt(self, ticket, launch, message, records):
+    def rule_on_receipt(self, ticket, launch, message, projection):
         """Settle one child's final word; returns whether it settled anything.
 
         The word is the last verb line of the body rather than its opening: a child bundles its
@@ -2811,18 +2555,18 @@ class Loop:
             self.settle(ticket, FAILED, line)
             return True
         if verb == COMPLETE_VERB:
-            self.rule_on_completion(ticket, launch, line, records)
+            self.rule_on_completion(ticket, launch, line, projection)
             return True
         offending = machine_log.malformed_receipt(message)
         if offending is not None:
-            self.rule_on_malformed(ticket, launch, offending, records)
+            self.rule_on_malformed(ticket, launch, offending, projection)
             return True
         # Anything else a child says is conversation, not a verdict: the run reads the grammar its
         # first turn gave it and leaves everything outside it alone. A message that reached for no
         # verb at all is conversation, and nothing is owed back for it.
         return False
 
-    def rule_on_malformed(self, ticket, launch, line, records):
+    def rule_on_malformed(self, ticket, launch, line, projection):
         """Answer a near-miss receipt once; a second one settles the ticket failed. Returns nothing.
 
         The grammar refuses the line either way — a receipt with prose on it settles nothing, and
@@ -2830,8 +2574,7 @@ class Loop:
         and what shape the line has to take, on the scripted rung, so the coordinator is not woken
         for mechanics (ADR-0004, ADR-0015).
         """
-        launches = launch_records(records)
-        if instructions_sent(records, launches, ticket, RESEND_MARKER):
+        if projection.ticket(ticket).instruction_count(RESEND_MARKER):
             self.settle(ticket, FAILED, f"a second receipt missed the verb grammar: {line}")
             return
         self.deliver(ticket, launch, RESEND_TEMPLATE.format(
@@ -2846,7 +2589,7 @@ class Loop:
                 parked.write(f"{worktree}\n")
         self.settle(ticket, PARKED, message)
 
-    def rule_on_completion(self, ticket, launch, message, records):
+    def rule_on_completion(self, ticket, launch, message, projection):
         """Verify a claimed receipt, and settle what a second failure of it means."""
         words = message.split()
         sha = words[2] if len(words) > 2 else ""
@@ -2863,8 +2606,7 @@ class Loop:
             # receipt that held is not something judgment is spent on.
             return
         problem = (result.stdout or result.stderr).strip().replace("\n", " ")
-        launches = launch_records(records)
-        if instructions_sent(records, launches, ticket, RECHECK_MARKER):
+        if projection.ticket(ticket).instruction_count(RECHECK_MARKER):
             self.settle(ticket, FAILED, f"a second receipt did not verify: {problem}")
             return
         self.deliver(ticket, launch, RECHECK_TEMPLATE.format(
@@ -2884,20 +2626,17 @@ class Loop:
         ) if worktree else None
         return forked or self.run["integration_base_commit"]
 
-    def rule_on_statuses(self, statuses, records):
+    def rule_on_statuses(self, statuses, projection):
         """Settle every non-busy child a wake monitor reported; returns whether anything changed."""
-        launches = launch_records(records)
-        states = settled_states(records)
-        pending = unanswered(records, launches)
-        waiting = awaiting_receipt(records, launches)
         acted = False
         for ticket, status in sorted(statuses.items()):
-            launch = launches.get(ticket)
+            facts = projection.ticket(ticket)
+            launch = facts.launch
             if launch is None or status in (STATUS_BUSY, STATUS_PARKED):
                 continue
-            if ticket in states and ticket not in waiting:
+            if facts.latest_settling_event is not None and not facts.awaiting_receipt:
                 continue
-            if ticket in pending:
+            if facts.unanswered_child_message is not None:
                 # Its own last word is still to be settled, and that word decides the ticket; a
                 # status is only ever read about a child that has said nothing.
                 continue
@@ -2905,7 +2644,7 @@ class Loop:
                 self.settle(ticket, FAILED, "the child's session vanished with no receipt sent")
                 acted = True
             elif status == STATUS_IDLE:
-                acted = self.rule_on_idle(ticket, launch, records) or acted
+                acted = self.rule_on_idle(ticket, launch, facts) or acted
             else:
                 raise Wake(
                     JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
@@ -2914,7 +2653,7 @@ class Loop:
                 )
         return acted
 
-    def rule_on_idle(self, ticket, launch, records):
+    def rule_on_idle(self, ticket, launch, facts):
         """One nudge per silence for an idle child; returns whether the rung acted.
 
         A silence the nudge never broke settles the ticket failed — per silence rather than per
@@ -2927,10 +2666,9 @@ class Loop:
         report something — which it honestly answers `CREW PARKED`, settling a ticket whose
         question the coordinator had already answered.
         """
-        launches = launch_records(records)
-        if ticket in awaiting_a_ruling(records, launches):
+        if facts.awaiting_ruling:
             return False
-        if instructions_sent(records, launches, ticket, RESEND_MARKER):
+        if facts.instruction_count(RESEND_MARKER):
             # The bounce was this ticket's one re-ask, and it named the shape of every verb a
             # child can send back. Nudging now would ask the same question a second time under
             # another marker; the ladder is one rung deep whichever way the line went wrong.
@@ -2938,7 +2676,7 @@ class Loop:
                 ticket, FAILED, "a bounced receipt was never resent and the child went idle"
             )
             return True
-        if ticket in outstanding_nudges(records, launches):
+        if facts.outstanding_nudge:
             self.settle(ticket, FAILED, "a nudged child went idle again with no receipt sent")
             return True
         self.deliver(ticket, launch, NUDGE_TEMPLATE.format(marker=NUDGE_MARKER, ticket=ticket))
@@ -2977,10 +2715,11 @@ class Loop:
             )
         self.close_merged()
         records = self.records()
-        following = current_wave(records)
+        projection = machine_log.project(records)
+        following = projection.current_wave
         if following == wave:
             return None
-        self.open_wave(records)
+        self.open_wave(projection)
         return following
 
     def rule_on_halt(self, wave, result):
@@ -2997,28 +2736,32 @@ class Loop:
         """
         self.close_merged()
         records = self.records()
-        launches = launch_records(records)
-        conflicts = semantic_conflicts(records)
+        projection = machine_log.project(records)
         halted = [
             str(ticket["id"]) for ticket in self.tickets_of(wave)
-            if str(ticket["id"]) in conflicts and str(ticket["id"]) in launches
+            if (
+                projection.ticket(ticket["id"]).semantic_conflict_detail is not None
+                and projection.ticket(ticket["id"]).launch is not None
+            )
         ]
         for ticket in halted:
-            launch = launches[ticket]
-            if instructions_sent(records, launches, ticket, MERGE_MARKER):
+            facts = projection.ticket(ticket)
+            launch = facts.launch
+            if facts.instruction_count(MERGE_MARKER):
                 raise Wake(
                     JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
                     detail=f"the semantic conflict on {ticket} came back a second time:"
-                           f" {conflicts[ticket]}",
+                           f" {facts.semantic_conflict_detail}",
                     child=launch.get("child"), window=launch.get("window"),
                 )
             self.deliver(ticket, launch, MERGE_TEMPLATE.format(
                 marker=MERGE_MARKER, ticket=ticket, branch=self.branch_of(ticket, launch),
-                integration=self.run["integration_branch"], reason=conflicts[ticket],
+                integration=self.run["integration_branch"],
+                reason=facts.semantic_conflict_detail,
             ))
         if halted:
             return wave
-        unsettled = self.unsettled_halt(wave, records)
+        unsettled = self.unsettled_halt(wave, projection)
         if unsettled:
             raise Wake(
                 JUDGMENT_NEEDED, ticket=unsettled[0], pointer=str(self.log),
@@ -3026,10 +2769,10 @@ class Loop:
             )
         # Every reason the chain stopped on is one the rule table already settled, so there is
         # nothing left for this run to launch and nothing for anyone to rule on.
-        self.record_stopped(wave, records)
+        self.record_stopped(wave, projection)
         return None
 
-    def record_stopped(self, wave, records):
+    def record_stopped(self, wave, projection):
         """Put this run's ending into the log, where every surface reads it from; returns nothing.
 
         The `escalated` decision above it cannot carry that meaning: the same word is written when
@@ -3038,10 +2781,10 @@ class Loop:
         nobody is waiting for.
         """
         tickets = wave_advance.every_ticket(self.table)
-        launches = set(launch_records(records))
-        states = {
-            number: machine_log.settlement_state(records, number) for number in tickets
+        launches = {
+            number for number in tickets if projection.ticket(number).launch is not None
         }
+        states = {number: projection.ticket(number).settlement_state for number in tickets}
         stopping_roots = {
             number for number, state in states.items() if state in (FAILED, PARKED)
         }
@@ -3067,7 +2810,7 @@ class Loop:
             pointer=str(self.log),
         )
 
-    def unsettled_halt(self, wave, records):
+    def unsettled_halt(self, wave, projection):
         """The wave's tickets whose halt no rule of the table has already accounted for.
 
         A ticket settled `failed` or `parked` stopped the chain by its own recorded verdict. One
@@ -3076,7 +2819,7 @@ class Loop:
         """
         return [
             str(ticket["id"]) for ticket in self.tickets_of(wave)
-            if machine_log.settlement_state(records, str(ticket["id"]))
+            if projection.ticket(ticket["id"]).settlement_state
             not in (COMPLETED, FAILED, PARKED)
         ]
 
@@ -3096,14 +2839,17 @@ class Loop:
                 return dispatch.branch_name(entry)
         return ticket
 
-    def open_wave(self, records):
+    def open_wave(self, projection):
         """Give the wave advance just launched everything a launched wave has; returns nothing.
 
         Its children get this run's escalation hook and the dashboard is pointed at the run again,
         exactly as the first wave's launch did — the command owns the run's one window, so calling
         it every wave is what brings a window the operator closed back.
         """
-        for ticket, launch in sorted(launch_records(records).items()):
+        for ticket, facts in sorted(projection.tickets.items()):
+            launch = facts.launch
+            if launch is None:
+                continue
             worktree = launch.get("worktree")
             if worktree:
                 install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
@@ -3112,12 +2858,15 @@ class Loop:
     def close_merged(self):
         """Close every merged ticket in the run's tracker, recording each undo; returns nothing."""
         records = self.records()
+        projection = machine_log.project(records)
         already = {
             str(record.get("ticket")) for record in records
             if record.get("event") == "outcome" and record.get("outcome") == COMPLETED
         }
         tickets = {str(ticket["id"]): ticket for ticket in dispatch.walk_tickets(self.table)}
-        for number in merged_tickets(records):
+        for number, facts in sorted(projection.tickets.items()):
+            if not facts.merge_landed:
+                continue
             if number in already or number not in tickets:
                 continue
             undo = close_ticket(self.run, tickets[number], number)
@@ -3146,15 +2895,19 @@ class Loop:
         of it twice is what an adoption that kept its own state would risk.
         """
         records = self.records()
+        projection = machine_log.project(records)
         install_hook(self.log, self.repo / SETTINGS_PATH, COORDINATOR_ROLE)
-        for ticket, launch in sorted(launch_records(records).items()):
+        for ticket, facts in sorted(projection.tickets.items()):
+            launch = facts.launch
+            if launch is None:
+                continue
             worktree = launch.get("worktree")
             if worktree and pathlib.Path(worktree).is_dir():
                 install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
-        self.reanchor(records)
+        self.reanchor(projection)
         start_dashboard(self.args, self.repo, self.run_dir)
 
-    def reanchor(self, records):
+    def reanchor(self, projection):
         """Point the run and its live children at the coordinator driving it now; returns nothing.
 
         A coordinator that restarted has a new pid, so every Claude child of the run is holding a
@@ -3176,9 +2929,11 @@ class Loop:
         pathlib.Path(self.table_path).write_text(
             json.dumps(self.table, indent=2) + "\n", encoding="utf-8"
         )
-        settled = settled_states(records)
-        for ticket, launch in sorted(launch_records(records).items()):
-            if ticket in settled or lane_of(launch) == CODEX:
+        for ticket, facts in sorted(projection.tickets.items()):
+            launch = facts.launch
+            if launch is None:
+                continue
+            if facts.latest_settling_event is not None or lane_of(launch) == CODEX:
                 continue
             with contextlib.suppress(Unreachable):
                 self.deliver(ticket, launch, ANCHOR_TEMPLATE.format(
@@ -3188,7 +2943,7 @@ class Loop:
 
     # --- the loop itself ----------------------------------------------------------------------
 
-    def arm(self, wave, records):
+    def arm(self, wave, projection):
         """Arm a monitor over the wave's live children in every lane that has none; returns nothing.
 
         Lane by lane, because they exit independently: a Claude monitor that has fired and been
@@ -3199,11 +2954,11 @@ class Loop:
         """
         bindings = self.bindings()
         armed = {(monitor["lane"], monitor["account"]) for monitor in self.monitors}
-        launches = launch_records(records)
         children = [
-            launches[ticket] for ticket in self.live(wave, records)
-            if ticket in launches and launches[ticket].get("worktree")
-            and watch_lane(launches[ticket], bindings.get(ticket)) not in armed
+            projection.ticket(ticket).launch for ticket in self.live(wave, projection)
+            if projection.ticket(ticket).launch is not None
+            and projection.ticket(ticket).launch.get("worktree")
+            and watch_lane(projection.ticket(ticket).launch, bindings.get(ticket)) not in armed
         ]
         if children:
             self.monitors += arm_monitors(
@@ -3244,7 +2999,7 @@ class Loop:
                 )
             statuses.update(
                 codex_statuses(output, monitor["tickets"]) if monitor["lane"] == CODEX
-                else claude_statuses(output, self.records())
+                else claude_statuses(output, machine_log.project(self.records()))
             )
         self.monitors = still_armed
         return statuses
@@ -3252,23 +3007,27 @@ class Loop:
     def poll(self, wave):
         """One turn of the loop over one wave; returns the wave to work next, or None when done."""
         records = self.records()
-        if self.rule_on_messages(records):
+        projection = machine_log.project(records)
+        if self.rule_on_messages(projection):
             return wave
         statuses = self.harvest()
-        if statuses and self.rule_on_statuses(statuses, self.records()):
-            return wave
+        if statuses:
+            projection = machine_log.project(self.records())
+            if self.rule_on_statuses(statuses, projection):
+                return wave
         records = self.records()
-        if not self.live(wave, records):
+        projection = machine_log.project(records)
+        if not self.live(wave, projection):
             disarm(self.monitors)
             self.monitors = []
             return self.advance(wave)
-        self.arm(wave, records)
+        self.arm(wave, projection)
         return wave
 
     def run_until_woken(self):
         """Apply the rule table until it is done or something outside it needs judgment."""
-        records = self.records()
-        wave = current_wave(records)
+        projection = machine_log.project(self.records())
+        wave = projection.current_wave
         deadline = time.monotonic() + self.args.timeout
         seen = None
         while True:
@@ -3310,7 +3069,7 @@ class Loop:
         return 0
 
 
-def claude_statuses(output, records):
+def claude_statuses(output, projection):
     """{ticket: status} from a wake monitor's TSV lines, joined to tickets by worktree path.
 
     The monitor prints a line per status *change*, so the picture is the last word about each
@@ -3318,7 +3077,10 @@ def claude_statuses(output, records):
     resolved, because the same directory is reached by two spellings on macOS (ADR-0007).
     """
     by_worktree = {}
-    for ticket, launch in launch_records(records).items():
+    for ticket, facts in projection.tickets.items():
+        launch = facts.launch
+        if launch is None:
+            continue
         worktree = launch.get("worktree")
         if worktree:
             by_worktree[os.path.realpath(worktree)] = ticket
@@ -3525,7 +3287,7 @@ def run_answer(args):
         )
     loop = Loop(args, run_dir.parent, run_dir, table_path)
     ticket = str(args.ticket)
-    launch = launch_records(loop.records()).get(ticket)
+    launch = machine_log.project(loop.records()).ticket(ticket).launch
     if launch is None:
         raise DriverError(
             f"{ticket} has no recorded child in {loop.log}", ticket=ticket, pointer=str(loop.log)

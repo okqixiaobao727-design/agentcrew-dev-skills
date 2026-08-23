@@ -24,6 +24,8 @@ TESTS_DIR = pathlib.Path(__file__).resolve().parent
 MONITOR = TESTS_DIR.parent / "monitor.py"
 # The sibling module the monitor reads an account binding through; part of every release of it.
 ACCOUNTS = TESTS_DIR.parents[1] / "accounts.py"
+# The projection module the monitor reads Machine-log facts through; part of every release of it.
+MACHINE_LOG = TESTS_DIR.parents[1] / "machine_log.py"
 # The review lane the dashboard's annotation is drawn from, written by this bridge and no fixture.
 REVIEW_BRIDGE = TESTS_DIR.parents[1] / "review" / "scripts" / "claude_review_bridge.py"
 
@@ -679,7 +681,8 @@ class Fixture:
         directory.mkdir(parents=True, exist_ok=True)
         copy = directory / MONITOR.name
         shutil.copy2(str(MONITOR), str(copy))
-        shutil.copy2(str(ACCOUNTS), str(directory.parent / ACCOUNTS.name))
+        for dependency in (ACCOUNTS, MACHINE_LOG):
+            shutil.copy2(str(dependency), str(directory.parent / dependency.name))
         return copy
 
     def dead_pid(self):
@@ -1038,6 +1041,35 @@ class DashboardTests(MonitorTestCase):
         self.fixture.worktree("07")
         self.fixture.launch("06")
         self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+
+    def test_an_os_error_reading_the_machine_log_is_treated_as_an_empty_snapshot(self):
+        self.fixture.table()
+        self.fixture.log.mkdir()
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pending=3", result.stdout)
+
+    def test_missing_blank_malformed_non_object_and_unknown_records_are_tolerated(self):
+        self.fixture.table()
+
+        missing = self.fixture.dashboard()
+        self.fixture.log.write_text('\nnot json\n[]\n{"event":"unknown"}\n')
+        mixed = self.fixture.dashboard()
+
+        for result in (missing, mixed):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pending=3", result.stdout)
+
+    def test_a_unicode_failure_reading_the_machine_log_remains_fatal(self):
+        self.fixture.table()
+        self.fixture.log.write_bytes(b"\xff\xfe")
+
+        result = self.fixture.dashboard()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UnicodeDecodeError", result.stderr)
 
     def start_loop(self):
         """Start the dashboard's refresh loop; returns the `Popen`, killed and reaped at cleanup.

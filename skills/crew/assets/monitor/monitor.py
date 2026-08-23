@@ -48,8 +48,9 @@ import tomllib
 # another's login.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import accounts  # noqa: E402
+import machine_log  # noqa: E402
 
-TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+TIMESTAMP_FORMAT = machine_log.TIMESTAMP_FORMAT
 # The writer that owns the log's schema: a receipt this script verifies is appended through it
 # rather than formatted here, so the closed sets stay in one place.
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
@@ -177,21 +178,8 @@ ESCALATION_EVENT = "escalation"
 # instruction the driver sends the child that lost the race, which the log carries as a ruling
 # opening with the driver's merge marker. The pair is the whole signal — an escalated merge with
 # no instruction after it is nobody's work yet, and it keeps the abnormal word it always had.
-MERGE_EVENT = "merge"
-MERGE_ESCALATED = "escalated"
-RULING_EVENT = "ruling"
-MERGE_INSTRUCTION_MARKER = "CREW MERGE"
 REVIEW_EVENT = "review"
 REVIEW_RUNNING = "running"
-# The advance decisions after which nothing more happens in this run, and the two that stop a wave
-# without ending it. A wave that escalated or was interrupted is re-run once the coordinator rules
-# on it — or adopted by the next driver — so both keep every surface drawing; the driver appends
-# `stopped` when it ends a run whose chain halted for good, which is the only thing that tells
-# that ending from a wave awaiting a ruling. This is the run's single definition of "over": the
-# driver imports it rather than restating it.
-ADVANCE_EVENT = "advance"
-FINAL_DECISIONS = ("complete", "stopped")
-HALTED_DECISIONS = ("escalated", "interrupted")
 # What the summary line says while the run is waiting on the operator, so a halted wave is never
 # mistaken for a frozen frame.
 AWAITING_RULING = "⚠ awaiting your ruling"
@@ -425,20 +413,9 @@ def descends_from(worktree, base):
 def read_log(path):
     """Every record in the machine log, oldest first; an absent or half-written line is skipped."""
     try:
-        text = pathlib.Path(path).read_text(encoding="utf-8")
+        return machine_log.read_records(path)
     except OSError:
-        return []
-    records = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
+        return ()
 
 
 def agent_states(claude_bin, timeout=None, binding=None):
@@ -781,20 +758,7 @@ def settling_state(record):
     return words.get(str(record.get(key)))
 
 
-def settled(events):
-    """The last record that settled this ticket and the word it settled it into, or two Nones.
-
-    The last one wins rather than the first: a ticket keeps travelling after its receipt — a
-    landable branch is merged next — and where it is now is what the operator is looking for.
-    """
-    for record in reversed(events):
-        state = settling_state(record)
-        if state is not None:
-            return record, state
-    return None, None
-
-
-def reworking(events, settling, launch, sources, binding=None):
+def reworking(facts, launch, sources, binding=None):
     """Whether this ticket's child is working on the conflict its escalated merge left behind.
 
     Three things make it true, and the order between the first two is the whole point: the last
@@ -808,19 +772,7 @@ def reworking(events, settling, launch, sources, binding=None):
     at a prompt, or vanished under its instruction is not reworking anything, and drawing it as
     though it were would hide exactly the row the operator has to go and look at.
     """
-    if settling is None or settling.get("event") != MERGE_EVENT:
-        return False
-    if str(settling.get("result")) != MERGE_ESCALATED:
-        return False
-    if not working(launch, sources, binding):
-        return False
-    for record in events[index_of(events, settling) + 1:]:
-        if record.get("event") != RULING_EVENT:
-            continue
-        message = record.get("message")
-        if isinstance(message, str) and message.lstrip().startswith(MERGE_INSTRUCTION_MARKER):
-            return True
-    return False
+    return facts.merge_rework_requested and working(launch, sources, binding)
 
 
 def working(launch, sources, binding=None):
@@ -834,19 +786,7 @@ def working(launch, sources, binding=None):
     return state == RUNNING and anomaly is None and status is not None
 
 
-def index_of(events, record):
-    """Where `record` sits among `events`, by identity — the one thing two events differ in.
-
-    Equality would not do: a run can write two lines carrying the same fields, and "the merge that
-    settled this ticket" is one of them rather than either.
-    """
-    for index, candidate in enumerate(events):
-        if candidate is record:
-            return index
-    return len(events)
-
-
-def settling_wave(settlements, records):
+def settling_wave(settlements, projection):
     """Whether this wave is between its last receipt and its merges, which is what `settling` says.
 
     Every ticket of the wave has settled, so the receipts are all in and the driver's per-wave
@@ -857,7 +797,7 @@ def settling_wave(settlements, records):
     """
     if not settlements or any(record is None for record in settlements):
         return False
-    return not over(records)
+    return not projection.ended
 
 
 def live_state(launch, sources, binding=None):
@@ -936,18 +876,13 @@ def annotations(events, state, anomaly, moment):
     return lines
 
 
-def build_rows(waves, records, moment, sources):
+def build_rows(waves, projection, moment, sources):
     """One row per ticket of every wave, in the order the approved table lists them.
 
     A ticket no `launch` event names has not started, which is what `pending` says: the frame
     shows the whole run from its first draw, so "not started yet" is never read as "lost". A
     ticket launched twice — a replacement child — is the one row its last launch describes.
     """
-    launches = {}
-    for record in records:
-        if record.get("event") == "launch":
-            launches[str(record.get("ticket"))] = record
-
     rows = []
     for wave in waves:
         number = str(wave.get("wave", ""))
@@ -955,22 +890,24 @@ def build_rows(waves, records, moment, sources):
         # Read once for the whole wave, because two of the words a row can be drawn need the wave
         # rather than the ticket: `settling` is what the wave's last receipt puts its unmerged rows
         # into, and no row can know that from its own events.
-        wave_events = {
-            str(entry.get("id", "")): [
-                record for record in records
-                if str(record.get("ticket")) == str(entry.get("id", ""))
-            ]
+        wave_facts = {
+            str(entry.get("id", "")): projection.ticket(entry.get("id", ""))
             for entry in entries
         }
         wave_settled = {
-            ticket: settled(events) for ticket, events in wave_events.items()
+            ticket: (
+                facts.progress_event,
+                settling_state(facts.progress_event) if facts.progress_event is not None else None,
+            )
+            for ticket, facts in wave_facts.items()
         }
-        merging = settling_wave([settling for settling, _ in wave_settled.values()], records)
+        merging = settling_wave([settling for settling, _ in wave_settled.values()], projection)
         for entry in entries:
             ticket = str(entry.get("id", ""))
             binding = accounts.row_binding(entry)
-            events = wave_events[ticket]
-            launch = launches.get(ticket)
+            facts = wave_facts[ticket]
+            events = facts.events
+            launch = facts.launch
             settling, settled_into = wave_settled[ticket]
             anomaly = None
             status = None
@@ -980,7 +917,7 @@ def build_rows(waves, records, moment, sources):
                 started = parse_timestamp(launch.get("ts"))
                 if settling is not None:
                     state, end = settled_into, parse_timestamp(settling.get("ts"))
-                    if state == WAITING and reworking(events, settling, launch, sources, binding):
+                    if state == WAITING and reworking(facts, launch, sources, binding):
                         state = REWORKING
                     elif state == LANDABLE and merging:
                         state = SETTLING
@@ -1006,34 +943,6 @@ def build_rows(waves, records, moment, sources):
                 "annotations": annotations(events, state, anomaly, moment),
             })
     return rows
-
-
-def over(records):
-    """Whether nothing more will happen in this run, which is when the frame stops moving.
-
-    The run's one answer to that question, and the one the driver asks too: a run ends on the
-    `complete` its last wave landed, or on the `stopped` the driver appends when the chain halted
-    on reasons no ruling will undo. A wave that escalated or was interrupted is carried on by the
-    ruling or by the run that adopts it, and a surface that stopped at either would go quiet on a
-    run that is still going.
-    """
-    return any(
-        record.get("event") == ADVANCE_EVENT and str(record.get("decision")) in FINAL_DECISIONS
-        for record in records
-    )
-
-
-def halted(records):
-    """Whether the run is stopped at a wave awaiting the coordinator's ruling.
-
-    The newest `advance` decides: it is the line the driver writes when it hands a wave over, and
-    the line it writes again when the wave carries on, so a ruling that lands and a wave that
-    re-runs take the marker away by themselves.
-    """
-    for record in reversed(records):
-        if record.get("event") == ADVANCE_EVENT:
-            return str(record.get("decision")) in HALTED_DECISIONS
-    return False
 
 
 def terminal_width():
@@ -1294,20 +1203,21 @@ def draw(args, run_dir, moment):
     """Draw one frame of the whole run; returns whether the run it drew is over."""
     waves = read_table(run_dir)
     records = read_log(run_dir / MACHINE_LOG_NAME)
+    projection = machine_log.project(records)
     rows = build_rows(
-        waves, records, moment,
+        waves, projection, moment,
         live_sources(args.claude_bin, run_dir, records=records, bindings=table_bindings(waves)),
     )
     print(
         render(
             rows, run_dir.name, len(waves), moment,
-            colour=colour_wanted(args), awaiting_ruling=halted(records),
+            colour=colour_wanted(args), awaiting_ruling=projection.halted,
             dead_driver=dead_driver_banner(run_dir),
         ),
         flush=True,
     )
     emit_toasts(rows, toast_state_path(args, run_dir), args.tmux_bin)
-    return over(records)
+    return projection.ended
 
 
 def hold():
@@ -1768,17 +1678,18 @@ def pin_frame_data(args, run_dir, moment):
     rather than on the operator's screen.
     """
     records = read_log(run_dir / MACHINE_LOG_NAME)
-    if over(records):
+    projection = machine_log.project(records)
+    if projection.ended:
         return None
     waves = read_table(run_dir)
     sources = live_sources(
         args.claude_bin, run_dir, args.timeout, records, table_bindings(waves)
     )
-    rows = build_rows(waves, records, moment, sources)
+    rows = build_rows(waves, projection, moment, sources)
     frame = render(
         rows, run_dir.name, len(waves), moment,
         colour=pin_colour(args), max_lines=pin_line_budget(args),
-        awaiting_ruling=halted(records), dead_driver=dead_driver_banner(run_dir),
+        awaiting_ruling=projection.halted, dead_driver=dead_driver_banner(run_dir),
     )
     return frame, rows
 
@@ -2487,10 +2398,11 @@ def cost_rows(records, claude_homes=None, account_problem=None):
     `account_problem` diagnoses Claude rows when the run's account map cannot be read; Codex rows
     remain readable from their own configured root.
     """
-    launches = {}
-    for record in records:
-        if record.get("event") == "launch":
-            launches[str(record.get("ticket"))] = record
+    projection = machine_log.project(records)
+    launches = {
+        ticket: facts.launch for ticket, facts in projection.tickets.items()
+        if facts.launch is not None
+    }
     reviewed = review_sessions(records)
     claude_homes = claude_homes or {}
 

@@ -12,9 +12,13 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 from harness import BASE_BRANCH, DRIVER, Fixture, INTEGRATION_BRANCH, git
+
+sys.path.insert(0, str(DRIVER.parent))
+import driver as driver_module  # noqa: E402
 
 
 MERGED_BRANCH = "recorded/merged"
@@ -36,6 +40,37 @@ def read_json_lines(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+class StrictClearReadTests(unittest.TestCase):
+    """Clear refuses damaged state while accepting blank and unknown object records."""
+
+    def setUp(self):
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.log = pathlib.Path(self.work.name) / "log.jsonl"
+
+    def test_missing_log_is_rejected_as_unreadable(self):
+        with self.assertRaisesRegex(driver_module.ClearError, "is unreadable"):
+            driver_module.clear_records(self.log)
+
+    def test_blank_and_unknown_object_records_are_accepted(self):
+        self.log.write_text('\n{"event":"unknown","future":true}\n')
+
+        self.assertEqual(
+            driver_module.clear_records(self.log),
+            [{"event": "unknown", "future": True}],
+        )
+
+    def test_io_and_unicode_failures_are_rejected_as_unreadable(self):
+        self.log.mkdir()
+        with self.assertRaisesRegex(driver_module.ClearError, "is unreadable"):
+            driver_module.clear_records(self.log)
+
+        self.log.rmdir()
+        self.log.write_bytes(b"\xff\xfe")
+        with self.assertRaisesRegex(driver_module.ClearError, "is unreadable"):
+            driver_module.clear_records(self.log)
+
+
 class ClearTests(unittest.TestCase):
     def setUp(self):
         self.fixture = Fixture()
@@ -51,6 +86,15 @@ class ClearTests(unittest.TestCase):
             env=self.fixture.environment(),
             cwd=str(self.fixture.repo),
         )
+
+    def test_malformed_and_non_object_log_lines_are_rejected_with_line_numbers(self):
+        cases = (("not json", "line 1 is not JSON"), ("[]", "line 1 is not an object"))
+        for line, message in cases:
+            with self.subTest(line=line):
+                self.log_path.write_text(line + "\n")
+                result = self.run_clear("yes")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(message, result.stderr)
 
     def seed_run(self):
         self.fixture.ticket("01", "merged ticket")

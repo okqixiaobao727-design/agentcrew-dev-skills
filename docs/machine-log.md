@@ -7,6 +7,213 @@ memory, and so bookkeeping costs the coordinator zero turns
 
 The writer is [`skills/crew/assets/machine_log.py`](../skills/crew/assets/machine_log.py).
 
+## Accepted Run projection design
+
+[ADR-0017](adr/0017-machine-log-owns-run-facts-driver-owns-workflow-policy.md) makes the Machine
+log module the one owner of facts derived from the ordered log. The design is deliberately a
+snapshot, not a second workflow engine: it says what the log establishes now, while the Driver
+still combines those facts with the Wave table and rule table to choose the next action. The
+monitor still translates facts and live child status into the human-facing Ticket state.
+
+### Interface
+
+The public seam has three operations:
+
+```python
+records = machine_log.read_records(path)
+projection = machine_log.project(records)
+ticket = projection.ticket(ticket_id)
+```
+
+`read_records(path)` owns the normal runtime JSONL read. `project(records)` is an in-process,
+side-effect-free reduction over an already ordered iterable and returns an immutable
+`RunProjection`. `ticket(ticket_id)` normalises the id with `str()` and returns empty/live facts
+for a ticket the log has never mentioned. There is no generic query language, reducer registry,
+storage adapter, diagnostics surface, incremental reader or cache.
+
+The intended result shape is:
+
+```python
+@dataclass(frozen=True)
+class RunProjection:
+    tickets: Mapping[str, TicketFacts]
+    current_wave: int
+    ended: bool
+    halted: bool
+
+    def ticket(self, ticket: object) -> TicketFacts: ...
+
+
+@dataclass(frozen=True)
+class TicketFacts:
+    ticket: str
+    events: tuple[Mapping[str, object], ...]
+    first_launch: Mapping[str, object] | None
+    launch: Mapping[str, object] | None
+    receipt: Mapping[str, object] | None
+    latest_settling_event: Mapping[str, object] | None
+    progress_event: Mapping[str, object] | None
+    settlement_state: str
+    unanswered_child_message: Mapping[str, object] | None
+    awaiting_receipt: bool
+    awaiting_ruling: bool
+    outstanding_nudge: bool
+    merge_result: str | None
+    merge_landed: bool
+    semantic_conflict_detail: str | None
+    merge_rework_requested: bool
+
+    def instruction_count(self, marker: str) -> int: ...
+```
+
+This sketch fixes the interface and vocabulary, not the implementation layout. `events` contains
+only records that explicitly name the ticket, in accepted-record order. The projection may
+correlate a ticketless ruling internally through its `to` child, but must not add that inferred
+record to `events`: the monitor's visible annotations currently use explicit ticket records only.
+Callers that render audit, cost or report detail retain the original `records`; they must not
+re-derive a named projection fact from them.
+
+### Ordering and state contracts
+
+- Physical JSONL order is authoritative. A timestamp is data, never a sort key.
+- A snapshot never changes after construction. A caller explicitly reads again after an external
+  action; in particular, advance keeps its read before landing and its second read afterwards.
+- First and latest launch remain distinct. The latest launch includes the verified amendment that
+  follows a provisional launch; the first launch starts report duration.
+- `latest_settling_event` means the last receipt or outcome with a non-empty value. It answers
+  whether the ticket has received a settling event.
+- `settlement_state` retains the closed Machine-log vocabulary and its existing category
+  precedence: a valid outcome wins over receipt and merge evidence; otherwise the latest valid
+  receipt wins, with a landable receipt completed by a landed merge. It must not be collapsed with
+  `latest_settling_event`.
+- `progress_event` is the latest recognised receipt, outcome or merge used by the monitor as input
+  to its own Ticket state mapping. The projection does not produce Ticket state.
+- A ticketless ruling is correlated through `to` and the final latest-launch child mapping, exactly
+  as the Driver does today. Explicit `ticket` always wins.
+- `unanswered_child_message`, receipt/ruling waits, outstanding nudge, instruction counts,
+  semantic-conflict detail and merge-rework request all preserve their existing ordered-event
+  rules. Record position stays private; callers receive the selected record, not an index.
+- `current_wave` starts at 1 and follows the last integer-like `advance=launched` record.
+- `ended` is an ever rule: any `advance=complete|stopped` ends the run. `halted` is a latest rule:
+  the last advance is `escalated|interrupted`. They are separate facts, not one run-state enum.
+
+### Reading and error contracts
+
+The normal runtime reader preserves the behavior shared by the Driver, advance and merge driver:
+
+- a missing path returns an empty ordered record tuple;
+- blank lines, invalid JSON lines and valid non-object JSON values are skipped;
+- valid objects with unknown events or fields remain in the returned records but contribute no
+  unknown fact;
+- other `OSError` and UTF-8 decoding failures propagate unchanged;
+- no skipped-line diagnostics are printed or added to command output.
+
+The monitor retains its existing presentation policy by catching `OSError` around
+`read_records()` and projecting an empty tuple. The error policy is not a parameter on the Machine
+log interface: making it one would leak a caller decision into the module.
+
+Two strict readers are explicitly outside this interface. The post-dispatch `launched_children`
+read fails on malformed JSON because launch adoption must not proceed from a damaged record. The
+clear path refuses unreadable, malformed and non-object records with line-specific errors before
+deleting anything. Neither may be replaced by the tolerant runtime reader.
+
+### What moves and what stays
+
+The implementation behind the projection seam owns normal JSONL parsing; first/latest selection;
+ticket/child correlation; settlement precedence; message, receipt, ruling and nudge episodes;
+merge outcome and semantic-conflict standing; current wave; and run finality. Protocol markers the
+projection interprets are defined once in the Machine log module and imported by the Driver.
+
+The following remain with their current owners:
+
+- Wave membership, dependencies and next-wave selection stay with the Wave table and advance.
+- The Driver keeps the rule table and every choice to deliver, settle, merge, advance or stop.
+- Ticket state, live-source combination, annotations, elapsed time and all rendering stay with the
+  monitor.
+- Report wording, cost aggregation, undo rendering and strict clear validation stay with the
+  Driver or monitor. They may inspect retained records for presentation, but not redefine a named
+  Run projection fact.
+- Git receipt verification and branch movement stay with the merge driver.
+
+The remaining raw Machine-log scans are an explicit allowlist rather than alternate fact readers:
+
+- `advance.already_advanced` keeps the exact advance record used by the Wave-table duplicate-launch
+  safety check and its error text; the decision combines a log event with the table's next wave.
+- Driver's post-dispatch `launched_children` and all `clear_*` reads stay strict. Clear also walks
+  every historical launch because destructive cleanup must inventory every recorded artefact, not
+  only the latest child.
+- Driver report helpers retain receipt/outcome chronology, ruling text, tracker undo text and
+  terminal detail for presentation. Hook uninstall likewise walks every historical launch path.
+- Driver's tracker-close idempotence scan distinguishes a recorded completed outcome from a landed
+  merge, while `halt_detail` retains the exact escalated explanation used in an error. Neither
+  distinction is a named projection fact.
+- Monitor's fallback announcement checks whether the audit event was ever written, and its cost
+  pass reads review-session audit rows. Transcript scans are executor logs, not Machine log.
+
+`merge_driver.py` has no remaining raw Machine-log scan. Normal reads in all four consumers enter
+through `read_records()`; the allowlisted scans above operate on that accepted record tuple except
+for the two deliberately strict Driver paths.
+
+The projection reduction is `O(records)` and a ticket lookup is `O(1)`. Two linear passes are
+allowed because a ticketless ruling is interpreted through the final latest-launch child mapping.
+There is no cross-read cache. The existing re-evaluation point remains one run log around 5 MB;
+below that measured threshold an incremental reader has not earned its complexity.
+
+### Migration and verification
+
+Migration replaces existing logic rather than layering a permanent second path:
+
+1. Add characterization tests at the new interface using fixed expected facts, never old helper
+   output as the oracle.
+2. Add `read_records`, `project` and the immutable projection without changing a caller.
+3. Migrate merge driver's tolerant receipt read, then delete `receipts()`.
+4. Migrate advance while preserving the distinct snapshots before and after landing; delete only
+   the helpers the projection replaces.
+5. Migrate monitor's tolerant read, ticket grouping and run finality. Keep presentation mapping and
+   its empty-on-`OSError` behavior.
+6. Migrate the Driver's shared helper cluster and remove its dependency on `monitor.over`. Delete
+   each replaced helper in the same change that migrates its last caller.
+7. Migrate report selections only where the projection already names that fact; keep report-only
+   chronology and formatting local.
+8. Search the four callers for remaining raw event scans. Every survivor must be one of the
+   documented Wave-table, presentation, report, cost, audit or strict-safety cases above.
+
+The tests pin malformed and missing input; physical order against misleading timestamps;
+provisional and verified launches; receipt/outcome/merge precedence; repeated child messages;
+ticketless rulings; receipt/ruling/nudge episodes; semantic-conflict rework; run ended versus
+halted; the two advance snapshots; and byte-for-byte parity of existing command output and monitor
+frames. Because the implementation touches the spine, its final gate is the focused root, driver
+and monitor suites, the validator, then `python3 scripts/test.py` in full.
+
+### Recorded findings
+
+These findings were exposed by the design work. None is silently fixed by this behavior-preserving
+change.
+
+1. **Documentation and test gap:** `LANDED_MERGE_RESULTS` includes `resolved`, while
+   `settlement_state()` says only `clean` or `repaired` in its docstring and its direct tests omit
+   `resolved`. Add a characterization test during migration; correct the prose only in a separately
+   traceable fix.
+2. **Compatibility constraint:** normal runtime readers, the monitor, post-dispatch launch reading
+   and clear deliberately have different failure strength. The migration preserves all four rather
+   than weakening the strict paths or making every display error fatal.
+3. **Naming hazard covered by this design:** `settled_states()` answers whether a receipt/outcome
+   exists, while `settlement_state()` judges settlement quality. The new names keep those facts
+   distinct.
+4. **Association behavior requiring characterization:** the Driver correlates a ticketless ruling
+   using the final latest-launch child mapping. A historical ruling to a replaced child can
+   therefore become unassociated. Preserve it first; any correction needs its own evidence and
+   ruling.
+5. **Possible stale conflict detail:** `semantic_conflicts()` can pair the latest `escalated` merge
+   with an older semantic-conflict detail when no newer conflict record replaced it. Add a focused
+   reproduction before deciding whether this is a defect.
+6. **Out-of-order compatibility:** `settlement_state()` selects the latest valid receipt and latest
+   valid merge by category; it does not require the landed merge to follow the landable receipt.
+   Characterize the existing answer for a damaged or hand-written out-of-order log before moving
+   the rule.
+7. **Snapshot constraint:** advance's two reads surround a subprocess that appends merge and outcome
+   events. Combining them into one cached snapshot would change behavior and is forbidden.
+
 ## Format
 
 JSON Lines: one JSON object per line, UTF-8, appended and never rewritten. A line is written

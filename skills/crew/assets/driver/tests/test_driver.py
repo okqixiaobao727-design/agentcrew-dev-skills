@@ -55,6 +55,54 @@ from harness import (
     routing_naming,
 )
 
+sys.path.insert(0, str(DRIVER.parent))
+import driver as driver_module  # noqa: E402
+
+
+class StrictLaunchReadTests(DriverTestCase):
+    """Post-dispatch launch adoption refuses a damaged log instead of weakening the boundary."""
+
+    def test_malformed_json_fails_the_post_dispatch_launch_read(self):
+        log = self.fixture.root / "damaged-log.jsonl"
+        log.write_text('{"event":"launch"}\nnot json\n')
+
+        with self.assertRaises(json.JSONDecodeError):
+            driver_module.launched_children(log)
+
+    def test_every_other_launch_reader_boundary_remains_strict_or_accepted(self):
+        log = self.fixture.root / "boundary-log.jsonl"
+        with self.assertRaises(FileNotFoundError):
+            driver_module.launched_children(log)
+
+        log.write_text('\n{"event":"unknown"}\n')
+        self.assertEqual(driver_module.launched_children(log), [])
+
+        log.write_text("[]\n")
+        with self.assertRaises(AttributeError):
+            driver_module.launched_children(log)
+
+        log.unlink()
+        log.mkdir()
+        with self.assertRaises(IsADirectoryError):
+            driver_module.launched_children(log)
+
+        log.rmdir()
+        log.write_bytes(b"\xff\xfe")
+        with self.assertRaises(UnicodeDecodeError):
+            driver_module.launched_children(log)
+
+
+class ReportSelectionTests(unittest.TestCase):
+    """Report chronology remains distinct from the projection's non-empty settling fact."""
+
+    def test_received_is_the_last_receipt_or_outcome_even_when_its_value_is_empty(self):
+        records = (
+            {"event": "outcome", "ticket": "7", "outcome": "completed", "ts": "01"},
+            {"event": "receipt", "ticket": "7", "ts": "02"},
+        )
+
+        self.assertIs(driver_module.report_received(records, "7"), records[-1])
+
 
 class PreflightTests(DriverTestCase):
     def test_a_dirty_working_tree_stops_the_run(self):

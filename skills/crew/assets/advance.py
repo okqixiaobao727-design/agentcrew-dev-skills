@@ -72,9 +72,6 @@ ESCALATED = "escalated"
 COMPLETE = "complete"
 INTERRUPTED = "interrupted"
 
-SETTLING_EVENTS = ("receipt", "outcome")
-SETTLED_STATE_KEYS = ("verdict", "outcome")
-
 INTERRUPT_EXIT = 128 + signal.SIGINT
 ESCALATED_EXIT = 1
 
@@ -115,40 +112,6 @@ def log_event(log, *arguments):
     result = run_shielded([sys.executable, str(MACHINE_LOG), "--log", str(log), *arguments])
     if result.returncode != 0:
         raise AdvanceError(f"machine log: {(result.stderr or result.stdout).strip()}")
-
-
-def read_log(log):
-    """Every record in the machine log, oldest first; a half-written line is skipped."""
-    path = pathlib.Path(log)
-    if not path.exists():
-        return []
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
-
-
-def settled_states(records):
-    """{ticket: the word its last settling event settled it into} — a receipt's verdict, or an
-    outcome. A ticket the log has neither for is still live, and is absent here."""
-    states = {}
-    for record in records:
-        if record.get("event") not in SETTLING_EVENTS:
-            continue
-        for key in SETTLED_STATE_KEYS:
-            if record.get(key):
-                states[str(record.get("ticket"))] = str(record[key])
-                break
-    return states
-
-
-def launched_tickets(records):
-    return {str(record.get("ticket")) for record in records if record.get("event") == "launch"}
 
 
 # --- the table --------------------------------------------------------------------------------
@@ -278,14 +241,17 @@ def record(options, wave, decision, detail=None):
     log_event(options["log"], *arguments)
 
 
-def block_descendants(table, records, roots, options):
+def block_descendants(table, projection, roots, options):
     """Record every unlaunched descendant of a stopped ticket blocked; returns the lines printed.
 
     A ticket that already ran has an outcome of its own, and a ticket the halt leaves untouched is
     not this decision's business — only what can no longer start is blocked.
     """
     tickets = every_ticket(table)
-    started = launched_tickets(records) | set(settled_states(records))
+    started = {
+        ticket for ticket, facts in projection.tickets.items()
+        if facts.launch is not None or facts.latest_settling_event is not None
+    }
     blocked = {}
     for root, verdict in sorted(roots.items()):
         for number in descendants(tickets, [root]):
@@ -310,9 +276,9 @@ def decision_detail(detail, passed_over=()):
     return f"{detail}; passed over as settled: " + "; ".join(passed_over)
 
 
-def halt(table, wave, records, reasons, roots, options, passed_over=()):
+def halt(table, wave, projection, reasons, roots, options, passed_over=()):
     """Stop the chain: block what can no longer start, and record the one escalation."""
-    lines = block_descendants(table, records, roots, options)
+    lines = block_descendants(table, projection, roots, options)
     detail = decision_detail("; ".join(reasons), passed_over)
     record(options, wave, ESCALATED, detail)
     return lines + [f"wave {wave} {ESCALATED} {detail}"]
@@ -334,10 +300,13 @@ def advance_wave(table, table_path, wave, options, interrupt):
     if not tickets:
         raise AdvanceError(f"wave {wave} holds no tickets")
 
-    records = read_log(options["log"])
+    records = machine_log.read_records(options["log"])
+    projection = machine_log.project(records)
     following = next_wave(table, wave)
-    states = settled_states(records)
-    live = [str(ticket["id"]) for ticket in tickets if str(ticket["id"]) not in states]
+    live = [
+        str(ticket["id"]) for ticket in tickets
+        if projection.ticket(ticket["id"]).latest_settling_event is None
+    ]
     if live:
         # Nothing has been decided and nothing should be: the wave is still being worked.
         raise AdvanceError(f"wave {wave} has not settled: " + ", ".join(live))
@@ -352,14 +321,15 @@ def advance_wave(table, table_path, wave, options, interrupt):
         return stop_short(wave, options), INTERRUPT_EXIT
     lines = land(table_path, wave, options)
 
-    records = read_log(options["log"])
+    records = machine_log.read_records(options["log"])
+    projection = machine_log.project(records)
     all_tickets = None
     reasons = []
     roots = {}
     passed_over = []
     for ticket in tickets:
         number = str(ticket["id"])
-        state = machine_log.settlement_state(records, number)
+        state = projection.ticket(number).settlement_state
         if state == PARKED:
             if all_tickets is None:
                 all_tickets = every_ticket(table)
@@ -380,7 +350,7 @@ def advance_wave(table, table_path, wave, options, interrupt):
             reasons.append(f"{number} did not land; {pointers(ticket)}")
     if reasons:
         return (
-            lines + halt(table, wave, records, reasons, roots, options, passed_over),
+            lines + halt(table, wave, projection, reasons, roots, options, passed_over),
             ESCALATED_EXIT,
         )
 

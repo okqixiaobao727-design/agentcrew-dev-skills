@@ -284,6 +284,12 @@ this log is the only trail of what happened overnight; the run's `report.md` is 
 human gets at the end.
 _Avoid_: decision log (legacy), status report
 
+**Run projection** — The current facts about one run, derived solely from its ordered Machine log.
+It says what has happened and remains true; it contains neither the Wave table's plan nor the
+Driver's next action
+([ADR-0017](adr/0017-machine-log-owns-run-facts-driver-owns-workflow-policy.md)).
+_Avoid_: driver state, workflow decision, Ticket state (the human-facing vocabulary)
+
 **Pin** — The file that names a live run: the run directory as an absolute realpath (ADR-0007), the
 coordinator's pid, the coordinator's tmux session, and what draws it — the writing release's own
 `monitor.py` and interpreter. Those last two are recorded by a release alive at that moment and

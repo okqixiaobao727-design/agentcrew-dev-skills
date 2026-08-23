@@ -51,12 +51,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
 import dispatch  # noqa: E402
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import accounts  # noqa: E402
+import machine_log  # noqa: E402
 
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent / "machine_log.py"
 
 # The only verdict that lands. A failed or parked branch is never merged, and a ticket with no
 # receipt has not been verified by anything, which is not the same as being landable.
-LANDABLE = "landable"
+LANDABLE = machine_log.LANDABLE
 
 # ADR-0004: the repair rung is a headless session under a hard budget cap. `--max-budget-usd`
 # binds only on a headless (`--print`) session, so the two flags travel together or not at all.
@@ -123,26 +124,6 @@ def log_event(log, *args):
     )
     if result.returncode != 0:
         raise WaveError(f"machine log: {(result.stderr or result.stdout).strip()}")
-
-
-def receipts(log):
-    """{ticket: receipt} — verdict and sha, latest wins — from the log the monitor wrote.
-
-    A log that is absent or holds no receipts leaves every ticket unverified, which lands none of
-    them: the driver merges what was verified, and verifying is somebody else's job.
-    """
-    verified = {}
-    path = pathlib.Path(log)
-    if not path.exists():
-        return verified
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict) and record.get("event") == "receipt":
-            verified[str(record.get("ticket"))] = record
-    return verified
 
 
 def unverified_reason(repo, branch, receipt):
@@ -637,13 +618,13 @@ def land_wave(table, wave, options):
     check_repair_model(options["repair_model"])
     open_integration_branch(run)
 
-    verified = receipts(options["log"])
+    projection = machine_log.project(machine_log.read_records(options["log"]))
     lines = []
     escalated = False
     for ticket in tickets:
         number = str(ticket["id"])
         branch = dispatch.branch_name(ticket)
-        receipt = verified.get(number) or {}
+        receipt = projection.ticket(number).receipt or {}
         if receipt.get("verdict") != LANDABLE:
             lines.append(f"{number} skipped {receipt.get('verdict') or 'no receipt'}")
             continue

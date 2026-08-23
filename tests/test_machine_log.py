@@ -130,6 +130,153 @@ class MachineLogTestCase(unittest.TestCase):
         self.assertLess(drift, 120, "the stamp is UTC, not local time")
 
 
+class ReadRecordsTests(MachineLogTestCase):
+    """The normal runtime reader keeps usable objects and tolerates incomplete lines."""
+
+    def test_missing_and_mixed_logs_preserve_only_objects_in_physical_order(self):
+        self.assertEqual(machine_log.read_records(self.log), ())
+        self.log.write_text(
+            "\n"
+            "not json\n"
+            "[]\n"
+            '{"event":"launch","ticket":"07","ts":"later"}\n'
+            '{"event":"unknown","ticket":"07","ts":"earlier"}\n',
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            machine_log.read_records(self.log),
+            (
+                {"event": "launch", "ticket": "07", "ts": "later"},
+                {"event": "unknown", "ticket": "07", "ts": "earlier"},
+            ),
+        )
+
+    def test_non_missing_io_and_unicode_failures_propagate(self):
+        with self.assertRaises(IsADirectoryError):
+            machine_log.read_records(pathlib.Path(self.work.name))
+        self.log.write_bytes(b"\xff\xfe")
+        with self.assertRaises(UnicodeDecodeError):
+            machine_log.read_records(self.log)
+
+
+class RunProjectionTests(unittest.TestCase):
+    """The immutable run snapshot derives facts from accepted-record order."""
+
+    def test_launch_selection_uses_physical_order_and_the_snapshot_is_immutable(self):
+        projection = machine_log.project([
+            {"event": "launch", "ticket": 7, "child": "first", "ts": "later"},
+            {"event": "unknown", "ticket": "7", "detail": "kept"},
+            {"event": "launch", "ticket": "7", "child": "latest", "ts": "earlier"},
+        ])
+        facts = projection.ticket(7)
+
+        self.assertEqual(tuple(projection.tickets), ("7",))
+        self.assertEqual(facts.ticket, "7")
+        self.assertEqual(facts.first_launch["child"], "first")
+        self.assertEqual(facts.launch["child"], "latest")
+        self.assertEqual([event["event"] for event in facts.events], [
+            "launch", "unknown", "launch",
+        ])
+        with self.assertRaises(TypeError):
+            projection.tickets["8"] = facts
+        with self.assertRaises(TypeError):
+            facts.events[0]["child"] = "changed"
+        with self.assertRaises(AttributeError):
+            facts.ticket = "changed"
+
+        missing = projection.ticket("8")
+        self.assertEqual(missing.ticket, "8")
+        self.assertEqual(missing.events, ())
+        self.assertIsNone(missing.launch)
+
+    def test_settlement_facts_keep_event_presence_quality_and_progress_distinct(self):
+        projection = machine_log.project([
+            {"event": "receipt", "ticket": "7", "verdict": "landable", "ts": "03"},
+            {"event": "merge", "ticket": "7", "result": "resolved", "ts": "02"},
+            {"event": "outcome", "ticket": "7", "outcome": "future-word", "ts": "01"},
+            {"event": "merge", "ticket": "8", "result": "clean", "ts": "later"},
+            {"event": "receipt", "ticket": "8", "verdict": "landable", "ts": "earlier"},
+            {"event": "receipt", "ticket": "9", "outcome": "failed"},
+        ])
+
+        seven = projection.ticket("7")
+        self.assertEqual(seven.receipt["verdict"], "landable")
+        self.assertEqual(seven.latest_settling_event["outcome"], "future-word")
+        self.assertEqual(seven.progress_event["result"], "resolved")
+        self.assertEqual(seven.settlement_state, "completed")
+        self.assertEqual(seven.merge_result, "resolved")
+        self.assertTrue(seven.merge_landed)
+        self.assertEqual(projection.ticket("8").settlement_state, "completed")
+        nine = projection.ticket("9")
+        self.assertEqual(nine.latest_settling_event["outcome"], "failed")
+        self.assertEqual(nine.settlement_state, "live")
+
+    def test_message_episodes_correlate_ticketless_rulings_through_the_final_child(self):
+        projection = machine_log.project([
+            {"event": "launch", "ticket": "7", "child": "old-child"},
+            {"event": "message", "ticket": "7", "role": "child", "message": "first"},
+            {"event": "receipt", "ticket": "7", "verdict": "failed"},
+            {"event": "launch", "ticket": "7", "child": "new-child"},
+            {"event": "ruling", "to": "old-child", "message": "CREW NUDGE 7 old"},
+            {"event": "ruling", "to": "new-child", "message": "CREW NUDGE 7 new"},
+            {"event": "review", "ticket": "7", "state": "running"},
+            {"event": "message", "ticket": "7", "role": "child", "message": "latest"},
+            {"event": "launch", "ticket": "8", "child": "eight"},
+            {"event": "ruling", "ticket": "8", "message": "CREW RULED 8 handed over"},
+        ])
+
+        seven = projection.ticket("7")
+        self.assertEqual(seven.unanswered_child_message["message"], "latest")
+        self.assertTrue(seven.awaiting_receipt)
+        self.assertFalse(seven.awaiting_ruling)
+        self.assertFalse(seven.outstanding_nudge)
+        self.assertEqual(seven.instruction_count("CREW NUDGE"), 1)
+        self.assertNotIn("ruling", [record["event"] for record in seven.events])
+
+        eight = projection.ticket("8")
+        self.assertTrue(eight.awaiting_ruling)
+        self.assertEqual(eight.instruction_count("CREW RULED"), 1)
+
+    def test_semantic_conflict_and_rework_preserve_the_existing_order_rules(self):
+        projection = machine_log.project([
+            {"event": "merge", "ticket": "7", "result": "conflict",
+             "detail": "semantic: both tickets own the same name"},
+            {"event": "merge", "ticket": "7", "result": "escalated"},
+            {"event": "ruling", "ticket": "7", "message": "CREW MERGE 7 resolve it"},
+            {"event": "merge", "ticket": "8", "result": "conflict",
+             "detail": "semantic: old detail is retained"},
+            {"event": "ruling", "ticket": "8", "message": "CREW MERGE 8 first attempt"},
+            {"event": "merge", "ticket": "8", "result": "escalated"},
+        ])
+
+        seven = projection.ticket("7")
+        self.assertEqual(seven.semantic_conflict_detail, "both tickets own the same name")
+        self.assertTrue(seven.merge_rework_requested)
+
+        eight = projection.ticket("8")
+        self.assertEqual(eight.semantic_conflict_detail, "old detail is retained")
+        self.assertFalse(eight.merge_rework_requested)
+
+    def test_run_facts_distinguish_ever_ended_from_the_latest_halt(self):
+        projection = machine_log.project([
+            {"event": "advance", "decision": "launched", "wave": "2"},
+            {"event": "advance", "decision": "launched", "wave": "not-a-wave"},
+            {"event": "advance", "decision": "complete", "wave": 2},
+            {"event": "advance", "decision": "interrupted", "wave": 2},
+        ])
+
+        self.assertEqual(projection.current_wave, 2)
+        self.assertTrue(projection.ended)
+        self.assertTrue(projection.halted)
+        resumed = machine_log.project([
+            {"event": "advance", "decision": "escalated", "wave": 1},
+            {"event": "advance", "decision": "launched", "wave": 2},
+        ])
+        self.assertFalse(resumed.ended)
+        self.assertFalse(resumed.halted)
+
+
 class SettlementStateTests(unittest.TestCase):
     """The one public predicate every settlement-quality reader shares."""
 
