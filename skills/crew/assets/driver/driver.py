@@ -99,7 +99,7 @@ and the wake snapshot it leaves behind.
 
 import argparse
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import datetime
 import json
 import os
@@ -109,7 +109,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 
@@ -123,17 +122,14 @@ CODEX_BRIDGE = ASSETS / "codex" / "codex_bridge.py"
 ADVANCE = ASSETS / "advance.py"
 LAUNCH = ASSETS / "launch" / "launch.py"
 
-# The renderer owns two rules this module asks rather than restates: what counts as an alias, and
-# what a ticket's branch is called. Advance imports it the same way, from the same place.
+# The renderer owns what a ticket's branch is called.
 sys.path.insert(0, str(DISPATCH.parent))
 import dispatch  # noqa: E402
 sys.path.insert(0, str(ASSETS))
 import machine_log  # noqa: E402
-import advance as wave_advance  # noqa: E402
-# And the account registry owns one more: what a named account resolves to on this machine. It is
-# the one documented way from an account name to a profile directory, and this driver is where the
-# ticket's name is turned into one, once, as the wave table is built (ADR-0014).
+# Account bindings become process environments only through the account module.
 import accounts  # noqa: E402
+import run_plan  # noqa: E402
 # The monitor still owns process liveness, the driver pid record and every operator-facing surface;
 # Machine-log interpretation itself comes from the projection above.
 sys.path.insert(0, str(MONITOR.parent))
@@ -183,7 +179,7 @@ ACCOUNT_NAMES_KEYS = ("accounts", "names")
 # close operation may be asked for: anything else stops the run rather than guessing a CLI.
 TRACKER_GITHUB = "github"
 TRACKER_LOCAL = "local"
-TRACKERS = (TRACKER_GITHUB, TRACKER_LOCAL)
+TRACKERS = run_plan.TRACKERS
 # A local ticket's status is a `Status:` line in its own file, and the value a finished one carries
 # where the repo's convention document names none.
 STATUS_LINE = re.compile(r"^(\s*(?:[-*]\s+)?)(?:\*\*)?Status(?:\*\*)?\s*:\s*(.*?)\s*$")
@@ -210,30 +206,6 @@ DRIVER_ERROR_EXIT = 2
 # What a shell reports for a process an interrupt ended, which is what this ends on when the
 # operator stops the driver in its own window.
 INTERRUPTED_EXIT = 130
-
-# A ticket file of a feature: its number, as written, and whatever slug follows it.
-TICKET_FILE = re.compile(r"^(\d+)(?:-.*)?\.md$")
-# A `Key: value` routing line, in any order, as `Blocked by:` edges are parsed.
-ROUTING_LINE = re.compile(r"^([A-Za-z][A-Za-z ]*?)\s*:\s*(.+?)\s*$")
-BLOCKER = re.compile(r"#(\d+)")
-SECTION = re.compile(r"^##\s+(.*?)\s*$")
-
-ROUTING_SECTION = "routing"
-BLOCKED_BY_SECTION = "blocked by"
-# The routing keys the table carries under their own names, and the review lane's three words.
-ROUTING_KEYS = ("workflow", "executor", "model", "effort")
-REVIEW_KEY = "review"
-# The one routing key an operator names and `/route` never concludes, and the only one that is
-# optional in a ticket beside the review line. It is optional in the ticket alone: the table
-# carries the profile directory on every row, the coordinator's own where the ticket named none
-# (ADR-0014).
-ACCOUNT_KEY = accounts.ACCOUNT_KEY
-# Beside it on every row: how that ticket's Claude processes select the directory. A ticket that
-# named an account selects it explicitly; a ticket that named none inherits the environment the
-# run was started in, and the directory it carries is what identifies and observes it rather than
-# something to be set (ADR-0014, as amended by #110).
-ACCOUNT_MODE_KEY = accounts.ACCOUNT_MODE_KEY
-REVIEW_FIELDS = ("vendor", "model", "effort")
 
 CODEX = "codex"
 CLAUDE = "claude"
@@ -501,93 +473,6 @@ def run_command(arguments, message, ticket=None, pointer=None):
     return result.stdout
 
 
-# --- the tickets ----------------------------------------------------------------------------
-#
-# A feature directory has two layouts, and only the first is one this driver reads.
-#
-# The **runtime layout** is what `start` is given: `spec.md`, and one `<number>.md` ticket file
-# per ticket at the directory's root — `01.md`, or `07-slug.md` where a slug follows the number
-# (`TICKET_FILE` is the whole rule). Nothing below the root is a ticket; `read_tickets` globs that
-# one level and no deeper. The run's own working directory, `.crew/`, is created beside them.
-#
-# The **archive layout** is what a finished run is filed into afterwards, by hand or by whatever
-# tidies up: the ticket files moved down into a `tickets/` subdirectory, next to the run's
-# `report.md`. It is a record, not an input. Handing `start` a directory in that shape is handing
-# it a feature with no tickets, which is why `routing_problems` says so in those words.
-
-
-def sections(text):
-    """A ticket's `##` sections, keyed by their lowercased headings."""
-    found = {}
-    heading = None
-    for line in text.splitlines():
-        match = SECTION.match(line)
-        if match:
-            heading = match.group(1).lower()
-            found[heading] = []
-            continue
-        if heading is not None:
-            found[heading].append(line)
-    return {name: "\n".join(lines) for name, lines in found.items()}
-
-
-def title_of(text, number):
-    """The ticket's own first heading, which is the title the dashboard draws."""
-    for line in text.splitlines():
-        if line.startswith("# "):
-            return line[2:].strip()
-    return number
-
-
-def routing_of(section):
-    """The routing that section declares, under the table's own key names.
-
-    A key the section does not carry is left out rather than defaulted: routing has no default and
-    no fallback, and a ticket missing one is unrouted — which the renderer's validation is the
-    authority on, not this parser. `account` is the one key whose absence is ordinary rather than
-    a fault, and it is left out here too: what it means when absent is settled where the table is
-    built, not here (ADR-0014).
-    """
-    values = {}
-    for line in section.splitlines():
-        match = ROUTING_LINE.match(line)
-        if not match:
-            continue
-        key = match.group(1).strip().lower()
-        value = match.group(2).strip()
-        if key in ROUTING_KEYS or key == ACCOUNT_KEY:
-            values[key] = value
-        elif key == REVIEW_KEY:
-            words = value.split()
-            values[REVIEW_KEY] = dict(zip(REVIEW_FIELDS, words)) if len(words) == 3 else value
-    return values
-
-
-def blockers_of(section):
-    """The ticket ids this ticket is blocked by, as its `Blocked by` section writes them."""
-    return BLOCKER.findall(section)
-
-
-def read_tickets(feature_dir):
-    """Every ticket of the feature, in number order, carrying the routing it declares."""
-    tickets = []
-    for path in sorted(feature_dir.glob("*.md")):
-        match = TICKET_FILE.match(path.name)
-        if not match:
-            continue
-        text = path.read_text(encoding="utf-8")
-        parts = sections(text)
-        ticket = {
-            "id": match.group(1),
-            "title": title_of(text, match.group(1)),
-            "path": str(path),
-            "blocked_by": blockers_of(parts.get(BLOCKED_BY_SECTION, "")),
-        }
-        ticket.update(routing_of(parts.get(ROUTING_SECTION, "")))
-        tickets.append(ticket)
-    return tickets
-
-
 # --- the four preflight checks ----------------------------------------------------------------
 
 
@@ -681,251 +566,6 @@ def base_branch_problems(repo, branch, upstream):
             " diverged, so reconcile them before the run cuts from it"
         ]
     return []
-
-
-def routing_problems(tickets, run, launch_dir):
-    """The renderer's own verdict on this table's routing, one line per offending ticket.
-
-    The renderer's validation is the authority on the case list — the alias rule, the review
-    lane's rules, every required key — so the driver asks it rather than restating it. The
-    candidate table
-    is one wave of every ticket, because a table that cannot be routed is never dispatched and the
-    wave a ticket would sit in has no bearing on whether its routing is valid.
-
-    A feature with no tickets at all is the one case the renderer never sees, and it is the case a
-    hand-assembled run directory lands in most: the message therefore carries the whole diagnosis —
-    the directory searched, the filename pattern wanted at its root, and the archive layout that
-    looks like the input layout and is not.
-    """
-    if not tickets:
-        return [
-            f"run: {run['feature_dir']} carries no tickets to route — a ticket is a"
-            " `<number>.md` file at that directory's root (`01.md`, `07-slug.md`), and a"
-            " `tickets/` subdirectory there is the layout a finished run is archived into, not"
-            " where a run's input tickets go"
-        ]
-    candidate = launch_dir / "candidate-table.json"
-    candidate.parent.mkdir(parents=True, exist_ok=True)
-    candidate.write_text(
-        json.dumps({"run": run, "waves": [{"wave": 1, "tickets": accounted(tickets, run)}]}),
-        encoding="utf-8",
-    )
-    result = subprocess.run(
-        [
-            sys.executable, str(DISPATCH), "render",
-            "--table", str(candidate),
-            "--wave", "1",
-            "--out-dir", str(candidate.parent / "candidate"),
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        return []
-    return [line for line in result.stderr.splitlines() if line.strip()]
-
-
-def accounted(tickets, run):
-    """This run's tickets, copied, with the concrete account a wave table's rows carry.
-
-    What the renderer is handed is a wave table, and on a wave table `account` is concrete on
-    every row (ADR-0014) — while these tickets are the pre-table input, where the key is still the
-    optional name the operator wrote or nothing at all. `normalise_accounts` is the one place that
-    rule lives, so it is what fills the copies in.
-
-    A name the registry cannot resolve puts every row on the coordinator's home instead, because
-    what this table is for is the renderer's verdict on *routing*: `account_problems` is the check
-    that names an unregistered account and the registry it searched, and it says so far better
-    than a second line about the same account from the renderer would.
-    """
-    candidates = [dict(ticket) for ticket in tickets]
-    try:
-        return normalise_accounts(candidates, run)
-    except accounts.AccountsError:
-        for candidate in candidates:
-            bind(candidate, accounts.inherited(run["coordinator_config_home"]))
-        return candidates
-
-
-def config_problems(repo, run):
-    """Whether the run's two configured decisions are there and are values a run can act on.
-
-    Neither carries a default. A repair model compiled into this script would be a routing decision
-    nobody chose, and a tracker guessed from a name would reach a CLI nobody named; both are
-    exactly the failure a single committed config line clears for good.
-    """
-    problems = []
-    config = repo / CONFIG_NAME
-    model = run.get("repair_model")
-    if not isinstance(model, str) or not model.strip():
-        problems.append(
-            f"repair model: {config} names no [repair] model — the merge ladder's repair rung has"
-            " no model to run on, and it takes a full model ID, never an alias"
-        )
-    else:
-        fault = alias_problem(model)
-        if fault:
-            problems.append(f"repair model: {fault}")
-    kind = run.get("tracker")
-    if not isinstance(kind, str) or not kind.strip():
-        problems.append(
-            f"tracker: {config} names no [tracker] kind — a merged ticket has nowhere to be"
-            f" closed; it is one of {', '.join(TRACKERS)}"
-        )
-    elif kind not in TRACKERS:
-        problems.append(
-            f"tracker: `{kind}` is not a tracker this run closes tickets in — it is one of"
-            f" {', '.join(TRACKERS)}, the two `references/trackers.md` declares exercised"
-        )
-    return problems
-
-
-def account_problems(tickets, run):
-    """Whether every account a ticket names is one this repo declares and this machine registers.
-
-    Nothing is checked for a run whose tickets name no account: the registry is read only once a
-    ticket asks for one, so a machine that has never registered an account runs its single-account
-    waves exactly as it did before accounts existed, with no file to create.
-
-    Two faults are kept apart, because their fixes are in different files. A name this repository's
-    config never declared is answered in the config's own terms — the repo expects a set of names
-    and this is not one of them. A name the registry does not hold is answered with the registry
-    that was searched, which is the file the operator has to edit. Neither falls back to the
-    coordinator's account: a silent fallback is the defect the account key exists to remove
-    (ADR-0013).
-
-    Registration and directory existence are the whole of the check. Whether that profile is
-    logged in is deliberately not asked here — the CLI cannot be made to answer it, and the
-    reasoning is in the spec — so an unauthenticated account surfaces at verification, not here.
-    """
-    named = [(ticket, ticket[ACCOUNT_KEY]) for ticket in tickets if ticket.get(ACCOUNT_KEY)]
-    if not named:
-        return []
-    try:
-        registry = accounts.registry_path()
-        registered = accounts.load_registry(registry)
-    except accounts.AccountsError as error:
-        return [f"account: {error}"]
-    declared = run.get("declared_accounts") or []
-    config = pathlib.Path(run["repo_root"]) / CONFIG_NAME
-    problems = []
-    for ticket, name in named:
-        where = f"{ticket['id']} {ticket['path']}:"
-        if declared and name not in declared:
-            problems.append(
-                f"{where} names the account `{name}`, which {config} does not declare — this"
-                f" repository expects {', '.join(declared)}; add `{name}` to its [accounts] names,"
-                " or route the ticket to an account it declares"
-            )
-            continue
-        try:
-            directory = accounts.profile_directory(name, registered)
-        except accounts.UnknownAccount as error:
-            problems.append(f"{where} {error}")
-            continue
-        if not pathlib.Path(directory).is_dir():
-            problems.append(
-                f"{where} names the account `{name}`, whose profile directory {directory} is not"
-                f" there — the registry {registry} names it, so create it or point the entry at"
-                " the profile that account logs in under"
-            )
-    return problems
-
-
-def normalise_accounts(tickets, run):
-    """Give every ticket the concrete account binding it runs on, in place.
-
-    Where ambiguity ends (ADR-0014). A ticket that named an account is bound explicitly to the
-    profile directory that name resolves to; a ticket that named none is bound to the
-    coordinator's own configuration home, inherited. From the table onward both halves are on
-    every row, so no consumer downstream repeats the rule, and none can get it wrong on its own.
-
-    Concrete means *both* halves. Resolving an account-less ticket to a directory alone was the
-    first version of this rule, and it lost the one fact that separates the two cases: whether the
-    ticket's processes set `CLAUDE_CONFIG_DIR` at all. Setting it to the default home is not the
-    same as leaving it unset — the explicit spelling failed the login the inherited one succeeded
-    at, and account-less reviewers and repair sessions were told they were not logged in (#110).
-
-    Every name here is known registered: `account_problems` is what says so, and preflight is what
-    runs it before this. The registry is opened only where a ticket named an account, on the same
-    rule that check follows: a wave nobody asked an account for is a wave with no registry to read,
-    whatever the machine does or does not keep at that path.
-    """
-    named = any(ticket.get(ACCOUNT_KEY) for ticket in tickets)
-    registered = accounts.load_registry() if named else {}
-    for ticket in tickets:
-        name = ticket.get(ACCOUNT_KEY)
-        bind(ticket, (
-            accounts.explicit(accounts.profile_directory(name, registered)) if name
-            else accounts.inherited(run["coordinator_config_home"])
-        ))
-    return tickets
-
-
-def bind(ticket, binding):
-    """Write that account binding onto the row, both halves of it; returns nothing."""
-    ticket[ACCOUNT_KEY], ticket[ACCOUNT_MODE_KEY] = binding.directory, binding.mode
-
-
-def alias_problem(model):
-    """Why that model value is an alias rather than a full ID, asked of the renderer's own rule.
-
-    The repair rung's model is refused on the same rule as every routed model, from the same code:
-    an alias was measured to resolve to a different model than the one named (ADR-0003), and a
-    ladder that repairs on a model nobody chose is the routing this run exists to enforce, missed.
-    """
-    aliases = {alias.lower() for alias in dispatch.load_templates()["models"]["aliases"]}
-    return dispatch.alias_problem("`[repair] model`", model, aliases)
-
-
-def graph_problems(tickets):
-    """Whether every blocker exists in the feature and whether the graph is acyclic."""
-    problems = []
-    edges = {ticket["id"]: list(ticket["blocked_by"]) for ticket in tickets}
-    for ticket in tickets:
-        for blocker in ticket["blocked_by"]:
-            if blocker not in edges:
-                problems.append(
-                    f"{ticket['id']} {ticket['path']}: is blocked by #{blocker}, which no ticket"
-                    " of this feature carries"
-                )
-    cycle = find_cycle({
-        identifier: [blocker for blocker in blockers if blocker in edges]
-        for identifier, blockers in edges.items()
-    })
-    if cycle:
-        problems.append(
-            "dependency graph: " + " → ".join(cycle) + " is a cycle, which no wave can order"
-        )
-    return problems
-
-
-def find_cycle(edges):
-    """One cycle of that graph, as the ids around it, or None where it is acyclic."""
-    WALKING, DONE = 1, 2
-    marks = {}
-    stack = []
-
-    def walk(identifier):
-        marks[identifier] = WALKING
-        stack.append(identifier)
-        for blocker in edges[identifier]:
-            state = marks.get(blocker)
-            if state == WALKING:
-                return stack[stack.index(blocker):] + [blocker]
-            if state is None:
-                found = walk(blocker)
-                if found:
-                    return found
-        stack.pop()
-        marks[identifier] = DONE
-        return None
-
-    for identifier in edges:
-        if identifier not in marks:
-            found = walk(identifier)
-            if found:
-                return found
-    return None
 
 
 # --- the preflight notice ----------------------------------------------------------------------
@@ -1098,35 +738,6 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
     return run
 
 
-def assign_waves(tickets):
-    """Every ticket in the first wave its blockers allow, built from the dependency frontier.
-
-    Wave 1 is every ticket with no blocker, and a ticket joins the first wave after all of its
-    blockers. The graph is known complete and acyclic by the time this runs — preflight is what
-    says so — so every ticket is placed.
-    """
-    waves = []
-    remaining = list(tickets)
-    placed = {}
-    while remaining:
-        frontier = [
-            ticket for ticket in remaining
-            if all(blocker in placed for blocker in ticket["blocked_by"])
-        ]
-        if not frontier:
-            raise DriverError(
-                "the wave table cannot be ordered: "
-                + ", ".join(ticket["id"] for ticket in remaining)
-                + " block each other"
-            )
-        number = len(waves) + 1
-        waves.append({"wave": number, "tickets": frontier})
-        for ticket in frontier:
-            placed[ticket["id"]] = number
-        remaining = [ticket for ticket in remaining if ticket["id"] not in placed]
-    return waves
-
-
 def prepare_branches(repo, base_branch, integration_branch, pull):
     """Fast-forward the base branch and cut this run's integration branch from it; returns the
     branch the run returns to and the commit it is based on."""
@@ -1269,14 +880,6 @@ def spawn(arguments, environment=None):
 # --- clear ------------------------------------------------------------------------------------
 
 
-def clear_json(path, label):
-    """Read one recorded JSON document, refusing malformed run state before any action."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError) as error:
-        raise ClearError(f"{label} {path} is unreadable: {error}") from error
-
-
 def clear_records(log):
     """Read the append-only log as the source of every child path and window id."""
     try:
@@ -1303,33 +906,18 @@ def clear_run_data(run_dir):
     """Load the run table and log, keeping all paths at the recorded boundary."""
     table_path = run_dir / TABLE_NAME
     log_path = run_dir / LOG_NAME
-    table = clear_json(table_path, "the wave table")
-    if not isinstance(table, dict) or not isinstance(table.get("run"), dict):
-        raise ClearError(f"the wave table {table_path} carries no run section")
-    run = table["run"]
-    for key in ("repo_root", "integration_branch", "return_branch"):
-        if not run.get(key):
-            raise ClearError(f"the wave table {table_path} carries no run.{key}")
-    return table, run, clear_records(log_path), log_path
+    try:
+        plan = run_plan.load(table_path)
+    except run_plan.RunPlanError as error:
+        raise ClearError(str(error)) from error
+    if not plan.run.return_branch:
+        raise ClearError(f"the wave table {table_path} carries no run.return_branch")
+    return plan, plan.run, clear_records(log_path), log_path
 
 
-def clear_table_tickets(table):
-    """Yield ticket records from the recorded wave table in table order."""
-    for wave in table.get("waves") or []:
-        if not isinstance(wave, dict):
-            continue
-        for ticket in wave.get("tickets") or []:
-            if isinstance(ticket, dict):
-                yield ticket
-
-
-def clear_tickets(table, records):
+def clear_tickets(plan, records):
     """Return ticket ids in table order, followed by any recorded launch-only ids."""
-    identifiers = []
-    for ticket in clear_table_tickets(table):
-        identifier = ticket.get("id")
-        if identifier is not None and str(identifier) not in identifiers:
-            identifiers.append(str(identifier))
+    identifiers = [ticket.id for ticket in plan.tickets]
     for record in records:
         if record.get("event") != "launch" or record.get("ticket") is None:
             continue
@@ -1356,8 +944,7 @@ def clear_launches(records):
 
 def clear_codex_state_files(run, launches):
     """The state files named by recorded Codex ticket ids, never a directory glob."""
-    codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
-    state_dir = pathlib.Path(codex["state_dir"]) if codex.get("state_dir") else None
+    state_dir = pathlib.Path(run.codex.state_dir) if run.codex else None
     if state_dir is None:
         return []
     state_files = []
@@ -1425,25 +1012,24 @@ def clear_dashboard_window(path):
     return window or None
 
 
-def clear_inventory(run_dir, table, run, records, log_path):
+def clear_inventory(run_dir, plan, run, records, log_path):
     """Render every recorded ticket artefact and the exact uncommitted/unmerged work."""
-    repo = pathlib.Path(run["repo_root"])
+    repo = pathlib.Path(run.repo_root)
     launches = clear_launches(records)
     by_ticket = {}
     ticket_paths = {}
-    for ticket in clear_table_tickets(table):
-        if ticket.get("id") is not None:
-            ticket_paths[str(ticket["id"])] = ticket.get("path")
+    for ticket in plan.tickets:
+        ticket_paths[ticket.id] = ticket.path
     for launch in launches:
         by_ticket.setdefault(str(launch["ticket"]), []).append(launch)
     rows = []
     lines = [
         f"run: {run_dir}",
-        f"integration branch: {run['integration_branch']}",
-        f"return branch: {run['return_branch']}",
+        f"integration branch: {run.integration_branch}",
+        f"return branch: {run.return_branch}",
         f"machine log: {log_path}",
     ]
-    for ticket in clear_tickets(table, records):
+    for ticket in clear_tickets(plan, records):
         path = ticket_paths.get(ticket)
         lines.append(f"ticket {ticket}" + (f" ({path})" if path else "") + ":")
         ticket_launches = by_ticket.get(ticket, [])
@@ -1454,7 +1040,7 @@ def clear_inventory(run_dir, table, run, records, log_path):
             worktree = pathlib.Path(launch["worktree"])
             branch = str(launch["branch"])
             status = clear_status(worktree)
-            unmerged = clear_unmerged(repo, run["integration_branch"], branch)
+            unmerged = clear_unmerged(repo, run.integration_branch, branch)
             row = {
                 "ticket": ticket,
                 "executor": launch.get("executor"),
@@ -1550,8 +1136,7 @@ def clear_remove_worktree(repo, worktree):
 
 def clear_stop_codex_sessions(run, launches):
     """Stop the Codex session behind each recorded launch through the bridge that started it."""
-    codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
-    bridge = codex.get("bridge")
+    bridge = run.codex.bridge if run.codex else None
     for state_file in clear_codex_state_files(run, launches):
         if not state_file.exists():
             continue
@@ -1606,18 +1191,17 @@ def clear_worktrees_and_branches(repo, rows, trust_inventory=False):
 
 def clear_actions(run_dir, run, log_path, plan):
     """Apply the clearing steps using only the paths and ids in the inventory."""
-    repo = pathlib.Path(run["repo_root"])
-    integration_branch = str(run["integration_branch"])
+    repo = pathlib.Path(run.repo_root)
+    integration_branch = run.integration_branch
     if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
         clear_git(repo, "switch", "--", integration_branch)
 
-    codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
-    state_dir = pathlib.Path(codex["state_dir"]) if codex.get("state_dir") else None
+    state_dir = pathlib.Path(run.codex.state_dir) if run.codex else None
     clear_stop_codex_sessions(run, plan.launches)
     clear_kill_windows(plan)
     clear_worktrees_and_branches(repo, plan.rows)
 
-    return_branch = str(run["return_branch"])
+    return_branch = run.return_branch
     if git(repo, "show-ref", "--verify", f"refs/heads/{return_branch}").returncode == 0:
         clear_git(repo, "switch", "--", return_branch)
     else:
@@ -1646,8 +1230,8 @@ def clear_actions(run_dir, run, log_path, plan):
 def run_clear(args):
     """Inventory a run, ask in the terminal, and clear only after an affirmative answer."""
     run_dir = pathlib.Path(args.run_dir).resolve()
-    table, run, records, log_path = clear_run_data(run_dir)
-    lines, plan = clear_inventory(run_dir, table, run, records, log_path)
+    run_plan_value, run, records, log_path = clear_run_data(run_dir)
+    lines, plan = clear_inventory(run_dir, run_plan_value, run, records, log_path)
     print("\n".join(lines))
     try:
         answer = input("Clear this run? [y/N] ")
@@ -1679,7 +1263,7 @@ def epilogue_plan(plan, landed):
     )
 
 
-def epilogue(run_dir, run, table, records, log_path):
+def epilogue(run_dir, run, run_plan_value, records, log_path):
     """Clear a completed run's landed artefacts, without a question and without a token.
 
     The operator's `clear` asks first because it is aimed at a run in any state; this path runs
@@ -1687,13 +1271,13 @@ def epilogue(run_dir, run, table, records, log_path):
     integration branch the run exists to hand over, and the durable run directory are not the
     plan's to touch, so none of them is in it.
     """
-    _, plan = clear_inventory(run_dir, table, run, records, log_path)
+    _, plan = clear_inventory(run_dir, run_plan_value, run, records, log_path)
     projection = machine_log.project(records)
     landed = {ticket for ticket, facts in projection.tickets.items() if facts.merge_landed}
     plan = epilogue_plan(plan, landed)
     clear_stop_codex_sessions(run, plan.launches)
     clear_kill_windows(plan)
-    clear_worktrees_and_branches(pathlib.Path(run["repo_root"]), plan.rows)
+    clear_worktrees_and_branches(pathlib.Path(run.repo_root), plan.rows)
 
 
 def disarm(monitors):
@@ -1775,40 +1359,6 @@ def sweep_hook_logs(settings_path):
     return logs, []
 
 
-def run_section_of(run_dir):
-    """The run section the run at `run_dir` recorded, or None when nothing there can be read.
-
-    Every way a run cannot speak for itself reads the same: no table, a table this driver cannot
-    read, and a table carrying no run section. A run that cannot say whose process drove it or
-    which repository it worked in is a run this sweep judges on what it can see instead.
-    """
-    try:
-        table = json.loads((run_dir / TABLE_NAME).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-    run = table.get("run") if isinstance(table, dict) else None
-    return run if isinstance(run, dict) else None
-
-
-def run_coordinator_pid(run_dir):
-    """The pid the run at `run_dir` recorded for the coordinator driving it, or None.
-
-    None is every way a run cannot name a live coordinator: no table, a table this driver cannot
-    read, and a table whose run section carries no pid. The caller reads all of them the same way,
-    because a hook whose run cannot say whose it is names no process that could still be running.
-    """
-    run = run_section_of(run_dir) or {}
-    pid = run.get("coordinator_pid")
-    return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
-
-
-def run_repo_root(run_dir):
-    """The repository the run at `run_dir` recorded working in, resolved, or None where it says
-    nothing this driver can read as a path."""
-    repo_root = (run_section_of(run_dir) or {}).get("repo_root")
-    return pathlib.Path(repo_root).resolve() if isinstance(repo_root, str) and repo_root else None
-
-
 def uninstall_hook(log, settings):
     """Take every hook writing `log` out of that settings file, through the log's own operation."""
     run_command(
@@ -1826,12 +1376,12 @@ def sweep_landed(run_dir):
     Codex sessions are the epilogue's and not this sweep's: both belong to a session that died with
     the run, while a worktree is disk that outlives every session there ever was.
     """
-    table, run, records, log_path = clear_run_data(run_dir)
-    _, plan = clear_inventory(run_dir, table, run, records, log_path)
+    run_plan_value, run, records, log_path = clear_run_data(run_dir)
+    _, plan = clear_inventory(run_dir, run_plan_value, run, records, log_path)
     projection = machine_log.project(records)
     landed = {ticket for ticket, facts in projection.tickets.items() if facts.merge_landed}
     plan = epilogue_plan(plan, landed)
-    clear_worktrees_and_branches(pathlib.Path(run["repo_root"]), plan.rows, trust_inventory=True)
+    clear_worktrees_and_branches(pathlib.Path(run.repo_root), plan.rows, trust_inventory=True)
 
 
 def sweep_dead_runs(repo, keep_run_dir):
@@ -1844,21 +1394,21 @@ def sweep_dead_runs(repo, keep_run_dir):
     it. Every problem either step meets is returned as a warning rather than raised: the run about
     to start is not the place to fail over a run that ended weeks ago.
 
-    The landed artefacts go first, and the hook goes whether or not they went: a hook nobody reads
-    costs a python interpreter on every message sent in this repo, which is the burn this sweep
-    exists to end, and the warning names the run directory so what is left can be cleared by hand.
-    Only a dead run that recorded this repository has its artefacts cleared — the settings file is
-    this repo's to edit, while another repository's worktrees and branches are not this driver's to
+    For a valid dead plan the landed artefacts go first, and the hook goes whether or not they went:
+    a hook nobody reads costs a python interpreter on every message sent in this repo, which is the
+    burn this sweep exists to end. A rejected plan is touched nowhere, because without its trusted
+    coordinator and repository facts the sweep cannot prove the run is dead or belongs here. Only
+    a dead run that recorded this repository has its artefacts cleared — the settings file is this
+    repo's to edit, while another repository's worktrees and branches are not this driver's to
     delete, however dead the run that made them.
 
     The run this start is about is passed as `keep_run_dir` and is never swept. A driver adopting
     an interrupted run meets its own hook here, recorded under the coordinator that abandoned it —
     which is exactly the pid this judgment would call dead.
 
-    Both steps fail open on anything at all, and deliberately so: what they read is a settings file
-    and a machine log written by some earlier release of this project, and a shape neither the
-    clearing code nor this one anticipated has to come out as a warning about a run that is over
-    rather than as the exception that stopped the run being started now.
+    Every failure becomes a warning rather than stopping the new run. A plan defect is still a
+    strict rejection: the warning carries the Run plan error, and no fallback interpretation is
+    used to choose cleanup actions.
     """
     settings_path = repo / SETTINGS_PATH
     keep = pathlib.Path(keep_run_dir).resolve()
@@ -1868,13 +1418,21 @@ def sweep_dead_runs(repo, keep_run_dir):
         run_dir = pathlib.Path(log).parent
         if run_dir.resolve() == keep:
             continue
-        pid = run_coordinator_pid(run_dir)
-        if pid is not None and monitor.alive(pid):
-            continue
         if monitor.live_driver(run_dir):
             continue
-        repo_root = run_repo_root(run_dir)
-        if repo_root is not None and repo_root != repo_key:
+        try:
+            old_plan = run_plan.load(run_dir / TABLE_NAME)
+        except run_plan.RunPlanError as error:
+            warnings.append(
+                f"{run_dir}: its plan was rejected, so none of its artefacts or hook were"
+                f" cleared: {error}"
+            )
+            continue
+        pid = old_plan.run.coordinator_pid
+        if isinstance(pid, int) and not isinstance(pid, bool) and monitor.alive(pid):
+            continue
+        repo_root = pathlib.Path(old_plan.run.repo_root).resolve()
+        if repo_root != repo_key:
             warnings.append(
                 f"{run_dir}: its landed artefacts were left alone: it records the repository"
                 f" {repo_root}, which is not the one being started in"
@@ -1894,30 +1452,14 @@ def sweep_dead_runs(repo, keep_run_dir):
 # --- start ------------------------------------------------------------------------------------
 
 
-@contextlib.contextmanager
-def scratch():
-    """A working directory for preflight's own artifacts, removed whatever preflight decides.
-
-    Preflight is read-only about the run: the candidate table it hands the renderer, and what the
-    renderer renders from it, are this process's scratch and never the run directory's — a run
-    that does not start leaves no run directory behind.
-    """
-    directory = tempfile.mkdtemp(prefix="crew-preflight-")
-    try:
-        yield pathlib.Path(directory)
-    finally:
-        shutil.rmtree(directory, ignore_errors=True)
-
-
-def preflight(repo, tickets, base_branch, upstream, run):
+def preflight(repo, feature_dir, base_branch, upstream, run):
     """The four read-only checks and the run's two configured values, every problem of every one."""
     problems = dirty_tree_problems(repo)
     problems += base_branch_problems(repo, base_branch, upstream)
-    with scratch() as directory:
-        problems += routing_problems(tickets, run, directory)
-    problems += graph_problems(tickets)
-    problems += config_problems(repo, run)
-    problems += account_problems(tickets, run)
+    try:
+        run_plan.build(feature_dir, run)
+    except run_plan.RunPlanError as error:
+        problems += list(error.problems)
     return problems
 
 
@@ -1952,14 +1494,13 @@ def run_start(args):
         return adopt(args, repo, run_dir, table_path)
 
     base_branch = args.base_branch or default_base_branch(repo)
-    tickets = read_tickets(feature_dir)
     # The table preflight validates: everything the run section carries but the commit the run has
     # not cut yet, which no routing rule reads.
     head = git_output(repo, "rev-parse", "HEAD")
     config = project_config(repo)
     candidate = run_section(args, repo, feature_dir, run_dir, base_branch, head, head, config)
     upstream = upstream_state(repo, base_branch) if base_branch else (UPSTREAM_ABSENT, "")
-    problems = preflight(repo, tickets, base_branch, upstream, candidate)
+    problems = preflight(repo, feature_dir, base_branch, upstream, candidate)
 
     if problems:
         try:
@@ -1987,12 +1528,11 @@ def run_start(args):
     run = run_section(
         args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit, config
     )
-    table_path.write_text(
-        json.dumps(
-            {"run": run, "waves": assign_waves(normalise_accounts(tickets, run))}, indent=2
-        ) + "\n",
-        encoding="utf-8",
-    )
+    try:
+        plan = run_plan.build(feature_dir, run)
+        plan.write(table_path)
+    except run_plan.RunPlanError as error:
+        raise DriverError(str(error), pointer=str(feature_dir)) from error
 
     install_hook(log, repo / SETTINGS_PATH, "coordinator")
     dispatch_wave(table_path, log, launch_dir, run_dir)
@@ -2027,10 +1567,13 @@ def adopt(args, repo, run_dir, table_path):
     records = machine_log.read_records(log)
     projection = machine_log.project(records)
     if projection.ended:
-        table = json.loads(table_path.read_text(encoding="utf-8"))
+        try:
+            plan = run_plan.load(table_path)
+        except run_plan.RunPlanError as error:
+            raise DriverError(str(error), pointer=str(table_path)) from error
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
-        report = report_path(run_dir, table.get("run") or {})
+        report = report_path(run_dir, plan.run)
         snapshot(RUN_COMPLETE, pointer=str(report), report=str(report))
         return 0
     print(f"crew adopted wave {projection.current_wave}, run directory {run_dir}", flush=True)
@@ -2106,12 +1649,9 @@ def report_ticket_sort_key(ticket):
     return (0, int(value)) if value.isdigit() else (1, value)
 
 
-def report_tickets(table):
+def report_tickets(plan):
     """Every ticket in the approved table, keyed by the id the log records."""
-    return {
-        str(ticket["id"]): ticket
-        for ticket in dispatch.walk_tickets(table)
-    }
+    return {ticket.id: ticket for ticket in plan.tickets}
 
 
 def report_settlements(records, ticket):
@@ -2203,7 +1743,7 @@ def render_report(run, tickets, records, cost_output):
     lines.append("| --- | --- | --- |")
     for ticket in ticket_ids:
         lines.append(
-            f"| {ticket} | {tickets[ticket].get('title', ticket)} | {outcomes[ticket]} |"
+            f"| {ticket} | {tickets[ticket].title} | {outcomes[ticket]} |"
         )
 
     lines += ["", "## Parked checklists", ""]
@@ -2256,8 +1796,8 @@ def render_report(run, tickets, records, cost_output):
     else:
         lines.append("- none recorded")
 
-    integration = str(run.get("integration_branch") or "")
-    base = str(run.get("base_branch") or "")
+    integration = run.integration_branch
+    base = run.base_branch or ""
     lines += [
         "", "## Integration branch", "",
         f"- Integration branch: `{integration}`",
@@ -2295,12 +1835,12 @@ def render_report(run, tickets, records, cost_output):
 
 def report_path(run_dir, run):
     """The report's feature-level path, outside the durable run directory."""
-    return pathlib.Path(run.get("feature_dir") or run_dir.parent) / REPORT_NAME
+    return pathlib.Path(run.feature_dir or run_dir.parent) / REPORT_NAME
 
 
 def run_cost_pass(log, run):
     """Run the existing cost CLI and retain its exact rollup for the report."""
-    session = run.get("coordinator_session")
+    session = run.coordinator_session
     if session is None:
         session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     return run_command(
@@ -2324,7 +1864,7 @@ def remove_run_pin(run_dir):
 
 def uninstall_run_hooks(run_dir, run, records):
     """Remove this run's log hook from the coordinator and every launched child worktree."""
-    settings = [pathlib.Path(run["repo_root"]) / SETTINGS_PATH]
+    settings = [pathlib.Path(run.repo_root) / SETTINGS_PATH]
     for record in records:
         worktree = record.get("worktree") if record.get("event") == "launch" else None
         if worktree:
@@ -2343,11 +1883,11 @@ def uninstall_run_hooks(run_dir, run, records):
         )
 
 
-def write_report(run_dir, run, table, records, cost_output):
+def write_report(run_dir, run, plan, records, cost_output):
     """Write the complete report after the cost pass has appended its child rows."""
     path = report_path(run_dir, run)
     path.write_text(
-        render_report(run, report_tickets(table), records, cost_output),
+        render_report(run, report_tickets(plan), records, cost_output),
         encoding="utf-8",
     )
     return path
@@ -2365,8 +1905,11 @@ class Loop:
         self.run_dir = run_dir
         self.log = run_dir / LOG_NAME
         self.table_path = table_path
-        self.table = json.loads(pathlib.Path(table_path).read_text(encoding="utf-8"))
-        self.run = self.table["run"]
+        try:
+            self.plan = run_plan.load(table_path)
+        except run_plan.RunPlanError as error:
+            raise DriverError(str(error), pointer=str(table_path)) from error
+        self.run = self.plan.run
         self.monitors = []
 
     # --- what it reads --------------------------------------------------------------------
@@ -2375,18 +1918,18 @@ class Loop:
         return machine_log.read_records(self.log)
 
     def tickets_of(self, wave):
-        for entry in self.table.get("waves") or []:
-            if isinstance(entry, dict) and entry.get("wave") == wave:
-                return [dict(ticket) for ticket in entry.get("tickets") or []]
-        raise DriverError(f"the wave table holds no wave {wave}", pointer=str(self.table_path))
+        try:
+            return self.plan.wave(wave).tickets
+        except run_plan.RunPlanError as error:
+            raise DriverError(str(error), pointer=str(self.table_path)) from error
 
     def live(self, wave, projection):
         """The tickets of that wave the run is still waiting on."""
         return [
-            str(ticket["id"]) for ticket in self.tickets_of(wave)
+            ticket.id for ticket in self.tickets_of(wave)
             if (
-                projection.ticket(ticket["id"]).latest_settling_event is None
-                or projection.ticket(ticket["id"]).awaiting_receipt
+                projection.ticket(ticket.id).latest_settling_event is None
+                or projection.ticket(ticket.id).awaiting_receipt
             )
         ]
 
@@ -2428,9 +1971,14 @@ class Loop:
                     f"{ticket} needs text to receive an answer through the Codex bridge",
                     ticket=ticket, pointer=str(self.log),
                 )
+            if self.run.codex is None:
+                raise DriverError(
+                    f"{ticket} is a Codex child but the Run plan carries no Codex bridge",
+                    ticket=ticket, pointer=str(self.table_path),
+                )
             run_command(
                 [
-                    sys.executable, self.run["codex"]["bridge"], "send",
+                    sys.executable, self.run.codex.bridge, "send",
                     "--state-file", self.run_dir / CODEX_DIR_NAME / f"{ticket}.json",
                     "--machine-log", self.log, "--ticket", ticket, "--prompt", text,
                 ],
@@ -2622,9 +2170,9 @@ class Loop:
         """
         worktree = launch.get("worktree")
         forked = git_output(
-            worktree, "merge-base", "HEAD", self.run["integration_branch"]
+            worktree, "merge-base", "HEAD", self.run.integration_branch
         ) if worktree else None
-        return forked or self.run["integration_base_commit"]
+        return forked or self.run.integration_base_commit
 
     def rule_on_statuses(self, statuses, projection):
         """Settle every non-busy child a wake monitor reported; returns whether anything changed."""
@@ -2697,7 +2245,7 @@ class Loop:
                 sys.executable, str(ADVANCE), "advance",
                 "--table", str(self.table_path), "--wave", str(wave),
                 "--log", str(self.log), "--out-dir", str(self.run_dir / LAUNCH_DIR_NAME),
-                "--repair-model", str(self.run["repair_model"]),
+                "--repair-model", str(self.run.repair_model),
             ],
             capture_output=True, text=True,
         )
@@ -2738,10 +2286,10 @@ class Loop:
         records = self.records()
         projection = machine_log.project(records)
         halted = [
-            str(ticket["id"]) for ticket in self.tickets_of(wave)
+            ticket.id for ticket in self.tickets_of(wave)
             if (
-                projection.ticket(ticket["id"]).semantic_conflict_detail is not None
-                and projection.ticket(ticket["id"]).launch is not None
+                projection.ticket(ticket.id).semantic_conflict_detail is not None
+                and projection.ticket(ticket.id).launch is not None
             )
         ]
         for ticket in halted:
@@ -2756,7 +2304,7 @@ class Loop:
                 )
             self.deliver(ticket, launch, MERGE_TEMPLATE.format(
                 marker=MERGE_MARKER, ticket=ticket, branch=self.branch_of(ticket, launch),
-                integration=self.run["integration_branch"],
+                integration=self.run.integration_branch,
                 reason=facts.semantic_conflict_detail,
             ))
         if halted:
@@ -2780,7 +2328,7 @@ class Loop:
         line reads as still going — a dashboard redrawing it forever, saying a ruling is owed that
         nobody is waiting for.
         """
-        tickets = wave_advance.every_ticket(self.table)
+        tickets = tuple(ticket.id for ticket in self.plan.tickets)
         launches = {
             number for number in tickets if projection.ticket(number).launch is not None
         }
@@ -2788,7 +2336,7 @@ class Loop:
         stopping_roots = {
             number for number, state in states.items() if state in (FAILED, PARKED)
         }
-        stopped_descendants = set(wave_advance.descendants(tickets, stopping_roots))
+        stopped_descendants = set(self.plan.descendants(stopping_roots))
         for number in tickets:
             if number in launches or states[number] != machine_log.LIVE:
                 continue
@@ -2818,8 +2366,8 @@ class Loop:
         that is nobody's but the coordinator's.
         """
         return [
-            str(ticket["id"]) for ticket in self.tickets_of(wave)
-            if projection.ticket(ticket["id"]).settlement_state
+            ticket.id for ticket in self.tickets_of(wave)
+            if projection.ticket(ticket.id).settlement_state
             not in (COMPLETED, FAILED, PARKED)
         ]
 
@@ -2834,10 +2382,10 @@ class Loop:
         """The branch that ticket's child stands on, as its launch or the renderer's naming says."""
         if launch.get("branch"):
             return launch["branch"]
-        for entry in dispatch.walk_tickets(self.table):
-            if str(entry.get("id")) == ticket:
-                return dispatch.branch_name(entry)
-        return ticket
+        try:
+            return dispatch.branch_name(self.plan.ticket(ticket))
+        except run_plan.RunPlanError:
+            return ticket
 
     def open_wave(self, projection):
         """Give the wave advance just launched everything a launched wave has; returns nothing.
@@ -2863,7 +2411,7 @@ class Loop:
             str(record.get("ticket")) for record in records
             if record.get("event") == "outcome" and record.get("outcome") == COMPLETED
         }
-        tickets = {str(ticket["id"]): ticket for ticket in dispatch.walk_tickets(self.table)}
+        tickets = {ticket.id: ticket for ticket in self.plan.tickets}
         for number, facts in sorted(projection.tickets.items()):
             if not facts.merge_landed:
                 continue
@@ -2874,7 +2422,7 @@ class Loop:
                 [
                     sys.executable, MACHINE_LOG, "--log", self.log, "outcome",
                     "--ticket", number, "--outcome", COMPLETED,
-                    "--detail", f"closed in the {self.run['tracker']} tracker; undo: {undo}",
+                    "--detail", f"closed in the {self.run.tracker} tracker; undo: {undo}",
                 ],
                 f"the close of {number} could not be recorded",
                 ticket=number, pointer=str(self.log),
@@ -2923,12 +2471,11 @@ class Loop:
         coordinator here as it does everywhere else.
         """
         name, pid = self.args.coordinator_name, self.args.coordinator_pid
-        if (self.run.get("coordinator_name"), self.run.get("coordinator_pid")) == (name, pid):
+        if (self.run.coordinator_name, self.run.coordinator_pid) == (name, pid):
             return
-        self.run["coordinator_name"], self.run["coordinator_pid"] = name, pid
-        pathlib.Path(self.table_path).write_text(
-            json.dumps(self.table, indent=2) + "\n", encoding="utf-8"
-        )
+        self.run = replace(self.run, coordinator_name=name, coordinator_pid=pid)
+        self.plan = replace(self.plan, run=self.run)
+        self.plan.write(self.table_path)
         for ticket, facts in sorted(projection.tickets.items()):
             launch = facts.launch
             if launch is None:
@@ -2961,8 +2508,9 @@ class Loop:
             and watch_lane(projection.ticket(ticket).launch, bindings.get(ticket)) not in armed
         ]
         if children:
+            bridge = self.run.codex.bridge if self.run.codex else ""
             self.monitors += arm_monitors(
-                self.run_dir, self.log, children, self.run["codex"]["bridge"], bindings
+                self.run_dir, self.log, children, bridge, bindings
             )
 
     def bindings(self):
@@ -2973,8 +2521,8 @@ class Loop:
         a child — an attribution, not the execution semantics a monitor has to reproduce.
         """
         return {
-            str(ticket["id"]): accounts.row_binding(ticket)
-            for ticket in dispatch.walk_tickets(self.table)
+            ticket.id: ticket.binding
+            for ticket in self.plan.tickets
         }
 
     def harvest(self):
@@ -3051,7 +2599,7 @@ class Loop:
         try:
             cost_output = run_cost_pass(self.log, self.run)
             records = self.records()
-            report = write_report(self.run_dir, self.run, self.table, records, cost_output)
+            report = write_report(self.run_dir, self.run, self.plan, records, cost_output)
         finally:
             try:
                 remove_run_pin(self.run_dir)
@@ -3062,7 +2610,7 @@ class Loop:
         # coordinator reads, so a half-cleared site says so there rather than nowhere.
         cleanup = None
         try:
-            epilogue(self.run_dir, self.run, self.table, records, self.log)
+            epilogue(self.run_dir, self.run, self.plan, records, self.log)
         except ClearError as error:
             cleanup = str(error)
         snapshot(RUN_COMPLETE, pointer=str(report), report=str(report), cleanup=cleanup)
@@ -3119,7 +2667,7 @@ def close_ticket(run, ticket, number):
     Only the two trackers `references/trackers.md` declares exercised are reachable here — anything
     else stopped the run in preflight rather than arriving at a CLI nobody named.
     """
-    if run.get("tracker") == TRACKER_GITHUB:
+    if run.tracker == TRACKER_GITHUB:
         return close_github_issue(run, number)
     return close_local_ticket(run, ticket, number)
 
@@ -3132,7 +2680,7 @@ def close_local_ticket(run, ticket, number):
     that carries uncommitted changes, and a close left loose would stop the run's next wave on
     bookkeeping the run itself wrote.
     """
-    path = pathlib.Path(ticket["path"])
+    path = pathlib.Path(ticket.path)
     try:
         lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     except OSError as error:
@@ -3152,7 +2700,7 @@ def close_local_ticket(run, ticket, number):
         with path.open("a", encoding="utf-8") as handle:
             handle.write(f"\nStatus: {STATUS_FINISHED}\n")
         undo = f"take the `Status: {STATUS_FINISHED}` line off the end of {path}"
-    commit_close(run["repo_root"], path, number)
+    commit_close(run.repo_root, path, number)
     return undo
 
 
@@ -3175,7 +2723,7 @@ def close_github_issue(run, number):
     `OWNER/REPO` slug there, not a path, and the checkout it is run in is what it resolves the
     slug from — which is also the one repository this run is allowed to touch.
     """
-    repo = run["repo_root"]
+    repo = run.repo_root
     listed = gh(repo, "issue", "view", number, "--json", "labels")
     labels = []
     if listed.returncode == 0:

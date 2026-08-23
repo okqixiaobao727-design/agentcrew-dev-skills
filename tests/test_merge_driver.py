@@ -131,7 +131,7 @@ class Fixture:
             "id": number,
             "title": slug.replace("-", " "),
             "path": str(path),
-            "workflow": "tdd",
+            "workflow": "direct",
             "executor": "claude",
             "model": "claude-opus-4-5-20251101",
             "effort": "medium",
@@ -162,8 +162,17 @@ class Fixture:
         table = {
             "run": {
                 "repo_root": str(self.repo),
+                "spec_path": str(self.repo / FEATURE / "spec.md"),
                 "integration_branch": INTEGRATION_BRANCH,
                 "integration_base_commit": self.base_commit,
+                "coordinator_name": "crew-coordinator",
+                "coordinator_pid": 1504,
+                "crew_skill_dir": str(ASSETS.parent),
+                "tmux_session": "$7:",
+                "permission_mode": "acceptEdits",
+                "coordinator_config_home": str(self.coordinator_account),
+                "repair_model": REPAIR_MODEL,
+                "tracker": "github",
             },
             "waves": waves or [
                 {"wave": 1, "tickets": tickets if tickets is not None else self.tickets}
@@ -662,21 +671,18 @@ class RepairAccountTests(MergeDriverTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.fixture.repairs()[0]["env"][self.CONFIG_HOME])
 
-    def test_a_row_carrying_no_account_escalates_rather_than_repairing_on_the_coordinators(self):
-        """No fallback: a repair that quietly bills the wrong account is what this key removes."""
+    def test_a_row_carrying_no_account_is_rejected_before_merge_or_repair(self):
+        """Every production reader applies the Run plan's strict account contract."""
         branch = self.conflict()
         self.fixture.tickets[-1].pop("account")
 
         result = self.fixture.land()
 
-        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Account", result.stderr)
         self.assertEqual(self.fixture.repairs(), [], "no session is launched on a guessed account")
         self.assertFalse(self.fixture.merged(branch))
-        escalations = [
-            entry for entry in self.fixture.events("merge") if entry["result"] == "escalated"
-        ]
-        self.assertEqual(len(escalations), 1, escalations)
-        self.assertIn("account", escalations[0]["detail"])
+        self.assertEqual(self.fixture.events("merge"), [])
         self.assertOnIntegrationBranch()
 
 
@@ -758,6 +764,7 @@ class WaveTests(MergeDriverTestCase):
     def test_only_the_named_waves_tickets_are_landed(self):
         first = self.fixture.ticket("07", "alpha", {"alpha.txt": "alpha\n"})
         second = self.fixture.ticket("08", "beta", {"beta.txt": "beta\n"})
+        self.fixture.tickets[1]["blocked_by"] = ["07"]
 
         result = self.fixture.land(wave=1, waves=[
             {"wave": 1, "tickets": [self.fixture.tickets[0]]},

@@ -255,21 +255,34 @@ class Fixture:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def parsed(directory):
-    """What the driver's own parsing makes of that directory: its tickets and its wave table."""
+def parsed(directory, environment):
+    """What the Run plan builder makes of that staged directory."""
     program = (
         "import json,pathlib,sys;"
+        f"sys.path.insert(0, {str(STAGE.parent)!r});"
         f"sys.path.insert(0, {str(DRIVER.parent)!r});"
+        f"sys.path.insert(0, {str(DRIVER.parent.parent)!r});"
         "import driver;"
-        f"tickets = driver.read_tickets(pathlib.Path({str(directory)!r}));"
+        "import run_plan;"
+        f"directory = pathlib.Path({str(directory)!r});"
+        "repo = pathlib.Path(driver.git_output(directory, 'rev-parse', '--show-toplevel'));"
+        "config = driver.project_config(repo);"
+        "plan = run_plan.build("
+        "directory, __import__('stage').candidate_run(repo, directory, config));"
+        "tickets = [{"
+        "'id': t.id, 'title': t.title, 'blocked_by': list(t.blocked_by),"
+        "'effort': t.effort, 'account': t.binding.directory,"
+        "'account_mode': t.binding.mode"
+        "} for t in plan.tickets];"
         "print(json.dumps({"
         "'tickets': tickets,"
-        "'problems': driver.graph_problems(tickets),"
-        "'waves': [[t['id'] for t in w['tickets']] for w in driver.assign_waves(tickets)]"
+        "'problems': [],"
+        "'waves': [[t.id for t in w.tickets] for w in plan.waves]"
         "}))"
     )
     result = subprocess.run(
-        [sys.executable, "-c", program], capture_output=True, text=True, check=True
+        [sys.executable, "-c", program], capture_output=True, text=True, check=True,
+        env=environment,
     )
     return json.loads(result.stdout)
 
@@ -338,7 +351,7 @@ class StagingTests(unittest.TestCase):
 
     def test_the_staged_directory_is_what_the_drivers_own_parsing_accepts(self):
         self.stage_two()
-        read = parsed(self.fixture.run_dir())
+        read = parsed(self.fixture.run_dir(), self.fixture.environment())
         self.assertEqual([ticket["id"] for ticket in read["tickets"]], ["61", "62"])
         self.assertEqual([ticket["title"] for ticket in read["tickets"]],
                          [TITLES["61"], TITLES["62"]])
@@ -377,6 +390,38 @@ class StagingTests(unittest.TestCase):
         self.assertIn("62", result.stderr)
         self.assertIn("Workflow", result.stderr)
 
+    def test_a_malformed_review_is_a_named_blocking_item_and_withholds_the_command(self):
+        malformed = ROUTING.replace(
+            f"Review: codex {CODEX_MODEL} max",
+            "Review: missing-effort",
+        )
+        ticket = self.fixture.issue(61, body=ticket_body(routing=malformed))
+
+        result = self.fixture.stage(ticket)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("/crew ", result.stdout)
+        self.assertIn("Review", result.stderr)
+        self.assertIn("vendor", result.stderr)
+        self.assertIn("model", result.stderr)
+        self.assertIn("effort", result.stderr)
+
+    def test_an_empty_review_is_a_named_blocking_item_and_withholds_the_command(self):
+        empty = ROUTING.replace(
+            f"Review: codex {CODEX_MODEL} max",
+            "Review:",
+        )
+        ticket = self.fixture.issue(61, body=ticket_body(routing=empty))
+
+        result = self.fixture.stage(ticket)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("/crew ", result.stdout)
+        self.assertIn("Review", result.stderr)
+        self.assertIn("vendor", result.stderr)
+        self.assertIn("model", result.stderr)
+        self.assertIn("effort", result.stderr)
+
     def test_a_missing_config_is_a_named_blocking_item_and_withholds_the_command(self):
         self.two_tickets()
         (self.fixture.repo / "agentcrew.toml").unlink()
@@ -403,7 +448,7 @@ class StagingTests(unittest.TestCase):
         self.fixture.issue(70, state="CLOSED")
         result = self.fixture.stage(self.fixture.issue(61, blocked_by=("70",)))
         self.assertEqual(result.returncode, 0, result.stderr)
-        read = parsed(self.fixture.run_dir())
+        read = parsed(self.fixture.run_dir(), self.fixture.environment())
         self.assertEqual(read["tickets"][0]["blocked_by"], [])
         self.assertEqual(read["problems"], [])
 
@@ -461,8 +506,10 @@ class StagingTests(unittest.TestCase):
         result = self.stage_approved(first, "--routing", routing)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(APPROVED_SECTION, self.fixture.tracker_body("61"))
-        self.assertEqual(parsed(self.fixture.run_dir())["tickets"][0]["effort"],
-                         APPROVED["effort"])
+        self.assertEqual(
+            parsed(self.fixture.run_dir(), self.fixture.environment())["tickets"][0]["effort"],
+            APPROVED["effort"],
+        )
 
     def test_an_approved_account_reaches_the_ticket_and_the_drivers_own_parsing(self):
         self.fixture.register(second=self.fixture.profile("second"))
@@ -472,15 +519,19 @@ class StagingTests(unittest.TestCase):
         for number in ("61", "62"):
             self.assertIn(f"Account: {ACCOUNT}", self.fixture.tracker_body(number))
         self.assertEqual(
-            [ticket["account"] for ticket in parsed(self.fixture.run_dir())["tickets"]],
-            [ACCOUNT, ACCOUNT],
+            [ticket["account"] for ticket in parsed(
+                self.fixture.run_dir(), self.fixture.environment()
+            )["tickets"]],
+            [str(self.fixture.profile("second")), str(self.fixture.profile("second"))],
         )
 
-    def test_an_approved_entry_naming_no_account_writes_the_section_it_always_wrote(self):
+    def test_an_approved_entry_naming_no_account_builds_an_inherited_binding(self):
         result = self.stage_two_approved()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Account:", self.fixture.tracker_body("61"))
-        self.assertNotIn("account", parsed(self.fixture.run_dir())["tickets"][0])
+        ticket = parsed(self.fixture.run_dir(), self.fixture.environment())["tickets"][0]
+        self.assertEqual(ticket["account_mode"], "inherited")
+        self.assertTrue(pathlib.Path(ticket["account"]).is_absolute())
 
     def test_an_account_this_machine_has_not_registered_is_a_named_blocking_item(self):
         approved = dict(APPROVED, account=ACCOUNT)
@@ -498,7 +549,7 @@ class StagingTests(unittest.TestCase):
     def test_the_staged_ticket_carries_the_approved_routing_the_tracker_was_given(self):
         result = self.stage_two_approved()
         self.assertEqual(result.returncode, 0, result.stderr)
-        read = parsed(self.fixture.run_dir())
+        read = parsed(self.fixture.run_dir(), self.fixture.environment())
         self.assertEqual([ticket["effort"] for ticket in read["tickets"]],
                          [APPROVED["effort"], APPROVED["effort"]])
 

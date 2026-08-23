@@ -8,11 +8,12 @@ and then asks the driver's own code whether that directory would start. Only a f
 prints `/crew crewtask/<n>`. Anything else names each blocking item beside its fix and withholds
 the command, because a printed command that fails is the defect this script exists to remove.
 
-**The self-check is the driver's, not a copy of it.** Ticket parsing, `## Routing` validation, the
-dependency graph and the wave-table build are `driver.py`'s own functions, called here on the
-directory just written; the environment gates are the driver's `config_problems` and
-`dirty_tree_problems`, plus its default base-branch check. Two skills that both decide what a valid
-run directory is would drift; one that asks the other cannot. The driver's base-branch check is
+**The self-check uses the Run plan, not a copy of it.** Ticket parsing, `## Routing` validation,
+concrete account binding, the dependency graph and the wave-table build are the Run plan builder's
+own work, called here on the directory just written; the environment gates are the Driver's
+`config_problems` and `dirty_tree_problems`, plus its default base-branch check. Two modules that
+both decide what a valid run directory is would drift; staging therefore asks the same builder a
+real run asks. The Driver's base-branch check is
 included for the default case: a bare command must not be printed when the repository cannot
 resolve the default branch that a later run would use. A later run may still name an explicit
 `--base-branch` override at start time.
@@ -54,18 +55,22 @@ to commit before the command is typed.
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
 
-# The driver owns the parsing and the validation this script self-checks with, so it is imported
-# rather than restated. Reached from this file's own location, never from an install path.
+# Driver supplies environment-derived metadata; Run plan owns the planning this script checks.
+# Both are reached from this file's own location, never from an install path.
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[4]
+CREW_ASSETS = PLUGIN_ROOT / "skills" / "crew" / "assets"
 DRIVER_DIR = PLUGIN_ROOT / "skills" / "crew" / "assets" / "driver"
+sys.path.insert(0, str(CREW_ASSETS))
 sys.path.insert(0, str(DRIVER_DIR))
 
 import driver  # noqa: E402  (the path above is what makes this importable)
+import run_plan  # noqa: E402
 
 RUN_ROOT = "crewtask"
 SPEC_NAME = "spec.md"
@@ -157,7 +162,7 @@ def local_read(repo, reference):
             f"ticket {reference}: resolves to {path}, outside {repo} — under the local tracker a"
             " ticket is a file in the repository, so pass a path inside it"
         ])
-    match = driver.TICKET_FILE.match(path.name)
+    match = run_plan.TICKET_FILE.match(path.name)
     if not match or not path.is_file():
         raise Blocked([
             f"ticket {reference}: is not a ticket file — under the local tracker a ticket"
@@ -205,7 +210,7 @@ def read_ticket(kind, repo, reference):
     text = path.read_text(encoding="utf-8")
     return {
         "id": number,
-        "title": driver.title_of(text, number),
+        "title": run_plan.ticket_title(text, number),
         "body": text,
         "text": text,
         "path": path,
@@ -265,7 +270,7 @@ def outside_closed(kind, repo, number, sources):
         return (issue.get("state") or "").upper() == GH_STATE_CLOSED
     for directory in sources:
         for path in sorted(directory.glob("*.md")):
-            match = driver.TICKET_FILE.match(path.name)
+            match = run_plan.TICKET_FILE.match(path.name)
             if match and match.group(1) == number:
                 return local_status(path.read_text(encoding="utf-8")) == driver.STATUS_FINISHED
     raise Blocked([
@@ -276,11 +281,6 @@ def outside_closed(kind, repo, number, sources):
 
 
 # --- the dependency closure ----------------------------------------------------------------------
-
-
-def blockers_of(text):
-    """The tickets that text declares itself blocked by, read by the driver's own parser."""
-    return driver.blockers_of(driver.sections(text).get(driver.BLOCKED_BY_SECTION, ""))
 
 
 def resolve_closure(kind, repo, tickets, sources):
@@ -295,7 +295,7 @@ def resolve_closure(kind, repo, tickets, sources):
     stripped = set()
     problems = []
     for ticket in tickets:
-        for number in blockers_of(ticket["text"]):
+        for number in run_plan.ticket_dependencies(ticket["text"]):
             if number in inside or number in stripped:
                 continue
             if outside_closed(kind, repo, number, sources):
@@ -323,9 +323,9 @@ def strip_edges(text, stripped):
     inside = False
     written = []
     for line in text.splitlines(keepends=True):
-        heading = driver.SECTION.match(line.rstrip("\n"))
+        heading = run_plan.SECTION.match(line.rstrip("\n"))
         if heading:
-            inside = heading.group(1).lower() == driver.BLOCKED_BY_SECTION
+            inside = heading.group(1).lower() == run_plan.BLOCKED_BY_SECTION
         elif inside:
             line = TICKET_NUMBER.sub(
                 lambda match: (
@@ -499,14 +499,14 @@ def with_routing(body, section):
     index = 0
     replaced = False
     while index < len(lines):
-        heading = driver.SECTION.match(lines[index].rstrip("\n"))
-        if heading and heading.group(1).lower() == driver.ROUTING_SECTION:
+        heading = run_plan.SECTION.match(lines[index].rstrip("\n"))
+        if heading and heading.group(1).lower() == run_plan.ROUTING_SECTION:
             written.append(section.rstrip("\n") + "\n\n")
             replaced = True
             index += 1
             while index < len(lines):
                 line = lines[index].rstrip("\n")
-                if driver.SECTION.match(line) or driver.STATUS_LINE.match(line):
+                if run_plan.SECTION.match(line) or driver.STATUS_LINE.match(line):
                     break
                 index += 1
             continue
@@ -636,7 +636,7 @@ def candidate_run(repo, directory, config):
         spec=None,
         codex_bridge=None,
         coordinator_name=LATER,
-        coordinator_pid=LATER,
+        coordinator_pid=os.getpid(),
         tmux_session=LATER,
         permission_mode=LATER,
     )
@@ -648,26 +648,17 @@ def candidate_run(repo, directory, config):
 
 
 def self_check(repo, directory, config):
-    """Every blocking item the driver's own checks find in that directory, in the driver's words."""
-    tickets = driver.read_tickets(directory)
+    """Every blocking item the real run checks find in that directory, in their own words."""
     run = candidate_run(repo, directory, config)
     problems = driver.dirty_tree_problems(repo)
     base_branch = driver.default_base_branch(repo)
     if base_branch is None:
         # Fetch and fast-forward checks belong to run start; staging only checks default naming.
         problems += driver.base_branch_problems(repo, base_branch, (driver.UPSTREAM_ABSENT, ""))
-    with driver.scratch() as scratch:
-        problems += driver.routing_problems(tickets, run, scratch)
-    problems += driver.graph_problems(tickets)
-    problems += driver.config_problems(repo, run)
-    problems += driver.account_problems(tickets, run)
-    if not problems:
-        # The wave table is the last thing the driver builds before it dispatches, so a directory
-        # that cannot be ordered into waves is not one a run starts from, whatever else passed.
-        try:
-            driver.assign_waves(tickets)
-        except driver.DriverError as error:
-            problems.append(f"wave table: {error}")
+    try:
+        run_plan.build(directory, run)
+    except run_plan.RunPlanError as error:
+        problems += list(error.problems)
     return problems
 
 
@@ -693,8 +684,12 @@ def tracker_kind(repo, config):
         "repair_model": driver.config_value(config, driver.REPAIR_MODEL_KEYS),
         "tracker": driver.config_value(config, driver.TRACKER_KIND_KEYS),
     }
-    problems = driver.config_problems(repo, run)
-    if run["tracker"] not in driver.TRACKERS:
+    problems = run_plan.configuration_problems(
+        repo,
+        run["repair_model"],
+        run["tracker"],
+    )
+    if run["tracker"] not in run_plan.TRACKERS:
         # Without a tracker there is no reading of tickets at all, so this one stops staging here
         # rather than at the self-check, and carries whatever else the config was missing with it.
         raise Blocked(problems)

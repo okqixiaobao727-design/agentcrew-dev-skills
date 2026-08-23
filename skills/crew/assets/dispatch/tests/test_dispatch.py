@@ -123,6 +123,8 @@ class Fixture:
             "tmux_session": TMUX_SESSION,
             "permission_mode": PERMISSION_MODE,
             "coordinator_config_home": str(self.config_dir),
+            "repair_model": CLAUDE_MODEL,
+            "tracker": "github",
             "codex": {
                 "bridge": str(self.codex_bridge),
                 "state_dir": str(self.feature_dir / ".crew-codex"),

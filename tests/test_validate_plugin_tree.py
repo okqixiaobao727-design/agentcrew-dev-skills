@@ -713,10 +713,10 @@ class ProjectConfigTests(unittest.TestCase):
 
 
 class AliasVerdictParityTests(unittest.TestCase):
-    """The config-time check and the launch-time check must call the same names aliases.
+    """The config-time check and the Run plan check must call the same names aliases.
 
     They are two implementations of one rule over one list. Whenever they disagree the weaker one
-    decides, and dispatch is the last gate before a wave spends real money on the wrong model.
+    decides, and the Run plan is the gate before a wave spends real money on the wrong model.
     """
 
     @staticmethod
@@ -730,6 +730,7 @@ class AliasVerdictParityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.validator = cls.load(SCRIPT, "validate_plugin_tree")
         cls.dispatch = cls.load(PLUGIN_ROOT / DISPATCH, "dispatch")
+        cls.run_plan = cls.dispatch.run_plan
         cls.aliases = cls.validator.model_aliases(PLUGIN_ROOT, [])
         if not cls.aliases:
             raise AssertionError("the shipped alias list is empty, so parity would be vacuous")
@@ -745,7 +746,7 @@ class AliasVerdictParityTests(unittest.TestCase):
             with self.subTest(name=form):
                 self.assertEqual(
                     self.validator.is_alias(form, self.aliases),
-                    self.dispatch.alias_problem("Model", form, self.aliases) is not None,
+                    self.run_plan.model_problem("Model", form) is not None,
                     f"{form!r} splits the two checkers",
                 )
 

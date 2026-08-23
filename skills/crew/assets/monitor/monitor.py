@@ -49,6 +49,7 @@ import tomllib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import accounts  # noqa: E402
 import machine_log  # noqa: E402
+import run_plan  # noqa: E402
 
 TIMESTAMP_FORMAT = machine_log.TIMESTAMP_FORMAT
 # The writer that owns the log's schema: a receipt this script verifies is appended through it
@@ -243,13 +244,8 @@ TMUX_ENVIRONMENT_FIELDS = 3
 SESSION_PREFIX = "$"
 SESSION_TARGET_SUFFIX = ":"
 
-# The wave table's per-ticket account binding: the profile directory itself, resolved by the
-# driver as it built the table, never a name this end resolves — and beside it whether that
-# ticket's Claude processes select that directory or inherit the environment they were started in
-# (ADR-0014). A row without it is a table written before accounts existed, and its ticket is read
-# from the configuration home this process was started under, which is where that release's
-# children were looked for. `accounts.row_binding` is what reads either shape.
-ACCOUNT_KEY = accounts.ACCOUNT_KEY
+# The Run plan's per-ticket account binding is resolved when the plan is built. Monitor consumes
+# that binding directly and never resolves an account name or tolerates a partial table.
 
 # The Claude lane's primary live source (ADR-0012): the CLI's own per-session files, one JSON
 # object per live session, under the same configured home the pin registry hangs off. Reading them
@@ -675,21 +671,18 @@ def claude_states(claude_bin, run_dir=None, timeout=None, records=(), binding=No
     return fetched
 
 
-def table_bindings(waves):
+def table_bindings(plan):
     """Every account binding the wave table carries, once each, in the table's own order.
 
-    A row without the key is the table a release before accounts wrote, and its binding is None —
-    the configuration home this process was started under, which is where that release's children
-    were looked for and found. Two rows on the same directory in different modes are two
-    bindings, because the login one of them asks is not the login the other asks.
+    Two rows on the same directory in different modes are two bindings, because the login one of
+    them asks is not the login the other asks.
     """
     named = []
-    for wave in waves:
-        for entry in wave.get("tickets") or []:
-            binding = accounts.row_binding(entry)
-            if binding not in named:
-                named.append(binding)
-    return named or [None]
+    for ticket in plan.tickets:
+        binding = ticket.binding
+        if binding not in named:
+            named.append(binding)
+    return named
 
 
 def live_sources(claude_bin, run_dir, timeout=None, records=(), bindings=(None,)):
@@ -713,8 +706,8 @@ def live_sources(claude_bin, run_dir, timeout=None, records=(), bindings=(None,)
     }
 
 
-def read_table(run_dir):
-    """The run's approved wave table: every wave, with every ticket of it, in the table's order.
+def read_plan(run_dir):
+    """The run's validated plan, preserving every wave and ticket in approved order.
 
     A dashboard drawn from a table nobody could read would be an empty frame, which is exactly the
     failure this window exists to make impossible — so an unreadable table stops the command
@@ -722,32 +715,14 @@ def read_table(run_dir):
     """
     path = pathlib.Path(run_dir) / WAVE_TABLE_NAME
     try:
-        table = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise MonitorError(f"the run's wave table could not be read at {path}: {error}")
-    except ValueError as error:
-        raise MonitorError(f"{path} is not the wave table's JSON: {error}")
-    waves = table.get("waves") if isinstance(table, dict) else None
-    if not isinstance(waves, list):
-        raise MonitorError(f"{path} carries no waves list")
-    return waves
+        return run_plan.load(path)
+    except run_plan.RunPlanError as error:
+        raise MonitorError(str(error)) from error
 
 
 def account_homes(run_dir):
     """The Claude profile directory each ticket's wave-table row names, keyed by ticket."""
-    homes = {}
-    for wave in read_table(run_dir):
-        tickets = wave.get("tickets") if isinstance(wave, dict) else None
-        if not isinstance(tickets, list):
-            continue
-        for ticket in tickets:
-            if not isinstance(ticket, dict):
-                continue
-            identifier = ticket.get("id")
-            account = ticket.get(ACCOUNT_KEY)
-            if identifier is not None and account:
-                homes[str(identifier)] = str(account)
-    return homes
+    return {ticket.id: ticket.binding.directory for ticket in read_plan(run_dir).tickets}
 
 
 def settling_state(record):
@@ -876,7 +851,7 @@ def annotations(events, state, anomaly, moment):
     return lines
 
 
-def build_rows(waves, projection, moment, sources):
+def build_rows(plan, projection, moment, sources):
     """One row per ticket of every wave, in the order the approved table lists them.
 
     A ticket no `launch` event names has not started, which is what `pending` says: the frame
@@ -884,14 +859,14 @@ def build_rows(waves, projection, moment, sources):
     ticket launched twice — a replacement child — is the one row its last launch describes.
     """
     rows = []
-    for wave in waves:
-        number = str(wave.get("wave", ""))
-        entries = wave.get("tickets") or []
+    for wave in plan.waves:
+        number = str(wave.number)
+        entries = wave.tickets
         # Read once for the whole wave, because two of the words a row can be drawn need the wave
         # rather than the ticket: `settling` is what the wave's last receipt puts its unmerged rows
         # into, and no row can know that from its own events.
         wave_facts = {
-            str(entry.get("id", "")): projection.ticket(entry.get("id", ""))
+            entry.id: projection.ticket(entry.id)
             for entry in entries
         }
         wave_settled = {
@@ -903,8 +878,8 @@ def build_rows(waves, projection, moment, sources):
         }
         merging = settling_wave([settling for settling, _ in wave_settled.values()], projection)
         for entry in entries:
-            ticket = str(entry.get("id", ""))
-            binding = accounts.row_binding(entry)
+            ticket = entry.id
+            binding = entry.binding
             facts = wave_facts[ticket]
             events = facts.events
             launch = facts.launch
@@ -928,9 +903,9 @@ def build_rows(waves, projection, moment, sources):
             rows.append({
                 "wave": number,
                 "ticket": ticket,
-                "title": str(entry.get("title", "")),
+                "title": entry.title,
                 "executor": "/".join(
-                    part for part in (str(entry.get("executor", "")), str(entry.get("model", "")))
+                    part for part in (entry.executor, entry.model)
                     if part
                 ),
                 "state": state,
@@ -1201,16 +1176,16 @@ def colour_wanted(args):
 
 def draw(args, run_dir, moment):
     """Draw one frame of the whole run; returns whether the run it drew is over."""
-    waves = read_table(run_dir)
+    plan = read_plan(run_dir)
     records = read_log(run_dir / MACHINE_LOG_NAME)
     projection = machine_log.project(records)
     rows = build_rows(
-        waves, projection, moment,
-        live_sources(args.claude_bin, run_dir, records=records, bindings=table_bindings(waves)),
+        plan, projection, moment,
+        live_sources(args.claude_bin, run_dir, records=records, bindings=table_bindings(plan)),
     )
     print(
         render(
-            rows, run_dir.name, len(waves), moment,
+            rows, run_dir.name, len(plan.waves), moment,
             colour=colour_wanted(args), awaiting_ruling=projection.halted,
             dead_driver=dead_driver_banner(run_dir),
         ),
@@ -1681,13 +1656,13 @@ def pin_frame_data(args, run_dir, moment):
     projection = machine_log.project(records)
     if projection.ended:
         return None
-    waves = read_table(run_dir)
+    plan = read_plan(run_dir)
     sources = live_sources(
-        args.claude_bin, run_dir, args.timeout, records, table_bindings(waves)
+        args.claude_bin, run_dir, args.timeout, records, table_bindings(plan)
     )
-    rows = build_rows(waves, projection, moment, sources)
+    rows = build_rows(plan, projection, moment, sources)
     frame = render(
-        rows, run_dir.name, len(waves), moment,
+        rows, run_dir.name, len(plan.waves), moment,
         colour=pin_colour(args), max_lines=pin_line_budget(args),
         awaiting_ruling=projection.halted, dead_driver=dead_driver_banner(run_dir),
     )
@@ -2390,13 +2365,11 @@ def coordinator_usage(session):
     return {**row, "sessions": [session], "counters": counters}
 
 
-def cost_rows(records, claude_homes=None, account_problem=None):
+def cost_rows(records, claude_homes=None):
     """One row per launched ticket, in ticket order: what it was routed to, and what it spent.
 
     A ticket launched twice into the same worktree — a replacement child — is one row, and its
     figures are every session that ran there, because both children spent the ticket's tokens.
-    `account_problem` diagnoses Claude rows when the run's account map cannot be read; Codex rows
-    remain readable from their own configured root.
     """
     projection = machine_log.project(records)
     launches = {
@@ -2419,8 +2392,6 @@ def cost_rows(records, claude_homes=None, account_problem=None):
             )
         if not worktree:
             usage = diagnosed("the launch event names no worktree to read a transcript in")
-        elif executor == CLAUDE and account_problem:
-            usage = diagnosed(account_problem)
         else:
             config_home = claude_homes.get(ticket) if executor == CLAUDE else None
             usage = child_usage(executor, worktree, reviewed, config_home)
@@ -2498,21 +2469,15 @@ def log_session_cost(log, row):
 def run_cost(args):
     """Append one `session-cost` per launched child and print the run's rollup; returns 0.
 
-    The log's parent holds the wave table that maps Claude tickets to profile directories. If that
-    table cannot be read, Claude rows carry the diagnosis rather than guessing a root; Codex rows
-    still use their own configured home.
+    The log's parent holds the Run plan that maps Claude tickets to profile directories. The plan
+    is loaded before any cost row is written, so an invalid plan rejects the whole report.
 
     The coordinator's row is printed and not logged: the log's `session-cost` is a launched
     ticket's line, and the session that drives the run is not one.
     """
     run_dir = pathlib.Path(args.log).parent
-    try:
-        homes = account_homes(run_dir)
-        account_problem = None
-    except MonitorError as error:
-        homes = {}
-        account_problem = str(error)
-    rows = cost_rows(read_log(args.log), homes, account_problem)
+    homes = account_homes(run_dir)
+    rows = cost_rows(read_log(args.log), homes)
     for row in rows:
         log_session_cost(args.log, row)
     coordinator = None

@@ -26,6 +26,7 @@ MONITOR = TESTS_DIR.parent / "monitor.py"
 ACCOUNTS = TESTS_DIR.parents[1] / "accounts.py"
 # The projection module the monitor reads Machine-log facts through; part of every release of it.
 MACHINE_LOG = TESTS_DIR.parents[1] / "machine_log.py"
+RUN_PLAN = TESTS_DIR.parents[1] / "run_plan.py"
 # The review lane the dashboard's annotation is drawn from, written by this bridge and no fixture.
 REVIEW_BRIDGE = TESTS_DIR.parents[1] / "review" / "scripts" / "claude_review_bridge.py"
 
@@ -303,8 +304,21 @@ class Fixture:
         self.table_path.write_text(json.dumps({
             "run": {
                 "repo_root": str(self.repo),
+                "spec_path": str(self.root / "spec.md"),
                 "integration_branch": "crew/feature",
                 "integration_base_commit": self.base_commit,
+                "coordinator_name": "crew-coordinator",
+                "coordinator_pid": 1504,
+                "crew_skill_dir": str(TESTS_DIR.parents[2]),
+                "tmux_session": "$7:",
+                "permission_mode": "acceptEdits",
+                "coordinator_config_home": str(self.claude_home),
+                "repair_model": MODEL,
+                "tracker": "github",
+                "codex": {
+                    "bridge": str(TESTS_DIR.parents[1] / "codex" / "codex_bridge.py"),
+                    "state_dir": str(self.run_dir / "codex"),
+                },
             },
             "waves": [
                 {
@@ -314,12 +328,15 @@ class Fixture:
                             "id": ticket,
                             "title": TITLES[ticket],
                             "path": str(self.root / f"{ticket}.md"),
-                            "workflow": "tdd",
+                            "workflow": "direct",
                             "executor": EXECUTORS[ticket],
                             "model": MODELS[ticket],
                             "effort": "medium",
                             "account": str(accounts.get(ticket, self.claude_home)),
                             "account_mode": "explicit" if ticket in accounts else "inherited",
+                            "blocked_by": (
+                                list(waves[wave - 1]) if wave > min(waves) else []
+                            ),
                         }
                         for ticket in tickets
                     ],
@@ -681,7 +698,7 @@ class Fixture:
         directory.mkdir(parents=True, exist_ok=True)
         copy = directory / MONITOR.name
         shutil.copy2(str(MONITOR), str(copy))
-        for dependency in (ACCOUNTS, MACHINE_LOG):
+        for dependency in (ACCOUNTS, MACHINE_LOG, RUN_PLAN):
             shutil.copy2(str(dependency), str(directory.parent / dependency.name))
         return copy
 
@@ -2818,8 +2835,8 @@ class MultiAccountTests(MonitorTestCase):
         self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
                       result.stdout)
 
-    def test_a_wave_table_from_before_accounts_is_drawn_from_the_configured_home(self):
-        """A run interrupted under the release before this one is resumed, not broken."""
+    def test_a_wave_table_from_before_accounts_is_rejected_before_drawing(self):
+        """Every production reader applies the Run plan's strict account contract."""
         self.mixed_wave()
         self.fixture.drop_accounts()
         self.fixture.agents({"06": "busy", "08": "busy"})
@@ -2827,9 +2844,10 @@ class MultiAccountTests(MonitorTestCase):
 
         result = self.fixture.dashboard()
 
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Account", result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertEqual(self.fixture.calls("claude"), [])
-        self.assertIn(row("1", "08", TITLES["08"], CLAUDE_LANE, "running", LIVE_ELAPSED),
-                      result.stdout)
 
 
 class WindowTests(MonitorTestCase):
@@ -3397,7 +3415,7 @@ class CostTests(MonitorTestCase):
             ],
         )
 
-    def test_a_table_without_an_account_uses_the_current_claude_home_for_compatibility(self):
+    def test_a_table_without_an_account_rejects_cost_before_writing_any_rows(self):
         self.fixture.table(waves={1: ("06",)})
         self.fixture.drop_accounts()
         self.fixture.worktree("06")
@@ -3406,10 +3424,12 @@ class CostTests(MonitorTestCase):
 
         result = self.cost()
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.costs()[0]["total_tokens"], CLAUDE_TOTALS["total"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Account", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.costs(), [])
 
-    def test_an_unreadable_wave_table_diagnoses_claude_cost_instead_of_failing_or_zeroing(self):
+    def test_an_unreadable_wave_table_rejects_cost_before_writing_any_rows(self):
         self.fixture.table(waves={1: ("06",)})
         self.fixture.worktree("06")
         self.fixture.launch("06")
@@ -3418,16 +3438,12 @@ class CostTests(MonitorTestCase):
 
         result = self.cost()
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        entry = self.costs()[0]
-        self.assertIn("wave table", entry["detail"])
-        self.assertNotIn("total_tokens", entry)
-        self.assertEqual(
-            cost_rows(result.stdout)[1],
-            ["06", "claude", MODEL, "--", "--", "--", "--", "--"],
-        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wave table", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.costs(), [])
 
-    def test_an_unreadable_wave_table_leaves_codex_cost_measured(self):
+    def test_an_unreadable_wave_table_rejects_all_cost_lanes(self):
         self.fixture.table(waves={1: ("06", "07")})
         self.fixture.worktree("06")
         self.fixture.worktree("07")
@@ -3439,19 +3455,12 @@ class CostTests(MonitorTestCase):
 
         result = self.cost()
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        entries = {entry["ticket"]: entry for entry in self.costs()}
-        self.assertNotIn("total_tokens", entries["06"])
-        self.assertEqual(entries["07"]["total_tokens"], CODEX_TOTALS["total"])
-        self.assertEqual(
-            cost_rows(result.stdout)[2],
-            ["07", "codex", CODEX_MODEL] + [
-                str(CODEX_TOTALS[name])
-                for name in ("input", "output", "cache_read", "cache_creation", "total")
-            ],
-        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wave table", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.costs(), [])
 
-    def test_a_missing_wave_table_diagnoses_claude_cost_instead_of_failing_or_zeroing(self):
+    def test_a_missing_wave_table_rejects_cost_before_writing_any_rows(self):
         self.fixture.table(waves={1: ("06",)})
         self.fixture.worktree("06")
         self.fixture.launch("06")
@@ -3460,14 +3469,10 @@ class CostTests(MonitorTestCase):
 
         result = self.cost()
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        entry = self.costs()[0]
-        self.assertIn("wave table", entry["detail"])
-        self.assertNotIn("total_tokens", entry)
-        self.assertEqual(
-            cost_rows(result.stdout)[1],
-            ["06", "claude", MODEL, "--", "--", "--", "--", "--"],
-        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wave table", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.costs(), [])
 
     def test_one_session_cost_event_is_appended_per_launched_child(self):
         self.fixture.worktree("06")
