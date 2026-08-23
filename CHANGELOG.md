@@ -7,6 +7,32 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-24
+
+### Changed
+- The Driver, monitor, advance and merge driver read the run's current facts from one
+  Run projection instead of each deriving them from the Machine log itself. The facts
+  always came from one ordered log, but the ordering rules lived in the four readers, so
+  the same event sequence had four interpretations and changing one fact could leave
+  parts of a single run disagreeing about it. `skills/crew/assets/machine_log.py` now
+  owns reading records and deriving those facts; it does not read the Wave table, choose
+  the Driver's next action, or translate a fact into the human-facing Ticket state — the
+  Driver keeps its rule table and the monitor keeps its presentation-only state mapping
+  (ADR-0017). Behaviour-preserving: commands, output, state meanings and execution order
+  are unchanged, and `driver.py` shed 238 lines saying the same thing. (#121)
+- One Run plan module owns the whole meaning of the Wave table. Construction, validation,
+  JSON reading, wave lookup, ticket traversal and dependency interpretation were split
+  across the Driver, dispatch, advance, merge driver, monitor and route staging, so a
+  change to the plan's shape meant coordinated edits in six modules that only wanted the
+  resulting plan. `skills/crew/assets/run_plan.py` now builds a plan from ticket input,
+  resolves and validates it, reads and writes the same local JSON file, and hands callers
+  immutable run, wave, ticket and dependency facts; no caller parses that JSON or
+  reimplements a plan query. The plan says only what should happen — it does not read the
+  Machine log, launch children, merge branches or render the monitor (ADR-0018). This is a
+  replacement rather than a compatibility layer: the migrated helpers are deleted from
+  their former callers, and the plan stays reloadable rather than hidden behind a
+  write-once cache. (#122)
+
 ## [0.9.1] - 2026-08-21
 
 ### Changed
