@@ -15,7 +15,15 @@ import sys
 import tempfile
 import unittest
 
-from harness import BASE_BRANCH, DRIVER, Fixture, INTEGRATION_BRANCH, git
+from harness import (
+    BASE_BRANCH,
+    DRIVER,
+    Fixture,
+    INTEGRATION_BRANCH,
+    REPAIR_MODEL,
+    TRACKER,
+    git,
+)
 
 sys.path.insert(0, str(DRIVER.parent))
 import driver as driver_module  # noqa: E402
@@ -145,9 +153,12 @@ class ClearTests(unittest.TestCase):
             "crew_skill_dir": str(DRIVER.parents[1]),
             "tmux_session": "$7:",
             "permission_mode": "acceptEdits",
+            "coordinator_config_home": str(self.fixture.config_dir),
             "base_branch": BASE_BRANCH,
             "return_branch": BASE_BRANCH,
             "feature_dir": str(self.fixture.feature_dir),
+            "repair_model": REPAIR_MODEL,
+            "tracker": TRACKER,
             "codex": {
                 "bridge": str(DRIVER.parent / "tests" / "stub_codex_bridge.py"),
                 "state_dir": str(self.codex_dir),
@@ -158,20 +169,24 @@ class ClearTests(unittest.TestCase):
                 "id": "01",
                 "title": "merged ticket",
                 "path": str(self.fixture.feature_dir / "01.md"),
-                "workflow": "tdd",
+                "workflow": "direct",
                 "executor": "claude",
                 "model": "claude-opus-5",
                 "effort": "medium",
+                "account": str(self.fixture.config_dir),
+                "account_mode": "inherited",
                 "blocked_by": [],
             },
             {
                 "id": "02",
                 "title": "unmerged ticket",
                 "path": str(self.fixture.feature_dir / "02.md"),
-                "workflow": "tdd",
+                "workflow": "direct",
                 "executor": "codex",
                 "model": "gpt-5.6-luna",
                 "effort": "max",
+                "account": str(self.fixture.config_dir),
+                "account_mode": "inherited",
                 "blocked_by": [],
             },
         ]

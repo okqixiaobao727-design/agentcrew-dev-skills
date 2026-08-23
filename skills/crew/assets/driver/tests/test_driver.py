@@ -1376,7 +1376,7 @@ class LoopTests(DriverTestCase):
         )
         self.assertEqual(self.events("advance", decision="stopped")[0]["wave"], "1")
 
-    def test_stopped_refuses_an_unlaunched_ticket_the_halt_did_not_block(self):
+    def test_resume_rejects_a_rewritten_table_whose_waves_no_longer_match_dependencies(self):
         process = self.start(("01", ()), ("02", ("01",)))
         process.kill()
         process.communicate()
@@ -1390,7 +1390,7 @@ class LoopTests(DriverTestCase):
         self.fixture.says("01", "CREW FAILED the approach does not work")
         snapshot = self.woken(resumed, "driver-error")
 
-        self.assertIn("stopped refused: ticket 02 is still launchable", snapshot["detail"])
+        self.assertIn("do not follow the dependency frontier", snapshot["detail"])
         self.assertEqual(self.events("advance", decision="stopped"), [])
 
     def test_a_failure_receipt_is_recorded_by_the_driver(self):

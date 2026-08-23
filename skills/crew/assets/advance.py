@@ -41,7 +41,6 @@ Exit 0 when the run advanced or finished, 1 when it escalated, 130 when it was i
 """
 
 import argparse
-import json
 import pathlib
 import signal
 import subprocess
@@ -52,6 +51,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
 import dispatch  # noqa: E402
 import machine_log  # noqa: E402
+import run_plan  # noqa: E402
 
 ASSETS = pathlib.Path(__file__).resolve().parent
 MACHINE_LOG = ASSETS / "machine_log.py"
@@ -114,31 +114,6 @@ def log_event(log, *arguments):
         raise AdvanceError(f"machine log: {(result.stderr or result.stdout).strip()}")
 
 
-# --- the table --------------------------------------------------------------------------------
-
-
-def wave_tickets(table, wave):
-    for entry in table.get("waves") or []:
-        if isinstance(entry, dict) and entry.get("wave") == wave:
-            return list(entry.get("tickets") or [])
-    raise AdvanceError(f"the table holds no wave {wave}")
-
-
-def every_ticket(table):
-    """{id: ticket} across every wave, which is the graph the `blocked_by` edges run through."""
-    return {str(ticket["id"]): ticket for ticket in dispatch.walk_tickets(table)}
-
-
-def next_wave(table, wave):
-    """The number of the wave after this one, or None when this was the last."""
-    numbers = sorted(
-        entry["wave"] for entry in table.get("waves") or []
-        if isinstance(entry, dict) and isinstance(entry.get("wave"), int)
-    )
-    later = [number for number in numbers if number > wave]
-    return later[0] if later else None
-
-
 def already_advanced(records, wave, following):
     """The decision that already carried the run past `wave`, or None.
 
@@ -158,23 +133,9 @@ def already_advanced(records, wave, following):
     return None
 
 
-def descendants(tickets, roots):
-    """Every ticket that reaches one of `roots` through `blocked_by`, however far down."""
-    reached = set()
-    frontier = list(roots)
-    while frontier:
-        blocker = frontier.pop()
-        for number, ticket in tickets.items():
-            edges = ticket.get("blocked_by") or []
-            if blocker in [str(edge) for edge in edges] and number not in reached:
-                reached.add(number)
-                frontier.append(number)
-    return sorted(reached)
-
-
 def pointers(ticket):
     """A ticket's own file and branch, so a ruling on it never starts with a hunt."""
-    return f"ticket {ticket['path']}; branch {dispatch.branch_name(ticket)}"
+    return f"ticket {ticket.path}; branch {dispatch.branch_name(ticket)}"
 
 
 # --- the steps ----------------------------------------------------------------------------------
@@ -223,7 +184,7 @@ def toast(text):
 def landed_head(run):
     """The commit the integration branch stands at, which is what the next wave is cut from."""
     result = subprocess.run(
-        ["git", "-C", str(run["repo_root"]), "rev-parse", run["integration_branch"]],
+        ["git", "-C", run.repo_root, "rev-parse", run.integration_branch],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -241,20 +202,19 @@ def record(options, wave, decision, detail=None):
     log_event(options["log"], *arguments)
 
 
-def block_descendants(table, projection, roots, options):
+def block_descendants(plan, projection, roots, options):
     """Record every unlaunched descendant of a stopped ticket blocked; returns the lines printed.
 
     A ticket that already ran has an outcome of its own, and a ticket the halt leaves untouched is
     not this decision's business — only what can no longer start is blocked.
     """
-    tickets = every_ticket(table)
     started = {
         ticket for ticket, facts in projection.tickets.items()
         if facts.launch is not None or facts.latest_settling_event is not None
     }
     blocked = {}
     for root, verdict in sorted(roots.items()):
-        for number in descendants(tickets, [root]):
+        for number in plan.descendants((root,)):
             blocked.setdefault(number, []).append(f"{root} {verdict}")
     lines = []
     for number, why in sorted(blocked.items()):
@@ -276,9 +236,9 @@ def decision_detail(detail, passed_over=()):
     return f"{detail}; passed over as settled: " + "; ".join(passed_over)
 
 
-def halt(table, wave, projection, reasons, roots, options, passed_over=()):
+def halt(plan, wave, projection, reasons, roots, options, passed_over=()):
     """Stop the chain: block what can no longer start, and record the one escalation."""
-    lines = block_descendants(table, projection, roots, options)
+    lines = block_descendants(plan, projection, roots, options)
     detail = decision_detail("; ".join(reasons), passed_over)
     record(options, wave, ESCALATED, detail)
     return lines + [f"wave {wave} {ESCALATED} {detail}"]
@@ -290,22 +250,18 @@ def stop_short(wave, options, passed_over=()):
     return list(passed_over) + [f"wave {wave} {INTERRUPTED}"]
 
 
-def advance_wave(table, table_path, wave, options, interrupt):
+def advance_wave(plan, table_path, wave, options, interrupt):
     """Advance the run past `wave`; returns `(the lines to print, the exit code)`."""
-    run = table["run"] if isinstance(table.get("run"), dict) else {}
-    for key in ("repo_root", "integration_branch"):
-        if not run.get(key):
-            raise AdvanceError(f"the table's run section lacks {key}")
-    tickets = wave_tickets(table, wave)
-    if not tickets:
-        raise AdvanceError(f"wave {wave} holds no tickets")
+    run = plan.run
+    tickets = plan.wave(wave).tickets
 
     records = machine_log.read_records(options["log"])
     projection = machine_log.project(records)
-    following = next_wave(table, wave)
+    following_wave = plan.following_wave(wave)
+    following = following_wave.number if following_wave else None
     live = [
-        str(ticket["id"]) for ticket in tickets
-        if projection.ticket(ticket["id"]).latest_settling_event is None
+        ticket.id for ticket in tickets
+        if projection.ticket(ticket.id).latest_settling_event is None
     ]
     if live:
         # Nothing has been decided and nothing should be: the wave is still being worked.
@@ -323,17 +279,14 @@ def advance_wave(table, table_path, wave, options, interrupt):
 
     records = machine_log.read_records(options["log"])
     projection = machine_log.project(records)
-    all_tickets = None
     reasons = []
     roots = {}
     passed_over = []
     for ticket in tickets:
-        number = str(ticket["id"])
+        number = ticket.id
         state = projection.ticket(number).settlement_state
         if state == PARKED:
-            if all_tickets is None:
-                all_tickets = every_ticket(table)
-            if not descendants(all_tickets, [number]):
+            if not plan.descendants((number,)):
                 passed_over.append(f"{number} parked passed over as settled; no descendants")
                 continue
             roots[number] = state
@@ -350,7 +303,7 @@ def advance_wave(table, table_path, wave, options, interrupt):
             reasons.append(f"{number} did not land; {pointers(ticket)}")
     if reasons:
         return (
-            lines + halt(table, wave, projection, reasons, roots, options, passed_over),
+            lines + halt(plan, wave, projection, reasons, roots, options, passed_over),
             ESCALATED_EXIT,
         )
 
@@ -373,7 +326,7 @@ def advance_wave(table, table_path, wave, options, interrupt):
             + [f"wave {following} {ESCALATED} {detail}"], ESCALATED_EXIT
         )
 
-    children = ", ".join(str(ticket["id"]) for ticket in wave_tickets(table, following))
+    children = ", ".join(ticket.id for ticket in plan.wave(following).tickets)
     detail = decision_detail(f"advanced from wave {wave}: {children}", passed_over)
     record(options, following, LAUNCHED, detail)
     toast(f"crew wave {following} {LAUNCHED}")
@@ -402,9 +355,10 @@ def main(argv=None):
     interrupt = Interrupt()
     interrupt.arm()
     try:
-        table = json.loads(pathlib.Path(args.table).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        print(f"run: {args.table} is not a readable wave table: {error}", file=sys.stderr)
+        plan = run_plan.load(args.table)
+    except run_plan.RunPlanError as error:
+        for problem in error.problems:
+            print(problem, file=sys.stderr)
         return ESCALATED_EXIT
 
     options = {
@@ -416,8 +370,8 @@ def main(argv=None):
         "repair_timeout": args.repair_timeout,
     }
     try:
-        lines, code = advance_wave(table, args.table, args.wave, options, interrupt)
-    except AdvanceError as error:
+        lines, code = advance_wave(plan, args.table, args.wave, options, interrupt)
+    except (AdvanceError, run_plan.RunPlanError) as error:
         print(f"run: {error}", file=sys.stderr)
         return ESCALATED_EXIT
 

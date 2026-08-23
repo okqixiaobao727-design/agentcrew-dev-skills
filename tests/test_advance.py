@@ -180,6 +180,8 @@ class Fixture:
             "tmux_session": TMUX_SESSION,
             "permission_mode": PERMISSION_MODE,
             "coordinator_config_home": str(self.config_dir),
+            "repair_model": REPAIR_MODEL,
+            "tracker": "github",
         }
         waves = [
             {
@@ -196,6 +198,7 @@ class Fixture:
                         # Concrete on every row, as the driver leaves it: this run names no
                         # account, so every ticket takes the coordinator's own home (ADR-0014).
                         "account": str(self.config_dir),
+                        "account_mode": "inherited",
                         "review": dict(REVIEW),
                         "blocked_by": list(blocked_by),
                     }

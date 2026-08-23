@@ -74,10 +74,10 @@ advanced whatever the child is doing.
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import pathlib
-import re
 import shlex
 import subprocess
 import sys
@@ -92,43 +92,12 @@ MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 # this renderer decides neither what "inherit" means nor how an account is spelled into a process.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import accounts  # noqa: E402
+import run_plan  # noqa: E402
 
-EXECUTORS = ("claude", "codex")
-REVIEW_VENDORS = ("claude", "codex")
 # Guard assets every Claude worktree carries before a child starts in it.
 GUARD_ASSETS = ("red-line.sh", "worktree-guard.sh", "settings.local.json")
 EXECUTABLE_ASSETS = ("red-line.sh", "worktree-guard.sh")
 WORKTREE_PLACEHOLDER = "<WORKTREE_ABSOLUTE_PATH>"
-# A bare vendor-less word is an alias whatever the vendor's catalogue holds today.
-BARE_WORD = re.compile(r"^[A-Za-z]+$")
-# A context-window suffix rides on both forms — `sonnet[1m]` is still that alias, and
-# `claude-opus-5[1m]` is still that full ID — so it comes off before either test.
-CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]$")
-
-RUN_KEYS = (
-    "repo_root",
-    "spec_path",
-    "integration_base_commit",
-    "coordinator_name",
-    "coordinator_pid",
-    "crew_skill_dir",
-    "tmux_session",
-    "permission_mode",
-)
-# The routing keys every ticket carries, under the names the wave table shows the user.
-TICKET_KEYS = {
-    "id": "Ticket id",
-    "path": "Path",
-    "workflow": "Workflow",
-    "executor": "Executor",
-    "model": "Model",
-    "effort": "Effort",
-    # Concrete on every row by the time the table is validated: the profile directory this
-    # ticket's Claude processes run under, which the driver resolved from the ticket's account
-    # name or from the coordinator's own configuration home (ADR-0014).
-    "account": "Account",
-}
-
 # A child's transcripts, as the three parts `monitor.py` and `launch.py` already spell such a
 # directory in: the variable that moves the configuration home, the home's own name under `~`, and
 # the fixed subdirectory inside it. Reading it through the shared shape rather than inline is what
@@ -139,14 +108,6 @@ TRANSCRIPTS = (CONFIG_HOME_VARIABLE, ".claude", "projects")
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 90.0
 DEFAULT_HOOK_TIMEOUT_SECONDS = 120.0
 VERIFY_POLL_SECONDS = 1.0
-
-
-class TableError(Exception):
-    """The table cannot be dispatched. Carries one line per offending ticket."""
-
-    def __init__(self, problems):
-        super().__init__("\n".join(problems))
-        self.problems = problems
 
 
 class LaunchError(Exception):
@@ -169,151 +130,25 @@ def block(text):
     return text.strip("\n")
 
 
-# --- the table ----------------------------------------------------------------------------
-
-
-def alias_problem(label, value, aliases):
-    if not isinstance(value, str):
-        return f"{label} `{value}` is not a model name"
-    bare = CONTEXT_SUFFIX.sub("", value.strip())
-    if bare.lower() in aliases or BARE_WORD.match(bare):
-        return f"{label} `{value}` is an alias, not a full model ID"
-    return None
-
-
-def walk_tickets(table):
-    """Every ticket the table holds, whatever shape the caller wrote it in."""
-    if not isinstance(table, dict):
-        return
-    waves = table.get("waves")
-    for wave in waves if isinstance(waves, list) else []:
-        tickets = wave.get("tickets") if isinstance(wave, dict) else None
-        for ticket in tickets if isinstance(tickets, list) else []:
-            yield ticket
-
-
-def validate(table, templates):
-    """Raise a TableError carrying one line per offending ticket, or return having found none."""
-    problems = []
-    if not isinstance(table, dict):
-        raise TableError(["run: the table is not a JSON object"])
-    run = table.get("run")
-    if not isinstance(run, dict):
-        raise TableError(["run: the table carries no run section"])
-    if not isinstance(table.get("waves"), list):
-        raise TableError(["run: the table carries no list of waves"])
-    missing_run = [key for key in RUN_KEYS if not run.get(key)]
-    if missing_run:
-        problems.append("run: lacks " + ", ".join(missing_run))
-
-    codex = run.get("codex") if isinstance(run.get("codex"), dict) else {}
-    missing_codex = [key for key in ("bridge", "state_dir") if not codex.get(key)]
-
-    aliases = {alias.lower() for alias in templates["models"]["aliases"]}
-    shapes = templates["workflows"]
-    seen = set()
-    for ticket in walk_tickets(table):
-        if not isinstance(ticket, dict):
-            problems.append(f"{ticket}: is not a ticket object")
-            continue
-        number = ticket.get("id") or "(no id)"
-        faults = []
-        for key, label in TICKET_KEYS.items():
-            if not ticket.get(key):
-                faults.append(f"lacks {label}")
-        workflow = ticket.get("workflow")
-        if not isinstance(workflow, str):
-            workflow = None
-        if workflow and workflow not in shapes:
-            faults.append(
-                f"Workflow `{workflow}` is outside {', '.join(sorted(shapes))}"
-            )
-        executor = ticket.get("executor")
-        if executor and executor not in EXECUTORS:
-            faults.append(f"Executor `{executor}` is outside {', '.join(EXECUTORS)}")
-        if ticket.get("model"):
-            fault = alias_problem("Model", ticket["model"], aliases)
-            if fault:
-                faults.append(fault)
-        account = ticket.get("account")
-        if account and not os.path.isabs(str(account)):
-            # ADR-0007: the child reads this path in its own worktree, where a relative spelling
-            # names another directory — one profile written and another verified.
-            faults.append(f"Account `{account}` is not an absolute path")
-        mode = ticket.get(accounts.ACCOUNT_MODE_KEY)
-        if mode is not None and mode not in accounts.ACCOUNT_MODES:
-            # The half of the binding that says whether this ticket's processes select the account
-            # or inherit it. A word that is neither would be read as one of them by every consumer
-            # downstream, which is a wave silently launched on the wrong login.
-            faults.append(
-                f"Account mode `{mode}` is outside {', '.join(accounts.ACCOUNT_MODES)}"
-            )
-        if str(ticket.get("id")) in seen:
-            faults.append("is listed twice")
-        seen.add(str(ticket.get("id")))
-
-        if ticket.get("executor") == "codex" and missing_codex:
-            faults.append(
-                "needs the run's codex " + ", ".join(missing_codex)
-                + ", which the table does not carry"
-            )
-
-        review = ticket.get("review")
-        if review is not None and not isinstance(review, dict):
-            faults.append(f"Review `{review}` is not a review lane")
-            review = None
-        wants_lane = bool(workflow in shapes and shapes[workflow]["review_lane"])
-        if wants_lane and not review:
-            faults.append("lacks Review, which its workflow requires")
-        elif review and not wants_lane:
-            faults.append(f"carries a Review, which workflow `{workflow}` takes none of")
-        elif review:
-            vendor = review.get("vendor")
-            if vendor not in REVIEW_VENDORS:
-                faults.append(f"Review vendor `{vendor}` is outside {', '.join(REVIEW_VENDORS)}")
-            elif vendor == executor:
-                faults.append(f"Review vendor `{vendor}` is its own Executor, not a lane")
-            for key in ("model", "effort"):
-                if not review.get(key):
-                    faults.append(f"Review lacks {key}")
-            if review.get("model"):
-                fault = alias_problem("Review model", review["model"], aliases)
-                if fault:
-                    faults.append(fault)
-
-        if faults:
-            problems.append(f"{number} {ticket.get('path', '')}: " + "; ".join(faults))
-
-    if problems:
-        raise TableError(problems)
-
-
-def wave_tickets(table, number):
-    for wave in table["waves"]:
-        if isinstance(wave, dict) and wave.get("wave") == number:
-            return list(wave.get("tickets") or [])
-    raise TableError([f"run: the table holds no wave {number}"])
-
-
 def ticket_slug(ticket):
-    if ticket.get("slug"):
-        return ticket["slug"]
-    stem = pathlib.Path(ticket["path"]).stem
-    prefix = f"{ticket['id']}-"
+    if ticket.slug:
+        return ticket.slug
+    stem = pathlib.Path(ticket.path).stem
+    prefix = f"{ticket.id}-"
     return stem[len(prefix):] if stem.startswith(prefix) else stem
 
 
 def worktree_path(run, ticket):
-    name = f"{ticket['id']}-{ticket_slug(ticket)}"
-    return pathlib.Path(run["repo_root"]) / ".claude" / "worktrees" / name
+    name = f"{ticket.id}-{ticket_slug(ticket)}"
+    return pathlib.Path(run.repo_root) / ".claude" / "worktrees" / name
 
 
 def branch_name(ticket):
-    return f"worktree-{ticket['id']}-{ticket_slug(ticket)}"
+    return f"worktree-{ticket.id}-{ticket_slug(ticket)}"
 
 
 def base_commit(run, ticket):
-    return ticket.get("base_commit") or run["integration_base_commit"]
+    return ticket.base_commit or run.integration_base_commit
 
 
 # --- the first turn -----------------------------------------------------------------------
@@ -328,7 +163,7 @@ def review_log_flags(ticket, log):
     """
     if not log:
         return ""
-    return f" --machine-log {log} --ticket {ticket['id']}"
+    return f" --machine-log {log} --ticket {ticket.id}"
 
 
 def review_account_flag(ticket):
@@ -340,20 +175,16 @@ def review_account_flag(ticket):
     where a ticket's account name stopped being a name (ADR-0014), and nothing here reads the
     account registry.
 
-    A row bound to an inherited account renders the command exactly as it rendered before accounts
-    existed: the bridge sets `CLAUDE_CONFIG_DIR` for an account it is given and touches the
-    environment for no other, so a ticket that named no account reviews on the login the operator
-    is signed into rather than under an explicitly spelled default that fails to authenticate
-    (#110). A row carrying no account at all renders the same way, which is the candidate table
-    the driver's preflight renders to ask this renderer whether a ticket's routing is valid —
-    asked before a ticket's account has been resolved.
+    An inherited binding leaves the environment untouched, so a ticket that named no account
+    reviews on the login the operator is signed into rather than under an explicitly spelled
+    default that fails to authenticate (#110).
 
     Quoted, unlike every other path this renderer writes into the command: those are the run's own
     directories, and this one is whatever the operator registered the account against — a profile
     directory under a path with a space in it would otherwise reach the bridge as two arguments,
     and the review would be launched on an account nobody named.
     """
-    account = accounts.environment_delta(accounts.row_binding(ticket)).get(CONFIG_HOME_VARIABLE)
+    account = accounts.environment_delta(ticket.binding).get(CONFIG_HOME_VARIABLE)
     return f"  --account {shlex.quote(str(account))} \\\n" if account else ""
 
 
@@ -380,35 +211,35 @@ def completion_template(shape, turn, ticket, log):
     reads the final message of a turn and writes the log from it, and so does either lane on a run
     dispatched without a machine log: there is no log path to name.
     """
-    if ticket["executor"] == "claude" and log:
+    if ticket.executor == "claude" and log:
         return shape.get("completion_claude") or turn["completion_claude"]
     return shape.get("completion") or turn["completion"]
 
 
 def render_turn(run, ticket, templates, log=None):
-    shape = templates["workflows"][ticket["workflow"]]
+    shape = templates["workflows"][ticket.workflow]
     turn = templates["turn"]
     values = {
-        "<absolute ticket path>": ticket["path"],
-        "<absolute spec path>": run["spec_path"],
+        "<absolute ticket path>": ticket.path,
+        "<absolute spec path>": run.spec_path,
         "<ticket base commit>": base_commit(run, ticket),
         "<worktree-abs-path>": worktree_path(run, ticket),
-        "<crew-skill-dir>": run["crew_skill_dir"],
-        "<NN>": ticket["id"],
-        "<coordinator name>": run["coordinator_name"],
-        "<coordinator pid>": run["coordinator_pid"],
+        "<crew-skill-dir>": run.crew_skill_dir,
+        "<NN>": ticket.id,
+        "<coordinator name>": run.coordinator_name,
+        "<coordinator pid>": run.coordinator_pid,
         "<machine log path>": log or "",
         "<machine log script>": run_log_script(log),
     }
 
     workflow_block = block(shape["block"])
     if shape["review_lane"]:
-        review = ticket["review"]
+        review = ticket.review
         review_block = fill(
-            block(templates["review"][review["vendor"]]["block"]),
+            block(templates["review"][review.vendor]["block"]),
             {
-                "<review model>": review["model"],
-                "<review effort>": review["effort"],
+                "<review model>": review.model,
+                "<review effort>": review.effort,
                 "<review log>": review_log_flags(ticket, log),
                 "<rounds contract>": block(templates["review"]["rounds"]),
                 # Only the Claude lane spends a Claude login, and only its block carries this
@@ -424,7 +255,7 @@ def render_turn(run, ticket, templates, log=None):
         "<completion condition>", shape.get("completion_condition", "")
     )
     coordinator = block(
-        turn["coordinator_claude"] if ticket["executor"] == "claude"
+        turn["coordinator_claude"] if ticket.executor == "claude"
         else turn["coordinator_codex"]
     )
 
@@ -445,7 +276,7 @@ def agents_definition(ticket, templates, turn):
 
 
 def agent_name(ticket):
-    return f"crew-{ticket['id']}"
+    return f"crew-{ticket.id}"
 
 
 def render_wave(run, tickets, templates, out_dir, log=None):
@@ -453,17 +284,17 @@ def render_wave(run, tickets, templates, out_dir, log=None):
     rendered = []
     for ticket in tickets:
         turn = render_turn(run, ticket, templates, log)
-        turn_file = out_dir / f"{ticket['id']}.turn.txt"
+        turn_file = out_dir / f"{ticket.id}.turn.txt"
         turn_file.write_text(turn)
         launch_json = None
-        if ticket["executor"] == "claude":
-            launch_json = out_dir / f"{ticket['id']}.agents.json"
+        if ticket.executor == "claude":
+            launch_json = out_dir / f"{ticket.id}.agents.json"
             launch_json.write_text(
                 json.dumps(agents_definition(ticket, templates, turn), indent=2) + "\n"
             )
         rendered.append({
-            "ticket": ticket["id"],
-            "executor": ticket["executor"],
+            "ticket": ticket.id,
+            "executor": ticket.executor,
             "turnFile": str(turn_file),
             "launchJson": str(launch_json) if launch_json else None,
             "worktree": str(worktree_path(run, ticket)),
@@ -495,7 +326,7 @@ def prepare_worktree(run, ticket):
     """
     path = worktree_path(run, ticket)
     branch = branch_name(ticket)
-    repo = run["repo_root"]
+    repo = run.repo_root
     if path.is_dir():
         standing = git(path, "rev-parse", "--abbrev-ref", "HEAD")
         if standing != branch:
@@ -514,7 +345,7 @@ def prepare_worktree(run, ticket):
 
 def install_guard_assets(run, worktree):
     """Copy the guard hooks in before any Claude starts in the worktree."""
-    source = pathlib.Path(run["crew_skill_dir"]) / "assets"
+    source = pathlib.Path(run.crew_skill_dir) / "assets"
     target = worktree / ".claude"
     target.mkdir(parents=True, exist_ok=True)
     for name in GUARD_ASSETS:
@@ -530,8 +361,7 @@ def install_guard_assets(run, worktree):
 
 
 def hook_environment(run):
-    hook = run.get("launch_hook") or {}
-    return {str(key): str(value) for key, value in (hook.get("env") or {}).items()}
+    return dict(run.launch_hook.env) if run.launch_hook else {}
 
 
 def run_launch_hook(run, worktree, window_id, timeout):
@@ -540,8 +370,8 @@ def run_launch_hook(run, worktree, window_id, timeout):
     The hook belongs to the project, not to this run, so it is held to a timeout: a hook that
     hangs must not hold up a wave that is otherwise ready to work.
     """
-    hook = run.get("launch_hook") or {}
-    command = hook.get("command")
+    hook = run.launch_hook
+    command = hook.command if hook else None
     if not command:
         return None
     environment = dict(os.environ)
@@ -590,10 +420,10 @@ def new_window(run, ticket, worktree):
     as leaving it unset, and the explicit spelling fails the login the inherited one succeeds at
     (#110). Which pairs those are is the account module's to decide, never this renderer's.
     """
-    delta = accounts.environment_delta(accounts.row_binding(ticket))
+    delta = accounts.environment_delta(ticket.binding)
     pairs = [argument for name, value in delta.items() for argument in ("-e", f"{name}={value}")]
     return tmux(
-        "new-window", "-d", "-t", run["tmux_session"], "-n", ticket["id"],
+        "new-window", "-d", "-t", run.tmux_session, "-n", ticket.id,
         "-c", str(worktree), *pairs,
         "-P", "-F", "#{window_id}",
     )
@@ -621,9 +451,9 @@ def launch_command(run, ticket, launch_json):
         f"{prefix}command claude"
         f" --agents \"$(cat {shlex.quote(str(launch_json))})\""
         f" --agent {shlex.quote(agent_name(ticket))}"
-        f" --model {shlex.quote(ticket['model'])}"
-        f" --effort {shlex.quote(ticket['effort'])}"
-        f" --permission-mode {shlex.quote(run['permission_mode'])}"
+        f" --model {shlex.quote(ticket.model)}"
+        f" --effort {shlex.quote(ticket.effort)}"
+        f" --permission-mode {shlex.quote(run.permission_mode)}"
     )
 
 
@@ -706,7 +536,7 @@ def verify_child(ticket, worktree, timeout):
     with nothing running does too. This timeout is therefore the one surface such a profile
     appears on, so it names the account rather than the worktree.
     """
-    binding = accounts.row_binding(ticket)
+    binding = ticket.binding
     account = binding.directory
     deadline = time.monotonic() + timeout
     entry = None
@@ -722,10 +552,10 @@ def verify_child(ticket, worktree, timeout):
         time.sleep(VERIFY_POLL_SECONDS)
 
     listed = entry.get("model")
-    if listed and listed != ticket["model"]:
+    if listed and listed != ticket.model:
         raise LaunchError(
             f"model mismatch: the agents list reports {listed},"
-            f" the table approved {ticket['model']}"
+            f" the table approved {ticket.model}"
         )
 
     model = None
@@ -740,10 +570,10 @@ def verify_child(ticket, worktree, timeout):
             )
         time.sleep(VERIFY_POLL_SECONDS)
 
-    if model != ticket["model"]:
+    if model != ticket.model:
         raise LaunchError(
             f"model mismatch: transcript reports {model},"
-            f" the table approved {ticket['model']}"
+            f" the table approved {ticket.model}"
         )
     return entry
 
@@ -761,7 +591,7 @@ def launch_claude_child(run, ticket, artifacts, timeouts, log=None):
         "child": "",
         "window": window_id,
         "worktree": str(worktree),
-        "account": ticket["account"],
+        "account": ticket.binding.directory,
     }
     started_note = log_note(log, ticket, details)
     try:
@@ -775,7 +605,7 @@ def launch_claude_child(run, ticket, artifacts, timeouts, log=None):
     verified_note = log_note(log, ticket, details)
     note = started_note or verified_note
     line = (
-        f"{ticket['id']} launched {ticket['executor']} {ticket['model']} {ticket['effort']}"
+        f"{ticket.id} launched {ticket.executor} {ticket.model} {ticket.effort}"
         f" window={window_id} name={entry['name']} pid={entry['pid']}"
         f" session={entry['sessionId']}{hook_note(hook)}"
     )
@@ -792,15 +622,15 @@ def verify_codex_child(ticket, worktree, state_file):
         state = json.loads(state_file.read_text())
     except (OSError, ValueError) as error:
         raise LaunchError(f"the codex state file {state_file} is unreadable: {error}") from error
-    if state.get("model") != ticket["model"]:
+    if state.get("model") != ticket.model:
         raise LaunchError(
             f"model mismatch: the codex session runs {state.get('model')},"
-            f" the table approved {ticket['model']}"
+            f" the table approved {ticket.model}"
         )
-    if state.get("effort") != ticket["effort"]:
+    if state.get("effort") != ticket.effort:
         raise LaunchError(
             f"effort mismatch: the codex session runs {state.get('effort')},"
-            f" the table approved {ticket['effort']}"
+            f" the table approved {ticket.effort}"
         )
     recorded = state.get("cwd")
     if not recorded:
@@ -812,24 +642,24 @@ def verify_codex_child(ticket, worktree, state_file):
 
 def launch_codex_child(run, ticket, artifacts, timeouts, log=None):
     worktree = prepare_worktree(run, ticket)
-    codex = run["codex"]
-    state_file = pathlib.Path(codex["state_dir"]) / f"{ticket['id']}.json"
+    codex = run.codex
+    state_file = pathlib.Path(codex.state_dir) / f"{ticket.id}.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
     environment.update(hook_environment(run))
     command = [
-        sys.executable, str(codex["bridge"]), "launch",
+        sys.executable, str(codex.bridge), "launch",
         "--cwd", str(worktree),
-        "--tmux-session", run["tmux_session"],
-        "--window-name", ticket["id"],
+        "--tmux-session", run.tmux_session,
+        "--window-name", ticket.id,
         "--state-file", str(state_file),
-        "--model", ticket["model"],
-        "--effort", ticket["effort"],
+        "--model", ticket.model,
+        "--effort", ticket.effort,
         "--prompt-file", artifacts["turnFile"],
     ]
     if log:
         command.extend(
-            ["--machine-log", str(log), "--ticket", str(ticket["id"])]
+            ["--machine-log", str(log), "--ticket", ticket.id]
         )
     result = subprocess.run(
         command,
@@ -847,7 +677,7 @@ def launch_codex_child(run, ticket, artifacts, timeouts, log=None):
     state = verify_codex_child(ticket, worktree, state_file)
     hook = run_launch_hook(run, worktree, window_id, timeouts["hook"])
     line = (
-        f"{ticket['id']} launched {ticket['executor']} {ticket['model']} {ticket['effort']}"
+        f"{ticket.id} launched {ticket.executor} {ticket.model} {ticket.effort}"
         f" window={window_id} state={state_file}{hook_note(hook)}"
     )
     # A Codex child has no agents-list name; the thread the bridge pinned is what identifies it.
@@ -869,12 +699,12 @@ def log_launch(log, ticket, details):
     """
     arguments = [
         sys.executable, str(MACHINE_LOG), "--log", str(log), "launch",
-        "--ticket", str(ticket["id"]),
+        "--ticket", ticket.id,
         "--child", str(details.get("child") or ""),
-        "--workflow", str(ticket["workflow"]),
-        "--executor", str(ticket["executor"]),
-        "--model", str(ticket["model"]),
-        "--effort", str(ticket["effort"]),
+        "--workflow", ticket.workflow,
+        "--executor", ticket.executor,
+        "--model", ticket.model,
+        "--effort", ticket.effort,
         "--branch", branch_name(ticket),
         "--worktree", str(details["worktree"]),
     ]
@@ -914,7 +744,7 @@ def log_launch_failure_note(log, ticket, error):
         return ""
     arguments = [
         sys.executable, str(MACHINE_LOG), "--log", str(log), "launch-failed",
-        "--ticket", str(ticket["id"]), "--detail", str(error),
+        "--ticket", ticket.id, "--detail", str(error),
     ]
     result = subprocess.run(arguments, capture_output=True, text=True)
     if result.returncode != 0:
@@ -927,7 +757,7 @@ def dispatch_wave(run, tickets, rendered, timeouts, log=None):
     failed = False
     for ticket, artifacts in zip(tickets, rendered):
         try:
-            if ticket["executor"] == "claude":
+            if ticket.executor == "claude":
                 line, note = launch_claude_child(
                     run, ticket, artifacts, timeouts, log=log
                 )
@@ -937,7 +767,7 @@ def dispatch_wave(run, tickets, rendered, timeouts, log=None):
                 )
         except LaunchError as error:
             failed = True
-            lines.append(f"{ticket['id']} FAILED {error}".replace("\n", " "))
+            lines.append(f"{ticket.id} FAILED {error}".replace("\n", " "))
             continue
         failed = failed or bool(note)
         lines.append(line + note)
@@ -978,26 +808,23 @@ def main(argv=None):
     args = parse_args(argv)
     templates = load_templates()
     try:
-        table = json.loads(pathlib.Path(args.table).read_text())
-    except (OSError, ValueError) as error:
-        # ValueError covers both a table that is not JSON and one that is not even text.
-        print(f"run: {args.table} is not a readable wave table: {error}", file=sys.stderr)
-        return 1
-
-    if args.base_commit and isinstance(table.get("run"), dict):
-        # One value, read by the worktree and by the first turn's review base alike: a wave cut
-        # from a later commit is also reviewed against it.
-        table["run"]["integration_base_commit"] = args.base_commit
-
-    try:
-        validate(table, templates)
-        tickets = wave_tickets(table, args.wave)
-    except TableError as error:
+        plan = run_plan.load(args.table)
+        if args.base_commit:
+            # One value, read by the worktree and by the first turn's review base alike: a wave cut
+            # from a later commit is also reviewed against it.
+            plan = dataclasses.replace(
+                plan,
+                run=dataclasses.replace(
+                    plan.run, integration_base_commit=args.base_commit,
+                ),
+            )
+        tickets = plan.wave(args.wave).tickets
+    except run_plan.RunPlanError as error:
         for problem in error.problems:
             print(problem, file=sys.stderr)
         return 1
 
-    run = table["run"]
+    run = plan.run
     # Absolute before anything is recorded: the launch line runs in the child's own worktree, not
     # in this process's working directory, so a relative artifact path there resolves to nothing.
     out_dir = pathlib.Path(os.path.abspath(args.out_dir))

@@ -39,7 +39,6 @@ started.
 
 import argparse
 import hashlib
-import json
 import os
 import pathlib
 import subprocess
@@ -51,6 +50,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
 import dispatch  # noqa: E402
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import accounts  # noqa: E402
+import run_plan  # noqa: E402
 import machine_log  # noqa: E402
 
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent / "machine_log.py"
@@ -75,7 +75,6 @@ REPAIR_PERMISSION_MODE = "acceptEdits"
 # environment that binding is — one variable set, or nothing touched — is the account module's
 # answer, not this script's.
 CONFIG_HOME_ENV_VAR = accounts.CONFIG_HOME_VARIABLE
-ACCOUNT_KEY = accounts.ACCOUNT_KEY
 
 # The conflict markers, in the style the merge is run under: `diff3` keeps the base section, and
 # whether that section is empty is the whole of the mechanical/semantic test.
@@ -462,7 +461,7 @@ def start_merge(repo, branch):
 
 def escalation_detail(reason, ticket, branch, paths):
     """An escalation carries its own pointers, so a ruling never starts with a hunt."""
-    pointers = f"{reason}; ticket {ticket['path']}; branch {branch}"
+    pointers = f"{reason}; ticket {ticket.path}; branch {branch}"
     return f"{pointers}; conflicted {', '.join(paths)}" if paths else pointers
 
 
@@ -470,8 +469,8 @@ def merge_recorder(run, ticket, branch, options):
     """A one-argument writer of this ticket's `merge` events, so every one of them agrees."""
     def record(result, **fields):
         log_event(
-            options["log"], "merge", "--ticket", str(ticket["id"]), "--result", result,
-            "--branch", branch, "--into", run["integration_branch"],
+            options["log"], "merge", "--ticket", ticket.id, "--result", result,
+            "--branch", branch, "--into", run.integration_branch,
             *[flag for name, value in fields.items() for flag in (f"--{name}", value)],
         )
     return record
@@ -481,7 +480,7 @@ def escalate(run, ticket, branch, options, reason, paths):
     """Record the one event that wakes the coordinator; returns `(printed line, True)`."""
     detail = escalation_detail(reason, ticket, branch, paths)
     merge_recorder(run, ticket, branch, options)("escalated", detail=detail)
-    return f"{ticket['id']} escalated {detail}", True
+    return f"{ticket.id} escalated {detail}", True
 
 
 def climb_the_ladder(repo, into, ticket, branch, options, record):
@@ -506,16 +505,9 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
         git_or_raise(repo, "commit", "--no-edit")
         sha = git_or_raise(repo, "rev-parse", "HEAD")
         record(RESOLVED, sha=sha, detail=f"kept both sides' insertions in {', '.join(paths)}")
-        return f"{ticket['id']} {RESOLVED} {sha}", None
+        return f"{ticket.id} {RESOLVED} {sha}", None
 
-    binding = accounts.row_binding(ticket)
-    if binding is None:
-        # Every row of a validated wave table carries the account its ticket's processes run on,
-        # so a row without one is a table this ladder cannot spend against. Falling back to
-        # whichever account this script happens to be running under is forbidden: a repair billed
-        # to the wrong subscription is indistinguishable afterwards from a correct one, which is
-        # the defect the account key exists to remove.
-        return None, "the ticket's row carries no account for the repair session to run on"
+    binding = ticket.binding
 
     command = repair_command(
         options["repair_model"], options["repair_budget"],
@@ -539,7 +531,7 @@ def climb_the_ladder(repo, into, ticket, branch, options, record):
                 REPAIRED, sha=sha,
                 detail=f"repair session {attempt} of {attempts} resolved {', '.join(paths)}",
             )
-            return f"{ticket['id']} {REPAIRED} {sha}", None
+            return f"{ticket.id} {REPAIRED} {sha}", None
     return None, f"{attempts} repair sessions left the conflict standing: {failure}"
 
 
@@ -550,9 +542,9 @@ def land_ticket(run, ticket, branch, options):
     the next ticket starts from a repository in one piece, and one `escalated` event carries the
     reason to the coordinator.
     """
-    repo = run["repo_root"]
-    into = run["integration_branch"]
-    number = str(ticket["id"])
+    repo = run.repo_root
+    into = run.integration_branch
+    number = ticket.id
     record = merge_recorder(run, ticket, branch, options)
 
     paths = []
@@ -579,42 +571,34 @@ def land_ticket(run, ticket, branch, options):
 
 def ticket_order(ticket):
     """Ticket order: by number where a ticket is numbered, and by name where it is not."""
-    number = str(ticket["id"])
+    number = ticket.id
     return (0, int(number), "") if number.isdigit() else (1, 0, number)
 
 
-def wave_tickets(table, wave):
-    if not isinstance(table, dict) or not isinstance(table.get("waves"), list):
-        raise WaveError("the table carries no list of waves")
-    for entry in table["waves"]:
-        if isinstance(entry, dict) and entry.get("wave") == wave:
-            return sorted(entry.get("tickets") or [], key=ticket_order)
-    raise WaveError(f"the table holds no wave {wave}")
+def merge_tickets(plan, wave):
+    """The selected plan wave in merge policy's numeric ticket order."""
+    return sorted(plan.wave(wave).tickets, key=ticket_order)
 
 
 def check_repair_model(model):
     """Refuse an alias before a wave starts: an alias resolves to a model nobody approved."""
-    aliases = {alias.lower() for alias in dispatch.load_templates()["models"]["aliases"]}
-    problem = dispatch.alias_problem("Repair model", model, aliases)
+    problem = run_plan.model_problem("Repair model", model)
     if problem:
         raise WaveError(problem)
 
 
 def open_integration_branch(run):
     """Check the integration branch out, refusing a repository with work of its own in the way."""
-    repo = run["repo_root"]
+    repo = run.repo_root
     if git_or_raise(repo, "status", "--porcelain", "--untracked-files=no"):
         raise WaveError(f"{repo} has uncommitted changes; nothing was merged")
-    git_or_raise(repo, "checkout", run["integration_branch"])
+    git_or_raise(repo, "checkout", run.integration_branch)
 
 
-def land_wave(table, wave, options):
+def land_wave(plan, wave, options):
     """Land every landable ticket of `wave`; returns `(printed lines, whether any escalated)`."""
-    run = table["run"] if isinstance(table.get("run"), dict) else {}
-    for key in ("repo_root", "integration_branch"):
-        if not run.get(key):
-            raise WaveError(f"the table's run section lacks {key}")
-    tickets = wave_tickets(table, wave)
+    run = plan.run
+    tickets = merge_tickets(plan, wave)
     check_repair_model(options["repair_model"])
     open_integration_branch(run)
 
@@ -622,13 +606,13 @@ def land_wave(table, wave, options):
     lines = []
     escalated = False
     for ticket in tickets:
-        number = str(ticket["id"])
+        number = ticket.id
         branch = dispatch.branch_name(ticket)
         receipt = projection.ticket(number).receipt or {}
         if receipt.get("verdict") != LANDABLE:
             lines.append(f"{number} skipped {receipt.get('verdict') or 'no receipt'}")
             continue
-        unverified = unverified_reason(run["repo_root"], branch, receipt)
+        unverified = unverified_reason(run.repo_root, branch, receipt)
         if unverified:
             line, _ = escalate(run, ticket, branch, options, unverified, [])
             lines.append(line)
@@ -668,20 +652,21 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        table = json.loads(pathlib.Path(args.table).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        print(f"run: {args.table} is not a readable wave table: {error}", file=sys.stderr)
+        plan = run_plan.load(args.table)
+    except run_plan.RunPlanError as error:
+        for problem in error.problems:
+            print(problem, file=sys.stderr)
         return 1
 
     try:
-        lines, escalated = land_wave(table, args.wave, {
+        lines, escalated = land_wave(plan, args.wave, {
             "log": args.log,
             "repair_model": args.repair_model,
             "repair_budget": args.repair_budget_usd,
             "repair_attempts": args.repair_attempts,
             "repair_timeout": args.repair_timeout,
         })
-    except WaveError as error:
+    except (WaveError, run_plan.RunPlanError) as error:
         print(f"run: {error}", file=sys.stderr)
         return 1
 

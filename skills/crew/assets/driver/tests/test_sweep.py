@@ -16,7 +16,7 @@ import subprocess
 import sys
 import unittest
 
-from harness import BASE_BRANCH, DRIVER, DriverTestCase, git
+from harness import BASE_BRANCH, DRIVER, REPAIR_MODEL, TRACKER, DriverTestCase, git
 
 
 MACHINE_LOG = DRIVER.parents[1] / "machine_log.py"
@@ -78,14 +78,42 @@ class SeededRun:
                 "crew_skill_dir": str(DRIVER.parents[1]),
                 "tmux_session": "$7:",
                 "permission_mode": "acceptEdits",
+                "coordinator_config_home": str(fixture.config_dir),
                 "base_branch": BASE_BRANCH,
                 "return_branch": BASE_BRANCH,
                 "feature_dir": str(self.feature_dir),
-                "codex": {"state_dir": str(self.run_dir / "codex")},
+                "repair_model": REPAIR_MODEL,
+                "tracker": TRACKER,
+                "codex": {
+                    "bridge": str(DRIVER.parent / "tests" / "stub_codex_bridge.py"),
+                    "state_dir": str(self.run_dir / "codex"),
+                },
             },
             "waves": [{"wave": 1, "tickets": [
-                {"id": LANDED_TICKET, "title": "landed", "blocked_by": []},
-                {"id": PARKED_TICKET, "title": "parked", "blocked_by": []},
+                {
+                    "id": LANDED_TICKET,
+                    "title": "landed",
+                    "path": str(self.feature_dir / f"{LANDED_TICKET}.md"),
+                    "workflow": "direct",
+                    "executor": "claude",
+                    "model": "claude-opus-5",
+                    "effort": "medium",
+                    "account": str(fixture.config_dir),
+                    "account_mode": "inherited",
+                    "blocked_by": [],
+                },
+                {
+                    "id": PARKED_TICKET,
+                    "title": "parked",
+                    "path": str(self.feature_dir / f"{PARKED_TICKET}.md"),
+                    "workflow": "direct",
+                    "executor": "claude",
+                    "model": "claude-opus-5",
+                    "effort": "medium",
+                    "account": str(fixture.config_dir),
+                    "account_mode": "inherited",
+                    "blocked_by": [],
+                },
             ]}],
         }) + "\n")
         self.log_path.write_text("".join(
