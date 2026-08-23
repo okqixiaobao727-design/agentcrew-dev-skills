@@ -94,6 +94,12 @@ every key on it is concrete: an optional key absent from a ticket is resolved to
 table is built, never carried onward as an absence
 ([ADR-0014](adr/0014-optional-routing-keys-are-resolved-at-the-wave-table-boundary.md)).
 
+**Run plan** — The validated meaning of a run's Wave table: its run metadata, ordered waves, tickets,
+dependencies and concrete routing. It says what should happen; the Machine log says what did
+happen. Every reader uses the same Run plan rather than interpreting the Wave-table JSON itself
+([ADR-0018](adr/0018-run-plan-owns-wave-table-meaning-callers-own-execution.md)).
+_Avoid_: wave-table dict, routing cache, workflow state
+
 **Workflow** — How a ticket gets developed. A closed set of six: `tdd`, `refactor`, `direct`,
 `spike`, `ops`, `acceptance`. It shapes the child's first prompt — which stages run and which are
 skipped.
