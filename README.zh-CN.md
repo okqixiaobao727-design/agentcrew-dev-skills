@@ -50,6 +50,11 @@ AgentCrew 是 [mattpocock-skills](https://github.com/mattpocock/skills) 的聚�
 - **tmux**——子 agent 以协调者所在会话的 window 形式运行。
 - **Python 3.11+**——配置校验脚本与 Codex bridge 需要。
 - 若要跑 Codex ticket：**Codex CLI**，以及为 Claude Code 所用的 Python 解释器安装的 `aiohttp` 包。
+- 若要跑带 review 的 ticket——即所有 `tdd` 与 `refactor` ticket：
+  **[Review-Switch](https://github.com/okqixiaobao727-design/review-switch)**，且要装到它的
+  `review-bridge` 命令在你的 `PATH` 上。AgentCrew 自己不带任何 review 实现，而是跨进程调用这条命令
+  （`docs/adr/0020-review-switch-owns-the-review-agentcrew-owns-the-reviewer.md`），所以 wave 表里
+  只要有 review lane，命令没装好这一趟 run 就会停在 preflight。
 
 每个使用 AgentCrew 的仓库还需要 `docs/agents/issue-tracker.md`：两个技能都从它读取 ticket 存放在哪里、
 状态写回到哪里，二者都没有兜底默认值。

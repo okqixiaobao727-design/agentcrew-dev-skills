@@ -55,6 +55,12 @@ verifies before merging. The base branch is untouched for the whole run; the fin
 - **Python 3.11+** — the config validator and the Codex bridge.
 - For Codex tickets: the **Codex CLI**, and the `aiohttp` package installed for the Python
   interpreter Claude Code runs.
+- For reviewed tickets — every `tdd` and `refactor` ticket:
+  **[Review-Switch](https://github.com/okqixiaobao727-design/review-switch)**, installed so that
+  its `review-bridge` command is on your `PATH`. AgentCrew ships no review implementation of its
+  own and calls that command across a process boundary
+  (`docs/adr/0020-review-switch-owns-the-review-agentcrew-owns-the-reviewer.md`), so a run whose
+  wave table carries a review lane stops in preflight until it is installed.
 
 Every repo you use AgentCrew in also needs `docs/agents/issue-tracker.md`: both skills read it to
 learn where tickets live and where status is written back, and neither has a fallback.
