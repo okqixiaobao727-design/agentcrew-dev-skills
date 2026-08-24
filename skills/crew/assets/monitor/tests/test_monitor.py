@@ -27,8 +27,6 @@ ACCOUNTS = TESTS_DIR.parents[1] / "accounts.py"
 # The projection module the monitor reads Machine-log facts through; part of every release of it.
 MACHINE_LOG = TESTS_DIR.parents[1] / "machine_log.py"
 RUN_PLAN = TESTS_DIR.parents[1] / "run_plan.py"
-# The review lane the dashboard's annotation is drawn from, written by this bridge and no fixture.
-REVIEW_BRIDGE = TESTS_DIR.parents[1] / "review" / "scripts" / "claude_review_bridge.py"
 
 # Stamped in the run's one timestamp format, so every elapsed time below is arithmetic a reader
 # can check: 09:00:00 to 09:12:31 is twelve minutes and thirty-one seconds.
@@ -462,32 +460,6 @@ class Fixture:
             ]) + "\n"
         path.write_text(text)
         return path
-
-    def review(self, ticket, model=MODEL):
-        """Run the real review bridge over this ticket, pointed at this run's machine log.
-
-        Returns the finished call and the log as the bridge left it *mid-review* — the stub
-        reviewer copies the file aside while it is running — so a frame can be drawn from a
-        review that is genuinely in flight rather than from a `review` line composed by hand.
-        """
-        snapshot = self.run_dir / "log-mid-review.jsonl"
-        environment = self.environment()
-        environment["AGENTCREW_STUB_REVIEW_LOG"] = str(self.log)
-        environment["AGENTCREW_STUB_REVIEW_SNAPSHOT"] = str(snapshot)
-        completed = subprocess.run(
-            [
-                sys.executable, str(REVIEW_BRIDGE),
-                "--cwd", str(self.worktrees[ticket]),
-                "--state-dir", str(self.run_dir / "review-state"),
-                "--claude-binary", str(TESTS_DIR / "stub_review_claude.py"),
-                "--machine-log", str(self.log),
-                "--ticket", ticket,
-                "--model", model,
-                "the changes in this worktree",
-            ],
-            capture_output=True, text=True, env=environment,
-        )
-        return completed, snapshot
 
     @staticmethod
     def set_claude_cwds(transcript, cwds):
@@ -1185,29 +1157,6 @@ class DashboardTests(MonitorTestCase):
         result = self.fixture.dashboard()
 
         self.assertNotIn("↳ review:", result.stdout)
-
-    def test_a_review_a_bridge_actually_ran_annotates_its_row_and_then_stops(self):
-        """The whole path, end to end: the bridge writes, the dashboard draws, both unaided.
-
-        Ticket 07 is the Codex child, so its review lane is the Claude one, and the elapsed clock
-        is left to whatever the frame measures — these stamps are the ones a live run wrote.
-        """
-        self.launch_wave_one()
-        self.fixture.live({"06": "busy", "07": "busy"})
-
-        completed, snapshot = self.fixture.review("07")
-
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        settled = self.fixture.log.read_text()
-        self.fixture.log.write_text(snapshot.read_text())
-        running = self.fixture.run_monitor("dashboard", "--run-dir", self.fixture.run_dir)
-        self.fixture.log.write_text(settled)
-        returned = self.fixture.run_monitor("dashboard", "--run-dir", self.fixture.run_dir)
-
-        self.assertEqual(running.returncode, 0, running.stderr)
-        self.assertIn(f"↳ review: claude {MODEL} running · ", running.stdout)
-        self.assertEqual(returned.returncode, 0, returned.stderr)
-        self.assertNotIn("↳ review:", returned.stdout)
 
     def test_a_settled_ticket_shows_its_state_and_stops_its_clock(self):
         self.launch_wave_one()

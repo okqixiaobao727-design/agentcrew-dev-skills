@@ -924,6 +924,27 @@ class CodexRenderTests(DispatchTestCase):
         self.assertIn("CREW COMPLETE <sha> ts=<unix time>", turn)
         self.assertFalse((self.fixture.out_dir / "07.agents.json").exists())
 
+    def test_a_claude_review_lane_uses_only_the_installed_review_switch_command(self):
+        result = self.fixture.run_dispatch("render", self.table)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = self.fixture.turn("07")
+        self.assertEqual(
+            review_command_argv(prompt),
+            [
+                "review-bridge",
+                "--reviewer", "claude",
+                "--cwd", str(self.fixture.repo / ".claude" / "worktrees" / "07-codex-child"),
+                "--model", CLAUDE_MODEL,
+                "--effort", CLAUDE_EFFORT,
+                "--base", self.fixture.base_commit,
+                "--spec", self.ticket["path"],
+                "--axis", "both",
+            ],
+        )
+        self.assertNotIn("tui_review_bridge.py", prompt)
+        self.assertNotIn("claude_review_bridge.py", prompt)
+
     def test_a_codex_ticket_launches_through_the_bridge_with_its_turn_file(self):
         result = self.fixture.run_dispatch("dispatch", self.table)
 

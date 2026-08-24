@@ -47,9 +47,9 @@ Three findings were fixed in `skills/route/SKILL.md` before publishing:
   downstream couples to — including two criteria of one ticket that contradicted each other. Step 3
   now requires a contract ticket's criteria to state the contract.
 
-One finding is open, and it belongs to the bridge rewrite already on the README's roadmap: a
-`tui_review_bridge.py` pane process outlives the review it ran, so a run leaves one per reviewed
-ticket behind until the shell that owns it exits.
+The run also exposed the pane-lifetime defect that motivated the later Review-Switch process
+boundary: a reviewer process outlived the review it ran, leaving one pane per reviewed ticket
+until the owning shell exited.
 
 ## Reproducing it
 
