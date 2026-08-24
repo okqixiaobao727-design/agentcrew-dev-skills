@@ -34,12 +34,13 @@ of emitting a wake snapshot.
 The `answer` subcommand is also an operator terminal command, but its failures emit a `driver-error`
 wake snapshot so the coordinator can see why the child could not be answered.
 
-**A preflight failure never reaches the coordinator as diagnosis.** Preflight is the four read-only
+**A preflight failure never reaches the coordinator as diagnosis.** Preflight is the five read-only
 checks — a clean working tree, a base branch that resolves and fast-forwards, a valid routing on
-every ticket (the renderer's own validation, which is the authority on the case list), and a
-complete acyclic dependency graph — plus the run's two configured decisions, the repair rung's
-model and the tracker its merged tickets are closed in, neither of which has a default. On any
-failure the driver launches nothing, prints the `preflight-failed` snapshot naming the problem
+every ticket (the renderer's own validation, which is the authority on the case list), a complete
+acyclic dependency graph, and, for a run that reviews at all, the installed Review-Switch command
+this repository's review lane is (ADR-0020) — plus the run's two configured decisions, the repair
+rung's model and the tracker its merged tickets are closed in, neither of which has a default. On
+any failure the driver launches nothing, prints the `preflight-failed` snapshot naming the problem
 count and the display surface, and shows the full problem list to the operator in a detached tmux
 window named `crew-preflight` in the run's own session, ending with the reminder that fixes must be
 committed. That notice is the run's only diagnosis surface: it is killed by name, in that session
@@ -188,6 +189,11 @@ STATUS_FINISHED = "done"
 # and the undo puts it back (`references/trackers.md`).
 PICKUP_LABELS = ("ready-for-agent", "ready-for-human")
 GH = "gh"
+# The installed Review-Switch command a reviewed ticket's child runs. This repository ships no
+# review implementation and calls it across a process boundary (ADR-0020), so on a machine where
+# it is not installed the review lane is a command the child discovers missing only once its work
+# is already written — which is the failure preflight moves to before the run.
+REVIEW_COMMAND = "review-bridge"
 
 # The wake reasons, exhaustively: nothing else ends this driver. `run-complete` stays the
 # wind-down's to fill out, and is named here because the snapshot's shape is one.
@@ -473,7 +479,7 @@ def run_command(arguments, message, ticket=None, pointer=None):
     return result.stdout
 
 
-# --- the four preflight checks ----------------------------------------------------------------
+# --- the five preflight checks ----------------------------------------------------------------
 
 
 def dirty_tree_problems(repo):
@@ -566,6 +572,25 @@ def base_branch_problems(repo, branch, upstream):
             " diverged, so reconcile them before the run cuts from it"
         ]
     return []
+
+
+def review_command_problems(plan):
+    """Whether the Review-Switch command is installed, asked only of a run that reviews.
+
+    A run whose wave table carries no review lane calls the command never, and a machine that
+    reviews nowhere is not misconfigured for lacking it — so the check is the plan's own question,
+    not the machine's. The lookup is this driver's `PATH`, which is the environment a child
+    inherits through the window the driver opens for it.
+    """
+    reviewed = [ticket.id for ticket in plan.tickets if ticket.review is not None]
+    if not reviewed or shutil.which(REVIEW_COMMAND) is not None:
+        return []
+    return [
+        f"review lane: `{REVIEW_COMMAND}` is not on this machine's PATH, and ticket"
+        f"{'s' if len(reviewed) > 1 else ''} {', '.join(reviewed)} carry a review this run has no"
+        " way to run — install Review-Switch, which owns the review this repository only routes"
+        " (ADR-0020), and put its command on your PATH"
+    ]
 
 
 # --- the preflight notice ----------------------------------------------------------------------
@@ -1474,13 +1499,16 @@ def sweep_dead_runs(repo, keep_run_dir):
 
 
 def preflight(repo, feature_dir, base_branch, upstream, run):
-    """The four read-only checks and the run's two configured values, every problem of every one."""
+    """The five read-only checks and the run's two configured values, every problem of every one."""
     problems = dirty_tree_problems(repo)
     problems += base_branch_problems(repo, base_branch, upstream)
     try:
-        run_plan.build(feature_dir, run)
+        plan = run_plan.build(feature_dir, run)
     except run_plan.RunPlanError as error:
-        problems += list(error.problems)
+        # A plan that does not build answers no question about what this run reviews, so the last
+        # check is not asked here rather than guessed at.
+        return problems + list(error.problems)
+    problems += review_command_problems(plan)
     return problems
 
 

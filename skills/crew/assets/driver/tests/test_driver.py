@@ -31,6 +31,7 @@ from harness import (
     COORDINATOR_NAME,
     COORDINATOR_PID,
     DASHBOARD_WINDOW,
+    DIRECT_ROUTING,
     DRIVER,
     DRIVER_RECORD,
     DriverTestCase,
@@ -120,6 +121,27 @@ class PreflightTests(DriverTestCase):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
         (self.fixture.repo / "scratch.txt").write_text("not mine\n")
+
+        self.started()
+
+    def test_a_missing_review_command_stops_a_run_that_reviews(self):
+        """The review lane is an installed command, so preflight asks for it before the work."""
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.uninstall_review_command()
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("review-bridge", notice)
+        self.assertIn("01", notice)
+        self.assertIn("Review-Switch", notice)
+
+    def test_a_missing_review_command_is_no_problem_for_a_run_that_reviews_nowhere(self):
+        """A machine that reviews nowhere is not misconfigured for lacking the command."""
+        self.fixture.ticket("01", "first thing", routing=DIRECT_ROUTING)
+        self.fixture.commit_feature()
+        self.fixture.uninstall_review_command()
 
         self.started()
 

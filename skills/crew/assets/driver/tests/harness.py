@@ -102,6 +102,18 @@ Reasons: a fixture ticket.
 """
 
 
+# The one fixture routing no review lane reaches: `direct` is a workflow whose shape carries none,
+# so a feature of these tickets is a run that reviews nowhere.
+DIRECT_ROUTING = f"""## Routing
+
+Workflow: direct
+Executor: claude
+Model: {CLAUDE_MODEL}
+Effort: {CLAUDE_EFFORT}
+Reasons: a fixture ticket with no review lane.
+"""
+
+
 def routing_naming(account):
     """The fixture routing carrying the optional `Account` line an operator may name."""
     return ROUTING.replace(
@@ -158,6 +170,10 @@ class Fixture:
         self._link_stub("claude", "stub_claude.py")
         self._link_stub("tmux", "stub_tmux.py")
         self._link_stub("gh", "stub_gh.py")
+        self._link_stub("review-bridge", "stub_review_bridge.py")
+        # Whether this fixture's machine has Review-Switch installed. The default is the machine
+        # a reviewed run needs, so every test that is not about the check sees the command.
+        self.review_command_installed = True
         self.running = []
         # The one session the stub server holds: a window asked for in any other is refused, as a
         # real tmux refuses a session it does not have.
@@ -170,6 +186,15 @@ class Fixture:
             "#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, TESTS_DIR / script)
         )
         target.chmod(0o755)
+
+    def uninstall_review_command(self):
+        """Take Review-Switch off this fixture's machine — the stub, and any real installation.
+
+        This fixture's PATH ends in the developer's own, so removing only the stub would leave a
+        machine that has Review-Switch installed passing a check the test is about failing.
+        """
+        (self.bin_dir / "review-bridge").unlink()
+        self.review_command_installed = False
 
     # --- the project's config -------------------------------------------------------------
 
@@ -249,7 +274,13 @@ class Fixture:
 
     def environment(self, overrides=None):
         environment = dict(os.environ)
-        environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
+        inherited = environment["PATH"]
+        if not self.review_command_installed:
+            inherited = os.pathsep.join(
+                entry for entry in inherited.split(os.pathsep)
+                if entry and not os.access(os.path.join(entry, "review-bridge"), os.X_OK)
+            )
+        environment["PATH"] = f"{self.bin_dir}{os.pathsep}{inherited}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
         environment["CLAUDE_CONFIG_DIR"] = str(self.config_dir)
         environment["AGENTCREW_ACCOUNT_REGISTRY"] = str(self.registry)
