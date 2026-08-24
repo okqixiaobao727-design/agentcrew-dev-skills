@@ -258,8 +258,11 @@ stays inert; the other four still run.
 
 ## Roadmap
 
-- **`review-switch`** — the review-lane dispatcher is a separate project, not yet public.
-- **The Codex bridge** — `codex_bridge.py` is vendored in as it stands; a rewrite is planned.
+- **`review-switch`** — the review lane is its own public project,
+  [okqixiaobao727-design/review-switch](https://github.com/okqixiaobao727-design/review-switch).
+  AgentCrew will call it rather than ship a copy of its bridge
+  ([ADR-0020](docs/adr/0020-review-switch-owns-the-review-agentcrew-owns-the-reviewer.md)).
+- **The Codex bridge** — `codex_bridge.py` is copied in as it stands; a rewrite is planned.
 - **The mattpocock-skills dependency** — required today, optional later.
 
 ## Docs

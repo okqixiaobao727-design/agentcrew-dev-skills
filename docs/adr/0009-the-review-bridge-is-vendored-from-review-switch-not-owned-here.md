@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0020
 ---
 
 # The review bridge is vendored from Review-Switch, not owned here

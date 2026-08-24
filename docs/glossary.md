@@ -160,10 +160,10 @@ approach. Missing any one of the three makes it open exploration.
 a different vendor than the implementer (Claude implements, Codex reviews, and vice versa). Review
 intensity rises with the quadrant's stakes.
 
-**Standards axis / Spec axis** — The two buckets every review finding falls into. Standards = style,
-naming, convention — anything that does not affect correctness. Spec = correctness, safety,
-divergence from the spec. Whichever vendor reviews, findings are bucketed on these two axes and
-share one round budget.
+**Standards axis / Spec axis** — The two axes a review runs and reports separately. Standards =
+style, naming, convention — anything that leaves behaviour intact. Spec = correctness, safety,
+divergence from the spec. Each axis carries its own cap, held and enforced by Review-Switch:
+standards is fixed in one pass, spec earns at most one re-review.
 
 **Model table** — The two tables mapping a classification case to vendor/model/effort: one for
 implementers, one for reviewers. This is AgentCrew's configurable surface. The classification logic
@@ -324,20 +324,11 @@ Read instruction in the body — e.g. the to-tickets+route handoff that route-on
 never see. Disclosure earns its cost only when some branch skips the material.
 
 **Review recovery** — Re-attaching to the review a child already has running, keyed on the owner
-tuple the review bridge stores: tmux server, origin pane, worktree root. The reviewing session
+tuple Review-Switch stores: tmux server, origin pane, worktree root. The reviewing session
 outlives the driver process that launched it, so a lost handle is recovered rather than replaced;
 starting a second review of one diff is the failure this recovery exists to prevent.
 _Avoid_: retry, restart
 
-**Vendored copy** — A file this repo ships but does not own. A change to it is made upstream and
-arrives by moving its pin, never by editing the copy (ADR-0009). Today the review bridge is the
-only one.
-_Avoid_: fork, local copy (both imply it may be edited here)
-
-**Vendored codex bridge** — `codex_bridge.py`, the Codex-side transport, maintained inside this repo
-rather than installed as a separate skill.
-
-**Vendored review bridge** — `tui_review_bridge.py`, the review lane's transport, copied into this
-repo from Review-Switch and pinned to one upstream commit. Unlike the codex bridge it is *not*
-maintained here: Review-Switch owns it, `scripts/sync-bridge.sh` holds the pin, and CI fails on any
-drift from it (ADR-0009). A fix goes upstream first and arrives by moving the pin.
+**Codex bridge** — `codex_bridge.py`, the Codex-side transport, written and maintained here rather
+than installed as a separate skill.
+_Avoid_: vendored codex bridge — the word said this repo may not edit it, and this repo owns it.
