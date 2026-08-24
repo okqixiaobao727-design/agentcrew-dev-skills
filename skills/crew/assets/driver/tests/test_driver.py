@@ -621,13 +621,22 @@ class WakeMonitorAccountTests(DriverTestCase):
 
         A monitor forks a subshell of its own around each poll, so the same command line can
         appear twice for one monitor for as long as that poll takes; the wait is for the count
-        the arming produced, which is the state the fork passes through and returns to.
+        the arming produced, which is the state the fork passes through and returns to. The
+        reading that count was taken from is the reading returned: asking the process table
+        again is another chance to land inside a fork, and a wait that passed on one reading
+        has no business answering from another.
         """
+        reading = []
+
+        def armed():
+            reading[:] = self.monitors()
+            return len(reading) == count
+
         self.assertTrue(
-            self.fixture.wait_for(lambda: len(self.monitors()) == count),
-            f"the run armed {len(self.monitors())} wake monitors, not {count}",
+            self.fixture.wait_for(armed),
+            f"the run armed {len(reading)} wake monitors, not {count}",
         )
-        return self.monitors()
+        return list(reading)
 
     def snapshot_homes(self):
         """The configuration home every agents-list read of this run was made under."""
