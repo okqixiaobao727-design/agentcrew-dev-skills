@@ -35,20 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the vendored Review-Switch bridge
-        if: matrix.python-version == '3.11'
-        run: |
-          scripts/sync-bridge.sh
-          git diff --exit-code -- skills/crew/assets/review/scripts/tui_review_bridge.py
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      # The validator is stdlib-only, but the review bridge talks to the Codex app server over
-      # a websocket, so its suite cannot be loaded without aiohttp.
-      - name: Install the review bridge's dependency
-        run: python3 -m pip install --disable-pip-version-check aiohttp
 
       - name: Validate the plugin tree
         run: python3 scripts/validate_plugin_tree.py

@@ -298,16 +298,15 @@ The dashboard reads this event and nothing else does: a ticket whose last `revie
 ([`docs/monitor-dashboard.md`](monitor-dashboard.md)), and a ticket whose review has `returned`
 goes quiet again.
 
-The writer is the review bridge — the [Codex
-one](../skills/crew/assets/review/scripts/tui_review_bridge.py) or the [Claude
-one](../skills/crew/assets/review/scripts/claude_review_bridge.py) — given the run's log and the
-ticket, which the dispatch renderer fills into the review command the reviewed child runs. The
-bridge writes the event rather than the child because it is the only party that deterministically
-knows both ends: a child asked in prose to log it may skip the line, and a child whose session
-dies mid-review could never write `returned` at all. So `returned` goes down on every exit path
-the bridge controls, a review that failed or was interrupted included. A bridge given no log path
-writes nothing, and a log it cannot write changes neither its exit status nor the report the child
-reads. Each round of a review is a review, so round two writes its own pair.
+The writers are the Lifecycle Hook commands the dispatch renderer passes to Review-Switch:
+`review-start` writes `running`, and `review-end` writes `returned`. The child does not write
+either line because Review-Switch is the party that deterministically knows both ends: a child
+asked in prose to log them may skip a line, and a child whose session dies mid-review could never
+write `returned` at all. So the end hook runs on every exit path Review-Switch controls, a review
+that failed or was interrupted included. A run with no log passes no commands, and a command that
+cannot write changes neither Review-Switch's exit status nor the result the child reads. Each call
+that reaches `review-start` writes one pair; a preparation failure opens no review and writes only
+`returned`.
 
 ### `advance` — what the run decided after a wave settled
 
@@ -353,9 +352,10 @@ is the same explanation printed after `MONITOR ERROR`.
 `ticket`, `executor`, `model`, `lane`, `session`, `input_tokens`, `output_tokens`,
 `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`, `detail`. One line per launched
 child, appended by the cost pass at run completion
-([`docs/monitor-dashboard.md`](monitor-dashboard.md)), plus one per review, appended by the review
-bridge that ran it — so a run's usage is in its own artifacts rather than in transcripts a later
-agent would have to dig through, and the review lane can be graded from the run's own log.
+([`docs/monitor-dashboard.md`](monitor-dashboard.md)), plus one per started review axis, appended
+by the `axis-end` Lifecycle Hook command — so a run's usage is in its own artifacts rather than
+in transcripts a later agent would have to dig through, and the review lane can be graded from
+the run's own log.
 
 `lane` is what tells the two apart. A row with no `lane` is an implementing child's, which is
 what every row written before reviews were costed is. A row carrying one is a review's, spelled
@@ -374,13 +374,13 @@ vendor already counts them. `session` names every session the figures were read 
 comma-separated — a resumed or replaced child spent the ticket's tokens too. A review names its
 own session, which is also what keeps it out of the child's row when the two share a vendor.
 
-A review's figures are cumulative over the rounds it has had, so a second round writes a second
-line that supersedes the first rather than a share to be added to it. **A consumer MUST take the
-last line per review session id as what that review spent, and MUST NOT sum a session's lines** —
-summing them bills round one twice. The log is append-only and a bridge cannot know at the end of
-round one whether a round two is coming, so superseding is what "one figure per review" means
-here: withholding round one's line until the review is provably over would leave no figure at all
-for a review whose earned re-review never happened.
+A review's figures are cumulative over its lineage, so a resumed invocation writes another line
+that supersedes the first rather than a share to be added to it. **A consumer MUST take the last
+line per review session id as what that review spent, and MUST NOT sum a session's lines** —
+summing them bills the earlier invocation twice. The log is append-only and a bridge cannot know
+whether a lineage will resume, so superseding is what "one figure per review" means here:
+withholding an invocation's line until the lineage is provably over would leave no figure when a
+permitted resume never happens.
 
 A session whose usage could not be read carries `detail` and no figures at all: the line says
 what went wrong and where to look, which is what makes a missing measurement visible rather than
@@ -535,7 +535,6 @@ JSON at all, appends nothing and exits 0.
 [ADR-0002](adr/0002-shell-scripts-drive-the-cli-not-workflows-or-the-sdk.md) chose scripts driving
 the CLI over dynamic workflows and the Agent SDK; it rejected those two, not a language. The
 zero-token layer already speaks stdlib Python where a shell script would need a dependency —
-`codex_bridge.py`, the review bridges, `launch_hook.py`. This writer copies arbitrary message
-values, including structured ones, into JSON verbatim, which bash cannot do without `jq`, and it
-reads a hook payload off stdin. Stdlib Python is what the repo already requires and CI already
-runs.
+`codex_bridge.py`, `dispatch.py`, and this writer. This writer copies arbitrary message values,
+including structured ones, into JSON verbatim, which bash cannot do without `jq`, and it reads a
+hook payload off stdin. Stdlib Python is what the repo already requires and CI already runs.

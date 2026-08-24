@@ -453,7 +453,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
         legacy_name = "ORCHESTR" + "ATE"
         self.tree.set_local_identifiers(personal_hostname, personal_account)
         self.tree.write(
-            "skills/crew/assets/review/tests/residue-fixture.txt",
+            "skills/crew/assets/monitor/tests/residue-fixture.txt",
             "\n".join(
                 (
                     f"$HOME/Library/Application Support/{private_app}/runtime/bridgectl",
@@ -466,7 +466,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
             )
             + "\n",
         )
-        self.assert_rejects("skills/crew/assets/review/tests/residue-fixture.txt")
+        self.assert_rejects("skills/crew/assets/monitor/tests/residue-fixture.txt")
 
     def test_shell_positional_parameters_are_not_spend_figures(self):
         self.tree.write(
