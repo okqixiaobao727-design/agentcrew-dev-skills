@@ -10,6 +10,7 @@ the exit code.
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,21 @@ TMUX_SESSION = "$7:"
 INHERITED = "inherited"
 EXPLICIT = "explicit"
 CONFIG_HOME_VARIABLE = "CLAUDE_CONFIG_DIR"
+
+
+def review_command_argv(prompt):
+    """The one installed Review-Switch command rendered into a child's first turn."""
+    lines = prompt.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == "review-bridge \\"]
+    if len(starts) != 1:
+        raise AssertionError(f"expected one review-bridge command, found {len(starts)}")
+    command = []
+    for line in lines[starts[0]:]:
+        continued = line.rstrip().endswith("\\")
+        command.append(line.rstrip().removesuffix("\\").strip())
+        if not continued:
+            break
+    return shlex.split(" ".join(command))
 
 
 def run_git(repo, *args):
@@ -393,39 +409,60 @@ class ClaudeRenderTests(DispatchTestCase):
             self.initial_prompt(),
         )
 
-    def test_the_first_turn_pins_the_review_lane_model_and_effort(self):
+    def test_the_first_turn_calls_review_switch_with_the_approved_review_and_scope(self):
         prompt = self.initial_prompt()
-        self.assertIn(
-            f"Review: codex at model {CODEX_MODEL}, effort {CODEX_EFFORT}. Once the work is in"
-            " place and\nbefore you commit it, run this as a background command —"
-            " `run_in_background: true` — and wait\nfor it.",
-            prompt,
+        self.assertEqual(
+            review_command_argv(prompt),
+            [
+                "review-bridge",
+                "--reviewer", "codex",
+                "--cwd", self.worktree,
+                "--model", CODEX_MODEL,
+                "--effort", CODEX_EFFORT,
+                "--base", self.fixture.base_commit,
+                "--spec", self.ticket_path,
+                "--axis", "both",
+            ],
         )
-        self.assertIn(
-            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
-            "  --cwd %s --model %s --effort %s \\\n"
-            "  -- 'the changes in this worktree since %s'"
-            % (CREW_SKILL_DIR, self.worktree, CODEX_MODEL, CODEX_EFFORT,
-               self.fixture.base_commit),
-            prompt,
-        )
+        self.assertNotIn("tui_review_bridge.py", prompt)
+        self.assertNotIn("claude_review_bridge.py", prompt)
 
-    def test_the_first_turn_names_the_recovery_call_a_lost_handle_needs(self):
-        """The review outlives its driver, so a killed driver is re-attached, not restarted."""
+    def test_the_first_turn_follows_next_and_maps_escalate_without_restating_rounds(self):
         prompt = self.initial_prompt()
-        self.assertIn(
-            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
-            "  --cwd %s --recover-session" % (CREW_SKILL_DIR, self.worktree),
-            prompt,
-        )
-        self.assertIn("`recovered` true", prompt)
-        self.assertIn("Exit\ncode 3 means no live session belongs to this worktree", prompt)
-        self.assertIn(
-            "Rounds. Classify each finding on two axes: standards — style, naming, convention,"
-            " anything that\nleaves behaviour intact — and spec — correctness, security,"
-            " deviation from the spec or ticket.",
-            prompt,
-        )
+        flattened = " ".join(prompt.split())
+        self.assertIn("do exactly what its `next` field permits", flattened)
+        self.assertIn("map it onto `CREW ASK`", flattened)
+        self.assertNotIn("Rounds.", prompt)
+
+    def test_the_first_turn_keeps_long_reviews_out_of_the_foreground_bash_limit(self):
+        prompt = " ".join(self.initial_prompt().split())
+        self.assertIn("background or long-running command", prompt)
+        self.assertIn("`run_in_background: true`", prompt)
+        self.assertIn("foreground Bash call is killed at ten minutes", prompt)
+
+    def test_the_first_turn_selects_the_returned_axis_when_it_resumes(self):
+        prompt = " ".join(self.initial_prompt().split())
+        self.assertIn("replace `--axis both` with that axis's own name", prompt)
+        self.assertIn("`--resume-session <reviewSessionId>`", prompt)
+
+    def test_the_first_turn_recovers_a_lost_result_before_starting_another_review(self):
+        prompt = " ".join(self.initial_prompt().split())
+        self.assertIn("add `--recover-session`", prompt)
+        self.assertIn("Exit code 3", prompt)
+        self.assertIn("only result that permits a fresh review", prompt)
+
+    def test_the_first_turn_retries_only_a_failed_axis_as_a_fresh_single_axis_review(self):
+        prompt = " ".join(self.initial_prompt().split())
+        self.assertIn("Keep every completed axis", prompt)
+        self.assertIn("rerun only each failed axis once as a fresh single-axis review", prompt)
+        self.assertIn("without `--resume-session`", prompt)
+        self.assertIn("If that axis fails again, escalate", prompt)
+
+    def test_the_first_turn_maps_any_other_top_level_status_onto_crew_ask(self):
+        prompt = " ".join(self.initial_prompt().split())
+        self.assertIn("Any other top-level `status`, including `refused`", prompt)
+        self.assertIn("map its `next` and reason onto `CREW ASK`", prompt)
+        self.assertIn("Do not start or resume another review", prompt)
 
     def test_the_first_turn_carries_the_coordinator_trust_anchor(self):
         self.assertIn(
@@ -458,10 +495,9 @@ class ClaudeRenderTests(DispatchTestCase):
 
 
 class ReviewEventRenderTests(DispatchTestCase):
-    """The rendered review command carries what the bridge needs to log the review it runs.
+    """The rendered Lifecycle Hook commands keep the run's existing review observations.
 
-    The bridge writes the run's `review` event pair, and it can only do that for a run whose
-    machine log and ticket id reached it — so the renderer is what supplies them.
+    Review-Switch owns when each point fires and AgentCrew owns the commands that write its log.
     """
 
     def setUp(self):
@@ -475,28 +511,93 @@ class ReviewEventRenderTests(DispatchTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.fixture.turn("06")
 
-    def test_the_codex_review_command_carries_the_ticket_and_the_runs_machine_log(self):
+    def hook_command(self, prompt, flag):
+        argv = review_command_argv(prompt)
+        return argv[argv.index(flag) + 1]
+
+    def expected_review_hook(self, state, vendor="codex", model=CODEX_MODEL):
+        return [
+            "python3", str(self.machine_log.parent / "machine_log.py"),
+            "--log", str(self.machine_log), "review", "--ticket", "06",
+            "--lane", f"{vendor} {model}", "--state", state,
+        ]
+
+    def run_axis_end_hook(self, **facts):
+        """Run the rendered hook and return the one session-cost event it appends."""
+        self.machine_log.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            DISPATCH.parents[1] / "machine_log.py",
+            self.machine_log.parent / "machine_log.py",
+        )
+        command = self.hook_command(
+            self.prompt_for("--log", str(self.machine_log)), "--on-axis-end"
+        )
+        environment = dict(os.environ)
+        for name in (
+            "REVIEW_COST_DETAIL", "REVIEW_INPUT_TOKENS", "REVIEW_OUTPUT_TOKENS",
+            "REVIEW_CACHE_READ_TOKENS", "REVIEW_CACHE_CREATION_TOKENS",
+        ):
+            environment.pop(name, None)
+        environment.update(facts)
+        result = subprocess.run(
+            ["sh", "-c", command], capture_output=True, text=True, env=environment
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.machine_log.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
+    def test_the_review_hooks_write_the_same_running_and_returned_pair(self):
         prompt = self.prompt_for("--log", str(self.machine_log))
 
-        self.assertIn(
-            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
-            "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
-            "  -- 'the changes in this worktree since %s'"
-            % (CREW_SKILL_DIR, self.worktree, CODEX_MODEL, CODEX_EFFORT,
-               self.machine_log, self.fixture.base_commit),
-            prompt,
+        self.assertEqual(
+            shlex.split(self.hook_command(prompt, "--on-review-start")),
+            self.expected_review_hook("running"),
+        )
+        self.assertEqual(
+            shlex.split(self.hook_command(prompt, "--on-review-end")),
+            self.expected_review_hook("returned"),
         )
 
-    def test_the_recovery_command_carries_them_too(self):
-        """A recovered review is a review in progress, so it logs its own pair."""
-        prompt = self.prompt_for("--log", str(self.machine_log))
+    def test_the_axis_end_hook_writes_the_review_figures_and_their_sum(self):
+        counters = {
+            "REVIEW_INPUT_TOKENS": "10",
+            "REVIEW_OUTPUT_TOKENS": "20",
+            "REVIEW_CACHE_READ_TOKENS": "30",
+            "REVIEW_CACHE_CREATION_TOKENS": "40",
+        }
 
-        self.assertIn(
-            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
-            "  --cwd %s --machine-log %s --ticket 06 --recover-session"
-            % (CREW_SKILL_DIR, self.worktree, self.machine_log),
-            prompt,
+        event = self.run_axis_end_hook(
+            REVIEW_MODEL=CODEX_MODEL, REVIEW_SESSION="review-session-06", **counters
         )
+
+        self.assertEqual(event["event"], "session-cost")
+        self.assertEqual(event["ticket"], "06")
+        self.assertEqual(event["executor"], "codex")
+        self.assertEqual(event["model"], CODEX_MODEL)
+        self.assertEqual(event["lane"], f"codex {CODEX_MODEL}")
+        self.assertEqual(event["session"], "review-session-06")
+        self.assertEqual(event["input_tokens"], 10)
+        self.assertEqual(event["output_tokens"], 20)
+        self.assertEqual(event["cache_read_tokens"], 30)
+        self.assertEqual(event["cache_creation_tokens"], 40)
+        self.assertEqual(event["total_tokens"], sum(map(int, counters.values())))
+        self.assertNotIn("detail", event)
+
+    def test_the_axis_end_hook_writes_a_diagnosis_instead_of_figures(self):
+        detail = "review result carried no counters"
+
+        event = self.run_axis_end_hook(
+            REVIEW_MODEL="", REVIEW_SESSION="", REVIEW_COST_DETAIL=detail
+        )
+
+        self.assertEqual(event["event"], "session-cost")
+        self.assertEqual(event["detail"], detail)
+        for key in (
+            "session", "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_creation_tokens", "total_tokens",
+        ):
+            self.assertNotIn(key, event)
 
     def claude_lane(self, account=None, **overrides):
         """A ticket whose reviewer is the Claude lane, on the account the caller names.
@@ -512,19 +613,17 @@ class ReviewEventRenderTests(DispatchTestCase):
             **overrides,
         )
 
-    def test_the_claude_review_command_carries_the_ticket_and_the_runs_machine_log(self):
+    def test_both_reviewing_vendors_use_the_same_installed_command_and_hook_shape(self):
         prompt = self.prompt_for("--log", str(self.machine_log), **self.claude_lane())
+        argv = review_command_argv(prompt)
 
-        self.assertIn(
-            "python3 %s/assets/review/scripts/claude_review_bridge.py \\\n"
-            "  --cwd %s --model %s --effort %s --machine-log %s --ticket 06 \\\n"
-            "  --base %s \\\n"
-            "  --verification '<the commands you ran to verify this work, and that they"
-            " passed>' \\\n"
-            "  'the changes in this worktree since %s'"
-            % (CREW_SKILL_DIR, self.worktree, CLAUDE_MODEL, CLAUDE_EFFORT,
-               self.machine_log, self.fixture.base_commit, self.fixture.base_commit),
-            prompt,
+        self.assertEqual(argv[0], "review-bridge")
+        self.assertEqual(argv[argv.index("--reviewer") + 1], "claude")
+        self.assertEqual(argv[argv.index("--model") + 1], CLAUDE_MODEL)
+        self.assertEqual(argv[argv.index("--effort") + 1], CLAUDE_EFFORT)
+        self.assertEqual(
+            shlex.split(self.hook_command(prompt, "--on-review-start")),
+            self.expected_review_hook("running", "claude", CLAUDE_MODEL),
         )
 
     def test_a_relative_log_reaches_the_child_as_an_absolute_path(self):
@@ -537,23 +636,16 @@ class ReviewEventRenderTests(DispatchTestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            f"--machine-log {here}/run/log.jsonl --ticket 06", self.fixture.turn("06")
-        )
+        argv = review_command_argv(self.fixture.turn("06"))
+        command = argv[argv.index("--on-review-start") + 1]
+        self.assertIn(f"--log {here}/run/log.jsonl", command)
 
     def test_a_run_with_no_machine_log_still_renders_a_valid_review_command(self):
         prompt = self.prompt_for()
+        argv = review_command_argv(prompt)
 
-        self.assertNotIn("--machine-log", prompt)
-        self.assertNotIn("--ticket", prompt)
-        self.assertIn(
-            "python3 %s/assets/review/scripts/tui_review_bridge.py \\\n"
-            "  --cwd %s --model %s --effort %s \\\n"
-            "  -- 'the changes in this worktree since %s'"
-            % (CREW_SKILL_DIR, self.worktree, CODEX_MODEL, CODEX_EFFORT,
-               self.fixture.base_commit),
-            prompt,
-        )
+        for flag in ("--on-review-start", "--on-axis-end", "--on-review-end"):
+            self.assertNotIn(flag, argv)
 
 
 class ReviewAccountTests(ReviewEventRenderTests):
@@ -570,7 +662,8 @@ class ReviewAccountTests(ReviewEventRenderTests):
 
         prompt = self.prompt_for(**self.claude_lane(account=second))
 
-        self.assertIn(f"--account {second} \\\n", prompt)
+        argv = review_command_argv(prompt)
+        self.assertEqual(argv[argv.index("--account") + 1], str(second))
 
     def test_a_ticket_that_named_no_account_hands_the_bridge_none(self):
         """An inherited binding reviews on the login the operator is signed into.
@@ -581,14 +674,16 @@ class ReviewAccountTests(ReviewEventRenderTests):
         """
         prompt = self.prompt_for(**self.claude_lane())
 
-        self.assertIn("claude_review_bridge.py", prompt)
-        self.assertNotIn("--account", prompt)
+        argv = review_command_argv(prompt)
+        self.assertEqual(argv[argv.index("--reviewer") + 1], "claude")
+        self.assertNotIn("--account", argv)
 
     def test_the_codex_review_lane_is_handed_no_account(self):
         prompt = self.prompt_for(account=str(self.fixture.config_dir))
 
-        self.assertIn("tui_review_bridge.py", prompt)
-        self.assertNotIn("--account", prompt)
+        argv = review_command_argv(prompt)
+        self.assertEqual(argv[argv.index("--reviewer") + 1], "codex")
+        self.assertNotIn("--account", argv)
 
     def test_a_profile_directory_with_a_space_reaches_the_bridge_as_one_argument(self):
         """A profile directory is the operator's path, and an operator's path can carry a space."""
@@ -597,7 +692,8 @@ class ReviewAccountTests(ReviewEventRenderTests):
 
         prompt = self.prompt_for(**self.claude_lane(account=second))
 
-        self.assertIn(f"--account '{second}' \\\n", prompt)
+        argv = review_command_argv(prompt)
+        self.assertEqual(argv[argv.index("--account") + 1], str(second))
 
 
 class ReceiptChannelTests(DispatchTestCase):
@@ -677,8 +773,8 @@ class ReceiptChannelTests(DispatchTestCase):
         )
         self.assertIn("CREW ASK 06 <doc-conflict|stuck|scope>", prompt)
 
-    def test_a_codex_child_keeps_the_receipt_its_bridge_reads(self):
-        """The Codex lane's bridge already writes the log; its turn shape does not change."""
+    def test_a_codex_child_keeps_the_sendable_receipt_its_bridge_reads(self):
+        """Its review hooks use the log writer, but its completion stays a bridge receipt."""
         prompt = self.prompt_for(
             "--log", str(self.machine_log),
             workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
@@ -692,7 +788,7 @@ class ReceiptChannelTests(DispatchTestCase):
             "CREW FAILED <reason> ts=<unix time>",
             prompt,
         )
-        self.assertNotIn("machine_log.py", prompt)
+        self.assertNotIn("--role child", prompt)
         self.assertIn("CREW ASK 06 <doc-conflict|stuck|scope>", prompt)
 
     def test_a_run_with_no_machine_log_leaves_the_receipt_a_message(self):
@@ -745,14 +841,8 @@ class BareVerbLineTests(DispatchTestCase):
             self.prompt_for("--log", str(self.machine_log), workflow="acceptance", review=None),
         )
 
-class ReReviewConditionTests(DispatchTestCase):
-    """The re-review cap, stated as a condition on both review lanes."""
-
-    CONDITION = (
-        "A second review\npass is permitted only when the first pass produced a spec finding that"
-        " required a fix, and it\nis scoped to exactly those fixes; a clean first pass, or one"
-        " carrying only standards findings,\nends the review there."
-    )
+class ReviewRoundOwnershipTests(DispatchTestCase):
+    """The Bridge owns its round cap; AgentCrew carries only the returned next action."""
 
     def prompt_for(self, **overrides):
         table = self.fixture.table([self.fixture.ticket("06", "reviewed", **overrides)])
@@ -760,16 +850,18 @@ class ReReviewConditionTests(DispatchTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.fixture.turn("06")
 
-    def test_the_codex_review_lane_states_the_condition(self):
-        self.assertIn(self.CONDITION, self.prompt_for())
+    def test_the_codex_review_lane_restates_no_round_rule(self):
+        prompt = self.prompt_for()
+        self.assertNotIn("Rounds.", prompt)
+        self.assertIn("`next` field", prompt)
 
-    def test_the_claude_review_lane_states_the_condition(self):
+    def test_the_claude_review_lane_restates_no_round_rule(self):
         prompt = self.prompt_for(
             workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
         )
-        self.assertIn("claude_review_bridge.py", prompt)
-        self.assertIn(self.CONDITION, prompt)
+        self.assertNotIn("Rounds.", prompt)
+        self.assertIn("`next` field", prompt)
 
 
 class WorkflowShapeTests(DispatchTestCase):
@@ -796,7 +888,7 @@ class WorkflowShapeTests(DispatchTestCase):
         )
         self.assertNotIn("CREW COMPLETE", prompt)
 
-    def test_a_codex_child_reviewed_by_claude_gets_the_headless_bridge_variant(self):
+    def test_a_codex_child_reviewed_by_claude_gets_the_same_installed_command(self):
         prompt = self.prompt_for(
             workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
@@ -804,7 +896,9 @@ class WorkflowShapeTests(DispatchTestCase):
         self.assertIn(
             f"Review: claude at model {CLAUDE_MODEL}, effort {CLAUDE_EFFORT}.", prompt
         )
-        self.assertIn("claude_review_bridge.py", prompt)
+        self.assertEqual(
+            review_command_argv(prompt)[0:3], ["review-bridge", "--reviewer", "claude"]
+        )
 
 
 class CodexRenderTests(DispatchTestCase):

@@ -22,7 +22,7 @@ Upstream contracts, all from mattpocock-skills and all unmodified (see the Matt-
 | `/to-spec` | the spec, with the test seam settled in advance |
 | `/to-tickets` | vertical-slice tickets carrying `Blocked by:` and `Status:` |
 | `/implement` | implement → `/tdd` → typecheck + full test run → code review → commit |
-| code review | two-axis findings, bounded by the round budget in §6 |
+| code review | two-axis findings, each carrying Review-Switch's next permitted action |
 
 **The issue tracker is configurable.** Both skills read the repo's `docs/agents/issue-tracker.md` to
 learn where tickets are read from and where status is written back, and hard-code neither. Two
@@ -49,7 +49,7 @@ untested; the operations are in [`trackers.md`](../references/trackers.md).
 │    └─ children report over the message channel:
 │         escalation → the coordinator rules and answers (§4)
 │         receipt    → verify the sha, merge into the integration branch, mark the window ✓
-│         silence    → the monitor is the safety net (§7)
+│         silence    → the monitor is the safety net (§6)
 │                                                                │
 └──── wave complete → cut the next wave's worktrees from the merged state ────┘
      │
@@ -65,8 +65,8 @@ Three things, none optional:
 1. **The ticket path** — what to build.
 2. **The spec path** — the basis for judging it correct, and the source of the pre-agreed test seam
    `/tdd` needs, so the child never stops to ask.
-3. **The base commit** — code review needs a fixed point. Without one it stops and asks, burning a
-   round.
+3. **The base commit** — code review needs a fixed point. Without one it stops and asks before a
+   review lane opens.
 
 Plus the scope note (*a hint, not a block*): work stays inside this worktree and this branch. And the
 coordinator's own address on the message channel — the trust anchor must arrive with the first
@@ -118,21 +118,7 @@ action is irreversible and to find a reversible route or explain what it wants t
 stops and asks; the coordinator catches it; if the deletion is genuinely unavoidable, the ticket
 **parks** for a human.
 
-## 6. Review rounds
-
-Findings are bucketed on the Standards and Spec axes, and each axis has a budget that is a **ceiling,
-not a target** — most reviews should come out clean in one round.
-
-- **Standards axis:** one round. Raised on the first pass, fixed, done. No re-review.
-- **Spec axis:** at most two. First pass plus at most one re-review, and the re-review checks only
-  the Spec-axis fixes.
-- Still open after the re-review, or an already-ruled finding reopened → escalate.
-
-The contract lives at the review-dispatch layer, so both vendors' review paths are bound by it
-equally; when review runs on the Codex side the contract ships with the review instruction and the
-caller buckets the findings.
-
-## 7. Message channel, and the monitor behind it
+## 6. Message channel, and the monitor behind it
 
 Escalations and answers travel over cross-session messaging. A receipt does not: a child records
 its own completion, failure or park in the run's machine log, which is where the driver verifies
@@ -150,7 +136,7 @@ A polling monitor stays as a safety net for the two cases messages cannot cover:
 permission confirmation (it cannot send) and a process that dies silently. It sets no timeout, and an
 unknown state stays fail-closed.
 
-## 8. Decisions and what each one gives up
+## 7. Decisions and what each one gives up
 
 | Topic | Decision | Given up |
 |---|---|---|
@@ -175,7 +161,7 @@ settled: execution, not design. But which vendor and model suits which quadrant 
 subscriptions you hold, so the tables are yours to edit per repo. The classification logic that
 picks a table cell is not configurable — that is the product opinion.
 
-## 9. Rejected alternatives
+## 8. Rejected alternatives
 
 - **Parsing transcript `.jsonl` directly** — the format is internal to Claude Code and changes
   between releases, so any script reading it breaks on an upgrade.
@@ -189,7 +175,7 @@ picks a table cell is not configurable — that is the product opinion.
   interface proved otherwise, the assumption failed and interactive won back full visibility and
   takeover.
 - **A resident teammate process** — rejected when no message channel existed between sessions.
-  Cross-session messaging removed that constraint, and §7 adopts it as the primary channel.
+  Cross-session messaging removed that constraint, and §6 adopts it as the primary channel.
 - **Vendoring Matt's `/to-tickets` prompt text into `/route`** — it would drift from upstream and
   reads as appropriating his work. `/route` has the user type his skill's command and layers
   additions on top instead; the skill's own gate against model invocation is honoured, not worked
@@ -198,7 +184,7 @@ picks a table cell is not configurable — that is the product opinion.
 - **Binding to mattpocock-skills through the repo name** — see
   [ADR 0002](adr/0002-description-layer-binding.md).
 
-## 10. The thinnest layer
+## 9. The thinnest layer
 
 **Permissions are fully open and, apart from the red line, nothing is blocked.** The only defence is
 a model choosing to stop and ask, and smaller models push on where larger ones would pause.

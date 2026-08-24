@@ -185,86 +185,73 @@ Send neither receipt with SendMessage: CREW ASK is the only line the coordinator
 '''
 
 [review]
-# Both variants close with the same contract; the reviewed child is the party that reads it.
-rounds = '''
-Rounds. Classify each finding on two axes: standards — style, naming, convention, anything that
-leaves behaviour intact — and spec — correctness, security, deviation from the spec or ticket.
-Fix the standards findings you accept in one pass; they are done without re-review. A second review
-pass is permitted only when the first pass produced a spec finding that required a fix, and it
-is scoped to exactly those fixes; a clean first pass, or one carrying only standards findings,
-ends the review there. Most reviews end clean after the first pass — the re-review is a cap, not
-a stage to fill.
-A spec finding still open after that re-review, or a finding the reviewer reopens after you ruled
-on it, ends the review: send your coordinator a CREW ASK carrying both positions, rather
-than opening another round.
-'''
-
-# `<review log>` is what lets the bridge write the run's `review` event: the run's machine log and
-# the ticket it is reviewing, as flags spliced into the invocation. A run dispatched without a
-# machine log fills it with nothing, and the command it leaves behind is a whole review invocation.
-#
-# The reviewer is always the vendor that did not implement, so the variant is keyed by that vendor.
-[review.codex]
 block = '''
-Review: codex at model <review model>, effort <review effort>. Once the work is in place and
-before you commit it, run this as a background command — `run_in_background: true` — and wait
-for it. A foreground Bash call is killed at ten minutes, which a review of this diff routinely
-outlasts; in the background it runs to completion and wakes you when it exits.
+Review: <review vendor> at model <review model>, effort <review effort>. Once the work is in place
+and before you commit it, run the installed Review-Switch command as a background or long-running
+command and wait for its result. In Claude Bash, set `run_in_background: true`; a foreground Bash
+call is killed at ten minutes, while Review-Switch permits a review to run for two hours.
 
-python3 <crew-skill-dir>/assets/review/scripts/tui_review_bridge.py \
-  --cwd <worktree-abs-path> --model <review model> --effort <review effort><review log> \
-  -- 'the changes in this worktree since <ticket base commit>'
+review-bridge \
+  --reviewer <review vendor> --cwd <review cwd> \
+  --model <review model> --effort <review effort><review account> \
+  --base <review base> --spec <review spec> --axis both<review hooks>
 
 This command is the ticket's only review; it satisfies every review step any skill you invoke
 asks of you.
 
-The bridge prints one JSON object. A `status` of `completed` with a non-empty `finalMessage` is
-the report; keep `reviewSessionId` and pass it back as `--resume-session '<reviewSessionId>'` on
-the same command for round two, so the follow-up still sees round one's findings and can say which
-of them the fixes closed. A `status` of `interrupted` carrying a `reviewSessionId` is a resumable
-pane: resume it the same way.
+Read the one JSON object through `axes`. Trust an axis report only when its `status` is `completed`
+and its `finalMessage` is non-empty. Keep every completed axis. On `partially_completed`, rerun only
+each failed axis once as a fresh single-axis review: replace `--axis both` with that axis's own name
+and run without `--resume-session`. If that axis fails again, escalate with its reason and report.
 
-If that JSON object never reaches you — the command was killed, its output was lost, or you hold
-no `reviewSessionId` for a review you know you started — recover the review you already have
-rather than starting a second one:
+For every trusted axis, do exactly what its `next` field permits and no other action. When it
+requires a resumed review, reuse the command, replace `--axis both` with that axis's own name, and
+add `--resume-session <reviewSessionId>` using that axis's `reviewSessionId`. When `next` says
+`escalate`, map it onto `CREW ASK` and carry both positions to your coordinator.
 
-python3 <crew-skill-dir>/assets/review/scripts/tui_review_bridge.py \
-  --cwd <worktree-abs-path><review log> --recover-session
+Any other top-level `status`, including `refused`, is not a report: map its `next` and reason onto
+`CREW ASK`. Do not start or resume another review.
 
-It re-attaches to the review pane still running for this worktree, waits out the turn in flight,
-and prints the same JSON object with `recovered` true and the original `reviewSessionId`. Exit
-code 3 means no live session belongs to this worktree, and that is the only result that licenses a
-fresh review: a first review started while the old pane lives bills the same diff twice and
-reviews it twice. Any other result is a failed review — retry once, then escalate with exactly
-what the bridge printed.
-
-<rounds contract>
+If the JSON object never reaches you, add `--recover-session` to the same command instead of
+starting another review. It waits for every live axis or returns an undelivered report. Exit code 3
+means there is nothing to recover and is the only result that permits a fresh review. Any other
+recovery failure gets one retry, then an escalation carrying the command's output.
 '''
 
-[review.claude]
-block = '''
-Review: claude at model <review model>, effort <review effort>. You have no Claude session of your
-own, so a headless one reviews for you. Once the work is in place and before you commit it, run:
-
-python3 <crew-skill-dir>/assets/review/scripts/claude_review_bridge.py \
-  --cwd <worktree-abs-path> --model <review model> --effort <review effort><review log> \
-<review account>  --base <ticket base commit> \
-  --verification '<the commands you ran to verify this work, and that they passed>' \
-  'the changes in this worktree since <ticket base commit>'
-
-This command is the ticket's only review; it satisfies every review step any skill you invoke
-asks of you.
-
-The bridge prints one JSON object: `findings` is the report, and `lineageId` is the handle for
-round two. Keep that handle and pass it back — the same command plus `--resume-session
-'<lineageId>'` — so the follow-up review still sees round one's findings and can say which of them
-the fixes closed.
-
-Read `status`, `exitCode`, and `permissionDenials` before you trust the report: a status of
-`error`, a nonzero exit, or any denial means the review is partial or absent. Retry once, then
-escalate with what the bridge printed and the `logFile` path it names.
-
-<rounds contract>
+# Review-Switch fires these commands at the lifecycle points it owns. They use the run's own copy
+# of the machine-log writer, so a plugin upgrade cannot move an in-flight run's event vocabulary.
+[review.hooks]
+on-review-start = '''
+python3 <machine log script>
+  --log <machine log path> review
+  --ticket <NN> --lane <review lane> --state running
+'''
+on-axis-end = '''
+set -- python3 <machine log script>
+  --log <machine log path> session-cost
+  --ticket <NN> --executor <review vendor> --model "$REVIEW_MODEL"
+  --lane <review lane>;
+if [ -n "$REVIEW_SESSION" ]; then
+  set -- "$@" --session "$REVIEW_SESSION";
+fi;
+if [ "${REVIEW_COST_DETAIL+x}" = x ]; then
+  set -- "$@" --detail "$REVIEW_COST_DETAIL";
+else
+  total="$((REVIEW_INPUT_TOKENS + REVIEW_OUTPUT_TOKENS +
+    REVIEW_CACHE_READ_TOKENS + REVIEW_CACHE_CREATION_TOKENS))";
+  set -- "$@"
+    --input-tokens "$REVIEW_INPUT_TOKENS"
+    --output-tokens "$REVIEW_OUTPUT_TOKENS"
+    --cache-read-tokens "$REVIEW_CACHE_READ_TOKENS"
+    --cache-creation-tokens "$REVIEW_CACHE_CREATION_TOKENS"
+    --total-tokens "$total";
+fi;
+"$@"
+'''
+on-review-end = '''
+python3 <machine log script>
+  --log <machine log path> review
+  --ticket <NN> --lane <review lane> --state returned
 '''
 
 [models]

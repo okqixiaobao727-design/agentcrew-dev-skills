@@ -11,9 +11,10 @@ Every artifact path is recorded absolute, whatever spelling `--out-dir` was give
 runs in the child's own worktree, so a relative path recorded here would resolve to nothing there.
 Given `--log`, every launched child earns one `launch` event in the run's machine log, written by
 dispatch itself — wave advancement and the dashboard read the launched set with no coordinator
-turn spent on bookkeeping (ADR-0001) — and every rendered review command carries that log and its
-ticket, so the review bridge writes the ticket's `review` event pair the same way. Child windows
-are created detached: a launching wave never takes the operator's focus.
+turn spent on bookkeeping (ADR-0001) — and every rendered review command carries this run's
+Lifecycle Hook commands, so Review-Switch writes the ticket's `review` event pair and per-axis
+cost through the log's own CLI. Child windows are created detached: a launching wave never takes
+the operator's focus.
 
 Every Claude process of a ticket runs on that ticket's account. The account is set on the child's
 window itself, so the whole window belongs to it — a `claude` the operator types in there by hand
@@ -154,19 +155,7 @@ def base_commit(run, ticket):
 # --- the first turn -----------------------------------------------------------------------
 
 
-def review_log_flags(ticket, log):
-    """The flags that let the review bridge write this ticket's `review` event, or nothing.
-
-    The bridge is what knows a review started and ended, so the bridge writes the event — but only
-    for a run that has a machine log to write it to. `--log` is optional on dispatch, and a run
-    without one must still render a review command a child can run as it stands.
-    """
-    if not log:
-        return ""
-    return f" --machine-log {log} --ticket {ticket.id}"
-
-
-def review_account_flag(ticket):
+def review_account_flag(ticket, vendor):
     """The flag that puts the Claude reviewer on this ticket's account, or nothing.
 
     A Claude reviewer is a Claude process belonging to this ticket, so it spends on the ticket's
@@ -179,13 +168,12 @@ def review_account_flag(ticket):
     reviews on the login the operator is signed into rather than under an explicitly spelled
     default that fails to authenticate (#110).
 
-    Quoted, unlike every other path this renderer writes into the command: those are the run's own
-    directories, and this one is whatever the operator registered the account against — a profile
-    directory under a path with a space in it would otherwise reach the bridge as two arguments,
-    and the review would be launched on an account nobody named.
+    A Codex reviewer uses its own vendor credentials and receives no Claude account argument.
     """
     account = accounts.environment_delta(ticket.binding).get(CONFIG_HOME_VARIABLE)
-    return f"  --account {shlex.quote(str(account))} \\\n" if account else ""
+    if vendor != "claude" or not account:
+        return ""
+    return f" --account {shlex.quote(str(account))}"
 
 
 def run_log_script(log):
@@ -199,6 +187,32 @@ def run_log_script(log):
     if not log:
         return ""
     return str(pathlib.Path(log).parent / MACHINE_LOG.name)
+
+
+def review_hook_flags(templates, ticket, log):
+    """Return this run's lifecycle-hook arguments for Review-Switch.
+
+    Each command is first filled and quoted for the shell Review-Switch starts, then the whole
+    command is quoted again for the child's shell. The writer comes from the run directory so an
+    in-flight review survives a plugin upgrade.
+    """
+    if not log:
+        return ""
+    review = ticket.review
+    values = {
+        "<machine log script>": shlex.quote(run_log_script(log)),
+        "<machine log path>": shlex.quote(str(log)),
+        "<NN>": shlex.quote(ticket.id),
+        "<review vendor>": shlex.quote(review.vendor),
+        "<review lane>": shlex.quote(f"{review.vendor} {review.model}"),
+    }
+    flags = []
+    for flag, template in templates["review"]["hooks"].items():
+        command = " ".join(
+            line.strip() for line in fill(template, values).splitlines() if line.strip()
+        )
+        flags.append(f" \\\n  --{flag} {shlex.quote(command)}")
+    return "".join(flags)
 
 
 def completion_template(shape, turn, ticket, log):
@@ -236,16 +250,16 @@ def render_turn(run, ticket, templates, log=None):
     if shape["review_lane"]:
         review = ticket.review
         review_block = fill(
-            block(templates["review"][review.vendor]["block"]),
+            block(templates["review"]["block"]),
             {
-                "<review model>": review.model,
-                "<review effort>": review.effort,
-                "<review log>": review_log_flags(ticket, log),
-                "<rounds contract>": block(templates["review"]["rounds"]),
-                # Only the Claude lane spends a Claude login, and only its block carries this
-                # placeholder: the Codex lane is another vendor with its own credentials, and
-                # takes none of it.
-                "<review account>": review_account_flag(ticket),
+                "<review vendor>": shlex.quote(review.vendor),
+                "<review model>": shlex.quote(review.model),
+                "<review effort>": shlex.quote(review.effort),
+                "<review cwd>": shlex.quote(str(worktree_path(run, ticket))),
+                "<review base>": shlex.quote(base_commit(run, ticket)),
+                "<review spec>": shlex.quote(ticket.path),
+                "<review account>": review_account_flag(ticket, review.vendor),
+                "<review hooks>": review_hook_flags(templates, ticket, log),
             },
         )
         workflow_block = workflow_block.replace("<review block>", review_block)

@@ -180,11 +180,11 @@ the operator that last line, and every other row stays quiet.
 `duplicate` and `unknown` are annotations rather than states: both say what a reading did, not
 where the ticket got to, so the row keeps the state its own log lines justify.
 
-The `review` event is written by the review bridge the reviewed child runs — a `running` line as
-the review starts and a `returned` line on every exit path the bridge controls — so the review
-annotation appears and disappears on its own, with no operator action and no model token spent
-([`docs/machine-log.md`](machine-log.md)). A run dispatched without a machine log reviews normally
-and draws no annotation, which is the only case in which the row stays quiet under a review.
+The `review` event is written by the Lifecycle Hook commands the reviewed child passes to
+Review-Switch — `running` at review start and `returned` on every exit path it controls — so the
+review annotation appears and disappears on its own, with no operator action and no model token
+spent ([`docs/machine-log.md`](machine-log.md)). A run dispatched without a machine log passes no
+hooks, reviews normally and draws no annotation.
 
 ### Colour and width
 
@@ -294,10 +294,10 @@ the `--log` path; this is how a mixed-account run reads every account it touches
 `account` (an older table) falls back to the current `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
 Codex sessions remain under `$CODEX_HOME` (default `~/.codex`) — the same roots the two executors
 write to, so what is measured is what ran. Every session of a worktree counts toward its ticket,
-including a replacement child's — except a review's, which the review bridge has already costed
-under its own lane-tagged `session-cost` line and which is skipped here by the session id that line
-names. Without that, a Claude child reviewed on the Claude lane would be billed for its own review
-as well.
+including a replacement child's — except a review's, which the axis-end Lifecycle Hook has already
+costed under its own lane-tagged `session-cost` line and which is skipped here by the session id
+that line names. Without that, a Claude child reviewed on the Claude lane would be billed for its
+own review as well.
 
 If the wave table cannot be read, Claude rows are shown as `--` with the table-reading diagnosis
 instead of being charged from an unknown profile or silently omitted; Codex rows can still be

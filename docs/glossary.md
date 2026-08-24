@@ -162,8 +162,8 @@ intensity rises with the quadrant's stakes.
 
 **Standards axis / Spec axis** — The two axes a review runs and reports separately. Standards =
 style, naming, convention — anything that leaves behaviour intact. Spec = correctness, safety,
-divergence from the spec. Each axis carries its own cap, held and enforced by Review-Switch:
-standards is fixed in one pass, spec earns at most one re-review.
+divergence from the spec. Review-Switch reports the next permitted action for each axis; AgentCrew
+does not carry a second copy of that rule.
 
 **Model table** — The two tables mapping a classification case to vendor/model/effort: one for
 implementers, one for reviewers. This is AgentCrew's configurable surface. The classification logic
@@ -225,8 +225,8 @@ _Avoid_: worker, teammate
 coordinator to human. A child must escalate in exactly three cases — a document conflict (spec,
 ticket and code reality disagree in any pair), the same obstacle surviving two attempts, and
 finishing the ticket requiring a change to its declared scope. A blocking review finding still open
-when the round budget runs out escalates too. Escalation is not an ending: once ruled on, the ticket
-keeps running.
+when Review-Switch returns `escalate` goes up too. Escalation is not an ending: once ruled on, the
+ticket keeps running.
 _Avoid_: question, ask (as a noun)
 
 **Ruling** — A judgment the coordinator issues in reply to an escalation: design direction, a
