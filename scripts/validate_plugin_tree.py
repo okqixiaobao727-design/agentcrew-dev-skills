@@ -51,7 +51,7 @@ PLUGIN_RELATIVE_PATH = re.compile(r"<plugin-dir>/([\w./-]+)")
 # A path that reaches into an installed skill or plugin by name instead.
 INSTALL_PATH = re.compile(r"[\w.~$/-]*/(?:skills|plugins)/[\w./-]*[\w-]")
 
-# These markers identify paths into the private bridge that was replaced by the vendored assets.
+# These markers identify private bridge paths that must never reach a published plugin tree.
 # Keep the old names split so this validator can scan its own source without finding its policy.
 PRIVATE_SKILL_NAME = "codex" + "-implement"
 PRIVATE_APP_NAME = "ChatGPT " + "Hands" + "-Free"

@@ -12,6 +12,7 @@ script exists to avoid.
 import importlib.util
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -183,6 +184,17 @@ class RunnerCLITests(unittest.TestCase):
         for name in ("root", "alpha", "beta"):
             self.assertIn(f"{name}: 1 tests in", run.stderr)
         self.assertIn("total: 3 tests in", run.stderr)
+
+    def test_deleting_one_asset_suite_leaves_the_remaining_inventory_runnable(self):
+        shutil.rmtree(self.tree.root / "skills/crew/assets/alpha")
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("root: 1 tests in", run.stderr)
+        self.assertIn("beta: 1 tests in", run.stderr)
+        self.assertNotIn("alpha:", run.stderr)
+        self.assertIn("total: 2 tests in", run.stderr)
 
     def test_naming_an_asset_runs_that_suite_and_no_other(self):
         run = self.tree.run("--asset", "alpha")

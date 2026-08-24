@@ -531,7 +531,6 @@ JSON at all, appends nothing and exits 0.
 [ADR-0002](adr/0002-shell-scripts-drive-the-cli-not-workflows-or-the-sdk.md) chose scripts driving
 the CLI over dynamic workflows and the Agent SDK; it rejected those two, not a language. The
 zero-token layer already speaks stdlib Python where a shell script would need a dependency —
-`codex_bridge.py`, the review bridges, `launch_hook.py`. This writer copies arbitrary message
-values, including structured ones, into JSON verbatim, which bash cannot do without `jq`, and it
-reads a hook payload off stdin. Stdlib Python is what the repo already requires and CI already
-runs.
+`codex_bridge.py`, `dispatch.py`, and this writer. This writer copies arbitrary message values,
+including structured ones, into JSON verbatim, which bash cannot do without `jq`, and it reads a
+hook payload off stdin. Stdlib Python is what the repo already requires and CI already runs.

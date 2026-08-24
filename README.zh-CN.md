@@ -201,10 +201,6 @@ pin 是什么、怎么接进 Claude Code，见
 
 ## 路线图
 
-- **`review-switch`**——review lane 是独立的开源项目，
-  [okqixiaobao727-design/review-switch](https://github.com/okqixiaobao727-design/review-switch)。
-  AgentCrew 将改为调用它，而不再随仓库分发它的 bridge 副本
-  （[ADR-0020](docs/adr/0020-review-switch-owns-the-review-agentcrew-owns-the-reviewer.md)）。
 - **Codex bridge**——`codex_bridge.py` 目前是原样内置的，重写已在计划中。
 - **mattpocock-skills 依赖**——现在是必需的，之后会变成可选。
 
