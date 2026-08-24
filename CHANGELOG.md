@@ -7,6 +7,39 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- A reviewed ticket's child reviews through the installed Review-Switch command instead of
+  through a copy of it vendored here. ADR-0009 kept this repository's own review bridge
+  honest by pinning it upstream and checking for drift, which made every upstream fix a
+  re-vendoring chore and left two implementations of one thing free to disagree. The child
+  now calls `review-bridge` across a process boundary, and AgentCrew keeps only the
+  reviewer — vendor, model, effort, account — while the review itself belongs to
+  Review-Switch (ADR-0020, superseding ADR-0009). AgentCrew's own lifecycle events and
+  per-axis cost accounting survive that boundary through the hooks it renders onto the
+  command, so the dashboard and the machine log say what they always said. (#124, #125)
+
+  **This adds an external dependency to an existing install.** Review-Switch is no longer
+  carried in the plugin, so a run whose wave table has a review lane — every `tdd` and
+  every `refactor` ticket — needs `review-bridge` on the operator's `PATH`. Both READMEs
+  now name it under their environment requirements.
+
+### Added
+- A fifth preflight check: the installed Review-Switch command, asked only of a run that
+  reviews at all. Preflight's other four checks are read-only git questions, so a machine
+  without the command had nothing stop it until a child that had already written its work
+  reached the review — the one failure in a run that costs the most to arrive at. The check
+  is the plan's own question rather than the machine's: a run whose wave table carries no
+  review lane calls the command never, and a machine that reviews nowhere is not
+  misconfigured for lacking it.
+
+### Fixed
+- The driver reconciles stale terminal state instead of deadlocking on it. A receipt
+  arriving after a failed settlement deadline left the run stuck, and descendants marked
+  `outcome=blocked` were never rescinded once the block cleared. Current ticket state is now
+  re-derived from later verified facts, so late completions and relaunched descendants
+  recover without rewriting the append-only log, and Claude text submission is confirmed
+  before delivery is recorded. (#126)
+
 ## [0.9.2] - 2026-08-24
 
 ### Changed
