@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-25
+
 ### Changed
 - A reviewed ticket's child reviews through the installed Review-Switch command instead of
   through a copy of it vendored here. ADR-0009 kept this repository's own review bridge
