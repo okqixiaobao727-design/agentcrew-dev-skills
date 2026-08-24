@@ -92,8 +92,11 @@ is one of the four outcomes the crew contract gives every ticket. Reached this w
 approved table is the run's one routing authority, and an edge kept anywhere else is a second one.
 The renderer ignores it. A table that carries no edges blocks nothing, and blocks nothing wrongly.
 
-Because a halt launches nothing, a blocked ticket never starts — the halt is what makes that true,
-not a filter somewhere downstream.
+Because a halt launches nothing, a blocked ticket does not start while its root remains stopped —
+the halt is what makes that true, not a filter somewhere downstream. If newer verified evidence
+repairs the root and advancement later launches the descendant, that launch begins its current
+settlement epoch. The earlier blocked outcome remains auditable, but it no longer settles the live
+child.
 
 ## The operator's interrupt
 

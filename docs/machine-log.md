@@ -82,17 +82,21 @@ re-derive a named projection fact from them.
   follows a provisional launch; the first launch starts report duration.
 - `latest_settling_event` means the last receipt or outcome with a non-empty value. It answers
   whether the ticket has received a settling event.
-- `settlement_state` retains the closed Machine-log vocabulary and its existing category
-  precedence: a valid outcome wins over receipt and merge evidence; otherwise the latest valid
-  receipt wins, with a landable receipt completed by a landed merge. It must not be collapsed with
-  `latest_settling_event`.
+- `settlement_state` retains the closed Machine-log vocabulary and its category precedence: a valid
+  outcome wins over receipt and merge evidence; otherwise the latest valid receipt wins, with a
+  landable receipt completed by a landed merge. One later fact opens a new settlement epoch: a
+  launch after `outcome=blocked` means the old derived block no longer controls that child, so its
+  current state is derived from the launch and the evidence after it. The blocked record remains in
+  `latest_settling_event` and in the append-only log. The two facts must not be collapsed.
 - `progress_event` is the latest recognised receipt, outcome or merge used by the monitor as input
   to its own Ticket state mapping. The projection does not produce Ticket state.
 - A ticketless ruling is correlated through `to` and the final latest-launch child mapping, exactly
   as the Driver does today. Explicit `ticket` always wins.
 - `unanswered_child_message`, receipt/ruling waits, outstanding nudge, instruction counts,
-  semantic-conflict detail and merge-rework request all preserve their existing ordered-event
-  rules. Record position stays private; callers receive the selected record, not an index.
+  semantic-conflict detail and merge-rework request follow their ordered-event rules. A valid
+  receipt claim remains unanswered until a receipt with the claimed SHA or a `CREW RECHECK` naming
+  that SHA consumes it; an unrelated receipt, ruling or outcome cannot hide it. Record position
+  stays private; callers receive the selected record, not an index.
 - `current_wave` starts at 1 and follows the last integer-like `advance=launched` record.
 - `ended` is an ever rule: any `advance=complete|stopped` ends the run. `halted` is a latest rule:
   the last advance is `escalated|interrupted`. They are separate facts, not one run-state enum.

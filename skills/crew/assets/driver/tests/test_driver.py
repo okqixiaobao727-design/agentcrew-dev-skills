@@ -1217,6 +1217,7 @@ class LoopTests(DriverTestCase):
         self.woken(process, "run-complete")
 
         self.assertIn("01", instruction)
+        self.assertIn("0" * 40, instruction)
         self.assertIn("CREW COMPLETE", instruction)
         self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
         self.assertEqual(self.verdict("01"), "completed")
@@ -1231,6 +1232,9 @@ class LoopTests(DriverTestCase):
         self.woken(process, "run-complete")
 
         self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
+        self.assertEqual(
+            self.events("receipt", ticket="01", verdict="failed")[-1]["sha"], "1" * 40
+        )
 
     def test_a_malformed_receipt_is_bounced_once_and_the_bare_resend_settles(self):
         """#105, verbatim: prose on the verb line left a finished ticket reading `waiting`."""
@@ -1705,6 +1709,71 @@ class LoopTests(DriverTestCase):
         self.assertIn("second time", snapshot["detail"])
         self.assertEqual(len(self.instructions("02", "CREW MERGE")), 1)
 
+    def test_a_late_completion_survives_an_unrelated_ruling_after_a_failed_nudge(self):
+        """The whole issue-126 timeline is reconciled from the child's newer completion fact."""
+        process = self.start(("01", ()), ("02", ()), shared="one\n")
+        self.fixture.completes("01", "01 rewrote\n", name="shared.txt")
+        self.fixture.completes("02", "02 rewrote\n", name="shared.txt")
+        self.wait_for_instruction("02", "CREW MERGE")
+
+        self.fixture.goes("02", "idle")
+        self.wait_for_verdict("02", "failed")
+        self.woken(process, "judgment-needed")
+
+        merge = git(self.fixture.worktree("02"), "merge", INTEGRATION_BRANCH, check=False)
+        self.assertNotEqual(merge.returncode, 0, "the semantic conflict was not reproduced")
+        sha = self.fixture.commit_work("02", "resolved\n", name="shared.txt")
+        self.fixture.says("02", f"CREW COMPLETE {sha}")
+        self.fixture.answers("02", "Continue with the verified completion")
+
+        resumed = self.fixture.resume()
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(
+            [record["verdict"] for record in self.events("receipt", ticket="02")],
+            ["landable", "failed", "landable"],
+        )
+        self.assertEqual(self.verdict("02"), "completed")
+        self.assertEqual(len(self.instructions("02", "CREW MERGE")), 1)
+
+    def test_a_descendant_launch_supersedes_the_blocked_outcome_left_by_a_repaired_root(self):
+        """A stale derived block remains auditable but cannot settle the newly launched child."""
+        process = self.start(
+            ("01", ()), ("02", ()), ("03", ("02",)), shared="one\n"
+        )
+        self.fixture.completes("01", "01 rewrote\n", name="shared.txt")
+        self.fixture.completes("02", "02 rewrote\n", name="shared.txt")
+        self.wait_for_instruction("02", "CREW MERGE")
+
+        self.fixture.goes("02", "idle")
+        self.wait_for_verdict("02", "failed")
+        self.woken(process, "judgment-needed")
+        self.assertEqual(self.verdict("03"), "blocked")
+        self.assertIsNone(self.fixture.launch_record("03"))
+
+        merge = git(self.fixture.worktree("02"), "merge", INTEGRATION_BRANCH, check=False)
+        self.assertNotEqual(merge.returncode, 0, "the semantic conflict was not reproduced")
+        self.fixture.completes("02", "resolved\n", name="shared.txt")
+
+        resumed = self.fixture.resume()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("03") is not None),
+            "the repaired root never released its descendant",
+        )
+        self.fixture.goes("03", "idle")
+        self.wait_for_instruction("03", "CREW NUDGE")
+        self.assertIsNone(resumed.poll(), "the stale blocked outcome stopped the live child's rule")
+        self.fixture.goes("03", "busy")
+        self.fixture.completes("03")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(self.verdict("03"), "completed")
+        self.assertEqual(len(self.events("outcome", ticket="03", outcome="blocked")), 1)
+        self.assertEqual(
+            [record["verdict"] for record in self.events("receipt", ticket="02")],
+            ["landable", "failed", "landable"],
+        )
+
     def test_a_mechanical_conflict_is_resolved_by_the_driver_without_a_repair_session(self):
         """Both children only inserted, so the run lands the wave itself and ends on its own."""
         process = self.start(("01", ()), ("02", ()), shared="one\n")
@@ -2105,6 +2174,59 @@ class AnswerTests(DriverTestCase):
         self.assertEqual(ruling["role"], "coordinator")
         self.assertEqual(ruling["to"], "stub-child-1")
         self.assertEqual(ruling["message"], text)
+
+    def test_text_left_in_the_composer_is_not_recorded_as_delivered(self):
+        self.start()
+        text = "Continue with the verified completion"
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+
+        result = self.answer("--text", text)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 2)
+
+    def assert_blank_text_is_not_recorded(self, text):
+        self.start()
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+
+        result = self.answer("--text", text)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 2)
+
+    def test_empty_text_cannot_be_recorded_when_submission_is_not_observable(self):
+        self.assert_blank_text_is_not_recorded("")
+
+    def test_whitespace_text_cannot_be_recorded_when_submission_is_not_observable(self):
+        self.assert_blank_text_is_not_recorded("   ")
+
+    def test_text_delivery_retries_one_dropped_enter_before_recording_the_ruling(self):
+        self.start()
+        text = "Continue with the verified completion"
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-drop-enter-once").touch()
+
+        result = self.answer("--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 2)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], text)
 
     def test_key_answer_sends_named_keys_without_literal_mode_and_records_them(self):
         self.start()

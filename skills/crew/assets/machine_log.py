@@ -190,6 +190,25 @@ def _freeze(value):
     return value
 
 
+def _current_settlement_epoch(records):
+    """Return the records that can settle the ticket's current launch epoch."""
+    latest_blocked = None
+    for index, record in enumerate(records):
+        if record.get("event") == "outcome" and record.get("outcome") == BLOCKED:
+            latest_blocked = index
+    if latest_blocked is None:
+        return records
+    relaunched = next(
+        (
+            index
+            for index, record in enumerate(records[latest_blocked + 1:], latest_blocked + 1)
+            if record.get("event") == "launch"
+        ),
+        None,
+    )
+    return records[relaunched:] if relaunched is not None else records
+
+
 def project(records):
     """Return an immutable factual projection of physically ordered `records`."""
     frozen_records = tuple(
@@ -256,7 +275,32 @@ def project(records):
             episode["awaiting_ruling"] = False
             episode["outstanding_nudge"] = False
         elif event in ("receipt", "ruling", "outcome"):
-            episode["unanswered_child_message"] = None
+            pending = episode["unanswered_child_message"]
+            pending_verb, pending_line = final_verb((pending or {}).get("message"))
+            completion_sha = (
+                pending_line.split()[2].lower()
+                if pending_verb == COMPLETE_VERB and pending_line is not None
+                else None
+            )
+            receipt_matches = (
+                event == "receipt"
+                and completion_sha is not None
+                and isinstance(record.get("sha"), str)
+                and record["sha"].lower() == completion_sha
+            )
+            ruling_words = message.lstrip().split() if isinstance(message, str) else []
+            recheck_matches = (
+                event == "ruling"
+                and completion_sha is not None
+                and len(ruling_words) >= 4
+                and " ".join(ruling_words[:2]) == RECHECK_MARKER
+                and ruling_words[3].lower() == completion_sha
+            )
+            if (
+                (pending_verb == COMPLETE_VERB and (receipt_matches or recheck_matches))
+                or pending_verb != COMPLETE_VERB
+            ):
+                episode["unanswered_child_message"] = None
 
         if event == "ruling" and isinstance(message, str):
             episode["instruction_messages"].append(message)
@@ -286,6 +330,15 @@ def project(records):
                 record.get("verdict") or record.get("outcome")
             ):
                 latest_settling_event = record
+            if event == "merge":
+                if record.get("result"):
+                    merge_result = str(record["result"])
+                detail = record.get("detail")
+                if record.get("result") == CONFLICT and isinstance(detail, str):
+                    classified_conflict = detail
+
+        for record in _current_settlement_epoch(events):
+            event = record.get("event")
             if event == "receipt":
                 if record.get("verdict") in VERDICTS:
                     progress_event = record
@@ -293,13 +346,8 @@ def project(records):
                 if record.get("outcome") in OUTCOMES:
                     progress_event = record
             elif event == "merge":
-                if record.get("result"):
-                    merge_result = str(record["result"])
                 if record.get("result") in MERGE_RESULTS:
                     progress_event = record
-                detail = record.get("detail")
-                if record.get("result") == CONFLICT and isinstance(detail, str):
-                    classified_conflict = detail
 
         semantic_conflict_detail = None
         if (
@@ -385,16 +433,19 @@ def settlement_state(records, ticket):
     ================  ==============================================================
 
     A completed outcome needs no receipt or merge lookup here: the tracker close that writes it
-    only happens after a landed merge. For a landable receipt, the latest merge result must be
-    clean or repaired; a conflict or escalation leaves the ticket landable rather than done.
+    only happens after a landed merge. A launch after a blocked outcome starts a current epoch, so
+    the old derived block remains history without settling the relaunched child. For a landable
+    receipt, the latest merge result must be clean or repaired; a conflict or escalation leaves the
+    ticket landable rather than done.
     """
     ticket = str(ticket)
+    ticket_records = [record for record in records if str(record.get("ticket")) == ticket]
+    ticket_records = _current_settlement_epoch(ticket_records)
+
     latest_outcome = None
     latest_receipt = None
     latest_merge = None
-    for record in records:
-        if str(record.get("ticket")) != ticket:
-            continue
+    for record in ticket_records:
         event = record.get("event")
         if event == "outcome" and record.get("outcome") in OUTCOMES:
             latest_outcome = str(record["outcome"])

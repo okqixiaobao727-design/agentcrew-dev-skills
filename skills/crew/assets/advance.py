@@ -19,8 +19,10 @@ The four decisions, each recorded once in the machine log as an `advance` event:
     interrupted  the operator stopped the run
 
 A halt also marks every unlaunched descendant of a failed or parked ticket `blocked`, following
-the `blocked_by` edges the wave table carries; because the halt launches nothing, a blocked
-ticket never starts. The edges are the table's, like everything else about routing (ADR-0003).
+the `blocked_by` edges the wave table carries; because the halt launches nothing, a blocked ticket
+does not start while that halt stands. A later launch after the root is repaired supersedes the
+derived block without deleting its history. The edges are the table's, like everything else about
+routing (ADR-0003).
 
 A wave the log says has already been advanced past is refused before anything is merged: a second
 run would start the same next wave again, in the worktrees the first one is working in. A wave
@@ -261,7 +263,7 @@ def advance_wave(plan, table_path, wave, options, interrupt):
     following = following_wave.number if following_wave else None
     live = [
         ticket.id for ticket in tickets
-        if projection.ticket(ticket.id).latest_settling_event is None
+        if projection.ticket(ticket.id).settlement_state == machine_log.LIVE
     ]
     if live:
         # Nothing has been decided and nothing should be: the wave is still being worked.

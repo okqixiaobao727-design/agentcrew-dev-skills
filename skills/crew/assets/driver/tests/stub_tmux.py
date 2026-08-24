@@ -94,6 +94,7 @@ def new_window(argv):
         "env": window_environment(argv),
         "command": argv[-1],
         "detached": "-d" in argv,
+        "composer": "",
     }
     save_windows(table)
     print(window_id)
@@ -149,6 +150,22 @@ def send_keys(argv):
         if not option_terminated and literal and literal[0].startswith("-"):
             print("command send-keys: invalid flag -", file=sys.stderr)
             return 1
+        table[target]["composer"] = table[target].get("composer", "") + "".join(literal)
+        save_windows(table)
+        return 0
+    if sent == ["S-Enter"]:
+        table[target]["composer"] = table[target].get("composer", "") + "\n"
+        save_windows(table)
+        return 0
+    if sent == ["Enter"]:
+        if (state_dir() / "tmux-ignore-enter").exists():
+            return 0
+        dropped = state_dir() / "tmux-drop-enter-once"
+        if dropped.exists():
+            dropped.unlink()
+            return 0
+        table[target]["composer"] = ""
+        save_windows(table)
         return 0
     if all(key in ANSWER_KEYS for key in sent):
         return 0
@@ -182,7 +199,18 @@ def main():
         return kill_window(argv)
     if command == "send-keys":
         return send_keys(argv)
+    if command == "capture-pane":
+        target = flag(argv, "-t")
+        if target not in windows():
+            print(f"can't find window: {target}", file=sys.stderr)
+            return 1
+        composer = windows()[target].get("composer", "")
+        print(f"❯ {composer.splitlines()[-1] if composer else ''}".rstrip())
+        return 0
     if command == "display-message" and "-p" in argv:
+        if argv[-1] == "#{cursor_y}":
+            print("0")
+            return 0
         path = state_dir() / "tmux-session"
         if path.exists():
             print(path.read_text().strip())

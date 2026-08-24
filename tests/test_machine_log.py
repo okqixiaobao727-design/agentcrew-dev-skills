@@ -238,6 +238,36 @@ class RunProjectionTests(unittest.TestCase):
         self.assertTrue(eight.awaiting_ruling)
         self.assertEqual(eight.instruction_count("CREW RULED"), 1)
 
+    def test_only_receipt_evidence_consumes_a_valid_completion_claim(self):
+        claim = {
+            "event": "message", "ticket": "7", "role": "child",
+            "message": f"CREW COMPLETE {'a' * 40}",
+        }
+        still_pending = machine_log.project([
+            claim,
+            {"event": "ruling", "ticket": "7", "message": "continue"},
+            {"event": "outcome", "ticket": "7", "outcome": "blocked"},
+        ])
+        self.assertEqual(still_pending.ticket("7").unanswered_child_message, claim)
+
+        unrelated = machine_log.project([
+            claim,
+            {"event": "receipt", "ticket": "7", "verdict": "failed"},
+            {"event": "receipt", "ticket": "7", "verdict": "landable", "sha": "b" * 40},
+            {"event": "ruling", "ticket": "7",
+             "message": f"CREW RECHECK 7 {'b' * 40} retry"},
+        ])
+        self.assertEqual(unrelated.ticket("7").unanswered_child_message, claim)
+
+        for evidence in (
+            {"event": "receipt", "ticket": "7", "verdict": "landable", "sha": "A" * 40},
+            {"event": "ruling", "ticket": "7",
+             "message": f"CREW RECHECK 7 {'A' * 40} retry"},
+        ):
+            with self.subTest(evidence=evidence["event"]):
+                consumed = machine_log.project([claim, evidence])
+                self.assertIsNone(consumed.ticket("7").unanswered_child_message)
+
     def test_semantic_conflict_and_rework_preserve_the_existing_order_rules(self):
         projection = machine_log.project([
             {"event": "merge", "ticket": "7", "result": "conflict",
@@ -322,6 +352,24 @@ class SettlementStateTests(unittest.TestCase):
             ]
             with self.subTest(outcome):
                 self.assertEqual(machine_log.settlement_state(records, "104"), outcome)
+
+    def test_a_launch_after_blocked_starts_a_current_settlement_epoch(self):
+        records = [
+            {"event": "outcome", "ticket": "104", "outcome": "blocked"},
+            {"event": "launch", "ticket": "104", "child": "child-104"},
+        ]
+
+        facts = machine_log.project(records).ticket("104")
+
+        self.assertEqual(facts.latest_settling_event["outcome"], "blocked")
+        self.assertIsNone(facts.progress_event)
+        self.assertEqual(facts.settlement_state, "live")
+
+        records += [
+            {"event": "receipt", "ticket": "104", "verdict": "landable"},
+            {"event": "merge", "ticket": "104", "result": "clean"},
+        ]
+        self.assertEqual(machine_log.project(records).ticket("104").settlement_state, "completed")
 
 
 class MalformedReceiptTests(unittest.TestCase):

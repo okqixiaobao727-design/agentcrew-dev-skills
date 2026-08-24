@@ -249,8 +249,8 @@ HANDED_OVER = (
 )
 
 RECHECK_TEMPLATE = (
-    "{marker} {ticket} — the receipt you sent did not verify: {problem}. Finish the work in your"
-    " worktree, commit it, and send a new CREW COMPLETE <sha>; if it cannot be finished, send"
+    "{marker} {ticket} {sha} — the receipt you sent did not verify: {problem}. Finish the work in"
+    " your worktree, commit it, and send a new CREW COMPLETE <sha>; if it cannot be finished, send"
     " CREW FAILED <reason>. This is the one re-ask — a second receipt that does not verify settles"
     " this ticket failed."
 )
@@ -596,6 +596,27 @@ def tmux(arguments, message):
     if result.returncode != 0:
         raise DriverError(f"{message}: {(result.stderr or result.stdout).strip()}")
     return result.stdout
+
+
+def composer_holds(window, text):
+    """Whether the pane's cursor line still holds the final line just typed."""
+    cursor = tmux(
+        ["display-message", "-p", "-t", window, "#{cursor_y}"],
+        f"the cursor in {window} could not be read",
+    ).strip()
+    try:
+        cursor_y = str(int(cursor))
+    except ValueError as error:
+        raise DriverError(f"the cursor in {window} was not a row number: {cursor}") from error
+    line = tmux(
+        ["capture-pane", "-p", "-J", "-t", window, "-S", "0", "-E", cursor_y],
+        f"the composer in {window} could not be read",
+    )
+    typed_lines = [typed.rstrip() for typed in text.splitlines() if typed.strip()]
+    if not typed_lines:
+        return True
+    cursor_line = line.splitlines()[-1] if line.splitlines() else ""
+    return typed_lines[-1] in cursor_line
 
 
 def notice_windows(session):
@@ -1928,24 +1949,27 @@ class Loop:
         return [
             ticket.id for ticket in self.tickets_of(wave)
             if (
-                projection.ticket(ticket.id).latest_settling_event is None
+                projection.ticket(ticket.id).settlement_state == machine_log.LIVE
                 or projection.ticket(ticket.id).awaiting_receipt
             )
         ]
 
     # --- what it says ---------------------------------------------------------------------
 
-    def settle(self, ticket, verdict, detail):
+    def settle(self, ticket, verdict, detail, sha=None):
         """Record a ticket's verdict through the log's own writer; returns nothing.
 
         The driver writes every parked and failed receipt the run earns. They used to be the
         coordinator's to type, and a wave settles on what the log holds.
         """
+        command = [
+            sys.executable, MACHINE_LOG, "--log", self.log, "receipt",
+            "--ticket", ticket, "--verdict", verdict, "--detail", detail,
+        ]
+        if sha is not None:
+            command.extend(("--sha", sha))
         run_command(
-            [
-                sys.executable, MACHINE_LOG, "--log", self.log, "receipt",
-                "--ticket", ticket, "--verdict", verdict, "--detail", detail,
-            ],
+            command,
             f"the {verdict} receipt for {ticket} could not be recorded",
             ticket=ticket, pointer=str(self.log),
         )
@@ -1957,8 +1981,9 @@ class Loop:
         child is reached through its tmux pane, which is the only channel a script has to it — the
         cross-session message tool belongs to a model — and keys pass no hook, so the instruction
         is written into the log here rather than by being sent. Claude keys are sent one at a time;
-        text is typed literally line by line, with S-Enter between lines and Enter at the end. The
-        ruling records the keys and text joined by a space.
+        text is typed literally line by line, with S-Enter between lines and Enter at the end. A
+        text instruction is recorded only after the cursor line confirms it left the composer; one
+        Enter is retried when it did not. The ruling records the keys and text joined by a space.
         """
         if launch.get("executor") == CODEX:
             if keys:
@@ -2013,10 +2038,17 @@ class Loop:
                             ["send-keys", "-t", window, "S-Enter"],
                             f"{ticket} could not be reached at {window}",
                         )
-                tmux(
-                    ["send-keys", "-t", window, "Enter"],
-                    f"{ticket} could not be reached at {window}",
-                )
+                for _attempt in range(2):
+                    tmux(
+                        ["send-keys", "-t", window, "Enter"],
+                        f"{ticket} could not be reached at {window}",
+                    )
+                    if not composer_holds(window, text):
+                        break
+                else:
+                    raise DriverError(
+                        f"{ticket}'s instruction remained in the composer at {window}"
+                    )
         except DriverError as error:
             raise Unreachable(str(error), ticket=ticket, pointer=str(self.log)) from error
         recorded = " ".join(keys or ())
@@ -2155,10 +2187,12 @@ class Loop:
             return
         problem = (result.stdout or result.stderr).strip().replace("\n", " ")
         if projection.ticket(ticket).instruction_count(RECHECK_MARKER):
-            self.settle(ticket, FAILED, f"a second receipt did not verify: {problem}")
+            self.settle(
+                ticket, FAILED, f"a second receipt did not verify: {problem}", sha=sha
+            )
             return
         self.deliver(ticket, launch, RECHECK_TEMPLATE.format(
-            marker=RECHECK_MARKER, ticket=ticket, problem=problem
+            marker=RECHECK_MARKER, ticket=ticket, sha=sha, problem=problem
         ))
 
     def base_commit(self, launch):
@@ -2182,7 +2216,7 @@ class Loop:
             launch = facts.launch
             if launch is None or status in (STATUS_BUSY, STATUS_PARKED):
                 continue
-            if facts.latest_settling_event is not None and not facts.awaiting_receipt:
+            if facts.settlement_state != machine_log.LIVE and not facts.awaiting_receipt:
                 continue
             if facts.unanswered_child_message is not None:
                 # Its own last word is still to be settled, and that word decides the ticket; a
@@ -2480,7 +2514,7 @@ class Loop:
             launch = facts.launch
             if launch is None:
                 continue
-            if facts.latest_settling_event is not None or lane_of(launch) == CODEX:
+            if facts.settlement_state != machine_log.LIVE or lane_of(launch) == CODEX:
                 continue
             with contextlib.suppress(Unreachable):
                 self.deliver(ticket, launch, ANCHOR_TEMPLATE.format(
