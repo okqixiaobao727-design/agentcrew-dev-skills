@@ -8,24 +8,27 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Removed
-- The `code-review-graph` MCP registration and both graph hooks. The server ran in every
-  Claude session on the machine — eight at once when measured — and nothing consumed it: the
-  review path reaches the graph through the Review-Switch Bridge's CLI call alone, and the
-  `AGENTS.md` rule sending agents to the graph before Grep/Glob/Read arrived with the
-  installer rather than from a need anyone stated. The `PostToolUse` hook was worse than
-  idle — since it began deriving the repository from the git common directory it re-parsed
-  nothing from a crew child's worktree, an interpreter start per edit for no result. A
-  worktree cannot share or copy the main checkout's graph, because the graph file stores
-  absolute paths, and the Bridge now builds one in the checkout under review, so nothing
-  here has to keep a graph fresh. `.mcp.json` and `.claude/settings.json` carried these
-  entries and nothing else, so both files go; the guard that pinned the server's launch
-  command now guards that no graph server is registered at all, under any name. The four
-  skills the same installer generated — `debug-issue`, `explore-codebase`, `refactor-safely`
-  and `review-changes` — go with it: every step in them is a graph MCP call, so unregistering
-  the server left four skills that fail on their first tool call, which is worse than their
-  absence. The CLI remains an optional dependency of Review-Switch, documented there, and
-  CONTRIBUTING.md no longer asks a contributor here to install it (review-switch ADR-0005,
-  #128).
+- The `code-review-graph` MCP registration and both graph hooks. `.mcp.json` sits at this
+  plugin's root, so the registration shipped: every install has carried a `code-review-graph`
+  server since 0.2.0, started automatically wherever the plugin was enabled, and on a machine
+  without that CLI on `PATH` it could only fail to connect. Upgrading drops it — there is
+  nothing to uninstall. On the machine that did have the CLI it merely succeeded at doing
+  nothing: the server started in every Claude session, eight at once when measured, and
+  nothing consumed it. The review path reaches the graph through the Review-Switch Bridge's
+  CLI call alone, and the `AGENTS.md` rule sending agents to the graph before Grep/Glob/Read
+  arrived with the installer rather than from a need anyone stated. The `PostToolUse` hook was
+  worse than idle — since it began deriving the repository from the git common directory it
+  re-parsed nothing from a crew child's worktree, an interpreter start per edit for no result.
+  A worktree cannot share or copy the main checkout's graph, because the graph file stores
+  absolute paths, and the Bridge now builds one in the checkout under review, so nothing here
+  has to keep a graph fresh. `.mcp.json` and `.claude/settings.json` carried these entries and
+  nothing else, so both files go; the guard that pinned the server's launch command now guards
+  that no graph server is registered at all, under any name. The four skills the same installer
+  generated — `debug-issue`, `explore-codebase`, `refactor-safely` and `review-changes` — go
+  with it: every step in them is a graph MCP call, so unregistering the server left four skills
+  that fail on their first tool call, which is worse than their absence. The CLI remains an
+  optional dependency of Review-Switch, documented there, and CONTRIBUTING.md no longer asks a
+  contributor here to install it (review-switch ADR-0005, #128).
 
 ## [0.9.3] - 2026-08-25
 
