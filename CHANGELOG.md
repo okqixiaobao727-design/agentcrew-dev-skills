@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Reading a ticket asks GitHub for the fields by name. The read operation
+  `references/trackers.md` names ran `gh issue view <n> --comments`, which prints the comment
+  thread *in place of* the body: on a fresh ticket that is empty output and a success exit
+  code, so an agent settling the tracker saw no requirements at all and had nothing to tell it
+  so. It now asks for `--json number,title,body,labels,comments`. The guidance came from the
+  upstream template and was wrong there in the same way (review-switch#30) (#129).
+
 ## [0.9.4] - 2026-08-26
 
 ### Removed
