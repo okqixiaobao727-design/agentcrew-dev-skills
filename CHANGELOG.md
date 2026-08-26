@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-08-26
+
 ### Fixed
 - Reading a ticket asks GitHub for the fields by name. The read operation
   `references/trackers.md` names ran `gh issue view <n> --comments`, which prints the comment
