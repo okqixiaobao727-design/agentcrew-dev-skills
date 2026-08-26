@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-26
+
 ### Removed
 - The `code-review-graph` MCP registration and both graph hooks. `.mcp.json` sits at this
   plugin's root, so the registration shipped: every install has carried a `code-review-graph`
