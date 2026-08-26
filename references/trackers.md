@@ -17,7 +17,7 @@ user with the rest of what that step reports.
 
 | Operation | github | local |
 | --- | --- | --- |
-| **read** — a ticket's body, its `Blocked by:` edges, and its current `## Routing` | `gh issue view <n> --comments`, and the convention document's list command for the whole feature | read the ticket file at the path the convention document gives that feature |
+| **read** — a ticket's body, its `Blocked by:` edges, and its current `## Routing` | `gh issue view <n> --json number,title,body,labels,comments`, and the convention document's list command for the whole feature | read the ticket file at the path the convention document gives that feature |
 | **edit** — replace a ticket's body with new text | `gh issue edit <n> --body-file -` with the complete new text, so the edit is one atomic replacement | rewrite the whole file |
 | **mark** — declare who may pick the ticket up | the triage labels `ready-for-agent` and `ready-for-human` | the same two role strings on the ticket's `Status:` line |
 | **comment** — leave a note on a ticket, its body untouched | `gh issue comment <n> --body <text>` | one `Crew: <text>` line in the ticket file, rewritten rather than repeated |
