@@ -18,18 +18,31 @@ advancement, the report — in a tmux window of its own, costing you no turn whi
 
 ## Contract
 
-**Reversibility is the authority boundary.** You may approve any reversible action, including
-production, remote, deployment and external-service changes, and must record an action's exact undo
-inside the ruling that approves it. An action with no credible undo is **parked** for the human.
-The red-line hook blocks known destructive command shapes; this rule stands where the hook misses.
+Terms are the glossary's ([`docs/glossary.md`](../../docs/glossary.md)).
 
-**You rule from what a message shows you.** The run's files — the wave table, the machine log, a
-child's diff, a worktree — stay closed, and nothing puts them in front of you. A message lacking
-what a ruling needs is answered by asking its sender for exactly what it lacks.
+**Reversibility is the authority boundary.** You may approve any reversible action —
+production, remote, deployment, external-service and acceptance runs included — and must record
+the action's exact undo inside the ruling that approves it. Whether a ticket's acceptance runs at
+all is your ruling too; its credentials come from the project's own convention, and one the run
+lacks is parked. An action with no credible undo is **parked** for the human. The red-line hook
+blocks known destructive command shapes; this rule stands where the hook misses.
 
-**Product code belongs to a child**, merge-conflict resolution included: answer with design
-direction or pseudocode, and the child writes the edit. The conflicts that reach you at all are the
-ones no rule settles — the merge driver resolves a mechanical conflict itself.
+**You rule from what the escalation and its witness brief show you** — the brief is a script's
+check of every pointer the child cites, each marked held, contradicted or missing, and it
+recommends nothing. Where the child and the brief state a fact differently, one bounded read
+settles it: that pointer, an explicit offset, 80 lines at most. A whole file, a search or a shell
+read is a hunt, and the hook refuses it. A message lacking what a ruling needs is answered by
+asking its sender for exactly what it lacks.
+
+**A ruling is one decision and its action** — pick an option, redirect, or sketch pseudocode —
+and the child writes the edit: product code belongs to a child, merge-conflict resolution included.
+
+**Leftovers are yours to place.** A `wrap-up` lists what a finished ticket leaves behind; rule
+each line into this ticket, a new ticket you open seeded from that line, or dropped.
+
+**The human hears from you for a decision that is theirs** — product direction, a material change
+of architecture, a widening of product scope, an action with no undo — and asks you for anything
+else.
 
 ## Start the run
 

@@ -68,6 +68,27 @@ driver crash, a timeout, an unknown status, a child at a permission prompt and a
 failed. Nothing else reaches the coordinator, and the coordinator narrates no status to the
 operator. A clean run costs it one turn to launch, one per ASK, and one to point at the report.
 
+> **Amended (advisor experiment, 2026-08-26).** Two days of running the same roles by hand — one
+> resident Fable advisor, one Opus developer per ticket, 22 developer sessions, 70 messages up —
+> measured what the three-kind surface leaves out and what the "message alone" rule costs.
+> *Kinds.* Children asked about two decisions per ticket, against 0.7 under `/crew`, and the extra
+> ones were decision points raised **before the first edit** — interface shape, architecture
+> placement, acceptance criteria — a phase the three kinds cannot name. Five categories of question
+> were used evenly and only two of seventy should have been settled by the child. So a `CREW ASK`
+> now comes in five kinds — `design`, `scope`, `doc-conflict`, `stuck`, `wrap-up` — and may arrive
+> at any phase; `wrap-up` carries a finished ticket's leftovers for the coordinator to place, which
+> is where the run's follow-up tickets now come from. *Evidence.* The advisor read files itself
+> 60–95 times a session, 69–141k characters of tool output that changed no ruling: every reversal
+> came from evidence the child sent. Its one prompted lever — delegate research to a cheap
+> sub-agent — fired once in four sessions. Prompted discipline does not hold, so the mechanism
+> changed: a script attaches a **witness brief** to every ASK (a fresh budget-capped cheap session
+> checks each pointer, no recommendation), and the coordinator's own reads are bounded by a hook to
+> one pointer of at most 80 lines — enough to settle a fact the child and the brief state
+> differently, never enough to hunt. *Cost.* Messages up averaged 475 words, 37% of them progress
+> or FYI with no decision in them; the advisor narrated 96 times to the operator for 4 decisions
+> asked. An escalation now carries a question or a wrap-up and nothing else, and the coordinator
+> speaks to the operator only for a decision that is theirs.
+
 ## Consequences
 
 - The crew skill document is the oracle's resident prefix, so it holds the reversibility contract,

@@ -277,6 +277,7 @@ def render_turn(run, ticket, templates, log=None):
     text = text.replace("<opening line>", block(shape["opening_line"]))
     text = text.replace("<workflow block>", workflow_block)
     text = text.replace("<coordinator paragraph>", coordinator)
+    text = text.replace("<escalation paragraph>", block(turn["escalate"]))
     text = text.replace("<completion paragraph>", completion)
     return fill(text, values) + "\n"
 

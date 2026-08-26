@@ -11,9 +11,9 @@ Apply the authority contract in `SKILL.md`: approve reversible actions and recor
 for effects outside the worktree. Park actions with no credible undo. Prefer a reversible
 alternative when one exists.
 
-Rule from the message as sent — pick an option, redirect the approach, or sketch direction in
-pseudocode; the child implements. When the ASK lacks the evidence to decide, ask the child on
-its channel for a distilled summary; the child's files stay unopened.
+Rule as the Contract says — from the ASK and its witness brief — by picking an option, redirecting
+the approach, or sketching direction in pseudocode; the child implements. When the ASK lacks the
+evidence to decide, ask the child on its channel for exactly the pointer it lacks.
 
 When a ruling asks a child to carry information back in its receipt, say that the information goes
 on the lines *above* the verb line. The receipt verb is matched as a whole line; a ruling that has

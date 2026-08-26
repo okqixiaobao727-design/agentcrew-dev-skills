@@ -67,7 +67,7 @@ _Avoid_: raw source states (busy, idle) in human-facing output
 | `running` | has a live child working on it |
 | `waiting` | has a child or merge needing a human: a prompt, an idle/shell turn, a blocked merge |
 | `reworking` | has a live child resolving the semantic merge conflict the run sent it back to |
-| `parked` | needs an irreversible action, so it is waiting for a human |
+| `parked` | needs an action only a human can take, so it is waiting for them |
 | `landable` | has a verified completion receipt and has not been merged yet |
 | `settling` | is landable in a wave whose last receipt is in, so its merge is what happens next |
 | `merged` | is in the integration branch |
@@ -191,9 +191,12 @@ missing, so tracker configuration stays in its one canonical place.
 **Coordinator** — The session in the main tmux window that runs `/crew`, and the run's **oracle**:
 its whole job is judgment. It launches the driver, rules on what children escalate and on what the
 rule table has no row for, and points at the report. It writes no product code and opens no run
-file — it rules from what a message shows it
-([ADR-0010](adr/0010-the-driver-runs-the-run-the-coordinator-rules.md)).
-_Avoid_: lead, orchestrator (legacy term from `/orchestrate`)
+file — it rules from what an escalation and its witness brief show it, with at most one bounded
+read to settle a fact they state differently
+([ADR-0010](adr/0010-the-driver-runs-the-run-the-coordinator-rules.md)). It speaks to the human
+only for a decision that is theirs; the human asks when they want to know.
+_Avoid_: lead, orchestrator (legacy term from `/orchestrate`), advisor (the role's name in a
+manual run's prompt, never in these documents)
 
 **Judgment turn** — Any coordinator turn that produces a ruling or an approval. The design goal is
 that a run contains no other kind of coordinator turn.
@@ -222,12 +225,38 @@ you can switch into it and take over at any moment.
 _Avoid_: worker, teammate
 
 **Escalation** — Handing a question up to the level that can rule on it: child to coordinator,
-coordinator to human. A child must escalate in exactly three cases — a document conflict (spec,
-ticket and code reality disagree in any pair), the same obstacle surviving two attempts, and
-finishing the ticket requiring a change to its declared scope. A blocking review finding still open
-when Review-Switch returns `escalate` goes up too. Escalation is not an ending: once ruled on, the
-ticket keeps running.
-_Avoid_: question, ask (as a noun)
+coordinator to human. A child escalates at any phase — before its first edit, mid-ticket, or at
+wrap-up — in exactly five kinds: `design` (a decision point), `scope` (finishing needs a change to
+the ticket's declared scope), `doc-conflict` (spec, ticket and code reality disagree in any pair),
+`stuck` (the same obstacle surviving two attempts) and `wrap-up` (leftovers at completion). A
+review ending on `escalate` goes up as `doc-conflict`; a review that cannot run goes up as `stuck`.
+Everything else the child settles itself: code shape, naming, tests, a root-caused bug, a refactor
+that changes no behaviour, what a document already answers. An escalation is one message carrying only
+what a ruling needs — every fact as a pointer; progress, reasoning and assumptions stay in the
+child's commits and receipt. Escalation is not an ending: once ruled on, the ticket keeps running.
+_Avoid_: question, ask (as a noun), progress report
+
+**Decision point** — A choice on product goal, acceptance, architecture, module boundary or
+public interface that the child cannot make alone, most often before its first edit. All of a
+phase's decision points travel as one `design` escalation, the child's own pick marked on each.
+
+**Witness brief** — The fact-check a fresh, budget-capped cheap-model session attaches to one
+escalation: each pointered claim marked held, contradicted or missing, and no recommendation. A
+script launches it — the driver on a `CREW ASK`, or the child before sending in a run without a
+driver — so it reaches the coordinator beside the escalation without anyone choosing to ask for it.
+_Avoid_: research, verification
+
+**Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers
+remain: one line per leftover — what it is, its pointer, and whether it touches only this ticket
+or another ticket or a public interface — with no recommendation. The coordinator rules each line:
+fixed in this ticket, opened as a ticket seeded from that line, or dropped. A completion with no
+leftovers is a receipt, not a wrap-up.
+_Avoid_: tail, follow-up list
+
+**Bounded read** — The one file access open to the coordinator: a single pointer, read with an
+explicit offset and at most 80 lines, to settle a fact the escalation and the witness brief state
+differently, or to see a pointer the brief marks missing. A whole file, a search, or a shell read
+is a **hunt**, and the hook refuses it.
 
 **Ruling** — A judgment the coordinator issues in reply to an escalation: design direction, a
 conflict verdict, or a scope decision.
@@ -309,8 +338,8 @@ _Avoid_: frame file, liveness file (there is no background process behind it)
 **Red line** — The one class of action blocked mechanically: irreversible destruction of data. A
 ticket that hits it is parked for a human.
 
-**Parked** — A child stopped, waiting for a human decision, because going on needs an irreversible
-action. The red-line hook is a mechanical block on known command shapes; the criterion for parking
+**Parked** — A child stopped, waiting on the human, because going on needs an action only they can
+take: an irreversible action, or a credential the run lacks. The red-line hook is a mechanical block on known command shapes; the criterion for parking
 is reversibility itself, so a hook that fails to catch something does not change the criterion.
 
 **Judgment core** — The judgment material every run consults: the classification tests, the

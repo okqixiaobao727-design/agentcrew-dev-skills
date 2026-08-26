@@ -12,6 +12,13 @@ cheap-model repair session that the *script* launches — the coordinator is not
 pays nothing. Only a double failure, or a conflict the rules classify as semantic (two
 children's designs disagree), escalates to the coordinator.
 
+> **Amended (advisor experiment, 2026-08-26).** The Sonnet rung now also runs *ahead* of the
+> coordinator on every escalation, as the **witness brief**: a script launches a fresh,
+> budget-capped cheap session that checks each pointer the child cites and marks it held,
+> contradicted or missing. It never rules; it makes the "coordinator rules from the message alone"
+> contract tenable without the coordinator's own reads, which the amended
+> [ADR-0010](0010-the-driver-runs-the-run-the-coordinator-rules.md) measured as pure cost.
+
 ## Considered Options
 
 - **Resident cheap "executive" session** doing all mechanics: grows its own long-context

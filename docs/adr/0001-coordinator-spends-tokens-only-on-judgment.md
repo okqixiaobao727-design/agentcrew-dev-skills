@@ -35,3 +35,6 @@ scripts. Replayed against the measured run, this removes 127 of 184 coordinator 
   price, so a mid-run insertion forces a 2× rewrite of everything after it. The
   coordinator instead gets a static reference index (paths + one-line descriptions, no
   contents) at session start, and escalation messages must carry their own file pointers.
+  (Amended by [ADR-0010](0010-the-driver-runs-the-run-the-coordinator-rules.md): what the
+  coordinator chooses to Read is itself bounded to one pointer, and the pointers arrive
+  pre-checked by a witness brief.)

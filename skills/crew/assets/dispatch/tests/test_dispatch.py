@@ -475,9 +475,9 @@ class ClaudeRenderTests(DispatchTestCase):
     def test_the_first_turn_carries_the_escalation_grammar_and_receipt(self):
         prompt = self.initial_prompt()
         self.assertIn(
-            "CREW ASK 06 <doc-conflict|stuck|scope> — question in one paragraph, 2-3 options with\n"
-            "yours marked, then the pointers: ticket <absolute path>, branch <name>, and the files"
-            " or\ndiffs at issue, ts=<unix time>",
+            "CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up> — the body above, what the ruling\n"
+            "touches, then the pointers: ticket <absolute path>, branch <name>, and every fact as a"
+            " pointer\n— <path:line>, #<ticket>, ADR-<nnnn> — re-read as you write it, ts=<unix time>",
             prompt,
         )
         self.assertIn(
@@ -771,7 +771,7 @@ class ReceiptChannelTests(DispatchTestCase):
             " on first send.",
             prompt,
         )
-        self.assertIn("CREW ASK 06 <doc-conflict|stuck|scope>", prompt)
+        self.assertIn("CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up>", prompt)
 
     def test_a_codex_child_keeps_the_sendable_receipt_its_bridge_reads(self):
         """Its review hooks use the log writer, but its completion stays a bridge receipt."""
@@ -789,7 +789,7 @@ class ReceiptChannelTests(DispatchTestCase):
             prompt,
         )
         self.assertNotIn("--role child", prompt)
-        self.assertIn("CREW ASK 06 <doc-conflict|stuck|scope>", prompt)
+        self.assertIn("CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up>", prompt)
 
     def test_a_run_with_no_machine_log_leaves_the_receipt_a_message(self):
         """There is no log to name, so the sendable receipt is what a child can still do."""

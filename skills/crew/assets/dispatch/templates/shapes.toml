@@ -4,7 +4,8 @@
 # cannot drift apart.
 #
 # Every `<token>` a block leaves open is filled from the approved wave table. Tokens the child is
-# meant to read literally — `<sha>`, `<unix time>`, `<reason>`, `<doc-conflict|stuck|scope>` — are
+# meant to read literally — `<sha>`, `<unix time>`, `<reason>`,
+# `<design|scope|doc-conflict|stuck|wrap-up>`, `<path:line>`, `#<ticket>`, `ADR-<nnnn>` — are
 # never substituted; the renderer fills a fixed, named set and nothing else.
 
 [turn]
@@ -19,16 +20,34 @@ Your scope is this worktree and branch only; every path you write resolves insid
 
 <coordinator paragraph>
 
-Escalate — one compact message, then wait; the answer wakes you — the moment any of these holds:
-the spec, the ticket, and the code disagree; the same obstacle has survived two attempts;
-finishing needs a change to the ticket's scope. Format:
-CREW ASK <NN> <doc-conflict|stuck|scope> — question in one paragraph, 2-3 options with
-yours marked, then the pointers: ticket <absolute path>, branch <name>, and the files or
-diffs at issue, ts=<unix time>
-Distil: the coordinator decides from this message alone and does not read your files, so
-carry every pointer it would otherwise have to hunt for.
+<escalation paragraph>
 
 <completion paragraph>
+'''
+
+# The escalation paragraph, one body per kind. A manual run's developer prompt renders this same
+# block, so the two cannot drift.
+escalate = '''
+Escalate — one compact message, then wait; the answer wakes you — at any phase, from before
+your first edit to wrap-up, the moment one of these holds:
+- design: a decision point on product goal, acceptance, architecture, a module boundary or a
+  public interface. One message per phase: each decision point numbered, 2-3 options, your
+  pick marked.
+- scope, doc-conflict, stuck: the question in one paragraph, 2-3 options with yours marked.
+  scope — finishing needs a change to the ticket's scope. doc-conflict — the spec, the ticket
+  and the code disagree, or a review ends on `escalate`. stuck — the same obstacle has
+  survived two attempts.
+- wrap-up: the ticket is complete and leftovers remain. One line per leftover — what, its
+  pointer, and whether it touches only this ticket, another ticket, or a public interface —
+  and no recommendation: placing them is the ruling.
+Everything else is yours to settle: code shape, naming, tests, a root-caused bug, a refactor
+that changes no behaviour, what a document already answers.
+Every message:
+CREW ASK <NN> <design|scope|doc-conflict|stuck|wrap-up> — the body above, what the ruling
+touches, then the pointers: ticket <absolute path>, branch <name>, and every fact as a pointer
+— <path:line>, #<ticket>, ADR-<nnnn> — re-read as you write it, ts=<unix time>
+Distil to about 250 words: the coordinator rules from this message and a witness brief that
+checks its pointers. Progress, reasoning and assumptions belong in your commits and receipt.
 '''
 
 # A Claude child authenticates the coordinator by sender socket; the pid is known before launch.
@@ -207,10 +226,10 @@ and run without `--resume-session`. If that axis fails again, escalate with its 
 For every trusted axis, do exactly what its `next` field permits and no other action. When it
 requires a resumed review, reuse the command, replace `--axis both` with that axis's own name, and
 add `--resume-session <reviewSessionId>` using that axis's `reviewSessionId`. When `next` says
-`escalate`, map it onto `CREW ASK` and carry both positions to your coordinator.
+`escalate`, send `CREW ASK <NN> doc-conflict` carrying both positions to your coordinator.
 
-Any other top-level `status`, including `refused`, is not a report: map its `next` and reason onto
-`CREW ASK`. Do not start or resume another review.
+Any other top-level `status`, including `refused`, is not a report: send `CREW ASK <NN> stuck`
+carrying its `next` and reason. Do not start or resume another review.
 
 If the JSON object never reaches you, add `--recover-session` to the same command instead of
 starting another review. It waits for every live axis or returns an undelivered report. Exit code 3
@@ -273,6 +292,26 @@ aliases = [
     # among are full IDs and belong nowhere near this list.
     "gpt-5.6",
 ]
+
+[manual]
+# The prompt pair a run without a driver pastes by hand — one resident coordinator session (the
+# "advisor") and one developer session per ticket. Both render from the blocks above and from the
+# crew skill's `## Contract`, so a manual run and `/crew` speak one text. Rendered by the dispatch
+# renderer's roles command; nothing here is typed out a second time.
+advisor = '''
+You are the coordinator of this run: the human's proxy on product and technical direction, and
+the developer sessions' final word. Spec: <absolute spec path>.
+
+<contract>
+'''
+
+developer = '''
+Your coordinator is the Claude session `<coordinator name>`; reply with SendMessage to it, ending
+every message with `ts=<unix time>`. Spec: <absolute spec path>. Ticket: <absolute ticket path>.
+
+<escalation paragraph>
+Before sending, run `<witness command>` and paste its brief under the message.
+'''
 
 [agent]
 # The `--agents` entry a Claude child is launched under. `prompt` is required for the CLI to
