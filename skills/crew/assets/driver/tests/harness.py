@@ -515,6 +515,13 @@ class Fixture:
                 agent["status"] = status
         self.set_agents(agents, home)
 
+    def codex_goes(self, ticket, status):
+        """Set the status the next Codex watch reports for one ticket."""
+        path = self.stub_dir / "codex-statuses.json"
+        statuses = json.loads(path.read_text()) if path.exists() else {}
+        statuses[ticket] = status
+        path.write_text(json.dumps(statuses))
+
     def vanishes(self, ticket):
         """Take that child's session off its account's list, as a session that died leaves it.
 

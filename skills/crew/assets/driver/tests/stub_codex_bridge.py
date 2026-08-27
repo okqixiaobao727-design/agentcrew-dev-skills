@@ -30,7 +30,19 @@ def main():
         handle.write(json.dumps({"argv": argv}) + "\n")
 
     if argv[:1] == ["watch"]:
-        print(json.dumps({"sessions": []}))
+        path = state_dir / "codex-statuses.json"
+        statuses = json.loads(path.read_text()) if path.exists() else {}
+        sessions = []
+        for state_file in argv[1:]:
+            ticket = pathlib.Path(state_file).stem
+            status = statuses.get(ticket)
+            if status is not None:
+                sessions.append({"stateFile": state_file, "status": status})
+                if status == "idle":
+                    statuses[ticket] = "busy"
+        if path.exists():
+            path.write_text(json.dumps(statuses))
+        print(json.dumps({"sessions": sessions}))
         return 0
 
     if argv[:1] == ["send"]:

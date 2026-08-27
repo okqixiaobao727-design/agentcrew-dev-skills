@@ -274,23 +274,18 @@ ASK_SHAPE = f"CREW ASK <NN> <{'|'.join(ESCALATION_KINDS)}> [— <body>] [ts=<uni
 
 RECHECK_TEMPLATE = (
     "{marker} {ticket} {sha} — the receipt you sent did not verify: {problem}. Finish the work in"
-    " your worktree, commit it, and send a new CREW COMPLETE <sha>; if it cannot be finished, send"
-    " CREW FAILED <reason>. This is the one re-ask — a second receipt that does not verify settles"
-    " this ticket failed."
+    " your worktree and commit it. {receipt_direction} This is the one re-ask — a second receipt"
+    " that does not verify settles this ticket failed."
 )
 RESEND_TEMPLATE = (
     "{marker} {ticket} — the line you ended on reached for one of this run's verbs and missed its"
-    " shape, so nothing settled and nobody was woken: {line}. Send it in exactly the shape shown:"
-    " `CREW COMPLETE <40-character sha> ts=<unix>`, CREW PARKED <checklist path>, CREW FAILED"
-    f" <reason>, or {ASK_SHAPE}. Anything you want to"
-    " say alongside it goes on the lines above. This is the one re-ask — a second line that misses"
-    " its shape settles this ticket failed."
+    " shape, so nothing settled and nobody was woken: {line}. {receipt_direction} This is the one"
+    " re-ask — a second line that misses its shape settles this ticket failed."
 )
 NUDGE_TEMPLATE = (
-    "{marker} {ticket} — your session is idle and this run holds no receipt from you. Send"
-    " CREW COMPLETE <sha> if the work is committed, CREW PARKED <checklist path> if finishing it"
-    " needs a human, or CREW FAILED <reason>. This is the one nudge — a second idle silence"
-    " settles this ticket failed."
+    "{marker} {ticket} — your session is idle and this run holds no receipt from you."
+    " {receipt_direction} This is the one nudge — a second idle silence settles this ticket"
+    " failed."
 )
 ANCHOR_TEMPLATE = (
     "{marker} {ticket} — this run is driven by a coordinator session that has restarted, so the"
@@ -304,9 +299,8 @@ ANCHOR_TEMPLATE = (
 MERGE_TEMPLATE = (
     "{marker} {ticket} — your branch {branch} conflicts with {integration} in a way no script can"
     " resolve: {reason}. Merge {integration} into {branch}, resolve the conflict, re-run the tests"
-    " the conflict touched, re-review scoped to the conflict-resolution diff, commit, and send a"
-    " new CREW COMPLETE <sha>. If this is a design disagreement you cannot settle alone, send"
-    " CREW ASK instead."
+    " the conflict touched, re-review scoped to the conflict-resolution diff, and commit."
+    " {receipt_direction}"
 )
 
 # The verdicts and events the loop reads back out of the log. The writer owns their spelling.
@@ -2188,6 +2182,22 @@ class Loop:
 
     # --- what it says ---------------------------------------------------------------------
 
+    def receipt_log_command(self, ticket):
+        """Return the command a Claude child uses to record one receipt in this run's own log."""
+        return shlex.join(str(argument) for argument in (
+            "python3", self.run_dir / MACHINE_LOG.name, "--log", self.log, "message",
+            "--role", CHILD_ROLE, "--ticket", ticket, "--message", "<receipt>",
+        ))
+
+    def receipt_direction(self, ticket, launch, codex, claude):
+        """Return one receipt direction rendered for the child's executor lane."""
+        if lane_of(launch) == CODEX:
+            return codex
+        return (
+            "Record the outcome in the run's machine log with:\n\n"
+            f"{self.receipt_log_command(ticket)}\n\n{claude}"
+        )
+
     def settle(self, ticket, verdict, detail, sha=None):
         """Record a ticket's verdict through the log's own writer; returns nothing.
 
@@ -2497,7 +2507,20 @@ class Loop:
             self.settle(ticket, FAILED, f"a second receipt missed the verb grammar: {line}")
             return
         self.deliver(ticket, launch, RESEND_TEMPLATE.format(
-            marker=RESEND_MARKER, ticket=ticket, line=line
+            marker=RESEND_MARKER, ticket=ticket, line=line,
+            receipt_direction=self.receipt_direction(
+                ticket, launch,
+                codex=(
+                    "Send it in exactly the shape shown: `CREW COMPLETE <40-character sha>"
+                    " ts=<unix>`, CREW PARKED <checklist path>, CREW FAILED <reason>, or"
+                    f" {ASK_SHAPE}. Anything you want to say alongside it goes on the lines above."
+                ),
+                claude=(
+                    "Replace `<receipt>` with exactly one of `CREW COMPLETE <40-character sha>"
+                    " ts=<unix>`, CREW PARKED <checklist path>, or CREW FAILED <reason>. For"
+                    f" {ASK_SHAPE}, use the escalation method from your first turn."
+                ),
+            ),
         ))
 
     def park(self, ticket, launch, message):
@@ -2531,7 +2554,18 @@ class Loop:
             )
             return
         self.deliver(ticket, launch, RECHECK_TEMPLATE.format(
-            marker=RECHECK_MARKER, ticket=ticket, sha=sha, problem=problem
+            marker=RECHECK_MARKER, ticket=ticket, sha=sha, problem=problem,
+            receipt_direction=self.receipt_direction(
+                ticket, launch,
+                codex=(
+                    "Send a new CREW COMPLETE <sha>; if it cannot be finished, send"
+                    " CREW FAILED <reason>."
+                ),
+                claude=(
+                    "Replace `<receipt>` with a new CREW COMPLETE <sha>, or CREW FAILED <reason>"
+                    " if the work cannot be finished."
+                ),
+            ),
         ))
 
     def base_commit(self, launch):
@@ -2600,7 +2634,21 @@ class Loop:
         if facts.outstanding_nudge:
             self.settle(ticket, FAILED, "a nudged child went idle again with no receipt sent")
             return True
-        self.deliver(ticket, launch, NUDGE_TEMPLATE.format(marker=NUDGE_MARKER, ticket=ticket))
+        self.deliver(ticket, launch, NUDGE_TEMPLATE.format(
+            marker=NUDGE_MARKER, ticket=ticket,
+            receipt_direction=self.receipt_direction(
+                ticket, launch,
+                codex=(
+                    "Send CREW COMPLETE <sha> if the work is committed, CREW PARKED <checklist"
+                    " path> if finishing it needs a human, or CREW FAILED <reason>."
+                ),
+                claude=(
+                    "Replace `<receipt>` with CREW COMPLETE <sha> if the work is committed,"
+                    " CREW PARKED <checklist path> if finishing it needs a human, or CREW FAILED"
+                    " <reason>."
+                ),
+            ),
+        ))
         return True
 
     # --- the wave boundary ------------------------------------------------------------------
@@ -2679,6 +2727,18 @@ class Loop:
                 marker=MERGE_MARKER, ticket=ticket, branch=self.branch_of(ticket, launch),
                 integration=self.run.integration_branch,
                 reason=facts.semantic_conflict_detail,
+                receipt_direction=self.receipt_direction(
+                    ticket, launch,
+                    codex=(
+                        "Send a new CREW COMPLETE <sha>. If this is a design disagreement you"
+                        " cannot settle alone, send CREW ASK instead."
+                    ),
+                    claude=(
+                        "Replace `<receipt>` with the new CREW COMPLETE <sha>. If this is a design"
+                        " disagreement you cannot settle alone, use CREW ASK instead through the"
+                        " escalation method from your first turn."
+                    ),
+                ),
             ))
         if halted:
             return wave
