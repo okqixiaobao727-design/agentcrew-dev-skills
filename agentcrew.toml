@@ -125,11 +125,6 @@ effort = "medium"
 # The command is a courtesy to what you already run: one that fails or hangs leaves the launch
 # itself standing.
 
-[hooks.on-child-launch]
-command = ""
-
-[hooks.on-child-launch.env]
-
 # --- Dashboard --------------------------------------------------------------
 # Which surface a run draws itself on. `window` gives the run its own tmux window, as it always
 # has; `pin` skips that window and draws the same frame into the coordinator's Claude Code
