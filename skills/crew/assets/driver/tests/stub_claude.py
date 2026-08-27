@@ -76,10 +76,31 @@ def write_transcript(session_id, cwd, model):
 def main():
     argv = sys.argv[1:]
     with (state_dir() / "claude-calls.jsonl").open("a") as handle:
-        handle.write(json.dumps({"argv": argv, "configHome": config_home()}) + "\n")
+        handle.write(json.dumps({
+            "argv": argv, "configHome": config_home(), "cwd": os.getcwd(),
+        }) + "\n")
 
     if argv[:2] == ["agents", "--json"]:
         print(json.dumps(read_agents()))
+        return 0
+
+    if "--print" in argv:
+        if os.environ.get("AGENTCREW_STUB_WITNESS_BEHAVIOUR") in ("fail", "overrun"):
+            print(os.environ["AGENTCREW_STUB_WITNESS_FAILURE"], file=sys.stderr)
+            return 7
+        usage = {
+            "input_tokens": 11,
+            "output_tokens": 22,
+            "cache_read_input_tokens": 33,
+            "cache_creation_input_tokens": 44,
+        }
+        if os.environ.get("AGENTCREW_STUB_WITNESS_BEHAVIOUR") == "partial-usage":
+            usage.pop("cache_creation_input_tokens")
+        print(json.dumps({
+            "is_error": False,
+            "result": os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
+            "usage": usage,
+        }))
         return 0
 
     cwd = os.getcwd()
