@@ -303,6 +303,40 @@ class RunProjectionTests(unittest.TestCase):
         self.assertTrue(eight.awaiting_ruling)
         self.assertEqual(eight.instruction_count("CREW RULED"), 1)
 
+    def test_a_witness_is_attached_only_to_the_escalation_it_checked(self):
+        first = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — first",
+        }
+        first_witness = {
+            "event": "witness", "ticket": "7", "outcome": "checked",
+            "reason": "", "duration_seconds": 1,
+        }
+        ruling = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": "CREW RULED 7 handed over",
+        }
+        second = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 scope — second",
+        }
+
+        awaiting_second_witness = machine_log.project([
+            first, first_witness, ruling, second,
+        ])
+        self.assertEqual(awaiting_second_witness.ticket("7").escalation, second)
+        self.assertIsNone(awaiting_second_witness.ticket("7").witness)
+
+        second_witness = {
+            "event": "witness", "ticket": "7", "outcome": "failed",
+            "reason": "session timed out", "duration_seconds": 2,
+        }
+        checked_second = machine_log.project([
+            first, first_witness, ruling, second, second_witness,
+        ])
+        self.assertEqual(checked_second.ticket("7").escalation, second)
+        self.assertEqual(checked_second.ticket("7").witness, second_witness)
+
     def test_only_receipt_evidence_consumes_a_valid_completion_claim(self):
         claim = {
             "event": "message", "ticket": "7", "role": "child",
@@ -667,6 +701,73 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(recorded[1]["ticket"], "26")
         self.assertEqual(recorded[1]["lane"], REVIEW_LANE)
         self.assertEqual(recorded[1]["detail"], "round one")
+
+    def test_a_witness_records_the_fact_check_and_its_session_cost(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--model", "claude-sonnet-5",
+            "--outcome", "failed", "--reason", "witness session timed out",
+            "--duration-seconds", "900.125",
+            "--input-tokens", "11", "--output-tokens", "22",
+            "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
+            "--total-tokens", "110", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "witness")
+        self.assertEqual(entry["ticket"], "07")
+        self.assertEqual(entry["model"], "claude-sonnet-5")
+        self.assertEqual(entry["outcome"], "failed")
+        self.assertEqual(entry["reason"], "witness session timed out")
+        self.assertEqual(entry["duration_seconds"], 900.125)
+        self.assertEqual(entry["input_tokens"], 11)
+        self.assertEqual(entry["output_tokens"], 22)
+        self.assertEqual(entry["cache_read_tokens"], 33)
+        self.assertEqual(entry["cache_creation_tokens"], 44)
+        self.assertEqual(entry["total_tokens"], 110)
+
+    def test_a_witness_outcome_outside_the_closed_grammar_is_refused(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--model", "claude-sonnet-5",
+            "--outcome", "unknown", "--reason", "why", "--duration-seconds", "1",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_witness_refuses_a_contradictory_result_or_cost(self):
+        cases = (
+            ("checked with a failure reason", [
+                "--outcome", "checked", "--reason", "failed", "--duration-seconds", "1",
+            ]),
+            ("failed without a reason", [
+                "--outcome", "failed", "--reason", "", "--duration-seconds", "1",
+            ]),
+            ("negative duration", [
+                "--outcome", "checked", "--reason", "", "--duration-seconds", "-1",
+            ]),
+            ("partial cost", [
+                "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--input-tokens", "11",
+            ]),
+            ("wrong total", [
+                "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--input-tokens", "11", "--output-tokens", "22",
+                "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
+                "--total-tokens", "111",
+            ]),
+        )
+        for label, fields in cases:
+            with self.subTest(label=label):
+                result = run_cli(
+                    "witness", "--ticket", "07", "--model", "claude-sonnet-5",
+                    *fields, log=self.log,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(self.log.exists())
 
     def test_a_review_state_outside_the_two_is_refused_and_appends_nothing(self):
         result = run_cli(

@@ -1,9 +1,11 @@
 # Triage: rule on a child
 
-Reached from a `judgment-needed` or `driver-error` wake snapshot, whose `detail`, `ticket`, `child`
-and `window` are what you rule from: a `CREW ASK` a child sent, a semantic conflict it bounced back
-a second time, or a state the rule table has no row for. A Claude child `waiting` at a permission
-prompt is that last case — read the question with `tmux capture-pane -p -t <window>`.
+Reached from a `judgment-needed` or `driver-error` wake snapshot. Rule from its `detail`, `ticket`,
+`child` and `window`; a child escalation also carries its fact-check in `brief`. A failed fact-check
+carries an empty `brief` and a plain-string `witness_reason` beside it; that field is absent on
+success. The snapshot may instead carry a semantic conflict bounced back a second time, or a state
+the rule table has no row for. A Claude child `waiting` at a permission prompt is that last case —
+read the question with `tmux capture-pane -p -t <window>`.
 
 ## Decide
 

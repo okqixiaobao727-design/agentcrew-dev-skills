@@ -27,6 +27,11 @@ run file, which is what keeps the oracle boundary intact; `monitor-wave.sh` and 
 `watch` already exit this way. A launched wave is not a wake reason: the driver prints its one
 launch line and goes on working, and only one of the four reasons ends it.
 
+A `judgment-needed` snapshot for a child escalation carries the child's message in `detail` and
+the checked text in `brief`. When the witness failed, `brief` is empty and the plain-string
+`witness_reason` sits beside it; `witness_reason` is absent on success and the snapshot's existing
+`reason` remains the wake reason.
+
 The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle
 event: it prints a multi-line inventory, asks for confirmation, and reports errors directly instead
 of emitting a wake snapshot.
@@ -122,6 +127,7 @@ MONITOR_WAVE = ASSETS / "monitor-wave.sh"
 CODEX_BRIDGE = ASSETS / "codex" / "codex_bridge.py"
 ADVANCE = ASSETS / "advance.py"
 LAUNCH = ASSETS / "launch" / "launch.py"
+WITNESS = ASSETS / "witness.py"
 
 # The renderer owns what a ticket's branch is called.
 sys.path.insert(0, str(DISPATCH.parent))
@@ -131,6 +137,7 @@ import machine_log  # noqa: E402
 # Account bindings become process environments only through the account module.
 import accounts  # noqa: E402
 import run_plan  # noqa: E402
+import witness as witness_runner  # noqa: E402
 # The monitor still owns process liveness, the driver pid record and every operator-facing surface;
 # Machine-log interpretation itself comes from the projection above.
 sys.path.insert(0, str(MONITOR.parent))
@@ -2108,6 +2115,103 @@ class Loop:
 
     # --- the rule table, row by row ---------------------------------------------------------
 
+    def run_witness(self, ticket, launch, message):
+        """Run and record one escalation witness; returns its checked or failed document."""
+        started = time.monotonic()
+
+        def failed(reason):
+            return {
+                "brief": "",
+                "outcome": "failed",
+                "reason": str(reason).strip() or "witness process failed",
+                "duration_seconds": round(time.monotonic() - started, 3),
+            }
+
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, WITNESS, "--escalation", "-",
+                    "--worktree", launch["worktree"],
+                    "--model", self.run.witness_model,
+                    "--budget-usd", f"{self.run.witness_budget_usd:g}",
+                ],
+                input=message,
+                capture_output=True,
+                text=True,
+                env=accounts.process_environment(self.plan.ticket(ticket).binding),
+                # The witness owns the session timeout. One poll interval lets it shape and print
+                # that failure before this outer guard treats the whole process as the overrun.
+                timeout=witness_runner.DEFAULT_TIMEOUT_SECONDS + self.args.poll_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            document = failed("witness process timed out")
+        except (OSError, KeyError, TypeError) as error:
+            document = failed(error)
+        else:
+            if result.returncode:
+                document = failed(
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or f"witness process exited {result.returncode}"
+                )
+            else:
+                try:
+                    document = json.loads(result.stdout)
+                except (TypeError, json.JSONDecodeError) as error:
+                    document = failed(f"witness process returned invalid JSON: {error}")
+                if not isinstance(document, dict):
+                    document = failed("witness process returned no result object")
+
+        outcome = document.get("outcome")
+        brief = document.get("brief")
+        reason = document.get("reason")
+        duration = document.get("duration_seconds")
+        sound = (
+            outcome in machine_log.WITNESS_OUTCOMES
+            and isinstance(brief, str)
+            and isinstance(reason, str)
+            and isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+            and duration >= 0
+            and (
+                (outcome == "checked" and bool(brief) and not reason)
+                or (outcome == "failed" and not brief and bool(reason.strip()))
+            )
+        )
+        if not sound:
+            document = failed("witness process returned a contradictory result")
+
+        usage = document.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        witness_event = [
+            sys.executable, MACHINE_LOG, "--log", self.log, "witness",
+            "--ticket", ticket,
+            "--model", self.run.witness_model,
+            "--outcome", document["outcome"],
+            "--reason", document["reason"],
+            "--duration-seconds", str(document["duration_seconds"]),
+        ]
+        counters = {
+            "input": usage.get("input_tokens"),
+            "output": usage.get("output_tokens"),
+            "cache-read": usage.get("cache_read_input_tokens"),
+            "cache-creation": usage.get("cache_creation_input_tokens"),
+        }
+        if all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in counters.values()
+        ):
+            for name, value in counters.items():
+                witness_event.extend([f"--{name}-tokens", str(value)])
+            witness_event.extend(["--total-tokens", str(sum(counters.values()))])
+        run_command(
+            witness_event,
+            f"the witness run for {ticket} could not be recorded",
+            ticket=ticket, pointer=str(self.log),
+        )
+        return document
+
     def hand_over(self, ticket, launch, message):
         """Record that this escalation is the coordinator's now, and wake it; never returns.
 
@@ -2122,12 +2226,18 @@ class Loop:
         without this the escalation would still be standing on the next poll and the run could
         never go on.
         """
+        witness_result = self.run_witness(ticket, launch, message)
         self.record_ruling(ticket, launch, HANDED_OVER.format(
             marker=HANDED_OVER_MARKER, ticket=ticket
         ))
         raise Wake(
             JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
-            detail=message, child=launch.get("child"), window=launch.get("window"),
+            detail=message, brief=witness_result["brief"],
+            child=launch.get("child"), window=launch.get("window"),
+            **(
+                {"witness_reason": witness_result["reason"]}
+                if witness_result["outcome"] == "failed" else {}
+            ),
         )
 
     def rule_on_messages(self, projection):

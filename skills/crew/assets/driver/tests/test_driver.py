@@ -52,8 +52,11 @@ from harness import (
     TRIAGE,
     UNREWRITABLE,
     WAKE_NAME,
+    WITNESS_BRIEF,
     WITNESS_BUDGET_USD,
+    WITNESS_FAILURE,
     WITNESS_MODEL,
+    WITNESS_OVERRUN,
     git,
     routing_naming,
 )
@@ -1688,6 +1691,129 @@ class LoopTests(DriverTestCase):
         self.assertEqual(snapshot["ticket"], "01")
         self.assertIn(message, snapshot["detail"])
         self.assertIsNone(self.verdict("01"), "a wrap-up ASK is not an outcome")
+
+    def test_a_wrap_up_crew_ask_wakes_with_its_witness_brief_beside_the_detail(self):
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+        })
+
+        message = "CREW ASK 01 wrap-up — check README.md:1 ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["detail"], message)
+        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
+        self.assertNotIn("witness_reason", snapshot)
+
+    def test_a_failed_witness_still_wakes_with_an_empty_brief_and_its_reason(self):
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BEHAVIOUR": "fail",
+            "AGENTCREW_STUB_WITNESS_FAILURE": WITNESS_FAILURE,
+        })
+
+        message = "CREW ASK 01 scope — check README.md:1 ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["reason"], "judgment-needed")
+        self.assertEqual(snapshot["detail"], message)
+        self.assertEqual(snapshot["brief"], "")
+        self.assertEqual(snapshot["witness_reason"], WITNESS_FAILURE)
+        witness = self.events("witness", ticket="01")
+        self.assertEqual(len(witness), 1, witness)
+        self.assertEqual(witness[0]["outcome"], "failed")
+        self.assertEqual(witness[0]["reason"], WITNESS_FAILURE)
+
+    def test_an_overrun_witness_still_wakes_with_the_timeout_reason(self):
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BEHAVIOUR": "overrun",
+            "AGENTCREW_STUB_WITNESS_FAILURE": WITNESS_OVERRUN,
+        })
+
+        self.fixture.says("01", "CREW ASK 01 stuck — check README.md:1 ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["brief"], "")
+        self.assertEqual(snapshot["witness_reason"], WITNESS_OVERRUN)
+        self.assertEqual(
+            self.events("witness", ticket="01")[0]["reason"], WITNESS_OVERRUN
+        )
+
+    def test_a_checked_brief_survives_an_incomplete_usage_block_without_cost(self):
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BEHAVIOUR": "partial-usage",
+            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+        })
+
+        self.fixture.says("01", "CREW ASK 01 scope — check README.md:1 ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
+        self.assertNotIn("witness_reason", snapshot)
+        witness = self.events("witness", ticket="01")[0]
+        self.assertEqual(witness["outcome"], "checked")
+        self.assertEqual(witness["reason"], "")
+        self.assertGreaterEqual(witness["duration_seconds"], 0)
+        for field in (
+            "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_creation_tokens", "total_tokens",
+        ):
+            self.assertNotIn(field, witness)
+
+    def test_the_witness_uses_its_configured_route_and_records_its_run(self):
+        model = "claude-haiku-4-5-20251001"
+        budget_usd = 1.25
+        profile = self.fixture.profile("paid")
+        self.fixture.register(paid=profile)
+        self.fixture.configure(
+            accounts=["paid"], witness_model=model, witness_budget_usd=budget_usd,
+        )
+        process = self.start(
+            ("01", ()), routing=routing_naming("paid"), env_overrides={
+                "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+            },
+        )
+
+        self.fixture.says("01", "CREW ASK 01 design — check README.md:1 ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
+        calls = [call for call in self.fixture.claude_calls() if "--print" in call["argv"]]
+        self.assertEqual(len(calls), 1, calls)
+        call = calls[0]
+        self.assertEqual(call["argv"][call["argv"].index("--model") + 1], model)
+        self.assertEqual(
+            call["argv"][call["argv"].index("--max-budget-usd") + 1], str(budget_usd)
+        )
+        self.assertEqual(pathlib.Path(call["cwd"]).resolve(), self.fixture.worktree("01"))
+        self.assertEqual(call["configHome"], str(profile))
+        witness = self.events("witness", ticket="01")
+        self.assertEqual(len(witness), 1, witness)
+        self.assertEqual(witness[0]["model"], model)
+        self.assertEqual(witness[0]["outcome"], "checked")
+        self.assertEqual(witness[0]["reason"], "")
+        self.assertGreaterEqual(witness[0]["duration_seconds"], 0)
+        self.assertEqual(witness[0]["input_tokens"], 11)
+        self.assertEqual(witness[0]["output_tokens"], 22)
+        self.assertEqual(witness[0]["cache_read_tokens"], 33)
+        self.assertEqual(witness[0]["cache_creation_tokens"], 44)
+        self.assertEqual(witness[0]["total_tokens"], 110)
+
+    def test_a_codex_childs_escalation_carries_the_same_witness_brief(self):
+        process = self.start(
+            ("01", ()), routing=CODEX_ROUTING, env_overrides={
+                "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+            },
+        )
+
+        message = "CREW ASK 01 scope — check README.md:1 ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["detail"], message)
+        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
+        self.assertNotIn("witness_reason", snapshot)
+        self.assertEqual(self.events("witness", ticket="01")[0]["outcome"], "checked")
 
     def test_a_second_escalation_after_a_ruling_wakes_the_coordinator_again(self):
         """A resume steps past the ASK it was run for, and past nothing else that ticket says."""

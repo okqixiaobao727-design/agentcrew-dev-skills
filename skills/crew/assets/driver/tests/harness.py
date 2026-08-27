@@ -69,6 +69,9 @@ BASE_BRANCH = "main"
 REPAIR_MODEL = "claude-sonnet-5"
 WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_BUDGET_USD = 2.0
+WITNESS_BRIEF = "README.md:1 — held — the fixture file exists"
+WITNESS_FAILURE = "stub witness failed on purpose"
+WITNESS_OVERRUN = "witness session timed out"
 # A file carrying a line that reads as an opening conflict marker: the merge driver will not
 # rewrite a conflict in it, so this is the shape that still climbs to the repair rung.
 UNREWRITABLE = "one\n<<<<<<< left over from an earlier merge\nthree\n"
@@ -201,7 +204,7 @@ class Fixture:
     # --- the project's config -------------------------------------------------------------
 
     def write_config(self, repair_model=REPAIR_MODEL, tracker=TRACKER, surface=None,
-                     accounts=None):
+                     accounts=None, witness_model=None, witness_budget_usd=None):
         """The project config the run reads its repair model and its tracker out of."""
         lines = []
         if repair_model is not None:
@@ -213,6 +216,12 @@ class Fixture:
         if accounts is not None:
             names = ", ".join(f'"{name}"' for name in accounts)
             lines += ["[accounts]", f"names = [{names}]"]
+        if witness_model is not None or witness_budget_usd is not None:
+            lines += ["[witness]"]
+            if witness_model is not None:
+                lines += [f'model = "{witness_model}"']
+            if witness_budget_usd is not None:
+                lines += [f"budget_usd = {witness_budget_usd}"]
         (self.repo / "agentcrew.toml").write_text("\n".join(lines) + "\n")
 
     # --- the machine's account registry -----------------------------------------------------

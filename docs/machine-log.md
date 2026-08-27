@@ -55,6 +55,8 @@ class TicketFacts:
     progress_event: Mapping[str, object] | None
     settlement_state: str
     unanswered_child_message: Mapping[str, object] | None
+    escalation: Mapping[str, object] | None
+    witness: Mapping[str, object] | None
     awaiting_receipt: bool
     awaiting_ruling: bool
     outstanding_nudge: bool
@@ -80,6 +82,10 @@ re-derive a named projection fact from them.
   action; in particular, advance keeps its read before landing and its second read afterwards.
 - First and latest launch remain distinct. The latest launch includes the verified amendment that
   follows a provisional launch; the first launch starts report duration.
+- `escalation` and `witness` are the latest checked pair. A later escalation replaces the first
+  and clears the second until its own witness event arrives, so an older fact-check cannot be
+  paired with a newer escalation. The handed-over ruling consumes the pending message but retains
+  this factual pair for audit and report readers.
 - `latest_settling_event` means the last receipt or outcome with a non-empty value. It answers
   whether the ticket has received a settling event.
 - `settlement_state` retains the closed Machine-log vocabulary and its category precedence: a valid
@@ -308,6 +314,21 @@ cannot write changes neither Review-Switch's exit status nor the result the chil
 that reaches `review-start` writes one pair; a preparation failure opens no review and writes only
 `returned`.
 
+### `witness` — one fact-check of a child escalation
+
+`ticket`, `model`, `outcome` (`checked` or `failed`), `reason`, `duration_seconds`,
+`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`.
+The Driver writes one line after the child escalation and before its handed-over ruling. `model`
+and the budget that bounded the run come from the run's `[witness]` configuration; the event names
+the model, while the hard budget remains in the Wave table. `reason` is empty for `checked` and is
+the witness failure reason for `failed`.
+
+The four token counters and `total_tokens` use the same meanings as `session-cost`, and total is
+their sum. They are absent together when the failed witness returned no usage; the outcome,
+reason, and duration still record the attempted fact-check. The Driver writes this event for both
+Claude and Codex children: the witness itself is driver-side, runs in the escalating child's
+worktree, and uses that ticket's named Claude account where it has one.
+
 ### `advance` — what the run decided after a wave settled
 
 `wave`, `decision`, `detail`. The one event that carries no `ticket`: a decision is about a wave.
@@ -413,6 +434,11 @@ machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parke
                                     [--detail TEXT]
 machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state running|returned \
                                     [--detail TEXT]
+machine_log.py --log <path> witness --ticket NN --model ID --outcome checked|failed \
+                                    --reason TEXT --duration-seconds N \
+                                    [--input-tokens N] [--output-tokens N] \
+                                    [--cache-read-tokens N] [--cache-creation-tokens N] \
+                                    [--total-tokens N]
 machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted|stopped \
                                     [--detail TEXT]

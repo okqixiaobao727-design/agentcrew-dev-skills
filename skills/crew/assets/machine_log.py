@@ -12,8 +12,8 @@ The file is JSON Lines: one object per line, appended and never rewritten, every
 duration. The audience is a later auditing agent, not a human; `docs/machine-log.md` publishes the
 schema this writes.
 
-    machine_log.py --log <path> launch|launch-failed|receipt|merge|outcome|review|advance|
-                                  live-source|monitor-error|session-cost|message ...
+    machine_log.py --log <path> launch|launch-failed|receipt|merge|outcome|review|witness|
+                                  advance|live-source|monitor-error|session-cost|message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
     machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
@@ -136,6 +136,7 @@ HALTED_DECISIONS = ("escalated", "interrupted")
 # The two lanes a child runs in. A usage figure is only readable against the executor that wrote
 # it, so an executor this log does not know is an executor whose figures nobody can check.
 EXECUTORS = ("claude", "codex")
+WITNESS_OUTCOMES = ("checked", "failed")
 # Where a lane's live children were read from, when a dashboard had to read them from anywhere but
 # its first choice (ADR-0012). The set is closed on the sources a lane actually has, so a line
 # saying a dashboard fell back names something a reader can go and look at.
@@ -162,6 +163,8 @@ class TicketFacts:
     progress_event: Mapping | None = None
     settlement_state: str = LIVE
     unanswered_child_message: Mapping | None = None
+    escalation: Mapping | None = None
+    witness: Mapping | None = None
     awaiting_receipt: bool = False
     awaiting_ruling: bool = False
     outstanding_nudge: bool = False
@@ -271,6 +274,8 @@ def project(records):
             ticket,
             {
                 "unanswered_child_message": None,
+                "escalation": None,
+                "witness": None,
                 "awaiting_receipt": False,
                 "awaiting_ruling": False,
                 "outstanding_nudge": False,
@@ -282,8 +287,15 @@ def project(records):
         child_message = event in ("message", "escalation") and record.get("role") == CHILD
         if child_message:
             episode["unanswered_child_message"] = record
+            if event == "escalation":
+                episode["escalation"] = record
+                episode["witness"] = None
             episode["awaiting_ruling"] = False
             episode["outstanding_nudge"] = False
+        elif event == "witness":
+            pending = episode["unanswered_child_message"]
+            if (pending or {}).get("event") == "escalation":
+                episode["witness"] = record
         elif event in ("receipt", "ruling", "outcome"):
             pending = episode["unanswered_child_message"]
             pending_verb, pending_line = final_verb((pending or {}).get("message"))
@@ -392,6 +404,8 @@ def project(records):
             progress_event=progress_event,
             settlement_state=settlement_state(events, ticket),
             unanswered_child_message=episode.get("unanswered_child_message"),
+            escalation=episode.get("escalation"),
+            witness=episode.get("witness"),
             awaiting_receipt=episode.get("awaiting_receipt", False),
             awaiting_ruling=episode.get("awaiting_ruling", False),
             outstanding_nudge=episode.get("outstanding_nudge", False),
@@ -1078,6 +1092,37 @@ def run_session_cost(args):
     return run_event(args)
 
 
+def witness_problem(args):
+    """Why a witness event contradicts itself, or None when its shape is complete."""
+    if args.duration_seconds < 0:
+        return "duration_seconds is never negative"
+    if args.outcome == "checked" and args.reason:
+        return "a checked witness carries an empty reason"
+    if args.outcome == "failed" and not args.reason.strip():
+        return "a failed witness carries its reason"
+    counters = [getattr(args, name) for name in COST_COUNTERS]
+    total = getattr(args, COST_TOTAL)
+    figures = [value for value in counters + [total] if value is not None]
+    if not figures:
+        return None
+    if len(figures) < len(COST_COUNTERS) + 1:
+        return f"witness cost carries all of {', '.join(COST_COUNTERS)} and {COST_TOTAL}, or none"
+    if any(value < 0 for value in figures):
+        return "a witness cost token count is never negative"
+    if total != sum(counters):
+        return f"{COST_TOTAL} {total} is not the sum of the four witness cost counters"
+    return None
+
+
+def run_witness(args):
+    """Append one witness event; returns 0, or 2 for a contradictory result."""
+    problem = witness_problem(args)
+    if problem is not None:
+        print(f"machine log: witness: {problem}", file=sys.stderr)
+        return 2
+    return run_event(args)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--log", required=True, help="the run's machine log")
@@ -1132,6 +1177,15 @@ def build_parser():
     )
     review.add_argument("--state", required=True, choices=REVIEW_STATES)
     review.add_argument("--detail")
+
+    witness = event_command("witness", "one witness fact-check of an escalation")
+    witness.set_defaults(handler=run_witness)
+    witness.add_argument("--model", required=True, help="the full model ID, never an alias")
+    witness.add_argument("--outcome", required=True, choices=WITNESS_OUTCOMES)
+    witness.add_argument("--reason", required=True)
+    witness.add_argument("--duration-seconds", required=True, type=float)
+    for tokens in ("input", "output", "cache-read", "cache-creation", "total"):
+        witness.add_argument(f"--{tokens}-tokens", type=int, help=f"{tokens} tokens, as counted")
 
     cost = event_command("session-cost", "what one session spent, in tokens")
     cost.set_defaults(handler=run_session_cost)
