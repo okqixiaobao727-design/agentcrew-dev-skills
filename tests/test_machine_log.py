@@ -21,6 +21,9 @@ import unittest
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "skills" / "crew" / "assets" / "machine_log.py"
+BOUNDED_SCRIPT = SCRIPT.with_name("bounded_read.py")
+CREW_DIR = SCRIPT.parent.parent
+COORDINATOR_SESSION = "9d1f4c2a-0000-4000-8000-000000000133"
 sys.path.insert(0, str(SCRIPT.parent))
 import machine_log  # noqa: E402
 
@@ -149,6 +152,17 @@ def registered_commands(settings):
         hook["command"]
         for block in document.get("hooks", {}).get("PostToolUse", [])
         if block["matcher"] == "SendMessage"
+        for hook in block["hooks"]
+    ]
+
+
+def registered_bounded_commands(settings):
+    """Every bounded-read hook command a settings file registers, in listed order."""
+    document = json.loads(pathlib.Path(settings).read_text(encoding="utf-8"))
+    return [
+        hook["command"]
+        for block in document.get("hooks", {}).get("PreToolUse", [])
+        if block["matcher"] == "Read|Grep|Glob|Bash"
         for hook in block["hooks"]
     ]
 
@@ -1212,12 +1226,25 @@ class InstallTests(MachineLogTestCase):
         self.assertEqual(len(blocks), 1, "one block claims the SendMessage matcher")
         return blocks[0]["hooks"]
 
-    def install(self, role="child", ticket=None, script=None):
+    def installed_bounded_read_hooks(self):
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        blocks = [
+            block for block in settings["hooks"]["PreToolUse"]
+            if block["matcher"] == "Read|Grep|Glob|Bash"
+        ]
+        self.assertEqual(len(blocks), 1, "one block claims the bounded-read matchers")
+        return blocks[0]["hooks"]
+
+    def install(self, role="child", ticket=None, script=None, session_id=None, crew_dir=None):
         args = ["install", "--settings", str(self.settings), "--role", role]
         if ticket is not None:
             args += ["--ticket", ticket]
         if script is not None:
             args += ["--hook-script", str(script)]
+        if session_id is not None:
+            args += ["--session-id", session_id]
+        if crew_dir is not None:
+            args += ["--crew-dir", str(crew_dir)]
         return run_cli(*args, log=self.log)
 
     def test_the_child_side_registers_a_posttooluse_hook_on_sendmessage(self):
@@ -1231,6 +1258,12 @@ class InstallTests(MachineLogTestCase):
         self.assertIn("--ticket 07", hooks[0]["command"])
         self.assertIn(str(self.log), hooks[0]["command"])
 
+    def test_the_child_side_carries_no_bounded_read_hook(self):
+        result = self.install(role="child", ticket="07")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_bounded_commands(self.settings), [])
+
     def test_the_coordinator_side_registers_the_same_hook_without_a_ticket(self):
         self.assertEqual(self.install(role="coordinator").returncode, 0)
 
@@ -1238,6 +1271,48 @@ class InstallTests(MachineLogTestCase):
 
         self.assertIn("--role coordinator", command)
         self.assertNotIn("--ticket", command)
+
+    def test_the_coordinator_install_also_registers_the_bounded_read_hook(self):
+        result = self.install(
+            role="coordinator", session_id=COORDINATOR_SESSION, crew_dir=CREW_DIR
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hook, = self.installed_bounded_read_hooks()
+        self.assertEqual(hook["type"], "command")
+        self.assertIn("bounded_read.py", hook["command"])
+        self.assertIn(" hook --crew-dir ", hook["command"])
+        self.assertIn(f"--crew-dir {CREW_DIR}", hook["command"])
+        self.assertIn(f"--session-id {COORDINATOR_SESSION}", hook["command"])
+
+    def test_installing_the_coordinator_twice_leaves_one_bounded_read_hook(self):
+        self.install(role="coordinator")
+        result = self.install(role="coordinator")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(registered_bounded_commands(self.settings)), 1)
+
+    def test_a_run_copy_uses_the_explicit_crew_directory_for_a_manual_install(self):
+        run_dir = pathlib.Path(self.work.name) / "run"
+        run_dir.mkdir()
+        copied_log = run_dir / "log.jsonl"
+        copied_script = run_dir / "machine_log.py"
+        copied_script.write_bytes(SCRIPT.read_bytes())
+        copied_script.with_name("bounded_read.py").write_bytes(BOUNDED_SCRIPT.read_bytes())
+
+        result = subprocess.run(
+            [
+                sys.executable, str(copied_script), "--log", str(copied_log),
+                "install", "--settings", str(self.settings), "--role", "coordinator",
+                "--crew-dir", str(CREW_DIR), "--session-id", COORDINATOR_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command, = registered_bounded_commands(self.settings)
+        self.assertIn(f"--crew-dir {CREW_DIR}", command)
 
     def test_the_registered_command_is_the_one_that_writes_the_log(self):
         self.install(role="child", ticket="07")
@@ -1427,6 +1502,7 @@ class VersionIndependentPathTests(MachineLogTestCase):
         )
         self.plugin.parent.mkdir(parents=True)
         self.plugin.write_bytes(SCRIPT.read_bytes())
+        self.plugin.with_name("bounded_read.py").write_bytes(BOUNDED_SCRIPT.read_bytes())
 
     def install_from_the_plugin(self):
         """Install the way a run does: the plugin's own copy, naming no script but itself."""
@@ -1458,6 +1534,23 @@ class VersionIndependentPathTests(MachineLogTestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.only_line()["event"], "ruling")
 
+    def test_the_bounded_hook_still_runs_after_the_installing_version_is_gone(self):
+        self.install_from_the_plugin()
+        command, = registered_bounded_commands(self.settings)
+        shutil.rmtree(pathlib.Path(self.work.name) / "plugins" / self.VERSION)
+
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            input=json.dumps({"tool_name": "Grep", "tool_input": {"pattern": "needle"}}),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+
 
 class UninstallTests(MachineLogTestCase):
     """Taking the hook back out: what the matching install wrote, and nothing else."""
@@ -1475,9 +1568,10 @@ class UninstallTests(MachineLogTestCase):
         self.settings.parent.mkdir(parents=True)
         self.log = self.project / "features" / "crew-v3" / ".crew" / "log.jsonl"
 
-    def install(self, log=None):
+    def install(self, log=None, role="child"):
+        ticket = ("--ticket", "07") if role == "child" else ()
         return run_cli(
-            "install", "--settings", str(self.settings), "--role", "child", "--ticket", "07",
+            "install", "--settings", str(self.settings), "--role", role, *ticket,
             log=log if log is not None else self.log,
         )
 
@@ -1494,6 +1588,37 @@ class UninstallTests(MachineLogTestCase):
 
     def test_uninstalling_removes_the_entry_the_matching_install_wrote(self):
         self.install()
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_commands(self.settings), [])
+
+    def test_uninstalling_the_coordinator_removes_both_entries(self):
+        self.install(role="coordinator")
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_commands(self.settings), [])
+        self.assertEqual(registered_bounded_commands(self.settings), [])
+
+    def test_uninstalling_removes_a_bounded_entry_when_the_message_entry_is_already_absent(self):
+        self.install(role="coordinator")
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        settings["hooks"].pop("PostToolUse")
+        self.settings.write_text(json.dumps(settings), encoding="utf-8")
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registered_bounded_commands(self.settings), [])
+
+    def test_uninstalling_removes_a_message_entry_when_the_bounded_entry_is_already_absent(self):
+        self.install(role="coordinator")
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        settings["hooks"].pop("PreToolUse")
+        self.settings.write_text(json.dumps(settings), encoding="utf-8")
 
         result = self.uninstall()
 
@@ -1531,7 +1656,7 @@ class UninstallTests(MachineLogTestCase):
                 ]}],
             },
         }), encoding="utf-8")
-        self.install()
+        self.install(role="coordinator")
 
         self.uninstall()
 
@@ -1540,6 +1665,7 @@ class UninstallTests(MachineLogTestCase):
         self.assertEqual(
             settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], self.GUARD_COMMAND
         )
+        self.assertEqual(registered_bounded_commands(self.settings), [])
         self.assertEqual(registered_commands(self.settings), [self.FOREIGN_COMMAND])
 
     def test_another_runs_entry_in_the_same_file_survives(self):

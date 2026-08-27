@@ -43,6 +43,8 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # be wrong.
 MESSAGE_TOOL = "SendMessage"
 HOOK_EVENT = "PostToolUse"
+BOUNDED_HOOK_EVENT = "PreToolUse"
+BOUNDED_TOOLS = "Read|Grep|Glob|Bash"
 # What a registered hook runs, and the subcommand that marks a registration as one of ours.
 PYTHON = "python3"
 HOOK_SUBCOMMAND = "hook"
@@ -51,6 +53,7 @@ HOOK_SUBCOMMAND = "hook"
 # from carries the version in its path, so an upgrade would leave the entry naming a file that is
 # no longer there, while the run directory outlives every upgrade (#37).
 SCRIPT_NAME = "machine_log.py"
+BOUNDED_SCRIPT_NAME = "bounded_read.py"
 # The directory a settings file lives in when it belongs to a checkout: `<project>/.claude/`.
 SETTINGS_DIRECTORY = ".claude"
 
@@ -662,6 +665,18 @@ def hook_command(script, log, role, ticket, scope):
     return command
 
 
+def bounded_hook_command(script, log, crew_dir, session_id=None):
+    """The coordinator's bounded-read command, owned by the same run log as its message hook."""
+    command = (
+        f"{shlex.quote(PYTHON)} {shlex.quote(absolute(script))} hook"
+        f" --crew-dir {shlex.quote(absolute(crew_dir))}"
+        f" --owner-log {shlex.quote(absolute(log))}"
+    )
+    if session_id is not None:
+        command += f" --session-id {shlex.quote(session_id)}"
+    return command
+
+
 def settings_scope(settings):
     """The directory whose sessions a settings file governs: the checkout it sits in.
 
@@ -684,6 +699,11 @@ def run_script(log):
     return pathlib.Path(absolute(pathlib.Path(log).parent / SCRIPT_NAME))
 
 
+def bounded_run_script(log):
+    """Where a run keeps the version-independent copy of its bounded-read runtime."""
+    return pathlib.Path(absolute(pathlib.Path(log).parent / BOUNDED_SCRIPT_NAME))
+
+
 def materialise_script(source, destination):
     """Put a copy of `source` at `destination`, replacing whatever was there; raises OSError.
 
@@ -693,7 +713,9 @@ def materialise_script(source, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     if absolute(source) == str(destination):
         return destination
-    handle, temporary = tempfile.mkstemp(dir=str(destination.parent), prefix=f".{SCRIPT_NAME}.")
+    handle, temporary = tempfile.mkstemp(
+        dir=str(destination.parent), prefix=f".{destination.name}."
+    )
     try:
         with open(handle, "wb") as copy:
             copy.write(pathlib.Path(source).read_bytes())
@@ -715,15 +737,20 @@ def settings_shape_is_sound(settings):
     hooks = settings.get("hooks", {})
     if not isinstance(hooks, dict):
         return False
-    events = hooks.get(HOOK_EVENT, [])
-    if not isinstance(events, list):
-        return False
-    # The block this install writes through is the one it would edit, nested list and all.
-    return all(
-        isinstance(block.get("hooks", []), list)
-        for block in events
-        if isinstance(block, dict) and block.get("matcher") == MESSAGE_TOOL
-    )
+    for event, matcher in (
+        (HOOK_EVENT, MESSAGE_TOOL),
+        (BOUNDED_HOOK_EVENT, BOUNDED_TOOLS),
+    ):
+        events = hooks.get(event, [])
+        if not isinstance(events, list):
+            return False
+        if not all(
+            isinstance(block.get("hooks", []), list)
+            for block in events
+            if isinstance(block, dict) and block.get("matcher") == matcher
+        ):
+            return False
+    return True
 
 
 def command_log(command):
@@ -771,6 +798,39 @@ def message_blocks(settings):
     ]
 
 
+def bounded_blocks(settings):
+    """Every block of the settings document that claims the bounded-read matchers."""
+    events = settings.get("hooks", {}).get(BOUNDED_HOOK_EVENT, [])
+    return [
+        block for block in events
+        if isinstance(block, dict) and block.get("matcher") == BOUNDED_TOOLS
+    ]
+
+
+def bounded_command_log(command):
+    """The run log owning a bounded-read registration, or None for another command."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if "hook" not in words or "--crew-dir" not in words or "--owner-log" not in words:
+        return None
+    for index, word in enumerate(words):
+        if word == "--owner-log" and index + 1 < len(words):
+            return absolute(words[index + 1])
+        if word.startswith("--owner-log="):
+            return absolute(word[len("--owner-log="):])
+    return None
+
+
+def bounded_registered_for(hook, log):
+    """Whether this bounded-read entry belongs to the install for `log`."""
+    return (
+        isinstance(hook, dict)
+        and bounded_command_log(str(hook.get("command", ""))) == absolute(log)
+    )
+
+
 def install_hook(settings, command, log):
     """The settings document with this hook registered in it, and nothing else disturbed.
 
@@ -793,6 +853,23 @@ def install_hook(settings, command, log):
     return settings
 
 
+def install_bounded_hook(settings, command, log):
+    """Return settings with one bounded-read entry for `log` and other hooks preserved."""
+    hooks = settings.setdefault("hooks", {})
+    events = hooks.setdefault(BOUNDED_HOOK_EVENT, [])
+    blocks = bounded_blocks(settings)
+    if blocks:
+        block = blocks[0]
+    else:
+        block = {"matcher": BOUNDED_TOOLS, "hooks": []}
+        events.append(block)
+    block["hooks"] = [
+        hook for hook in block.get("hooks", []) if not bounded_registered_for(hook, log)
+    ]
+    block["hooks"].append({"type": "command", "command": command})
+    return settings
+
+
 def uninstall_hook(settings, log):
     """The settings document with every entry installed for `log` taken out of it.
 
@@ -806,6 +883,22 @@ def uninstall_hook(settings, log):
     for block in message_blocks(settings):
         registered = block.get("hooks", [])
         kept = [hook for hook in registered if not registered_for(hook, log)]
+        if len(kept) == len(registered):
+            continue
+        removed = True
+        block["hooks"] = kept
+        if not kept:
+            events.remove(block)
+    return removed
+
+
+def uninstall_bounded_hook(settings, log):
+    """Return whether this run's bounded-read entry was removed from settings."""
+    removed = False
+    events = settings.get("hooks", {}).get(BOUNDED_HOOK_EVENT, [])
+    for block in bounded_blocks(settings):
+        registered = block.get("hooks", [])
+        kept = [hook for hook in registered if not bounded_registered_for(hook, log)]
         if len(kept) == len(registered):
             continue
         removed = True
@@ -864,12 +957,37 @@ def run_install(args):
             absolute(args.hook_script) if args.hook_script is not None
             else str(materialise_script(pathlib.Path(__file__).resolve(), run_script(args.log)))
         )
+        bounded_script = None
+        if args.role == COORDINATOR:
+            bounded_script = materialise_script(
+                pathlib.Path(__file__).resolve().with_name(BOUNDED_SCRIPT_NAME),
+                bounded_run_script(args.log),
+            )
     except OSError as error:
         print(f"machine log: {error}", file=sys.stderr)
         return 1
     scope = args.scope if args.scope is not None else settings_scope(path)
     command = hook_command(script, args.log, args.role, args.ticket, scope)
-    return write_settings(path, install_hook(settings, command, args.log))
+    install_hook(settings, command, args.log)
+    if args.role == COORDINATOR:
+        source = pathlib.Path(__file__).resolve()
+        crew_dir = args.crew_dir
+        if crew_dir is None and source.parent.name == "assets":
+            crew_dir = source.parent.parent
+        if crew_dir is None:
+            print(
+                "machine log: coordinator install from a copied script requires --crew-dir",
+                file=sys.stderr,
+            )
+            return 1
+        session_id = args.session_id
+        if session_id is None:
+            session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        bounded = bounded_hook_command(
+            bounded_script, args.log, crew_dir, session_id
+        )
+        install_bounded_hook(settings, bounded, args.log)
+    return write_settings(path, settings)
 
 
 def run_uninstall(args):
@@ -887,7 +1005,9 @@ def run_uninstall(args):
     if problem is not None:
         print(problem, file=sys.stderr)
         return 1
-    if not uninstall_hook(settings, args.log):
+    removed = uninstall_hook(settings, args.log)
+    removed = uninstall_bounded_hook(settings, args.log) or removed
+    if not removed:
         return 0
     return write_settings(path, settings)
 
@@ -1081,6 +1201,14 @@ def build_parser():
     install.add_argument(
         "--scope",
         help="the directory this settings file's sessions run in (default: the checkout above it)",
+    )
+    install.add_argument(
+        "--crew-dir",
+        help="the crew skill directory whose own files the coordinator may read without a bound",
+    )
+    install.add_argument(
+        "--session-id",
+        help="the one coordinator or manual-advisor session the bounded-read hook applies to",
     )
 
     uninstall = subcommands.add_parser(
