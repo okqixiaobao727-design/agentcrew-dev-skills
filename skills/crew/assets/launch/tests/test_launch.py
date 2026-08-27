@@ -257,9 +257,9 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(len(windows), 1, windows)
         return windows[0]["argv"]
 
-    # --- the three resolved values --------------------------------------------------------
+    # --- the four resolved values ---------------------------------------------------------
 
-    def test_the_composed_command_line_carries_the_resolved_pid_name_and_mode(self):
+    def test_the_composed_command_line_carries_the_resolved_session_identity_and_mode(self):
         """The whole of the start-up: the harness's records become the driver's command line."""
         self.fixture.registry(os.getpid())
         self.fixture.transcript([PERMISSION_MODE])
@@ -271,6 +271,7 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(flag(call["argv"], "--feature-dir"), str(self.fixture.run_dir))
         self.assertEqual(flag(call["argv"], "--coordinator-pid"), str(os.getpid()))
         self.assertEqual(flag(call["argv"], "--coordinator-name"), COORDINATOR_NAME)
+        self.assertEqual(flag(call["argv"], "--coordinator-session"), SESSION_ID)
         self.assertEqual(flag(call["argv"], "--permission-mode"), PERMISSION_MODE)
         # The driver's own wake is what the coordinator reads, and this waiter adds nothing to it.
         self.assertEqual(json.loads(result.stdout), DEFAULT_WAKE)
@@ -306,17 +307,30 @@ class LaunchTests(unittest.TestCase):
 
     # --- the values given explicitly ------------------------------------------------------
 
-    def test_the_three_values_given_explicitly_need_no_harness_records_at_all(self):
+    def test_the_four_values_given_explicitly_need_no_harness_records_at_all(self):
         """What the failure message instructs: passing them by hand is a complete substitute."""
         result = self.fixture.launch(extra=[
             "--coordinator-pid", "1504", "--coordinator-name", "given-by-hand",
+            "--coordinator-session", SESSION_ID,
             "--permission-mode", SWITCHED_MODE,
         ])
 
         call = self.one_call(result)
         self.assertEqual(flag(call["argv"], "--coordinator-pid"), "1504")
         self.assertEqual(flag(call["argv"], "--coordinator-name"), "given-by-hand")
+        self.assertEqual(flag(call["argv"], "--coordinator-session"), SESSION_ID)
         self.assertEqual(flag(call["argv"], "--permission-mode"), SWITCHED_MODE)
+
+    def test_an_explicit_hook_session_does_not_redirect_the_permission_mode_lookup(self):
+        explicit_session = "3cd60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        self.fixture.registry(os.getpid())
+        self.fixture.transcript([PERMISSION_MODE])
+
+        result = self.fixture.launch(extra=["--coordinator-session", explicit_session])
+
+        call = self.one_call(result)
+        self.assertEqual(flag(call["argv"], "--coordinator-session"), explicit_session)
+        self.assertEqual(flag(call["argv"], "--permission-mode"), PERMISSION_MODE)
 
     # --- what an unresolvable value does --------------------------------------------------
 
@@ -329,6 +343,16 @@ class LaunchTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--permission-mode", result.stderr)
+        self.assertEqual(self.fixture.driver_calls(), [])
+
+    def test_a_registry_entry_carrying_no_session_id_aborts_and_names_the_flag_to_pass(self):
+        self.fixture.registry(os.getpid(), session=None)
+        self.fixture.transcript([PERMISSION_MODE])
+
+        result = self.fixture.launch()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--coordinator-session", result.stderr)
         self.assertEqual(self.fixture.driver_calls(), [])
 
     def test_a_missing_transcript_aborts_and_names_the_flag_to_pass(self):
