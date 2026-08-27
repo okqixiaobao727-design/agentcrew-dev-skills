@@ -65,6 +65,12 @@ verifies before merging. The base branch is untouched for the whole run; the fin
 Every repo you use AgentCrew in also needs `docs/agents/issue-tracker.md`: both skills read it to
 learn where tickets live and where status is written back, and neither has a fallback.
 
+A project may also configure a base gate as an argv list: for example,
+`[preflight] gate = ["python3", "scripts/test.py"]`. AgentCrew runs it without a shell from the
+repository root, after checking out and fast-forwarding the base and before cutting the integration
+branch. With no gate, the run proceeds and both the machine log and final report say
+`base gate: none configured`; a skipped gate is never reported as a pass.
+
 ## Install
 
 ```text
@@ -109,10 +115,9 @@ shipped defaults answer every case, so a project file carries only the cells it 
 
 ## Configuration reference
 
-The configurable surface is the two model tables, one hook, and the dashboard's surface, in
-`agentcrew.toml` at your repo root. The classification logic — six workflows, core vs non-core,
-complex vs routine — is fixed product opinion: you configure the outcomes, not the decision
-procedure. The shipped, commented defaults are
+The configurable surface lives in `agentcrew.toml` at your repo root. The classification logic —
+six workflows, core vs non-core, complex vs routine — is fixed product opinion: you configure the
+outcomes, not the decision procedure. The shipped, commented defaults are
 [`config/agentcrew.default.toml`](config/agentcrew.default.toml).
 
 Every cell carries the same three fields:
@@ -197,6 +202,28 @@ surface = "window"
 
 What the pinned dashboard is and how it is wired into Claude Code is in
 [`docs/monitor-dashboard.md`](docs/monitor-dashboard.md).
+
+### `[preflight]` — the optional integration-base gate
+
+`gate` is a non-empty argv list, not a shell command string. The Driver runs it from the repository
+root after the cheap read-only preflight checks, after checking out and fast-forwarding the base,
+and immediately before cutting the integration branch. Exit 0 passes. Any other exit status stops
+the fresh run as `preflight-failed`, restores the branch or detached commit the operator started
+from, creates no integration branch or child worktree, and shows the command, exit status, and
+output tail in the preflight notice. AgentCrew sets no timeout and does not parse test-runner
+output; the configured command owns both concerns.
+
+Like every other value in the run section, the gate argv is read once from the project's config at
+start; a fast-forward does not re-read any run configuration. The machine log records the captured
+argv that was actually executed.
+
+```toml
+[preflight]
+gate = ["python3", "scripts/test.py"]
+```
+
+The key is optional and has no shipped active default. A fresh run with no key records
+`base gate: none configured`; adopting an existing run never executes the gate again.
 
 ### `[repair]` — the model the merge ladder repairs on
 

@@ -13,7 +13,8 @@ duration. The audience is a later auditing agent, not a human; `docs/machine-log
 schema this writes.
 
     machine_log.py --log <path> launch|launch-failed|receipt|merge|outcome|review|witness|
-                                  advance|live-source|monitor-error|session-cost|message ...
+                                  base-gate|advance|live-source|monitor-error|session-cost|
+                                  message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
     machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
@@ -137,6 +138,7 @@ HALTED_DECISIONS = ("escalated", "interrupted")
 # it, so an executor this log does not know is an executor whose figures nobody can check.
 EXECUTORS = ("claude", "codex")
 WITNESS_OUTCOMES = ("checked", "failed")
+BASE_GATE_STATUSES = ("passed", "not-configured")
 # Where a lane's live children were read from, when a dashboard had to read them from anywhere but
 # its first choice (ADR-0012). The set is closed on the sources a lane actually has, so a line
 # saying a dashboard fell back names something a reader can go and look at.
@@ -1123,6 +1125,17 @@ def run_witness(args):
     return run_event(args)
 
 
+def run_base_gate(args):
+    """Append one base-gate decision, or refuse a status that contradicts its argv."""
+    if args.status == "passed" and not args.argv:
+        print("machine log: base-gate: a passed gate carries its argv", file=sys.stderr)
+        return 2
+    if args.status == "not-configured" and args.argv:
+        print("machine log: base-gate: an unconfigured gate carries no argv", file=sys.stderr)
+        return 2
+    return run_event(args)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--log", required=True, help="the run's machine log")
@@ -1187,6 +1200,16 @@ def build_parser():
     witness.add_argument("--duration-seconds", required=True, type=float)
     for tokens in ("input", "output", "cache-read", "cache-creation", "total"):
         witness.add_argument(f"--{tokens}-tokens", type=int, help=f"{tokens} tokens, as counted")
+
+    base_gate = subcommands.add_parser(
+        "base-gate", help="whether the integration base passed its configured project gate"
+    )
+    base_gate.set_defaults(handler=run_base_gate)
+    base_gate.add_argument("--status", required=True, choices=BASE_GATE_STATUSES)
+    base_gate.add_argument(
+        "--argument", action="append", dest="argv",
+        help="one argv element, repeated in order; absent when no gate was configured",
+    )
 
     cost = event_command("session-cost", "what one session spent, in tokens")
     cost.set_defaults(handler=run_session_cost)

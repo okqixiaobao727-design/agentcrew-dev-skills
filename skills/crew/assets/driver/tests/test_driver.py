@@ -179,6 +179,142 @@ class ReportSelectionTests(unittest.TestCase):
 
 
 class PreflightTests(DriverTestCase):
+    def test_a_failing_configured_base_gate_stops_the_run_with_its_diagnosis(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        output = "\n".join(f"gate line {number}" for number in range(30)) + "\n"
+        self.fixture.configure_gate(exit_code=7, output=output)
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("base gate", notice)
+        self.assertIn("base-gate --full", notice)
+        self.assertIn("exit status 7", notice)
+        self.assertIn("gate line 29", notice)
+        self.assertNotIn("gate line 0\n", notice)
+        self.assertEqual(
+            self.fixture.gate_calls(),
+            [
+                {
+                    "cwd": str(self.fixture.repo),
+                    "argv": ["--full"],
+                    "head": git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip(),
+                }
+            ],
+        )
+
+    def test_a_passing_configured_base_gate_is_recorded_before_the_run_starts(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure_gate(output="base is green\n")
+
+        self.started()
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.events("base-gate")) == 1),
+            "the passing base gate was not recorded",
+        )
+        base_gate = self.events("base-gate")
+        self.assertEqual(len(base_gate), 1)
+        self.assertEqual(base_gate[0]["status"], "passed")
+        self.assertEqual(base_gate[0]["argv"], ["base-gate", "--full"])
+        self.assertEqual(len(self.fixture.gate_calls()), 1)
+
+    def test_a_dirty_working_tree_is_reported_without_running_the_base_gate(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure_gate()
+        (self.fixture.repo / "README.md").write_text("edited\n")
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("README.md", notice)
+        self.assertEqual(self.fixture.gate_calls(), [])
+
+    def test_a_diverged_base_is_reported_without_running_the_base_gate(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure_gate()
+        other = self.fixture.root / "other-gated"
+        subprocess.run(
+            ["git", "clone", str(self.fixture.origin), str(other)],
+            check=True, capture_output=True,
+        )
+        git(other, "config", "user.email", "crew@example.invalid")
+        git(other, "config", "user.name", "Crew Test")
+        (other / "elsewhere.md").write_text("theirs\n")
+        git(other, "add", "elsewhere.md")
+        git(other, "commit", "-m", "theirs")
+        git(other, "push", "origin", BASE_BRANCH)
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("fast-forward", notice)
+        self.assertEqual(self.fixture.gate_calls(), [])
+
+    def test_a_cross_branch_start_gates_the_pulled_base_and_returns_on_failure(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure_gate(exit_code=9, output="pulled base is red\n")
+        git(self.fixture.repo, "push", "origin", BASE_BRANCH)
+        git(self.fixture.repo, "switch", "-c", "starting-branch")
+        (self.fixture.repo / "starting.md").write_text("starting branch\n")
+        git(self.fixture.repo, "add", "starting.md")
+        git(self.fixture.repo, "commit", "-m", "starting branch")
+        starting_head = git(self.fixture.repo, "rev-parse", "HEAD").stdout.strip()
+
+        other = self.fixture.root / "other-ahead"
+        subprocess.run(
+            ["git", "clone", str(self.fixture.origin), str(other)],
+            check=True, capture_output=True,
+        )
+        git(other, "config", "user.email", "crew@example.invalid")
+        git(other, "config", "user.name", "Crew Test")
+        (other / "pulled.md").write_text("pulled base\n")
+        git(other, "add", "pulled.md")
+        git(other, "commit", "-m", "advance base")
+        git(other, "push", "origin", BASE_BRANCH)
+        pulled_head = git(other, "rev-parse", "HEAD").stdout.strip()
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("exit status 9", notice)
+        self.assertEqual(
+            git(self.fixture.repo, "branch", "--show-current").stdout.strip(),
+            "starting-branch",
+        )
+        self.assertEqual(git(self.fixture.repo, "rev-parse", "HEAD").stdout.strip(), starting_head)
+        self.assertEqual(self.fixture.gate_calls()[0]["head"], pulled_head)
+
+    def test_a_failing_base_gate_restores_a_detached_starting_commit(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure_gate(exit_code=6, output="detached base is red\n")
+        git(self.fixture.repo, "switch", "--detach", "HEAD")
+        starting_head = git(self.fixture.repo, "rev-parse", "HEAD").stdout.strip()
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("exit status 6", notice)
+        self.assertEqual(git(self.fixture.repo, "branch", "--show-current").stdout.strip(), "")
+        self.assertEqual(git(self.fixture.repo, "rev-parse", "HEAD").stdout.strip(), starting_head)
+
+    def test_a_malformed_base_gate_config_stops_before_any_command_runs(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure(gate="python3 scripts/test.py")
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("argv list", notice)
+        self.assertEqual(self.fixture.gate_calls(), [])
+
     def test_a_dirty_working_tree_stops_the_run(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
@@ -1104,6 +1240,12 @@ class LoopTests(DriverTestCase):
         )
         self.assertIn(INTEGRATION_BRANCH, report)
         self.assertIn("human", report.lower())
+        self.assertIn("## Base gate", report)
+        self.assertIn("- Base gate: none configured", report)
+        base_gate = self.events("base-gate")
+        self.assertEqual(len(base_gate), 1)
+        self.assertEqual(base_gate[0]["status"], "not-configured")
+        self.assertNotIn("command", base_gate[0])
         self.assertIn("TOTAL", report)
         cost = report.split("## Cost", 1)[1]
         self.assertRegex(cost, r"(?m)^coordinator\s+claude(?:\s+--){7}\s*$")
@@ -1136,7 +1278,9 @@ class LoopTests(DriverTestCase):
         self.assertTrue(self.fixture.wait_for(lambda: list(pin_dir.glob("*.json"))))
 
         def corrupt_the_first_timestamp(records):
-            records[0]["ts"] = "not-a-machine-log-timestamp"
+            next(record for record in records if record.get("event") == "launch")[
+                "ts"
+            ] = "not-a-machine-log-timestamp"
             return records
 
         self.fixture.edit_log(corrupt_the_first_timestamp)
@@ -2810,6 +2954,19 @@ class AdoptionTests(DriverTestCase):
         self.assertEqual(self.fixture.table()["run"], run, "the adopted run was started afresh")
         self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    def test_adopting_an_existing_run_does_not_run_its_configured_base_gate_again(self):
+        self.fixture.configure_gate()
+        self.interrupted(("01", ()))
+        calls_before_adoption = self.fixture.gate_calls()
+        (self.fixture.stub_dir / "base-gate-exit").write_text("8")
+
+        adopted = self.fixture.launch()
+        adopted.stdout.readline()
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(self.fixture.gate_calls(), calls_before_adoption)
 
     def test_adopting_an_interrupted_run_leaves_one_bounded_read_hook(self):
         self.interrupted(("01", ()))

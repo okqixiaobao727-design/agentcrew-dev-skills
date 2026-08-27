@@ -687,6 +687,26 @@ class ProjectConfigTests(unittest.TestCase):
     def test_a_project_declaring_account_names_that_are_not_a_list_is_rejected(self):
         self.assert_rejects_with_required('[accounts]\nnames = "work"\n', "names")
 
+    def test_a_project_can_configure_an_optional_preflight_gate_argv(self):
+        self.assert_accepts_with_required(
+            '[preflight]\ngate = ["python3", "scripts/test.py"]\n'
+        )
+
+    def test_a_preflight_gate_string_is_rejected_in_favour_of_argv(self):
+        self.assert_rejects_with_required(
+            '[preflight]\ngate = "python3 scripts/test.py"\n', "argv"
+        )
+
+    def test_an_empty_or_blank_preflight_gate_argv_is_rejected(self):
+        for gate in ('[]', '["python3", ""]', '["   "]'):
+            with self.subTest(gate=gate):
+                self.assert_rejects_with_required(
+                    f"[preflight]\ngate = {gate}\n", "non-empty"
+                )
+
+    def test_an_unknown_preflight_field_is_rejected(self):
+        self.assert_rejects_with_required('[preflight]\ntimeout = 900\n', "timeout")
+
     def test_a_project_choosing_another_surface_is_accepted(self):
         self.assert_accepts_with_required('[dashboard]\nsurface = "both"\n')
 

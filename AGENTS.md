@@ -23,8 +23,10 @@ python3 scripts/test.py   # every suite; give it a fifteen-minute timeout
 ```
 
 Six of the seven suites import the spine, so a focused run cannot see what a spine change broke.
-A change contained to one asset needs no local gate: CI runs the full gate on every push and pull
-request to `main`.
+A change contained to one asset needs no local full gate when its commit is pushed before another
+run is cut: CI runs the full gate on every push and pull request to `main`. For an unpushed base,
+this repo's `[preflight] gate` runs that same full gate after the Driver checks out and
+fast-forwards the base and immediately before it cuts an integration branch.
 
 Run the validator every time — it costs a second, and its residue lint reads your gitignored
 `.agentcrew-local-identifiers`, which CI has no copy of.

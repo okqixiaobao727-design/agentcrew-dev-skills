@@ -59,6 +59,11 @@ AgentCrew 是 [mattpocock-skills](https://github.com/mattpocock/skills) 的聚�
 每个使用 AgentCrew 的仓库还需要 `docs/agents/issue-tracker.md`：两个技能都从它读取 ticket 存放在哪里、
 状态写回到哪里，二者都没有兜底默认值。
 
+项目还可以把 base gate（集成基线门禁，也就是开工前必须通过的整套检查）配置成 argv 参数列表，例如
+`[preflight] gate = ["python3", "scripts/test.py"]`。AgentCrew 不经过 shell，切换并快进更新 base 后、创建
+集成分支前，从仓库根目录运行它。未配置时 run 会继续，machine log 与最终报告都会明确写
+`base gate: none configured`；跳过门禁绝不会被写成通过。
+
 ## 安装
 
 ```text
@@ -100,9 +105,9 @@ case，所以项目配置只需要携带它要覆盖的那些格子。
 
 ## 配置参考
 
-可配置面就是两张模型表、一个 hook，以及 dashboard 画在哪个面上，位于仓库根目录的 `agentcrew.toml`。分类逻辑——六种 workflow、
-core 与 non-core、complex 与 routine——是固定的产品判断：你配置的是结论，不是决策过程。随插件发布的
-带注释默认值在 [`config/agentcrew.default.toml`](config/agentcrew.default.toml)。
+可配置面位于仓库根目录的 `agentcrew.toml`。分类逻辑——六种 workflow、core 与 non-core、complex 与
+routine——是固定的产品判断：你配置的是结论，不是决策过程。随插件发布的带注释默认值在
+[`config/agentcrew.default.toml`](config/agentcrew.default.toml)。
 
 每个格子都由同样的三个字段构成：
 
@@ -182,6 +187,25 @@ surface = "window"
 
 pin 是什么、怎么接进 Claude Code，见
 [`docs/monitor-dashboard.md`](docs/monitor-dashboard.md)。
+
+### `[preflight]`——可选的集成基线门禁
+
+`gate` 是非空 argv 参数列表，不是一整段 shell 命令字符串。Driver 先完成便宜的只读 preflight 检查，
+再切换并快进更新 base，然后从仓库根目录运行门禁，紧接着才创建集成分支。退出码 0 表示通过；其他
+退出码会让新 run 以 `preflight-failed` 停止，恢复操作员开始时所在的分支或 detached commit（游离
+提交，即当前不在任何分支上），且不创建集成分支或子 worktree。preflight notice 会显示命令、退出码和
+输出末尾。AgentCrew 不另设超时，也不解析测试工具的输出；这些规则都由所配置的命令自己负责。
+
+和 run section（运行配置快照）里的其他值一样，gate argv 只在 start 时从项目配置读取一次；快进更新
+base 后不会重新读取任何 run 配置。machine log 会记录实际执行的那份 argv。
+
+```toml
+[preflight]
+gate = ["python3", "scripts/test.py"]
+```
+
+这个 key 可省略，发布的默认配置不会主动开启它。没有配置的新 run 会记录
+`base gate: none configured`；接管已有 run 时不会再次执行门禁。
 
 ## Tracker 支持
 

@@ -124,6 +124,9 @@ WITNESS_BUDGET = "budget_usd"
 # that declares none checks nothing, and the shipped defaults ship the section empty.
 ACCOUNTS = "accounts"
 ACCOUNT_NAMES = "names"
+# The optional project-owned command that checks the integration base before a run is cut.
+PREFLIGHT = "preflight"
+PREFLIGHT_GATE = "gate"
 
 TRACKER = "tracker"
 TRACKER_KIND = "kind"
@@ -315,7 +318,8 @@ def check_config_text(text, label, complete, aliases, problems):
         return
 
     expected = {
-        "implementer", "reviewer", "hooks", ACCOUNTS, DASHBOARD, REPAIR, WITNESS, TRACKER,
+        "implementer", "reviewer", "hooks", ACCOUNTS, DASHBOARD, PREFLIGHT, REPAIR, WITNESS,
+        TRACKER,
     }
     for section in sorted(set(config) - expected):
         problems.append(f"{label}: unknown section [{section}]")
@@ -336,6 +340,7 @@ def check_config_text(text, label, complete, aliases, problems):
 
     check_hook(config, label, complete, problems)
     check_accounts(config, label, problems)
+    check_preflight(config, label, problems)
     check_dashboard(config, label, complete, problems)
     check_witness(config, label, complete, aliases, problems)
     # Not governed by `complete`: neither of these is inheritable, so both are required of every
@@ -458,6 +463,30 @@ def check_accounts(config, label, problems):
             " account names under `names` and never a profile directory, which lives in the"
             " machine's own account registry"
         )
+
+
+def check_preflight(config, label, problems):
+    """The optional base gate, expressed as argv so the driver never invokes a shell."""
+    preflight = config.get(PREFLIGHT)
+    if preflight is None:
+        return
+    if not isinstance(preflight, dict):
+        problems.append(
+            f"{label}: [{PREFLIGHT}] must be a table with an optional argv {PREFLIGHT_GATE}"
+        )
+        return
+    gate = preflight.get(PREFLIGHT_GATE)
+    if gate is not None and (
+        not isinstance(gate, list)
+        or not gate
+        or not all(isinstance(argument, str) and argument.strip() for argument in gate)
+    ):
+        problems.append(
+            f"{label}: [{PREFLIGHT}] {PREFLIGHT_GATE} must be a non-empty argv list of non-empty"
+            " strings"
+        )
+    for field in sorted(set(preflight) - {PREFLIGHT_GATE}):
+        problems.append(f"{label}: [{PREFLIGHT}] carries an unknown field {field!r}")
 
 
 def check_dashboard(config, label, complete, problems):

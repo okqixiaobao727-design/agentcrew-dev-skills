@@ -103,6 +103,12 @@ operator. A clean run costs it one turn to launch, one per ASK, and one to point
 - A preflight failure reaches the model as one line. The full problem list goes to the operator
   through the dashboard channel, cleared at the next start so a stale notice cannot outlive its fix,
   and the repair happens in a separate cheap session. An aborted start costs the oracle nothing.
+  **Amended 2026-08-27 by #141:** a project may configure a `[preflight] gate` argv. After the cheap
+  read-only checks, the Driver checks out and fast-forwards the base, runs that command from the
+  repository root, and only then cuts the integration branch. A red gate restores the starting
+  branch or detached commit and reaches the same `preflight-failed` surface without creating an
+  integration branch or child worktree. A fresh run with no gate records `base gate: none
+  configured` in its machine log and final report; omission is never recorded as a pass.
 - Clearing a finished run is a standalone command the operator runs in a terminal, with its own
   inventory and its own confirmation. The coordinator never holds cleanup context.
 - Assumption-confirmation ASKs are deliberately not auto-approved. They were 2 occurrences in three

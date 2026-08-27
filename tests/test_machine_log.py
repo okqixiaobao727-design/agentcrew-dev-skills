@@ -729,6 +729,45 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["cache_creation_tokens"], 44)
         self.assertEqual(entry["total_tokens"], 110)
 
+    def test_a_passing_base_gate_records_its_argv_without_a_ticket(self):
+        result = run_cli(
+            "base-gate", "--status", "passed",
+            "--argument=python3", "--argument=scripts/test.py", "--argument=--full",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "base-gate")
+        self.assertEqual(entry["status"], "passed")
+        self.assertEqual(entry["argv"], ["python3", "scripts/test.py", "--full"])
+        self.assertNotIn("ticket", entry)
+
+    def test_an_unconfigured_base_gate_records_no_argv(self):
+        result = run_cli("base-gate", "--status", "not-configured", log=self.log)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["event"], "base-gate")
+        self.assertEqual(entry["status"], "not-configured")
+        self.assertNotIn("argv", entry)
+
+    def test_a_base_gate_refuses_a_status_that_contradicts_its_argv(self):
+        cases = (
+            ("passed without argv", ["--status", "passed"]),
+            (
+                "not configured with argv",
+                ["--status", "not-configured", "--argument=python3"],
+            ),
+        )
+        for label, fields in cases:
+            with self.subTest(label=label):
+                result = run_cli("base-gate", *fields, log=self.log)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(self.log.exists())
+
     def test_a_witness_outcome_outside_the_closed_grammar_is_refused(self):
         result = run_cli(
             "witness", "--ticket", "07", "--executor", "claude",

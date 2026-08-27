@@ -204,13 +204,15 @@ class Fixture:
     # --- the project's config -------------------------------------------------------------
 
     def write_config(self, repair_model=REPAIR_MODEL, tracker=TRACKER, surface=None,
-                     accounts=None, witness_model=None, witness_budget_usd=None):
+                     accounts=None, witness_model=None, witness_budget_usd=None, gate=None):
         """The project config the run reads its repair model and its tracker out of."""
         lines = []
         if repair_model is not None:
             lines += ["[repair]", f'model = "{repair_model}"']
         if tracker is not None:
             lines += ["[tracker]", f'kind = "{tracker}"']
+        if gate is not None:
+            lines += ["[preflight]", f"gate = {json.dumps(gate)}"]
         if surface is not None:
             lines += ["[dashboard]", f'surface = "{surface}"']
         if accounts is not None:
@@ -223,6 +225,34 @@ class Fixture:
             if witness_budget_usd is not None:
                 lines += [f"budget_usd = {witness_budget_usd}"]
         (self.repo / "agentcrew.toml").write_text("\n".join(lines) + "\n")
+
+    def configure_gate(self, exit_code=0, output=""):
+        """Install and configure the gate stub used only by tests that exercise base gating."""
+        target = self.bin_dir / "base-gate"
+        target.write_text(
+            "#!" + sys.executable + "\n"
+            "import json\n"
+            "import os\n"
+            "import pathlib\n"
+            "import subprocess\n"
+            "import sys\n"
+            "root = pathlib.Path(os.environ['AGENTCREW_STUB_DIR'])\n"
+            "head = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True)\n"
+            "with (root / 'base-gate-calls').open('a') as handle:\n"
+            "    handle.write(json.dumps({'cwd': os.getcwd(), 'argv': sys.argv[1:], "
+            "'head': head.stdout.strip()}) + '\\n')\n"
+            "sys.stdout.write((root / 'base-gate-output').read_text())\n"
+            "raise SystemExit(int((root / 'base-gate-exit').read_text()))\n"
+        )
+        target.chmod(0o755)
+        (self.stub_dir / "base-gate-output").write_text(output)
+        (self.stub_dir / "base-gate-exit").write_text(str(exit_code))
+        self.configure(gate=["base-gate", "--full"])
+
+    def gate_calls(self):
+        """Every configured base-gate invocation, in physical order."""
+        path = self.stub_dir / "base-gate-calls"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     # --- the machine's account registry -----------------------------------------------------
 

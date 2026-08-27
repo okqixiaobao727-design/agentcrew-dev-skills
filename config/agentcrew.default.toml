@@ -142,6 +142,15 @@ command = ""
 [dashboard]
 surface = "window"
 
+# --- Base preflight gate ----------------------------------------------------
+# Optional. Confirm the command that proves this project's integration base is green, then
+# uncomment it. Each argument is one list item; the Driver runs it from the repository root
+# without a shell, after checking out and fast-forwarding the base and before cutting the
+# integration branch. Leaving it commented means no base gate is configured.
+#
+# [preflight]
+# gate = ["python3", "scripts/test.py"]
+
 # --- Merge repair -----------------------------------------------------------
 # The model the merge ladder's repair rung runs on. A mechanical merge conflict — two children
 # editing the same region, neither rewriting the other's work — is resolved by the merge driver
