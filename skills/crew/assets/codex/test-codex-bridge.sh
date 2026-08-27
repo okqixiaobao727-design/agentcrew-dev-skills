@@ -24,7 +24,19 @@ CREW COMPLETE $STUB_SHA"
 
 WORK=$(mktemp -d -t codex-bridge-test)
 BIN="$WORK/bin"
+PLUGIN_ROOT="$WORK/mattpocock-skills"
+SKILL_DIR="$PLUGIN_ROOT/skills/engineering/implement"
+SKILL_PATH="$SKILL_DIR/SKILL.md"
+CACHE_PLUGIN_ROOT="$WORK/codex-home/plugins/cache/mattpocock/mattpocock-skills/1.2.3"
+CACHE_SKILL_DIR="$CACHE_PLUGIN_ROOT/skills/engineering/implement"
+CACHE_SKILL_PATH="$CACHE_SKILL_DIR/SKILL.md"
 mkdir -p "$BIN"
+mkdir -p "$SKILL_DIR"
+mkdir -p "$CACHE_SKILL_DIR"
+touch "$SKILL_PATH"
+touch "$CACHE_SKILL_PATH"
+export CODEX_STUB_PLUGIN_ROOT="$PLUGIN_ROOT"
+export CODEX_HOME="$WORK/codex-home"
 
 printf '#!/bin/sh\nexec "%s" -L codex-bridge-test "$@"\n' "$REAL_TMUX" > "$BIN/tmux"
 printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$PYTHON" "$STUB" > "$BIN/codex"
@@ -267,7 +279,7 @@ test_resume_keeps_logging_configuration() {
   sleep 0.2
   launch_with_options "$dir" "$sf" 20 "$WORK/t18.resume.json" \
     --thread-id "$thread_id" \
-    || { fail "resume-log: resumed launch exited $?"; return; }
+    || { fail "resume-log: resumed launch exited $? ($(cat "$WORK/t18.resume.json.err"))"; return; }
   watch "$WORK/t18.watch.json" "$sf" \
     || { fail "resume-log: watch exited $?"; return; }
   assert_log_event "$log" 0 escalation child 18 "$ESCALATION_MESSAGE" \
@@ -351,6 +363,8 @@ test_model_effort_overrides() {
   launch_with_options "$dir" "$sf" 12 "$out" \
     --model "$PINNED_MODEL" --effort "$PINNED_EFFORT" \
     || { fail "pinned: launch exited $?"; return; }
+  wait_for_stub_argv "$dir" 2 \
+    || { fail "pinned: TUI invocation was not recorded"; return; }
   assert_stub_argv "$dir" "$PINNED_MODEL" "$PINNED_EFFORT" 0 \
     && ok "pinned: both overrides reached app-server and TUI" \
     || fail "pinned: overrides missing from Codex argv"
@@ -366,6 +380,8 @@ test_without_model_effort_overrides() {
   local sf="$WORK/t12.state.json" out="$WORK/t12.launch.json"
   launch "$dir" "$sf" 13 "$out" \
     || { fail "unpinned: launch exited $?"; return; }
+  wait_for_stub_argv "$dir" 2 \
+    || { fail "unpinned: TUI invocation was not recorded"; return; }
   assert_stub_argv "$dir" "" "" 0 \
     && ok "unpinned: no model or effort override" \
     || fail "unpinned: unexpected Codex config override"
@@ -387,7 +403,7 @@ test_resume_keeps_pinned_model_effort() {
   sleep 0.2
   launch_with_options "$dir" "$sf" 15 "$WORK/t13.resume.json" \
     --thread-id "$thread_id" \
-    || { fail "resume: relaunch exited $?"; return; }
+    || { fail "resume: relaunch exited $? ($(cat "$WORK/t13.resume.json.err"))"; return; }
   wait_for_stub_argv "$dir" 4 \
     || { fail "resume: TUI invocation was not recorded"; return; }
   assert_stub_argv "$dir" "$PINNED_MODEL" "$PINNED_EFFORT" 2 \
@@ -405,6 +421,8 @@ test_model_only_pin_and_resume() {
   local sf="$WORK/t14.state.json" out="$WORK/t14.launch.json"
   launch_with_options "$dir" "$sf" 16 "$out" --model "$PINNED_MODEL" \
     || { fail "model-only: initial launch exited $?"; return; }
+  wait_for_stub_argv "$dir" 2 \
+    || { fail "model-only: TUI invocation was not recorded"; return; }
   assert_stub_argv "$dir" "$PINNED_MODEL" "" 0 \
     && ok "model-only: model override reached both Codex argv lists" \
     || fail "model-only: argv mismatch"
@@ -468,6 +486,133 @@ test_question_send() {
     *"CREW COMPLETE"*) ok "question: follow-up completed with receipt" ;;
     *) fail "question: follow-up receipt missing" ;;
   esac
+}
+
+# --- Test 22: a send opening with a skill passes its installed skill input item ---
+test_send_skill_input() {
+  local dir; dir=$(make_child t22 question)
+  local sf="$WORK/t22.state.json" out="$WORK/t22.launch.json"
+  launch "$dir" "$sf" 24 "$out" || { fail "send-skill: launch exited $?"; return; }
+  watch "$WORK/t22.watch.json" "$sf" || { fail "send-skill: watch exited $?"; return; }
+  "$PYTHON" "$BRIDGE" send --state-file "$sf" \
+    --prompt '$implement /tmp/ticket.md' > "$WORK/t22.send.json" 2>&1 \
+    || { fail "send-skill: send exited $?"; return; }
+  "$PYTHON" - "$dir/stub-requests.jsonl" \
+      "$CACHE_SKILL_PATH" <<'PY' \
+    && ok "send-skill: installed skill input posted" \
+    || fail "send-skill: installed skill input missing"
+import json
+import pathlib
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+turn = [request for request in requests if request["method"] == "turn/start"][-1]
+skill = turn["params"]["input"][1]
+assert skill["type"] == "skill", turn
+assert skill["name"] == "implement", turn
+assert pathlib.Path(skill["path"]).samefile(sys.argv[2]), turn
+PY
+}
+
+# --- Test 23: a launch opening with a skill posts the installed skill input item ---
+test_launch_skill_input() {
+  local dir; dir=$(make_child t23 receipt)
+  local sf="$WORK/t23.state.json" out="$WORK/t23.launch.json"
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 25 --state-file "$sf" --startup-timeout 15 \
+    --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
+    || { fail "launch-skill: launch exited $? ($(cat "$out.err"))"; return; }
+  "$PYTHON" - "$dir/stub-requests.jsonl" "$CACHE_SKILL_PATH" <<'PY' \
+    && ok "launch-skill: installed skill input posted" \
+    || fail "launch-skill: installed skill input missing"
+import json
+import pathlib
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+turn = [request for request in requests if request["method"] == "turn/start"][-1]
+skill = turn["params"]["input"][1]
+assert skill["type"] == "skill", turn
+assert skill["name"] == "implement", turn
+assert pathlib.Path(skill["path"]).samefile(sys.argv[2]), turn
+PY
+}
+
+# --- Test 27: an absent versioned cache falls back to the plugin source path ---
+test_skill_source_fallback() {
+  local dir; dir=$(make_child t27 receipt)
+  local sf="$WORK/t27.state.json" out="$WORK/t27.launch.json"
+  CODEX_STUB_PLUGIN_VERSION=9.9.9 "$PYTHON" "$BRIDGE" launch \
+    --cwd "$dir" --tmux-session 'bt:' --window-name 29 \
+    --state-file "$sf" --startup-timeout 15 \
+    --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
+    || { fail "skill-source: launch exited $? ($(cat "$out.err"))"; return; }
+  "$PYTHON" - "$dir/stub-requests.jsonl" "$SKILL_PATH" <<'PY' \
+    && ok "skill-source: absent cache fell back to source path" \
+    || fail "skill-source: source path fallback missing"
+import json
+import pathlib
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+turn = [request for request in requests if request["method"] == "turn/start"][-1]
+skill = turn["params"]["input"][1]
+assert skill["type"] == "skill", turn
+assert skill["name"] == "implement", turn
+assert pathlib.Path(skill["path"]).samefile(sys.argv[2]), turn
+PY
+}
+
+# --- Test 24: a prompt without a skill mention posts no skill input item ---
+test_plain_prompt_has_no_skill_input() {
+  local dir; dir=$(make_child t24 question)
+  local sf="$WORK/t24.state.json" out="$WORK/t24.launch.json"
+  launch "$dir" "$sf" 26 "$out" || { fail "plain-input: launch exited $?"; return; }
+  "$PYTHON" - "$dir/stub-requests.jsonl" <<'PY' \
+    && ok "plain-input: no skill input posted" \
+    || fail "plain-input: unexpected skill input posted"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+turn = [request for request in requests if request["method"] == "turn/start"][-1]
+assert [item["type"] for item in turn["params"]["input"]] == ["text"], turn
+PY
+}
+
+# --- Test 25: a named skill without an installed SKILL.md is reported ---
+test_missing_skill_path_is_reported() {
+  local dir; dir=$(make_child t25 question)
+  local sf="$WORK/t25.state.json" out="$WORK/t25.launch.json"
+  launch "$dir" "$sf" 27 "$out" || { fail "missing-skill: launch exited $?"; return; }
+  watch "$WORK/t25.watch.json" "$sf" || { fail "missing-skill: watch exited $?"; return; }
+  if "$PYTHON" "$BRIDGE" send --state-file "$sf" \
+      --prompt '$missing /tmp/ticket.md' > "$WORK/t25.send.json" 2> "$WORK/t25.send.err"; then
+    fail "missing-skill: send unexpectedly succeeded"
+    return
+  fi
+  grep -q "SKILL.md" "$WORK/t25.send.err" \
+    && ok "missing-skill: missing path reported" \
+    || fail "missing-skill: missing path was silently dropped"
+}
+
+# --- Test 26: a launch reports a missing installed SKILL.md path ---
+test_launch_missing_skill_path_is_reported() {
+  local dir; dir=$(make_child t26 receipt)
+  local sf="$WORK/t26.state.json" out="$WORK/t26.launch.json"
+  if "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+      --window-name 28 --state-file "$sf" --startup-timeout 15 \
+      --prompt '$missing /tmp/ticket.md' > "$out" 2> "$out.err"; then
+    fail "launch-missing-skill: launch unexpectedly succeeded"
+    return
+  fi
+  grep -q "SKILL.md" "$out.err" \
+    && ok "launch-missing-skill: missing path reported" \
+    || fail "launch-missing-skill: missing path detail lost"
 }
 
 # --- Test 3: watch stays armed while all busy, wakes on first idle child ---
@@ -588,6 +733,12 @@ test_resume_keeps_pinned_model_effort
 test_model_only_pin_and_resume
 test_unusable_resume_state
 test_question_send
+test_send_skill_input
+test_launch_skill_input
+test_plain_prompt_has_no_skill_input
+test_missing_skill_path_is_reported
+test_launch_missing_skill_path_is_reported
+test_skill_source_fallback
 test_wave_wakeup
 test_vanished
 test_failed_turn

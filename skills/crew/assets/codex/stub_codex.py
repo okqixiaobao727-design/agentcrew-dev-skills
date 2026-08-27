@@ -5,7 +5,7 @@ Emulates the two invocations codex_bridge.py makes:
 
     codex app-server --listen unix://<socket>
     codex --remote unix://<socket> --sandbox <s> --ask-for-approval <a> \
-        [resume <thread-id>] <prompt>
+        resume <thread-id>
 
 The scenario is read from `.codex-stub-scenario` in the working directory
 (falling back to $CODEX_STUB_SCENARIO, then "receipt"):
@@ -27,14 +27,35 @@ like from the outside. `stub-typed-turn-held` is the same turn still being worke
 completes, so the thread holds a finished turn behind an unfinished one.
 """
 
+import os
+import sys
+
+TUI_EXIT_MARKER = ".codex-stub-tui-exited"
+
+
+def exits_immediately():
+    argv = sys.argv[1:]
+    if (argv and argv[0] == "app-server") or argv[:3] == ["plugin", "list", "--json"]:
+        return False
+    try:
+        with open(".codex-stub-scenario", encoding="utf-8") as stream:
+            active_scenario = stream.read().strip()
+    except OSError:
+        active_scenario = os.environ.get("CODEX_STUB_SCENARIO", "receipt")
+    return active_scenario == "tui-exit"
+
+
+if exits_immediately():
+    print("stub TUI exiting immediately", file=sys.stderr, flush=True)
+    with open(TUI_EXIT_MARKER, "w", encoding="utf-8"):
+        pass
+    os._exit(1)
+
+
 import asyncio
 import json
-import os
 import pathlib
-import sys
 import time
-
-from aiohttp import web, WSMsgType
 
 STUB_SHA = "1234567890abcdef1234567890abcdef12345678"
 TURN_DELAY_SECONDS = float(os.environ.get("CODEX_STUB_DELAY", "0.3"))
@@ -67,16 +88,17 @@ def first_turn_result(active_scenario):
 
 
 class StubThread:
-    def __init__(self, prompt):
-        self.id = "stub-thread-1"
-        self.preview = prompt
-        self.turns = [
-            {"kind": "first", "text": prompt, "created": time.monotonic()}
-        ]
+    def __init__(self, thread_id="stub-thread-1"):
+        self.id = thread_id
+        self.preview = ""
+        self.turns = []
 
     def start_turn(self, text):
+        kind = "first" if not self.turns else "followup"
+        if not self.preview:
+            self.preview = text
         self.turns.append(
-            {"kind": "followup", "text": text, "created": time.monotonic()}
+            {"kind": kind, "text": text, "created": time.monotonic()}
         )
         return len(self.turns) - 1
 
@@ -137,32 +159,46 @@ class StubThread:
 
 
 class StubServer:
-    def __init__(self, socket_dir, active_scenario):
-        self.prompt_file = socket_dir / "tui-prompt.txt"
+    def __init__(self, active_scenario):
         self.scenario = active_scenario
         self.thread = None
 
     def ensure_thread(self):
-        if self.thread is None and self.prompt_file.is_file():
-            self.thread = StubThread(
-                self.prompt_file.read_text(encoding="utf-8")
-            )
         if self.thread is not None:
             self.thread.absorb_typed_turn()
 
     def handle(self, method, params):
         self.ensure_thread()
+        with pathlib.Path("stub-requests.jsonl").open("a", encoding="utf-8") as stream:
+            json.dump({"method": method, "params": params}, stream)
+            stream.write("\n")
+        # Model a TUI gone before list can find it, while read follows its real exit.
+        turn_marker_visible = (
+            self.scenario != "tui-exit"
+            or pathlib.Path(TUI_EXIT_MARKER).is_file()
+        )
         if method == "initialize":
             return {}
+        if method == "thread/start":
+            self.thread = StubThread()
+            return {"thread": {"id": self.thread.id}}
+        if method == "thread/resume":
+            if self.thread is None:
+                self.thread = StubThread(thread_id=params["threadId"])
+            return {"thread": {"id": self.thread.id}}
         if method == "thread/list":
             data = []
             if self.thread is not None:
-                data.append({"id": self.thread.id, "preview": self.thread.preview})
+                preview = "" if self.scenario == "tui-exit" else self.thread.preview
+                data.append({"id": self.thread.id, "preview": preview})
             return {"data": data}
         if method == "thread/read":
             if self.thread is None or params.get("threadId") != self.thread.id:
                 raise ValueError("unknown thread")
-            return {"thread": self.thread.render(self.scenario)}
+            thread = self.thread.render(self.scenario)
+            if not turn_marker_visible:
+                thread["turns"] = []
+            return {"thread": thread}
         if method == "turn/start":
             if self.thread is None or params.get("threadId") != self.thread.id:
                 raise ValueError("unknown thread")
@@ -174,6 +210,8 @@ class StubServer:
         raise ValueError(f"unsupported method: {method}")
 
     async def websocket_handler(self, request):
+        from aiohttp import web, WSMsgType
+
         websocket = web.WebSocketResponse()
         await websocket.prepare(request)
         async for message in websocket:
@@ -193,7 +231,9 @@ class StubServer:
 
 
 async def run_app_server(socket_path):
-    server = StubServer(socket_path.parent, scenario())
+    from aiohttp import web
+
+    server = StubServer(scenario())
     app = web.Application()
     app.router.add_get("/", server.websocket_handler)
     runner = web.AppRunner(app)
@@ -224,10 +264,6 @@ def tui_main(argv):
     if scenario() == "tui-exit":
         print("stub TUI exiting immediately", file=sys.stderr)
         return 1
-    remote = argv[argv.index("--remote") + 1]
-    socket_dir = pathlib.Path(remote.removeprefix("unix://")).parent
-    prompt = argv[-1]
-    (socket_dir / "tui-prompt.txt").write_text(prompt, encoding="utf-8")
     try:
         while True:
             time.sleep(3600)
@@ -238,6 +274,19 @@ def tui_main(argv):
 
 def main():
     argv = sys.argv[1:]
+    if argv[:3] == ["plugin", "list", "--json"]:
+        plugin_root = os.environ["CODEX_STUB_PLUGIN_ROOT"]
+        print(json.dumps({
+            "installed": [{
+                "name": "mattpocock-skills",
+                "marketplaceName": "mattpocock",
+                "version": os.environ.get("CODEX_STUB_PLUGIN_VERSION", "1.2.3"),
+                "installed": True,
+                "enabled": True,
+                "source": {"source": "local", "path": plugin_root},
+            }]
+        }))
+        return 0
     with pathlib.Path("stub-argv.jsonl").open("a", encoding="utf-8") as stream:
         json.dump(argv, stream)
         stream.write("\n")
