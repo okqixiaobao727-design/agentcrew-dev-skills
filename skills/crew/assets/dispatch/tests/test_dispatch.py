@@ -649,13 +649,13 @@ class ClaudeRenderTests(DispatchTestCase):
         )
         self.assertIn("`review-bridge --help` is the rule for what its exit codes permit", prompt)
 
-    def test_the_first_turn_contains_no_copy_of_the_bridge_protocol(self):
-        prompt = " ".join(self.review_block().split())
+    def test_the_review_template_contains_no_copy_of_the_bridge_protocol(self):
+        review_template = dispatch_module.load_templates()["review"]["block"]
         for copied_constant in (
             "--resume-session", "--response", "/tmp/", "two hours", "finalMessage",
         ):
             with self.subTest(copied_constant=copied_constant):
-                self.assertNotIn(copied_constant, prompt)
+                self.assertNotIn(copied_constant, review_template)
 
     def test_the_first_turn_sends_a_typed_stuck_ask_for_a_refusal(self):
         prompt = " ".join(self.initial_prompt().split())
