@@ -40,6 +40,7 @@ from harness import (
     INHERITED,
     INTEGRATION_BRANCH,
     LAUNCH,
+    MACHINE_LOG,
     MONITOR_WAVE_NAME,
     PARKED_PATHS,
     PERMISSION_MODE,
@@ -1205,6 +1206,13 @@ class LoopTests(DriverTestCase):
         )
         return self.instructions(ticket, marker)[-1]["message"]
 
+    def assert_claude_receipt_command(self, instruction):
+        run_machine_log = self.fixture.run_dir / MACHINE_LOG.name
+        self.assertIn(f"python3 {run_machine_log}", instruction)
+        self.assertIn(f"--log {self.fixture.run_dir / 'log.jsonl'}", instruction)
+        self.assertNotIn("SendMessage", instruction)
+        self.assertNotRegex(instruction, r"(?i)\bsend\b")
+
     # --- a whole run, with nothing outside the table in it ------------------------------------
 
     def test_a_clean_run_settles_every_wave_and_ends_without_one_wake(self):
@@ -1540,6 +1548,8 @@ class LoopTests(DriverTestCase):
         self.assertIn("01", instruction)
         self.assertIn("0" * 40, instruction)
         self.assertIn("CREW COMPLETE", instruction)
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("send a new CREW COMPLETE", instruction)
         self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
         self.assertEqual(self.verdict("01"), "completed")
 
@@ -1619,6 +1629,8 @@ class LoopTests(DriverTestCase):
             " [— <body>] [ts=<unix>]",
             instruction,
         )
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("Send it in exactly the shape shown", instruction)
         self.assertEqual(self.events("escalation", ticket="01"), [])
         self.assertEqual(self.verdict("01"), "completed")
 
@@ -1637,6 +1649,28 @@ class LoopTests(DriverTestCase):
         self.assertEqual(self.events("escalation", ticket="01"), [])
         failed = self.events("receipt", ticket="01", verdict="failed")
         self.assertIn(malformed, failed[-1]["detail"])
+
+    def test_a_codex_child_is_still_told_to_send_a_bounced_receipt(self):
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+
+        self.fixture.says("01", "CREW ASK 01 progress")
+        instruction = self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_codex_child_is_still_told_to_send_a_rechecked_receipt(self):
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+
+        self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
+        instruction = self.wait_for_instruction("01", "CREW RECHECK")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
+        self.assertEqual(self.verdict("01"), "completed")
 
     def test_a_message_that_speaks_no_verb_at_all_is_not_bounced(self):
         """Conversation is still conversation; only a near miss is answered."""
@@ -1761,7 +1795,20 @@ class LoopTests(DriverTestCase):
         self.woken(process, "run-complete")
 
         self.assertIn("CREW COMPLETE", instruction)
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("Send CREW COMPLETE", instruction)
         self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
+    def test_a_codex_child_is_still_told_to_send_a_nudged_receipt(self):
+        self.fixture.codex_goes("01", "idle")
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+
+        instruction = self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
+        self.assertEqual(self.verdict("01"), "completed")
 
     def test_a_child_awaiting_a_handed_over_ruling_is_not_nudged_until_it_is_answered(self):
         """A nudge to a child waiting on an answer races an answered ask into a parked receipt.
@@ -2152,9 +2199,24 @@ class LoopTests(DriverTestCase):
 
         self.assertIn(INTEGRATION_BRANCH, instruction)
         self.assertIn("CREW COMPLETE", instruction)
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("send a new CREW COMPLETE", instruction)
         self.assertIn(
             "semantic", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
         )
+
+    def test_a_codex_child_is_still_told_to_send_a_merge_receipt(self):
+        self.fixture.codex_goes("01", "busy")
+        self.fixture.codex_goes("02", "busy")
+        process = self.start(
+            ("01", ()), ("02", ()), shared="one\n", routing=CODEX_ROUTING
+        )
+
+        self.fixture.completes("01", "01 rewrote\n", name="shared.txt")
+        self.fixture.completes("02", "02 rewrote\n", name="shared.txt")
+        instruction = self.wait_for_instruction("02", "CREW MERGE")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
 
     def test_the_merge_rework_instruction_scopes_re_verification_to_the_conflict(self):
         """The rework instruction has never fired in a run, so its text is pinned before it does.
