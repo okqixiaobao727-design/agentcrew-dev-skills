@@ -230,6 +230,7 @@ COMPLETE_VERB = machine_log.COMPLETE_VERB
 PARKED_VERB = machine_log.PARKED_VERB
 FAILED_VERB = machine_log.FAILED_VERB
 ESCALATION_VERB = machine_log.ESCALATION_VERB
+ESCALATION_KINDS = machine_log.ESCALATION_KINDS
 
 # What the driver says back. Each opens with its own marker, because the marker is how the loop
 # reads its own history out of the log: a rung that has already fired for a ticket is a ruling of
@@ -253,6 +254,7 @@ HANDED_OVER = (
     " answered. An answer sent as tmux keys passes no hook and so reaches no log; this line is"
     " what the run's report has of it."
 )
+ASK_SHAPE = f"CREW ASK <NN> <{'|'.join(ESCALATION_KINDS)}> [— <body>] [ts=<unix>]"
 
 RECHECK_TEMPLATE = (
     "{marker} {ticket} {sha} — the receipt you sent did not verify: {problem}. Finish the work in"
@@ -262,10 +264,9 @@ RECHECK_TEMPLATE = (
 )
 RESEND_TEMPLATE = (
     "{marker} {ticket} — the line you ended on reached for one of this run's verbs and missed its"
-    " shape, so nothing settled and nobody was woken: {line}. Send it again with the verb line"
-    " bare — the message's final line, and nothing on it but the verb and its argument: exactly"
-    " `CREW COMPLETE <40-character sha> ts=<unix>`, or CREW PARKED <checklist path>, CREW FAILED"
-    " <reason>, or CREW ASK <ticket> <kind> — question in their own shapes. Anything you want to"
+    " shape, so nothing settled and nobody was woken: {line}. Send it in exactly the shape shown:"
+    " `CREW COMPLETE <40-character sha> ts=<unix>`, CREW PARKED <checklist path>, CREW FAILED"
+    f" <reason>, or {ASK_SHAPE}. Anything you want to"
     " say alongside it goes on the lines above. This is the one re-ask — a second line that misses"
     " its shape settles this ticket failed."
 )

@@ -492,7 +492,7 @@ The event name comes from the message the sender wrote, so the log reads the way
 | Message | `event` |
 | --- | --- |
 | anything sent by the coordinator | `ruling` |
-| sent by a child whose last verb line is a `CREW ASK` | `escalation` |
+| sent by a child whose last verb line is a valid `CREW ASK` | `escalation` |
 | anything else sent by a child | `message` |
 
 Only a child escalates — the coordinator is the top of the ladder — so the verb is read on the
@@ -500,20 +500,25 @@ child side alone.
 
 The verbs are read line by line rather than off the opening of the message, because a child
 composes its final turn freely and bundles the verb under the summary it wrote first as readily
-as it sends the line bare. A verb counts when it is a whole line of its own — `CREW ASK`,
-`CREW PARKED` and `CREW FAILED` followed by their argument, `CREW COMPLETE` followed by a full
-40-character sha and an optional `ts=` stamp — so the same words quoted inside a sentence are
-prose, as they are in the instructions that taught them. Where a message carries more than one,
-the last one is the word it sent: a final turn speaks once, and a child that withdrew an ask and
-finished anyway has said the thing it ended on. The driver's rule table reads a child's word
-through the same judgment, so the log and the run can never disagree about what was said.
+as it sends the line bare. An escalation has this shape:
+`CREW ASK <NN> <design|scope|doc-conflict|stuck|wrap-up> [— <body>] [ts=<unix>]`. `NN` is a numeric
+ticket; the body, when present, is introduced by ` — `, and the protocol timestamp follows either
+the kind or the body. Those five kinds are a closed set; a non-numeric ticket, an unknown kind, no
+kind, or any other trailing word or body separator is malformed.
+`CREW PARKED` and `CREW FAILED` carry their argument, and `CREW COMPLETE` carries a full
+40-character sha and an optional `ts=` stamp. A verb counts only when it is a whole line of its
+own, so the same words quoted inside a sentence are prose, as they are in the instructions that
+taught them. Where a message carries more than one, the last one is the word it sent: a final turn
+speaks once, and a child that withdrew an ask and finished anyway has said the thing it ended on.
+The driver's rule table reads a child's word through the same judgment, so the log and the run can
+never disagree about what was said.
 
 A line that opens at the margin with one of those verb words and then fails its own whole-line
 shape is a near miss rather than a silence, and the module names it separately
 (`malformed_receipt`) so the driver can answer it instead of dropping it — one scripted bounce
-quoting the line, then `failed` (ADR-0015). The grammar itself is unchanged: a near miss settles
-nothing, and prose that names a verb mid-line or quotes one indented is neither verb nor near
-miss.
+quoting the line and naming all five ask kinds, then `failed` on a second miss (ADR-0015). A near
+miss settles nothing, and prose that names a verb mid-line or quotes one indented is neither verb
+nor near miss.
 
 A child's own `CREW COMPLETE` is a claim about a sha, not a verified receipt, so it is copied in
 as a `message`. Only the script that checked the sha writes a `receipt`, and the log therefore
