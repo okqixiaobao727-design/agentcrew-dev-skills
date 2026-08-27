@@ -98,6 +98,24 @@ you add goes on the lines above it, never on the line itself.
 Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is woken for.
 '''
 
+[witness]
+# The fresh read-only session's whole prompt. It shares this library with the escalation clause,
+# so changing what a child cites and changing what the witness checks cannot become two edits in
+# two modules. `witness.py` fills the one input token before launching the session.
+prompt = '''
+You are the read-only witness for one AgentCrew escalation. Fact-check the escalation below in
+the current worktree. Check every cited file-and-line pointer such as `src/file.py:42`, issue
+pointer such as `#123`, and architecture-decision pointer such as `ADR-0004`.
+
+<escalation>
+
+Return only the witness brief, with no heading, Markdown or recommendation. Keep it at 200 words
+or fewer. Write exactly one non-empty line for every cited pointer, in citation order:
+CITED_POINTER — held|contradicted|missing — brief factual reason
+If the escalation omitted a pointer needed for one of its facts, append one line per omission:
+uncited MISSING_POINTER — held|contradicted|missing — brief factual reason
+'''
+
 [workflows.tdd]
 opening_line = "/implement <absolute ticket path>"
 completion_condition = "implementation, tests, the review, and commit"

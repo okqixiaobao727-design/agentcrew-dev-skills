@@ -6,6 +6,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -15,6 +16,10 @@ PLUGIN_ROOT = ASSETS.parents[2]
 sys.path.insert(0, str(ASSETS))
 
 import run_plan  # noqa: E402
+
+
+WITNESS_MODEL = "claude-sonnet-5"
+WITNESS_BUDGET_USD = 2.0
 
 
 class RunPlanTests(unittest.TestCase):
@@ -43,6 +48,8 @@ class RunPlanTests(unittest.TestCase):
             "return_branch": "main",
             "feature_dir": str(self.feature),
             "repair_model": "claude-sonnet-5",
+            "witness_model": WITNESS_MODEL,
+            "witness_budget_usd": WITNESS_BUDGET_USD,
             "tracker": "local",
             "declared_accounts": [],
             "codex": {
@@ -84,6 +91,42 @@ class RunPlanTests(unittest.TestCase):
         )
         with self.assertRaises(dataclasses.FrozenInstanceError):
             plan.ticket("01").title = "changed"
+
+    def test_missing_witness_config_uses_its_own_shipped_defaults_in_the_plan_json(self):
+        self.ticket("01", "Foundation")
+        metadata = copy.deepcopy(self.run)
+        metadata.pop("witness_model")
+        metadata.pop("witness_budget_usd")
+        independent = self.root / "defaults.toml"
+        independent.write_text(
+            "[repair]\nmodel = \"claude-opus-5\"\n"
+            "[witness]\nmodel = \"claude-sonnet-5\"\nbudget_usd = 2.0\n",
+            encoding="utf-8",
+        )
+        path = self.root / "wave-table.json"
+
+        with mock.patch.object(run_plan, "DEFAULT_CONFIG", independent):
+            plan = run_plan.build(self.feature, metadata)
+            plan.write(path)
+
+        document = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(document["run"]["witness_model"], WITNESS_MODEL)
+        self.assertEqual(document["run"]["witness_budget_usd"], WITNESS_BUDGET_USD)
+
+    def test_an_aliased_witness_model_is_rejected(self):
+        self.ticket("01", "Foundation")
+        metadata = copy.deepcopy(self.run)
+        metadata["witness_model"] = "sonnet"
+
+        with self.assertRaisesRegex(run_plan.RunPlanError, "witness model.*alias"):
+            run_plan.build(self.feature, metadata)
+
+    def test_the_shipped_witness_defaults_are_the_advisor_ruled_literals(self):
+        with (PLUGIN_ROOT / "config" / "agentcrew.default.toml").open("rb") as handle:
+            witness = tomllib.load(handle)["witness"]
+
+        self.assertEqual(witness["model"], WITNESS_MODEL)
+        self.assertEqual(witness["budget_usd"], WITNESS_BUDGET_USD)
 
     def test_build_resolves_a_named_account_once_and_rejects_duplicate_ticket_ids(self):
         profile = self.root / "second-profile"

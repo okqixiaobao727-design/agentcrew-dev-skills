@@ -52,6 +52,8 @@ from harness import (
     TRIAGE,
     UNREWRITABLE,
     WAKE_NAME,
+    WITNESS_BUDGET_USD,
+    WITNESS_MODEL,
     git,
     routing_naming,
 )
@@ -809,6 +811,8 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(run["tmux_session"], TMUX_SESSION)
         self.assertEqual(run["permission_mode"], PERMISSION_MODE)
         self.assertEqual(run["repair_model"], REPAIR_MODEL)
+        self.assertEqual(run["witness_model"], WITNESS_MODEL)
+        self.assertEqual(run["witness_budget_usd"], WITNESS_BUDGET_USD)
         self.assertEqual(run["tracker"], TRACKER)
 
     def test_a_relative_path_is_recorded_absolute(self):

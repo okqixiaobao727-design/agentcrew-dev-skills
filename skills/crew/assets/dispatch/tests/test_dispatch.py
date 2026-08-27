@@ -21,6 +21,8 @@ import unittest
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 DISPATCH = TESTS_DIR.parent / "dispatch.py"
 CREW_SKILL_DIR = TESTS_DIR.parents[2]
+sys.path.insert(0, str(DISPATCH.parent))
+import dispatch as dispatch_module  # noqa: E402
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -229,6 +231,19 @@ class DispatchTestCase(unittest.TestCase):
         self.addCleanup(self.fixture.cleanup)
 
 
+class WitnessPromptTests(unittest.TestCase):
+    def test_the_ruled_witness_prompt_renders_from_witness_dot_prompt(self):
+        escalation = "CREW ASK 132 design — check src/check.py:12 and ADR-0004"
+
+        templates = dispatch_module.load_templates()
+        prompt = dispatch_module.render_witness_prompt(escalation, templates)
+
+        self.assertIn("witness", templates)
+        self.assertIn("prompt", templates["witness"])
+        self.assertIn(escalation, prompt)
+        self.assertNotIn("<", prompt)
+
+
 class TableValidationTests(DispatchTestCase):
     def test_every_offending_ticket_is_listed_with_what_it_lacks(self):
         tickets = [
@@ -427,11 +442,14 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertNotIn("tui_review_bridge.py", prompt)
         self.assertNotIn("claude_review_bridge.py", prompt)
 
-    def test_the_first_turn_follows_next_and_maps_escalate_without_restating_rounds(self):
+    def test_the_first_turn_follows_next_and_sends_a_typed_doc_conflict(self):
         prompt = self.initial_prompt()
         flattened = " ".join(prompt.split())
         self.assertIn("do exactly what its `next` field permits", flattened)
-        self.assertIn("map it onto `CREW ASK`", flattened)
+        self.assertIn(
+            "send `CREW ASK 06 doc-conflict` carrying both positions to your coordinator",
+            flattened,
+        )
         self.assertNotIn("Rounds.", prompt)
 
     def test_the_first_turn_keeps_long_reviews_out_of_the_foreground_bash_limit(self):
@@ -458,10 +476,10 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertIn("without `--resume-session`", prompt)
         self.assertIn("If that axis fails again, escalate", prompt)
 
-    def test_the_first_turn_maps_any_other_top_level_status_onto_crew_ask(self):
+    def test_the_first_turn_sends_a_typed_stuck_ask_for_other_top_level_statuses(self):
         prompt = " ".join(self.initial_prompt().split())
         self.assertIn("Any other top-level `status`, including `refused`", prompt)
-        self.assertIn("map its `next` and reason onto `CREW ASK`", prompt)
+        self.assertIn("send `CREW ASK 06 stuck` carrying its `next` and reason", prompt)
         self.assertIn("Do not start or resume another review", prompt)
 
     def test_the_first_turn_carries_the_coordinator_trust_anchor(self):

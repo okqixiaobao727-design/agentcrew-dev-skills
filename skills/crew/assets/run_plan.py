@@ -16,6 +16,7 @@ BLOCKER = re.compile(r"#(\d+)")
 ROUTING_SECTION = "routing"
 BLOCKED_BY_SECTION = "blocked by"
 TEMPLATES = pathlib.Path(__file__).resolve().parent / "dispatch" / "templates" / "shapes.toml"
+DEFAULT_CONFIG = pathlib.Path(__file__).resolve().parents[3] / "config" / "agentcrew.default.toml"
 PROJECT_CONFIG_NAME = "agentcrew.toml"
 EXECUTORS = ("claude", "codex")
 REVIEW_VENDORS = EXECUTORS
@@ -63,6 +64,8 @@ class RunMetadata:
     return_branch: str | None = None
     feature_dir: str | None = None
     repair_model: str | None = None
+    witness_model: str | None = None
+    witness_budget_usd: float | None = None
     tracker: str | None = None
     declared_accounts: tuple[str, ...] = ()
     codex: CodexConfig | None = None
@@ -280,6 +283,8 @@ def _validation_problems(plan, check_wave_layout=True):
     problems = configuration_problems(
         plan.run.repo_root,
         plan.run.repair_model,
+        plan.run.witness_model,
+        plan.run.witness_budget_usd,
         plan.run.tracker,
     )
     workflows, aliases = _routing_vocabulary()
@@ -418,8 +423,40 @@ def _absolute(values, key, label=None, optional=False):
     return value
 
 
-def configuration_problems(repo_root, repair_model, tracker):
-    """Problems in the two configured run decisions, in the Run plan's vocabulary."""
+def witness_defaults():
+    """The witness's independently shipped model and budget defaults."""
+    try:
+        with DEFAULT_CONFIG.open("rb") as handle:
+            witness = tomllib.load(handle).get("witness")
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RunPlanError([
+            f"run: shipped witness defaults {DEFAULT_CONFIG} are unreadable: {error}"
+        ]) from error
+    if not isinstance(witness, dict):
+        raise RunPlanError([
+            f"run: shipped defaults {DEFAULT_CONFIG} carry no [witness] table"
+        ])
+    return {
+        "model": witness.get("model"),
+        "budget_usd": witness.get("budget_usd"),
+    }
+
+
+def witness_routing(model, budget_usd):
+    """Resolve independently inheritable witness routing without consulting `[repair]`."""
+    if model is None or budget_usd is None:
+        defaults = witness_defaults()
+        if model is None:
+            model = defaults["model"]
+        if budget_usd is None:
+            budget_usd = defaults["budget_usd"]
+    return model, budget_usd
+
+
+def configuration_problems(
+    repo_root, repair_model, witness_model, witness_budget_usd, tracker
+):
+    """Problems in the configured run decisions, in the Run plan's vocabulary."""
     config = pathlib.Path(repo_root) / PROJECT_CONFIG_NAME
     problems = []
     if not isinstance(repair_model, str) or not repair_model.strip():
@@ -431,6 +468,31 @@ def configuration_problems(repo_root, repair_model, tracker):
         fault = model_problem("`[repair] model`", repair_model)
         if fault:
             problems.append(f"repair model: {fault}")
+    try:
+        witness_model, witness_budget_usd = witness_routing(
+            witness_model, witness_budget_usd
+        )
+    except RunPlanError as error:
+        problems.extend(error.problems)
+    else:
+        if not isinstance(witness_model, str) or not witness_model.strip():
+            problems.append(
+                f"witness model: {config} and the shipped defaults name no [witness] model —"
+                " fact-checking an escalation takes a full model ID, never an alias"
+            )
+        else:
+            fault = model_problem("`[witness] model`", witness_model)
+            if fault:
+                problems.append(f"witness model: {fault}")
+        if (
+            isinstance(witness_budget_usd, bool)
+            or not isinstance(witness_budget_usd, (int, float))
+            or witness_budget_usd <= 0
+        ):
+            problems.append(
+                f"witness budget: {config} and the shipped defaults do not name a positive"
+                " [witness] budget_usd"
+            )
     if not isinstance(tracker, str) or not tracker.strip():
         problems.append(
             f"tracker: {config} names no [tracker] kind — a merged ticket has nowhere to be"
@@ -479,6 +541,11 @@ def _metadata(values):
         key: _string(values, key, optional=True)
         for key in ("base_branch", "return_branch", "repair_model", "tracker")
     }
+    witness_model, witness_budget_usd = witness_routing(
+        values.get("witness_model"), values.get("witness_budget_usd")
+    )
+    if not isinstance(witness_model, str) or not witness_model.strip():
+        raise RunPlanError(["run: witness_model is not a non-empty string"])
     feature_dir = _absolute(values, "feature_dir", optional=True)
     declared_accounts = values.get("declared_accounts", [])
     if not isinstance(declared_accounts, list):
@@ -529,6 +596,8 @@ def _metadata(values):
         return_branch=optional["return_branch"],
         feature_dir=feature_dir,
         repair_model=optional["repair_model"],
+        witness_model=witness_model,
+        witness_budget_usd=witness_budget_usd,
         tracker=optional["tracker"],
         declared_accounts=tuple(declared_accounts),
         codex=codex_value,
@@ -551,7 +620,10 @@ def _metadata_object(run):
         "coordinator_config_home": run.coordinator_config_home,
         "declared_accounts": list(run.declared_accounts),
     }
-    for key in ("base_branch", "return_branch", "feature_dir", "repair_model", "tracker"):
+    for key in (
+        "base_branch", "return_branch", "feature_dir", "repair_model", "witness_model",
+        "witness_budget_usd", "tracker",
+    ):
         value = getattr(run, key)
         if value is not None:
             document[key] = value

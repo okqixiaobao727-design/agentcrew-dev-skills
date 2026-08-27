@@ -160,6 +160,18 @@ surface = "window"
 [repair]
 model = "claude-sonnet-5"
 
+# --- Escalation witness -----------------------------------------------------
+# The full model ID used by the fresh read-only session that fact-checks each escalation before
+# it reaches the coordinator. This is its own value, not an alias of `[repair] model`, so either
+# rung can be retargeted without silently moving the other.
+#
+# `budget_usd` is that witness session's own hard cap. It is independent of the merge repair
+# command's default even while both ship the same numeric value.
+
+[witness]
+model = "claude-sonnet-5"
+budget_usd = 2.0
+
 # --- Issue tracker ----------------------------------------------------------
 # Which tracker a run closes its merged tickets in, and so which close operation and which undo it
 # records (`references/trackers.md`). Two values are exercised end to end: `github`, where a ticket

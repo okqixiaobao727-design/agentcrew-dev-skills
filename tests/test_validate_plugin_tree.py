@@ -560,6 +560,21 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.edit_config('model = "claude-sonnet-5"', 'model = "sonnet"')
         self.assert_rejects("alias")
 
+    def test_shipped_defaults_without_the_witness_defaults_are_rejected(self):
+        self.tree.drop_config_block("witness")
+        self.assert_rejects("witness")
+
+    def test_an_aliased_witness_model_is_rejected(self):
+        self.tree.edit_config(
+            '[witness]\nmodel = "claude-sonnet-5"',
+            '[witness]\nmodel = "sonnet"',
+        )
+        self.assert_rejects("alias")
+
+    def test_a_witness_without_its_own_budget_is_rejected(self):
+        self.tree.edit_config("budget_usd = 2.0\n", "")
+        self.assert_rejects("budget_usd")
+
     def test_shipped_defaults_without_a_tracker_are_rejected(self):
         self.tree.edit_config('[tracker]\nkind = "local"\n', "")
         self.assert_rejects("tracker")
@@ -686,6 +701,16 @@ class ProjectConfigTests(unittest.TestCase):
 
     def test_a_project_naming_an_aliased_repair_model_is_rejected(self):
         self.assert_rejects('[repair]\nmodel = "haiku"\n[tracker]\nkind = "local"\n', "alias")
+
+    def test_a_project_can_override_the_inherited_witness_defaults(self):
+        self.assert_accepts_with_required(
+            '[witness]\nmodel = "claude-sonnet-5"\nbudget_usd = 2.0\n'
+        )
+
+    def test_a_project_witness_alias_is_rejected(self):
+        self.assert_rejects_with_required(
+            '[witness]\nmodel = "sonnet"\nbudget_usd = 2.0\n', "alias"
+        )
 
     def test_a_project_naming_a_tracker_that_is_not_exercised_is_rejected(self):
         self.assert_rejects('[repair]\nmodel = "claude-sonnet-5"\n[tracker]\nkind = "jira"\n', "jira")

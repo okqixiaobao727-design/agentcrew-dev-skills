@@ -24,6 +24,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 
 OURS = "<<<<<<<"
 BASE = "|||||||"
@@ -95,6 +96,28 @@ def main():
     step = behaviour(attempt)
     if step == "fail":
         return 1
+    if step == "witness-timeout":
+        time.sleep(30)
+        return 0
+    if step in ("witness", "witness-write", "witness-rewrite"):
+        if step == "witness-write":
+            (pathlib.Path(repo) / STRAY_FILE).write_text("work nobody asked for\n")
+        if step == "witness-rewrite":
+            (pathlib.Path(repo) / "src" / "check.py").write_text("witness changed it\n")
+        print(json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
+            "session_id": "witness-session",
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 22,
+                "cache_read_input_tokens": 33,
+                "cache_creation_input_tokens": 44,
+            },
+        }))
+        return 0
     if step == "noop":
         return 0
     for relative in conflicted_paths(repo):

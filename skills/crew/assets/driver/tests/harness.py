@@ -65,8 +65,10 @@ WAKE_NAME = "wake.json"
 FEATURE_NAME = "demo"
 INTEGRATION_BRANCH = "crew/demo"
 BASE_BRANCH = "main"
-# The two decisions the project's config carries, which the driver records into the run.
+# The configured decisions the driver records into the run.
 REPAIR_MODEL = "claude-sonnet-5"
+WITNESS_MODEL = "claude-sonnet-5"
+WITNESS_BUDGET_USD = 2.0
 # A file carrying a line that reads as an opening conflict marker: the merge driver will not
 # rewrite a conflict in it, so this is the shape that still climbs to the repair rung.
 UNREWRITABLE = "one\n<<<<<<< left over from an earlier merge\nthree\n"

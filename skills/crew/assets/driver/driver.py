@@ -159,8 +159,8 @@ NOTICE_REMINDER = (
 
 # The settings file a session's hooks are registered in, relative to the directory it runs in.
 SETTINGS_PATH = pathlib.Path(".claude") / "settings.local.json"
-# The project config the dashboard's surface, the launch hook, and the run's two configured
-# routing decisions are read from.
+# The project config the dashboard's surface, the launch hook, and the run's configured routing
+# decisions are read from.
 CONFIG_NAME = "agentcrew.toml"
 LAUNCH_HOOK_SECTION = ("hooks", "on-child-launch")
 # The repair rung's model and the tracker a merged ticket is closed in. Both are routing decisions
@@ -170,6 +170,10 @@ LAUNCH_HOOK_SECTION = ("hooks", "on-child-launch")
 # which committing the config permanently clears.
 REPAIR_MODEL_KEYS = ("repair", "model")
 TRACKER_KIND_KEYS = ("tracker", "kind")
+# Unlike those two required project decisions, witness routing inherits the independently shipped
+# defaults where the project leaves either cell out.
+WITNESS_MODEL_KEYS = ("witness", "model")
+WITNESS_BUDGET_KEYS = ("witness", "budget_usd")
 # The account *names* this repository expects, declared in its committed config and never a path
 # (ADR-0013). Declaring none is the ordinary case and checks nothing; declaring some makes a
 # ticket naming an account outside them a problem stated in the config's own terms, which is a
@@ -767,6 +771,11 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
         # resume of it read the run's own record rather than the config file, so editing
         # `agentcrew.toml` mid-run cannot silently retarget a run already under way.
         "repair_model": config_value(config, REPAIR_MODEL_KEYS),
+        # Missing witness values are deliberately left for RunPlan to resolve from the shipped
+        # `[witness]` defaults. They never fall through to `[repair]`, even while the literals
+        # shipped for the two rungs happen to match.
+        "witness_model": config_value(config, WITNESS_MODEL_KEYS),
+        "witness_budget_usd": config_value(config, WITNESS_BUDGET_KEYS),
         "tracker": config_value(config, TRACKER_KIND_KEYS),
         # The account names this repository declares, and the coordinator's own configuration
         # home — which is the account a ticket naming none runs on, written down here so the
