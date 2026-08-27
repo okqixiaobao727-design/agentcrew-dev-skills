@@ -3326,12 +3326,75 @@ class CostTests(MonitorTestCase):
             cost_rows(result.stdout),
             [
                 ["TICKET", "EXECUTOR", "MODEL", "INPUT", "OUTPUT",
-                 "CACHE-READ", "CACHE-CREATION", "TOTAL"],
-                ["06", "claude", MODEL, "24", "46", "6800", "900", "7770"],
-                ["07", "codex", CODEX_MODEL, "1000", "700", "4000", "250", "5950"],
-                ["TOTAL", "--", "--", "1024", "746", "10800", "1150", "13720"],
+                 "CACHE-READ", "CACHE-CREATION", "TOTAL", "DURATION"],
+                ["06", "claude", MODEL, "24", "46", "6800", "900", "7770", "--"],
+                ["07", "codex", CODEX_MODEL, "1000", "700", "4000", "250", "5950", "--"],
+                ["TOTAL", "--", "--", "1024", "746", "10800", "1150", "13720", "--"],
             ],
         )
+
+    def test_the_rollup_carries_each_witness_cost_and_duration_in_the_run_total(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.append(
+            LAUNCH_TS, "witness", ticket="06", executor="claude",
+            model="claude-sonnet-5", outcome="checked", reason="",
+            duration_seconds=1.25, input_tokens=11, output_tokens=22,
+            cache_read_tokens=33, cache_creation_tokens=44, total_tokens=110,
+        )
+        self.fixture.append(
+            LAUNCH_TS, "witness", ticket="06", executor="codex",
+            model="gpt-5.6-luna", outcome="checked", reason="",
+            duration_seconds=2.5, input_tokens=1, output_tokens=2,
+            cache_read_tokens=3, cache_creation_tokens=4, total_tokens=10,
+        )
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = cost_rows(result.stdout)
+        header = rows[0]
+        by_name = {row[0]: dict(zip(header, row)) for row in rows[1:]}
+        witnesses = [dict(zip(header, row)) for row in rows[1:] if row[0] == "witness-06"]
+        self.assertEqual(
+            witnesses,
+            [{
+                "TICKET": "witness-06", "EXECUTOR": "claude",
+                "MODEL": "claude-sonnet-5", "INPUT": "11", "OUTPUT": "22",
+                "CACHE-READ": "33", "CACHE-CREATION": "44", "TOTAL": "110",
+                "DURATION": "1.25s",
+            }, {
+                "TICKET": "witness-06", "EXECUTOR": "codex",
+                "MODEL": "gpt-5.6-luna", "INPUT": "1", "OUTPUT": "2",
+                "CACHE-READ": "3", "CACHE-CREATION": "4", "TOTAL": "10",
+                "DURATION": "2.5s",
+            }],
+        )
+        self.assertEqual(by_name["06"]["DURATION"], "--")
+        self.assertEqual(by_name["TOTAL"]["TOTAL"], "7890")
+        self.assertEqual(by_name["TOTAL"]["DURATION"], "--")
+
+    def test_a_witness_without_usage_keeps_its_duration_and_adds_no_tokens(self):
+        self.fixture.worktree("06")
+        self.fixture.launch("06")
+        self.fixture.claude_transcript("06")
+        self.fixture.append(
+            LAUNCH_TS, "witness", ticket="06", executor="claude",
+            model="claude-sonnet-5", outcome="failed", reason="session timed out",
+            duration_seconds=900.125,
+        )
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = cost_rows(result.stdout)
+        header = rows[0]
+        witness = dict(zip(header, next(row for row in rows if row[0] == "witness-06")))
+        self.assertEqual(witness["TOTAL"], "--")
+        self.assertEqual(witness["DURATION"], "900.125s")
+        total = dict(zip(header, next(row for row in rows if row[0] == "TOTAL")))
+        self.assertEqual(total["TOTAL"], "7770")
 
     def test_the_rollup_reads_claude_children_from_every_account_named_by_the_wave_table(self):
         self.fixture.table(
@@ -3357,10 +3420,10 @@ class CostTests(MonitorTestCase):
             cost_rows(result.stdout),
             [
                 ["TICKET", "EXECUTOR", "MODEL", "INPUT", "OUTPUT",
-                 "CACHE-READ", "CACHE-CREATION", "TOTAL"],
-                ["06", "claude", MODEL, "24", "46", "6800", "900", "7770"],
-                ["08", "claude", MODEL, "24", "46", "6800", "900", "7770"],
-                ["TOTAL", "--", "--", "48", "92", "13600", "1800", "15540"],
+                 "CACHE-READ", "CACHE-CREATION", "TOTAL", "DURATION"],
+                ["06", "claude", MODEL, "24", "46", "6800", "900", "7770", "--"],
+                ["08", "claude", MODEL, "24", "46", "6800", "900", "7770", "--"],
+                ["TOTAL", "--", "--", "48", "92", "13600", "1800", "15540", "--"],
             ],
         )
 
@@ -3467,7 +3530,7 @@ class CostTests(MonitorTestCase):
             self.assertNotIn(field, entry)
         self.assertEqual(
             cost_rows(result.stdout)[1],
-            ["06", "claude", MODEL, "--", "--", "--", "--", "--"],
+            ["06", "claude", MODEL, "--", "--", "--", "--", "--", "--"],
         )
         self.assertIn(entry["detail"], result.stdout)
 
@@ -3634,7 +3697,7 @@ class CostTests(MonitorTestCase):
             ["coordinator", "claude", "--"] + [
                 str(CLAUDE_TOTALS[name])
                 for name in ("input", "output", "cache_read", "cache_creation", "total")
-            ],
+            ] + ["--"],
         )
 
     def test_the_coordinator_row_is_left_out_of_the_runs_total(self):
@@ -3646,7 +3709,8 @@ class CostTests(MonitorTestCase):
         result = self.cost("--coordinator-session", COORDINATOR_SESSION)
 
         total = next(row for row in cost_rows(result.stdout) if row[0] == "TOTAL")
-        self.assertEqual(total[-1], str(CLAUDE_TOTALS["total"]))
+        self.assertEqual(total[-2], str(CLAUDE_TOTALS["total"]))
+        self.assertEqual(total[-1], "--")
 
     def test_the_coordinators_own_transcript_is_not_billed_to_a_child(self):
         self.fixture.worktree("06")
@@ -3677,7 +3741,7 @@ class CostTests(MonitorTestCase):
         result = self.cost("--coordinator-session", COORDINATOR_SESSION)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.coordinator_row(result.stdout)[-1], str(CLAUDE_TOTALS["total"]))
+        self.assertEqual(self.coordinator_row(result.stdout)[-2], str(CLAUDE_TOTALS["total"]))
 
     def test_a_line_that_does_not_parse_mid_session_is_a_dashed_row_and_a_reason(self):
         self.fixture.worktree("06")
@@ -3689,7 +3753,7 @@ class CostTests(MonitorTestCase):
         result = self.cost("--coordinator-session", COORDINATOR_SESSION)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.coordinator_row(result.stdout)[-1], "--")
+        self.assertEqual(self.coordinator_row(result.stdout)[-2], "--")
         self.assertIn(f"coordinator not measured: {transcript} carries a line", result.stdout)
 
     def test_a_session_with_no_transcript_is_a_dashed_row_and_a_reason(self):
@@ -3702,7 +3766,7 @@ class CostTests(MonitorTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.coordinator_row(result.stdout), ["coordinator", "claude", "--", "--", "--", "--",
-                                                  "--", "--"],
+                                                  "--", "--", "--"],
         )
         self.assertIn(f"coordinator not measured: no transcript named {COORDINATOR_SESSION}",
                       result.stdout)
@@ -3715,7 +3779,7 @@ class CostTests(MonitorTestCase):
         result = self.cost("--coordinator-session", "")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.coordinator_row(result.stdout)[-1], "--")
+        self.assertEqual(self.coordinator_row(result.stdout)[-2], "--")
         self.assertIn("coordinator not measured: no session id", result.stdout)
 
     def test_a_rollup_asked_for_no_coordinator_carries_no_such_row(self):

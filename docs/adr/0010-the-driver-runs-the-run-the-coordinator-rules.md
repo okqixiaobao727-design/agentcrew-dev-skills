@@ -60,7 +60,10 @@ conflict resolved in the merge driver itself, and only what it will not rewrite 
 budget-capped repair rung; a templated first answer to a semantic conflict; tracker
 closes for merged tickets; wave advancement, monitor re-arming and the dashboard. The report — the
 outcome table, the duration rows, the rulings, the undo list and the cost rollup with the
-coordinator's own row — is rendered by the driver from the machine log.
+coordinator's own row — is rendered by the driver from the machine log. The cost rollup gives each
+witness event its own `witness-<NN>` row, includes its tokens in the total and shows its recorded
+duration. The Rulings section renders every wrap-up leftover beside the placement the coordinator
+gave it; rulings for `design`, `scope`, `doc-conflict` and `stuck` keep their verbatim rendering.
 
 **The wake surface is exactly three items.** A `CREW ASK` of any kind; a semantic merge conflict a
 child has bounced back a second time; and any state the rule table has no row for, which includes a

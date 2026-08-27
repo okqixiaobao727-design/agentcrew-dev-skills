@@ -1775,8 +1775,74 @@ def report_terminal_details(records, ticket, outcome):
 
 
 def report_rulings(records):
-    """Every coordinator ruling, verbatim as the machine log recorded it."""
-    return [record for record in records if record.get("event") == "ruling"]
+    """Every ruling for display, with wrap-up leftovers paired to their placements."""
+    wrap_ups = {}
+    rendered = []
+    for position, record in enumerate(records):
+        ticket = str(record.get("ticket") or "run")
+        if record.get("event") == "escalation":
+            previous = wrap_ups.pop(ticket, None)
+            if previous and previous["handed_over"] is not None:
+                rendered.append(previous["handed_over"])
+            message = str(record.get("message") or "")
+            verb, verb_line = machine_log.final_verb(message)
+            words = verb_line.split() if verb == machine_log.ESCALATION_VERB else []
+            if len(words) >= 4 and words[3] == "wrap-up":
+                leftovers = [
+                    line for line in message.splitlines()
+                    if line.strip() and line != verb_line
+                ]
+                if not leftovers and " — " in verb_line:
+                    body = re.sub(r" ts=\d+$", "", verb_line.split(" — ", 1)[1]).strip()
+                    if body:
+                        leftovers.append(body)
+                wrap_ups[ticket] = {"leftovers": leftovers, "handed_over": None}
+            continue
+        if record.get("event") != "ruling":
+            continue
+        message = str(record.get("message") or "")
+        wrap_up = wrap_ups.get(ticket)
+        if wrap_up:
+            leftovers = wrap_up["leftovers"]
+            lines = message.splitlines()
+            placements = []
+            for leftover in leftovers:
+                closed = {
+                    f"{leftover} — this ticket",
+                    f"{leftover} — dropped",
+                }
+                placement = next(
+                    (
+                        line for line in lines
+                        if line in closed or line.startswith(f"{leftover} — opened ")
+                    ),
+                    None,
+                )
+                if placement is not None:
+                    placements.append(placement)
+            if len(placements) == len(leftovers):
+                rendered.extend(
+                    (position, order, ticket, placement)
+                    for order, placement in enumerate(placements)
+                )
+                wrap_ups.pop(ticket, None)
+                continue
+            if message.startswith(f"{HANDED_OVER_MARKER} "):
+                wrap_up["handed_over"] = (position, 0, ticket, message)
+                continue
+            if wrap_up["handed_over"] is not None:
+                rendered.append(wrap_up["handed_over"])
+            wrap_ups.pop(ticket, None)
+        rendered.append((position, 0, ticket, message))
+    rendered.extend(
+        wrap_up["handed_over"]
+        for wrap_up in wrap_ups.values()
+        if wrap_up["handed_over"] is not None
+    )
+    return [
+        (ticket, message)
+        for _position, _order, ticket, message in sorted(rendered)
+    ]
 
 
 def report_undo_effects(records):
@@ -1846,9 +1912,8 @@ def render_report(run, tickets, records, cost_output):
     lines += ["", "## Rulings", ""]
     rulings = report_rulings(records)
     if rulings:
-        for record in rulings:
-            ticket = record.get("ticket") or "run"
-            lines.append(f"- {ticket}: {record.get('message', '')}")
+        for ticket, message in rulings:
+            lines.append(f"- {ticket}: {message}")
     else:
         lines.append("- none recorded")
 
@@ -2118,6 +2183,9 @@ class Loop:
     def run_witness(self, ticket, launch, message):
         """Run and record one escalation witness; returns its checked or failed document."""
         started = time.monotonic()
+        witness_executor, witness_model, witness_budget_usd = run_plan.witness_routing(
+            self.run.witness_model, self.run.witness_budget_usd
+        )
 
         def failed(reason):
             return {
@@ -2132,8 +2200,8 @@ class Loop:
                 [
                     sys.executable, WITNESS, "--escalation", "-",
                     "--worktree", launch["worktree"],
-                    "--model", self.run.witness_model,
-                    "--budget-usd", f"{self.run.witness_budget_usd:g}",
+                    "--model", witness_model,
+                    "--budget-usd", f"{witness_budget_usd:g}",
                 ],
                 input=message,
                 capture_output=True,
@@ -2187,7 +2255,8 @@ class Loop:
         witness_event = [
             sys.executable, MACHINE_LOG, "--log", self.log, "witness",
             "--ticket", ticket,
-            "--model", self.run.witness_model,
+            "--executor", witness_executor,
+            "--model", witness_model,
             "--outcome", document["outcome"],
             "--reason", document["reason"],
             "--duration-seconds", str(document["duration_seconds"]),

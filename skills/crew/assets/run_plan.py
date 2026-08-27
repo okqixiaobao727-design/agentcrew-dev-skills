@@ -19,6 +19,9 @@ TEMPLATES = pathlib.Path(__file__).resolve().parent / "dispatch" / "templates" /
 DEFAULT_CONFIG = pathlib.Path(__file__).resolve().parents[3] / "config" / "agentcrew.default.toml"
 PROJECT_CONFIG_NAME = "agentcrew.toml"
 EXECUTORS = ("claude", "codex")
+# The witness launcher is the Claude CLI; exposing that here makes its complete route available to
+# every consumer without making presentation code infer a vendor from a model name.
+WITNESS_EXECUTOR = "claude"
 REVIEW_VENDORS = EXECUTORS
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ACCOUNT_MODES = accounts.ACCOUNT_MODES
@@ -443,14 +446,14 @@ def witness_defaults():
 
 
 def witness_routing(model, budget_usd):
-    """Resolve independently inheritable witness routing without consulting `[repair]`."""
+    """Resolve the witness executor, model and budget without consulting `[repair]`."""
     if model is None or budget_usd is None:
         defaults = witness_defaults()
         if model is None:
             model = defaults["model"]
         if budget_usd is None:
             budget_usd = defaults["budget_usd"]
-    return model, budget_usd
+    return WITNESS_EXECUTOR, model, budget_usd
 
 
 def configuration_problems(
@@ -469,7 +472,7 @@ def configuration_problems(
         if fault:
             problems.append(f"repair model: {fault}")
     try:
-        witness_model, witness_budget_usd = witness_routing(
+        _, witness_model, witness_budget_usd = witness_routing(
             witness_model, witness_budget_usd
         )
     except RunPlanError as error:
@@ -541,7 +544,7 @@ def _metadata(values):
         key: _string(values, key, optional=True)
         for key in ("base_branch", "return_branch", "repair_model", "tracker")
     }
-    witness_model, witness_budget_usd = witness_routing(
+    _, witness_model, witness_budget_usd = witness_routing(
         values.get("witness_model"), values.get("witness_budget_usd")
     )
     if not isinstance(witness_model, str) or not witness_model.strip():

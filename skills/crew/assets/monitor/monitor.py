@@ -297,6 +297,7 @@ TRANSCRIPT_GLOB = "**/*.jsonl"
 COUNTERS = ("input", "output", "cache_read", "cache_creation")
 COST_COLUMNS = (
     "TICKET", "EXECUTOR", "MODEL", "INPUT", "OUTPUT", "CACHE-READ", "CACHE-CREATION", "TOTAL",
+    "DURATION",
 )
 TOTAL_ROW = "TOTAL"
 # The row beneath the total: what the session driving the run spent, against the children's total.
@@ -2366,10 +2367,11 @@ def coordinator_usage(session):
 
 
 def cost_rows(records, claude_homes=None):
-    """One row per launched ticket, in ticket order: what it was routed to, and what it spent.
+    """One row per launched ticket and witness run: where each ran and what each spent.
 
     A ticket launched twice into the same worktree — a replacement child — is one row, and its
     figures are every session that ran there, because both children spent the ticket's tokens.
+    Each witness event is already a complete measurement, so it remains its own row.
     """
     projection = machine_log.project(records)
     launches = {
@@ -2399,7 +2401,30 @@ def cost_rows(records, claude_homes=None):
             "ticket": ticket,
             "executor": executor,
             "model": str(launch.get("model", "")),
+            "duration": NO_FIGURE,
+            "record_session_cost": True,
             **usage,
+        })
+    for record in records:
+        if record.get("event") != "witness":
+            continue
+        values = {
+            name: record.get(f"{name}_tokens")
+            for name in COUNTERS
+        }
+        counters = values if all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in values.values()
+        ) else None
+        rows.append({
+            "ticket": f"witness-{record.get('ticket', '')}",
+            "executor": str(record.get("executor", "")),
+            "model": str(record.get("model", "")),
+            "duration": f"{record.get('duration_seconds')}s",
+            "record_session_cost": False,
+            "sessions": [],
+            "counters": counters,
+            "detail": None,
         })
     return rows
 
@@ -2429,12 +2454,15 @@ def render_cost(rows, coordinator=None):
     cells = [list(COST_COLUMNS)]
     cells += [
         [row["ticket"], row["executor"] or NO_FIGURE, row["model"] or NO_FIGURE]
-        + figures(row["counters"])
+        + figures(row["counters"]) + [row["duration"]]
         for row in rows
     ]
-    cells.append([TOTAL_ROW, NO_FIGURE, NO_FIGURE] + figures(run_total(rows)))
+    cells.append([TOTAL_ROW, NO_FIGURE, NO_FIGURE] + figures(run_total(rows)) + [NO_FIGURE])
     if coordinator is not None:
-        cells.append([COORDINATOR_ROW, CLAUDE, NO_FIGURE] + figures(coordinator["counters"]))
+        cells.append(
+            [COORDINATOR_ROW, CLAUDE, NO_FIGURE]
+            + figures(coordinator["counters"]) + [NO_FIGURE]
+        )
         rows = rows + [coordinator]
     widths = [max(len(row[column]) for row in cells) for column in range(len(COST_COLUMNS))]
     lines = [
@@ -2479,7 +2507,8 @@ def run_cost(args):
     homes = account_homes(run_dir)
     rows = cost_rows(read_log(args.log), homes)
     for row in rows:
-        log_session_cost(args.log, row)
+        if row["record_session_cost"]:
+            log_session_cost(args.log, row)
     coordinator = None
     if args.coordinator_session is not None:
         coordinator = coordinator_usage(args.coordinator_session)

@@ -1180,6 +1180,7 @@ def build_parser():
 
     witness = event_command("witness", "one witness fact-check of an escalation")
     witness.set_defaults(handler=run_witness)
+    witness.add_argument("--executor", required=True, choices=EXECUTORS)
     witness.add_argument("--model", required=True, help="the full model ID, never an alias")
     witness.add_argument("--outcome", required=True, choices=WITNESS_OUTCOMES)
     witness.add_argument("--reason", required=True)

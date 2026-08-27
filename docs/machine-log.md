@@ -316,12 +316,12 @@ that reaches `review-start` writes one pair; a preparation failure opens no revi
 
 ### `witness` — one fact-check of a child escalation
 
-`ticket`, `model`, `outcome` (`checked` or `failed`), `reason`, `duration_seconds`,
+`ticket`, `executor`, `model`, `outcome` (`checked` or `failed`), `reason`, `duration_seconds`,
 `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`.
 The Driver writes one line after the child escalation and before its handed-over ruling. `model`
-and the budget that bounded the run come from the run's `[witness]` configuration; the event names
-the model, while the hard budget remains in the Wave table. `reason` is empty for `checked` and is
-the witness failure reason for `failed`.
+and the budget that bounded the run come from the run's `[witness]` configuration; `executor` and
+`model` are the resolved witness route, while the hard budget remains in the Wave table. `reason`
+is empty for `checked` and is the witness failure reason for `failed`.
 
 The four token counters and `total_tokens` use the same meanings as `session-cost`, and total is
 their sum. They are absent together when the failed witness returned no usage; the outcome,
@@ -435,6 +435,7 @@ machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parke
 machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state running|returned \
                                     [--detail TEXT]
 machine_log.py --log <path> witness --ticket NN --model ID --outcome checked|failed \
+                                    --executor claude|codex \
                                     --reason TEXT --duration-seconds N \
                                     [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \

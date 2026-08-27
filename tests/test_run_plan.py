@@ -128,6 +128,15 @@ class RunPlanTests(unittest.TestCase):
         self.assertEqual(witness["model"], WITNESS_MODEL)
         self.assertEqual(witness["budget_usd"], WITNESS_BUDGET_USD)
 
+    def test_witness_routing_names_the_executor_that_launches_the_session(self):
+        executor, model, budget_usd = run_plan.witness_routing(
+            WITNESS_MODEL, WITNESS_BUDGET_USD
+        )
+
+        self.assertEqual(executor, "claude")
+        self.assertEqual(model, WITNESS_MODEL)
+        self.assertEqual(budget_usd, WITNESS_BUDGET_USD)
+
     def test_build_resolves_a_named_account_once_and_rejects_duplicate_ticket_ids(self):
         profile = self.root / "second-profile"
         profile.mkdir()

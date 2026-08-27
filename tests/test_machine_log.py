@@ -704,7 +704,8 @@ class EventTests(MachineLogTestCase):
 
     def test_a_witness_records_the_fact_check_and_its_session_cost(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--model", "claude-sonnet-5",
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
             "--outcome", "failed", "--reason", "witness session timed out",
             "--duration-seconds", "900.125",
             "--input-tokens", "11", "--output-tokens", "22",
@@ -717,6 +718,7 @@ class EventTests(MachineLogTestCase):
         self.assertUniformTimestamp(entry)
         self.assertEqual(entry["event"], "witness")
         self.assertEqual(entry["ticket"], "07")
+        self.assertEqual(entry["executor"], "claude")
         self.assertEqual(entry["model"], "claude-sonnet-5")
         self.assertEqual(entry["outcome"], "failed")
         self.assertEqual(entry["reason"], "witness session timed out")
@@ -729,8 +731,19 @@ class EventTests(MachineLogTestCase):
 
     def test_a_witness_outcome_outside_the_closed_grammar_is_refused(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--model", "claude-sonnet-5",
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
             "--outcome", "unknown", "--reason", "why", "--duration-seconds", "1",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_witness_without_an_executor_is_refused_and_appends_nothing(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
             log=self.log,
         )
 
@@ -762,7 +775,8 @@ class EventTests(MachineLogTestCase):
         for label, fields in cases:
             with self.subTest(label=label):
                 result = run_cli(
-                    "witness", "--ticket", "07", "--model", "claude-sonnet-5",
+                    "witness", "--ticket", "07", "--executor", "claude",
+                    "--model", "claude-sonnet-5",
                     *fields, log=self.log,
                 )
 

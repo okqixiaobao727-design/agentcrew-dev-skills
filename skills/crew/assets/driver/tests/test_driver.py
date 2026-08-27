@@ -109,6 +109,74 @@ class ReportSelectionTests(unittest.TestCase):
 
         self.assertIs(driver_module.report_received(records, "7"), records[-1])
 
+    def test_a_one_line_wrap_up_body_is_paired_with_its_placement(self):
+        leftover = "Unreleased lock at src/lock.py:41"
+        records = (
+            {
+                "event": "escalation", "ticket": "7",
+                "message": f"CREW ASK 7 wrap-up — {leftover} ts=1",
+            },
+            {
+                "event": "ruling", "ticket": "7",
+                "message": "CREW RULED 7 — handed over",
+            },
+            {
+                "event": "ruling", "ticket": "7",
+                "message": f"{leftover} — opened #204",
+            },
+        )
+
+        self.assertEqual(
+            driver_module.report_rulings(records),
+            [("7", f"{leftover} — opened #204")],
+        )
+
+    def test_an_unmatched_wrap_up_falls_back_verbatim_without_poisoning_later_rulings(self):
+        records = (
+            {
+                "event": "escalation", "ticket": "7",
+                "message": "A at a.py:1\nB at b.py:2\nCREW ASK 7 wrap-up ts=1",
+            },
+            {
+                "event": "ruling", "ticket": "7",
+                "message": "CREW RULED 7 — handed over",
+            },
+            {
+                "event": "ruling", "ticket": "7",
+                "message": "- A at a.py:1 — dropped\nB at b.py:2 — opened #205",
+            },
+            {
+                "event": "ruling", "ticket": "7",
+                "message": "CREW RULED 7 — second thing",
+            },
+        )
+
+        self.assertEqual(
+            driver_module.report_rulings(records),
+            [
+                ("7", "CREW RULED 7 — handed over"),
+                ("7", "- A at a.py:1 — dropped\nB at b.py:2 — opened #205"),
+                ("7", "CREW RULED 7 — second thing"),
+            ],
+        )
+
+    def test_an_unanswered_wrap_up_keeps_its_handed_over_ruling(self):
+        records = (
+            {
+                "event": "escalation", "ticket": "7",
+                "message": "A at a.py:1\nCREW ASK 7 wrap-up ts=1",
+            },
+            {
+                "event": "ruling", "ticket": "7",
+                "message": "CREW RULED 7 — handed over",
+            },
+        )
+
+        self.assertEqual(
+            driver_module.report_rulings(records),
+            [("7", "CREW RULED 7 — handed over")],
+        )
+
 
 class PreflightTests(DriverTestCase):
     def test_a_dirty_working_tree_stops_the_run(self):
@@ -1038,7 +1106,7 @@ class LoopTests(DriverTestCase):
         self.assertIn("human", report.lower())
         self.assertIn("TOTAL", report)
         cost = report.split("## Cost", 1)[1]
-        self.assertRegex(cost, r"(?m)^coordinator\s+claude(?:\s+--){6}\s*$")
+        self.assertRegex(cost, r"(?m)^coordinator\s+claude(?:\s+--){7}\s*$")
         self.assertIn("coordinator not measured:", cost)
         self.assertIn("session-wide upper bound", report)
         self.assertEqual(
@@ -1098,7 +1166,7 @@ class LoopTests(DriverTestCase):
         coordinator_line = next(
             line for line in report.splitlines() if line.startswith("coordinator")
         )
-        self.assertRegex(coordinator_line, r"\b\d+\s+\d+\s+\d+\s+\d+\s+\d+$")
+        self.assertRegex(coordinator_line, r"\b\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+--$")
 
     def test_the_report_accounts_for_each_outcome_ruling_undo_and_duration_row(self):
         process = self.start(
@@ -1138,12 +1206,62 @@ class LoopTests(DriverTestCase):
         self.assertIn("## Cost", report)
         cost_section = report.split("## Cost", 1)[1]
         self.assertIn("TOTAL", cost_section)
-        self.assertRegex(cost_section, r"(?m)^coordinator\s+claude(?:\s+--){6}\s*$")
+        self.assertRegex(cost_section, r"(?m)^coordinator\s+claude(?:\s+--){7}\s*$")
         self.assertIn("coordinator not measured:", cost_section)
         self.assertEqual(
             sorted(record["ticket"] for record in self.events("session-cost")),
             ["01", "02", "03"],
         )
+
+    def test_the_report_costs_a_witness_and_keeps_a_design_ruling_rendered_as_before(self):
+        process = self.start(("01", ()), env_overrides={
+            "CLAUDE_CODE_SESSION_ID": "",
+            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+        })
+        self.fixture.says("01", "CREW ASK 01 design — use which seam? ts=1")
+        self.woken(process, "judgment-needed")
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        ruling = "Use the existing public CLI seam"
+        self.fixture.answers("01", ruling)
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+        report = (self.fixture.feature_dir / "report.md").read_text()
+        rulings = report.split("## Rulings", 1)[1].split("## Outside-worktree effects", 1)[0]
+        self.assertIn(f"- 01: {ruling}", rulings)
+        cost = report.split("## Cost", 1)[1]
+        self.assertRegex(
+            cost,
+            r"(?m)^witness-01\s+claude\s+claude-sonnet-5\s+11\s+22\s+33\s+44\s+110\s+\d+(?:\.\d+)?s$",
+        )
+        self.assertRegex(cost, r"(?m)^TOTAL(?:\s+--){2}\s+11\s+22\s+33\s+44\s+110\s+--$")
+
+    def test_the_report_lists_each_wrap_up_leftover_beside_its_placement(self):
+        process = self.start(("01", ()), env_overrides={
+            "CLAUDE_CODE_SESSION_ID": "",
+            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+        })
+        first = "Unreleased lock at src/lock.py:41"
+        second = "Duplicate cleanup in src/cleanup.py:9"
+        third = "Missing assertion in tests/test_lock.py:88"
+        self.fixture.says(
+            "01", f"{first}\n{second}\n{third}\nCREW ASK 01 wrap-up ts=1"
+        )
+        self.woken(process, "judgment-needed")
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.fixture.answers(
+            "01", f"{first} — opened #204\n{second} — dropped\n{third} — this ticket"
+        )
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+        report = (self.fixture.feature_dir / "report.md").read_text()
+        rulings = report.split("## Rulings", 1)[1].split("## Outside-worktree effects", 1)[0]
+        self.assertIn(f"- 01: {first} — opened #204", rulings.splitlines())
+        self.assertIn(f"- 01: {second} — dropped", rulings.splitlines())
+        self.assertIn(f"- 01: {third} — this ticket", rulings.splitlines())
 
     def test_a_receipt_that_verifies_settles_the_ticket_without_a_word_to_anyone(self):
         process = self.start(("01", ()))
@@ -1789,6 +1907,7 @@ class LoopTests(DriverTestCase):
         self.assertEqual(call["configHome"], str(profile))
         witness = self.events("witness", ticket="01")
         self.assertEqual(len(witness), 1, witness)
+        self.assertEqual(witness[0]["executor"], "claude")
         self.assertEqual(witness[0]["model"], model)
         self.assertEqual(witness[0]["outcome"], "checked")
         self.assertEqual(witness[0]["reason"], "")

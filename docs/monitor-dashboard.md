@@ -262,12 +262,13 @@ out of the transcripts that ran in that child's worktree, appends one `session-c
 child ([`docs/machine-log.md`](machine-log.md)), and prints the run's rollup for the report:
 
 ```text
-TICKET       EXECUTOR  MODEL                     INPUT  OUTPUT  CACHE-READ  CACHE-CREATION  TOTAL
-06           claude    claude-opus-4-5-20251101  24     46      6800        900             7770
-07           codex     gpt-5.6-luna              1000   700     4000        250             5950
-08           codex     gpt-5.6-luna              --     --      --          --              --
-TOTAL        --        --                        1024   746     10800       1150            13720
-coordinator  claude    --                        169    44772   5132660     197257          5374858
+TICKET       EXECUTOR  MODEL                     INPUT  OUTPUT  CACHE-READ  CACHE-CREATION  TOTAL    DURATION
+06           claude    claude-opus-4-5-20251101  24     46      6800        900             7770     --
+07           codex     gpt-5.6-luna              1000   700     4000        250             5950     --
+08           codex     gpt-5.6-luna              --     --      --          --              --       --
+witness-06   claude    claude-sonnet-5           11     22      33          44              110      1.25s
+TOTAL        --        --                        1035   768     10833       1194            13830    --
+coordinator  claude    --                        169    44772   5132660     197257          5374858  --
 
 08 not measured: no transcript under /Users/me/.codex/sessions was recorded in /repo/wt/08
 ```
@@ -285,6 +286,11 @@ read, so its last line alone is forgiven for not parsing — that one is the req
 unbilled either way. A line that does not parse with more of the session written after it is a
 hole in the history, and takes the row to `--` like any other.
 Without the flag the rollup ends at `TOTAL`, as it always did.
+
+Every `witness` event contributes its own `witness-<NN>` row using the executor, model, token
+counters and duration the event records. Its tokens are included in `TOTAL`; its duration is shown
+as `<duration_seconds>s`. Child, total and coordinator rows show `--` for duration. A run with no
+`witness` event has no witness row.
 
 Transcripts are found by the worktree they ran in, compared by realpath and path-component
 containment: a cwd at or below the launch event's worktree is that worktree, while a parent,

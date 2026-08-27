@@ -193,7 +193,7 @@ def project_witness_routing(ticket):
     witness = config.get("witness") if isinstance(config, dict) else None
     witness = witness if isinstance(witness, dict) else {}
     try:
-        model, budget = run_plan.witness_routing(
+        _, model, budget = run_plan.witness_routing(
             witness.get("model"), witness.get("budget_usd")
         )
     except run_plan.RunPlanError as error:
