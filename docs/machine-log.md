@@ -329,6 +329,16 @@ reason, and duration still record the attempted fact-check. The Driver writes th
 Claude and Codex children: the witness itself is driver-side, runs in the escalating child's
 worktree, and uses that ticket's named Claude account where it has one.
 
+### `base-gate` — whether a fresh run checked its integration base
+
+`status` (`passed` or `not-configured`), `argv`. This event carries no ticket because it describes
+the run's base. A configured gate records `passed` with its non-empty argv after the Driver checks
+out and fast-forwards the base and before it launches any child. An omitted gate records
+`not-configured` with no `argv`; omission is never spelled as a pass. A failing gate creates no run
+directory or machine log, so its command, status and output tail live only on the
+`preflight-failed` notice. Adoption records nothing new and does not rerun the gate; older runs
+without this event remain readable and their report says `not recorded`.
+
 ### `advance` — what the run decided after a wave settled
 
 `wave`, `decision`, `detail`. The one event that carries no `ticket`: a decision is about a wave.
@@ -440,6 +450,9 @@ machine_log.py --log <path> witness --ticket NN --model ID --outcome checked|fai
                                     [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \
                                     [--total-tokens N]
+machine_log.py --log <path> base-gate --status passed \
+                                    --argument=COMMAND [--argument=ARG ...]
+machine_log.py --log <path> base-gate --status not-configured
 machine_log.py --log <path> advance --wave N \
                                     --decision launched|complete|escalated|interrupted|stopped \
                                     [--detail TEXT]

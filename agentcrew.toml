@@ -125,6 +125,13 @@ effort = "medium"
 # The command is a courtesy to what you already run: one that fails or hangs leaves the launch
 # itself standing.
 
+# --- Base preflight gate ----------------------------------------------------
+# This repo requires its full test gate on the checked-out, fast-forwarded base before a Crew run
+# can cut an integration branch. Arguments are passed directly, without a shell.
+
+[preflight]
+gate = ["python3", "scripts/test.py"]
+
 # --- Dashboard --------------------------------------------------------------
 # Which surface a run draws itself on. `window` gives the run its own tmux window, as it always
 # has; `pin` skips that window and draws the same frame into the coordinator's Claude Code

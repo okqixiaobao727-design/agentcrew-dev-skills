@@ -39,17 +39,21 @@ of emitting a wake snapshot.
 The `answer` subcommand is also an operator terminal command, but its failures emit a `driver-error`
 wake snapshot so the coordinator can see why the child could not be answered.
 
-**A preflight failure never reaches the coordinator as diagnosis.** Preflight is the five read-only
-checks — a clean working tree, a base branch that resolves and fast-forwards, a valid routing on
-every ticket (the renderer's own validation, which is the authority on the case list), a complete
-acyclic dependency graph, and, for a run that reviews at all, the installed Review-Switch command
-this repository's review lane is (ADR-0020) — plus the run's two configured decisions, the repair
-rung's model and the tracker its merged tickets are closed in, neither of which has a default. On
-any failure the driver launches nothing, prints the `preflight-failed` snapshot naming the problem
-count and the display surface, and shows the full problem list to the operator in a detached tmux
-window named `crew-preflight` in the run's own session, ending with the reminder that fixes must be
-committed. That notice is the run's only diagnosis surface: it is killed by name, in that session
-alone, at the start of the next run, so a stale notice can never outlive its fix.
+**A preflight failure never reaches the coordinator as diagnosis.** Its first phase is five
+read-only checks — a clean working tree, a base branch that resolves and fast-forwards, a valid
+routing on every ticket (the renderer's own validation, which is the authority on the case list),
+a complete acyclic dependency graph, and, for a run that reviews at all, the installed
+Review-Switch command this repository's review lane is (ADR-0020) — plus the run's two configured
+decisions, the repair rung's model and the tracker its merged tickets are closed in, neither of
+which has a default. Once those pass, branch preparation checks out and fast-forwards the base and
+runs the project's optional `[preflight] gate` from the repository root, immediately before it cuts
+the integration branch. A red gate restores the starting ref and creates neither integration
+branch nor child worktree. On any failure the driver launches nothing, prints the
+`preflight-failed` snapshot naming the problem count and the display surface, and shows the full
+problem list to the operator in a detached tmux window named `crew-preflight` in the run's own
+session, ending with the reminder that fixes must be committed. That notice is the run's only
+diagnosis surface: it is killed by name, in that session alone, at the start of the next run, so a
+stale notice can never outlive its fix.
 
 **Starting and resuming are one action.** A feature that already carries a run directory is a run
 `start` adopts rather than one it starts beside: no branch is cut, no settled ticket is dispatched
@@ -177,6 +181,7 @@ LAUNCH_HOOK_SECTION = ("hooks", "on-child-launch")
 # which committing the config permanently clears.
 REPAIR_MODEL_KEYS = ("repair", "model")
 TRACKER_KIND_KEYS = ("tracker", "kind")
+PREFLIGHT_GATE_KEYS = ("preflight", "gate")
 # Unlike those two required project decisions, witness routing inherits the independently shipped
 # defaults where the project leaves either cell out.
 WITNESS_MODEL_KEYS = ("witness", "model")
@@ -327,6 +332,10 @@ STATUS_PARKED = "parked"
 # before a run that is going nowhere becomes a wake rather than a hang.
 DEFAULT_POLL_SECONDS = 5.0
 DEFAULT_TIMEOUT_SECONDS = 7200.0
+# A failed gate can print an entire parallel test run. The notice keeps the end, where test runners
+# put their summary and failure diagnosis, without turning the operator's diagnosis surface into a
+# second copy of the full log.
+GATE_OUTPUT_LINE_LIMIT = 20
 # How long a monitor asked to stop is given before it is killed.
 MONITOR_STOP_SECONDS = 5.0
 
@@ -605,6 +614,53 @@ def review_command_problems(plan):
     ]
 
 
+def configured_base_gate(config):
+    """The optional base-gate argv, plus any problem that makes it unsafe to execute."""
+    value = config_value(config, PREFLIGHT_GATE_KEYS)
+    if value is None:
+        return None, []
+    if not isinstance(value, list) or not value:
+        return None, [
+            "base gate: [preflight] gate is not a non-empty argv list — configure each command"
+            " argument as one string, or remove the key to leave the base ungated"
+        ]
+    invalid = [
+        argument
+        for argument in value
+        if not isinstance(argument, str) or not argument.strip()
+    ]
+    if invalid:
+        return None, [
+            "base gate: [preflight] gate carries an empty or non-string argument — configure each"
+            " command argument as one non-empty string"
+        ]
+    return tuple(value), []
+
+
+def base_gate_problem(repo, command):
+    """Run the configured gate on the checked-out base; return its problem or None on success."""
+    if command is None:
+        return None
+    rendered = shlex.join(command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError as error:
+        return f"base gate: `{rendered}` could not be started — {error}"
+    if result.returncode == 0:
+        return None
+    lines = (result.stdout or "").splitlines()
+    tail = "\n".join(lines[-GATE_OUTPUT_LINE_LIMIT:]) or "(no output)"
+    return (
+        f"base gate: `{rendered}` returned exit status {result.returncode} — last output:\n{tail}"
+    )
+
+
 # --- the preflight notice ----------------------------------------------------------------------
 
 
@@ -801,9 +857,22 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
     return run
 
 
-def prepare_branches(repo, base_branch, integration_branch, pull):
+def restore_return_branch(repo, return_branch):
+    """Put a failed preparation back on the branch or detached commit it started from."""
+    if git(repo, "show-ref", "--verify", f"refs/heads/{return_branch}").returncode == 0:
+        result = git(repo, "switch", "--", return_branch)
+    else:
+        result = git(repo, "switch", "--detach", "--", return_branch)
+    if result.returncode != 0:
+        raise DriverError(
+            f"the base gate failed and the starting ref {return_branch} could not be restored:"
+            f" {result.stderr.strip()}"
+        )
+
+
+def prepare_branches(repo, base_branch, integration_branch, pull, gate):
     """Fast-forward the base branch and cut this run's integration branch from it; returns the
-    branch the run returns to and the commit it is based on."""
+    branch the run returns to, the commit it is based on, and any base-gate problem."""
     current = git_output(repo, "rev-parse", "--abbrev-ref", "HEAD")
     return_branch = current if current and current != "HEAD" else git_output(
         repo, "rev-parse", "HEAD"
@@ -818,6 +887,10 @@ def prepare_branches(repo, base_branch, integration_branch, pull):
             raise DriverError(
                 f"{base_branch} could not be fast-forwarded: {result.stderr.strip()}"
             )
+    gate_problem = base_gate_problem(repo, gate)
+    if gate_problem is not None:
+        restore_return_branch(repo, return_branch)
+        return return_branch, None, gate_problem
     if git_output(repo, "rev-parse", "--verify", f"refs/heads/{integration_branch}"):
         raise DriverError(
             f"the integration branch {integration_branch} already exists, and this feature holds no"
@@ -830,7 +903,7 @@ def prepare_branches(repo, base_branch, integration_branch, pull):
             f"the integration branch {integration_branch} could not be cut:"
             f" {result.stderr.strip()}"
         )
-    return return_branch, git_output(repo, "rev-parse", "HEAD")
+    return return_branch, git_output(repo, "rev-parse", "HEAD"), None
 
 
 def install_hook(log, settings, role, ticket=None):
@@ -842,6 +915,17 @@ def install_hook(log, settings, role, ticket=None):
     if ticket:
         arguments += ["--ticket", ticket]
     run_command(arguments, f"the {role} hook could not be installed in {settings}")
+
+
+def record_base_gate(log, gate):
+    """Record whether this fresh run checked its base, through the Machine-log CLI."""
+    status = "not-configured" if gate is None else "passed"
+    arguments = [
+        sys.executable, MACHINE_LOG, "--log", log, "base-gate", "--status", status,
+    ]
+    for value in gate or ():
+        arguments.append(f"--argument={value}")
+    run_command(arguments, "the base-gate result could not be recorded", pointer=str(log))
 
 
 def launched_children(log):
@@ -1534,6 +1618,23 @@ def resolved(path):
     return pathlib.Path(path).resolve() if path else None
 
 
+def stop_for_preflight(args, feature_dir, problems):
+    """Show and emit one preflight failure; return the exit code a stopped start earns."""
+    try:
+        show_notice(args.tmux_session, problems)
+    except DriverError as error:
+        raise DriverError(
+            f"preflight stopped this run on {len(problems)} problems and none of them could"
+            f" be shown to the operator: {error}",
+            pointer=str(feature_dir),
+        ) from error
+    snapshot(
+        PREFLIGHT_FAILED, pointer=str(feature_dir),
+        count=len(problems), surface=NOTICE_WINDOW_NAME,
+    )
+    return PREFLIGHT_EXIT
+
+
 def run_start(args):
     feature_dir = pathlib.Path(args.feature_dir).resolve()
     if not feature_dir.is_dir():
@@ -1567,26 +1668,21 @@ def run_start(args):
     candidate = run_section(args, repo, feature_dir, run_dir, base_branch, head, head, config)
     upstream = upstream_state(repo, base_branch) if base_branch else (UPSTREAM_ABSENT, "")
     problems = preflight(repo, feature_dir, base_branch, upstream, candidate)
+    gate = None
+    if not problems:
+        gate, problems = configured_base_gate(config)
 
     if problems:
-        try:
-            show_notice(args.tmux_session, problems)
-        except DriverError as error:
-            raise DriverError(
-                f"preflight stopped this run on {len(problems)} problems and none of them could"
-                f" be shown to the operator: {error}",
-                pointer=str(feature_dir),
-            ) from error
-        snapshot(
-            PREFLIGHT_FAILED, pointer=str(feature_dir),
-            count=len(problems), surface=NOTICE_WINDOW_NAME,
-        )
-        return PREFLIGHT_EXIT
+        return stop_for_preflight(args, feature_dir, problems)
 
     integration_branch = candidate["integration_branch"]
-    return_branch, base_commit = prepare_branches(
-        repo, base_branch, integration_branch, pull=upstream[0] == UPSTREAM_PRESENT
+    return_branch, base_commit, gate_problem = prepare_branches(
+        repo, base_branch, integration_branch,
+        pull=upstream[0] == UPSTREAM_PRESENT,
+        gate=gate,
     )
+    if gate_problem is not None:
+        return stop_for_preflight(args, feature_dir, [gate_problem])
     run_dir.mkdir(parents=True, exist_ok=True)
     take_up_run(run_dir)
     launch_dir = run_dir / LAUNCH_DIR_NAME
@@ -1600,6 +1696,7 @@ def run_start(args):
     except run_plan.RunPlanError as error:
         raise DriverError(str(error), pointer=str(feature_dir)) from error
 
+    record_base_gate(log, gate)
     install_hook(log, repo / SETTINGS_PATH, "coordinator")
     dispatch_wave(table_path, log, launch_dir, run_dir)
     children = launched_children(log)
@@ -1855,6 +1952,25 @@ def report_undo_effects(records):
     ]
 
 
+def report_base_gate(records):
+    """Render the last recorded base-gate decision, retaining compatibility with older runs."""
+    gates = [record for record in records if record.get("event") == "base-gate"]
+    if not gates:
+        return "not recorded"
+    gate = gates[-1]
+    if gate.get("status") == "not-configured" and "argv" not in gate:
+        return "none configured"
+    argv = gate.get("argv")
+    if (
+        gate.get("status") == "passed"
+        and isinstance(argv, list)
+        and argv
+        and all(isinstance(argument, str) and argument for argument in argv)
+    ):
+        return f"passed — `{shlex.join(argv)}`"
+    raise DriverError("the machine log carries a contradictory base-gate record")
+
+
 def render_report(run, tickets, records, cost_output):
     """Render the complete human report from the table, machine log and cost-pass output."""
     ticket_ids = sorted(tickets, key=report_ticket_sort_key)
@@ -1877,6 +1993,8 @@ def render_report(run, tickets, records, cost_output):
         lines.append(
             f"| {ticket} | {tickets[ticket].title} | {outcomes[ticket]} |"
         )
+
+    lines += ["", "## Base gate", "", f"- Base gate: {report_base_gate(records)}"]
 
     lines += ["", "## Parked checklists", ""]
     parked = [ticket for ticket in ticket_ids if outcomes[ticket] == PARKED]
