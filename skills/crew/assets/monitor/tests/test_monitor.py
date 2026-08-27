@@ -7,6 +7,7 @@ Assertions are on external behaviour only — the frame the dashboard window dra
 was asked to display, the verdict line, the log lines that follow it, and the exit code.
 """
 
+import datetime
 import hashlib
 import json
 import os
@@ -49,6 +50,9 @@ AWAITING_RULING = "⚠ awaiting your ruling"
 # What the same slot carries instead when the run's driver was killed rather than exiting: the
 # run directory's own parent, which is what the operator typed `/crew` with.
 DRIVER_DEAD = "✖ driver dead — /crew {run} to resume"
+# And what it carries when a wake is standing with nobody left to carry it back: the harness reaps
+# the coordinator's waiter, and re-typing the command is what attaches another one (#127).
+NO_WAITER = "✖ no waiter — /crew {run} to re-attach"
 # The SGR red the dead-driver segment is painted in, and the reset that ends it.
 RED = "\x1b[31m"
 RESET = "\x1b[0m"
@@ -120,6 +124,14 @@ TOAST_STATE = "toasts.json"
 # The run directory's record of the driver driving it: written when its loop starts, removed by
 # every deliberate exit, and left standing by a kill.
 DRIVER_RECORD = "driver.pid"
+# The waiter's own liveness record beside it, and the wake snapshot it is blocking on.
+WAITER_RECORD = "waiter.pid"
+WAKE_RECORD = "wake.json"
+# How old a wake is made when a case wants it past the banner's grace, and how old when it wants
+# it inside one. An hour is past any grace a debounce on one file rename could sanely carry, and a
+# wake stamped at the drawn moment itself is one written this instant.
+PAST_GRACE_SECONDS = 3600
+WITHIN_GRACE_SECONDS = 0
 
 # What the executor column shows for each lane of this run, and what a row with no clock shows.
 CLAUDE_LANE = f"claude/{MODEL}"
@@ -653,6 +665,35 @@ class Fixture:
         run_dir = self.run_dir if run_dir is None else pathlib.Path(run_dir)
         path = run_dir / DRIVER_RECORD
         path.write_text(f"{os.getpid() if pid is None else pid}\n")
+        return path
+
+    def waiter_record(self, *pids, run_dir=None):
+        """The run directory's record of the waiters blocking on its wake, as they write it.
+
+        One pid per line, in the order they attached — a run carries as many waiters as `/crew`
+        has been typed at it. No pid at all is this process's, which is a waiter still attached; a
+        waiter that printed its snapshot and ended takes its own line away, and the last one out
+        leaves no file.
+        """
+        run_dir = self.run_dir if run_dir is None else pathlib.Path(run_dir)
+        path = run_dir / WAITER_RECORD
+        path.write_text("".join(f"{pid}\n" for pid in (pids or (os.getpid(),))))
+        return path
+
+    def wake(self, age_seconds=PAST_GRACE_SECONDS, run_dir=None):
+        """The wake snapshot the driver left for the coordinator, stamped `age_seconds` old.
+
+        The age is measured back from the moment every frame in this suite is drawn at, so a case
+        chooses which side of the banner's grace its wake falls on and no clock decides it.
+        """
+        run_dir = self.run_dir if run_dir is None else pathlib.Path(run_dir)
+        path = run_dir / WAKE_RECORD
+        path.write_text(json.dumps({"reason": "judgment-needed", "ticket": "06"}) + "\n")
+        drawn = datetime.datetime.strptime(NOW_TS, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+        stamped = drawn.timestamp() - age_seconds
+        os.utime(path, (stamped, stamped))
         return path
 
     def release_copy(self, name):
@@ -1926,6 +1967,185 @@ class DriverLivenessTests(MonitorTestCase):
         self.fixture.pin_frame("--no-color")
 
         self.assertTrue(record.exists(), "the tick removed the run's driver record")
+
+
+class WaiterLivenessTests(MonitorTestCase):
+    """What the frame says about the process that is supposed to be carrying the wake back.
+
+    The coordinator's waiter is a background task of a main session, and the harness reaps those
+    under memory pressure: it died three times in one run while the driver went on working, and
+    the ruling a child was waiting for sat unread until a human re-typed `/crew` (#127). Nothing
+    on disk said so. The protocol is the driver's own, one file over: `<run-dir>/waiter.pid` while
+    a waiter blocks, gone on each of its deliberate endings, and standing over a process that is
+    not running when one was killed.
+    """
+
+    def live_run(self):
+        """A run of two launched, busy children, drawn wide enough to hold the banner whole."""
+        self.fixture.columns = BANNER_COLUMNS
+        self.fixture.table()
+        self.fixture.worktree("06")
+        self.fixture.worktree("07")
+        self.fixture.launch("06")
+        self.fixture.launch("07", executor="codex", model=CODEX_MODEL)
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+    def banner(self):
+        """The segment the operator is meant to paste back, for this fixture's run."""
+        return NO_WAITER.format(run=self.fixture.run_dir.resolve().parent)
+
+    def summary_line(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return frame(result.stdout).splitlines()[0]
+
+    # --- the banner is up ---------------------------------------------------------------------
+
+    def test_a_wake_nobody_is_waiting_on_says_no_waiter(self):
+        """The stall this exists for: a snapshot is standing and no waiter is left to print it."""
+        self.live_run()
+        self.fixture.wake()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    def test_a_record_naming_a_waiter_that_is_gone_says_no_waiter_too(self):
+        """A reaped waiter cannot remove its own record, so the file outlives the process."""
+        self.live_run()
+        self.fixture.wake()
+        self.fixture.waiter_record(self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    def test_the_no_waiter_banner_carries_the_command_that_re_attaches_one(self):
+        """Recovery is one paste: the directory the operator typed `/crew` with, absolutely."""
+        self.live_run()
+        self.fixture.wake()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(f"/crew {self.fixture.run_dir.resolve().parent} to re-attach", line)
+
+    def test_the_statusline_tick_carries_the_same_banner(self):
+        """The surface the operator actually watches during a stall is the pinned one."""
+        self.live_run()
+        self.fixture.wake()
+        self.fixture.pin()
+
+        line = self.summary_line(self.fixture.pin_frame("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    # --- the banner is not up -----------------------------------------------------------------
+
+    def test_a_live_waiter_says_nothing_at_all(self):
+        """The ordinary case: the driver wrote its wake and the waiter is about to print it."""
+        self.live_run()
+        self.fixture.wake()
+        self.fixture.waiter_record()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("no waiter", line)
+
+    def test_a_run_with_no_wake_standing_says_nothing_at_all(self):
+        """Nothing is waiting to be carried, so nobody is missing: the run is simply running."""
+        self.live_run()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("no waiter", line)
+
+    def test_a_wake_written_this_instant_is_inside_the_grace_and_says_nothing(self):
+        """A waiter removes its record before the wake it printed is cleared, and the grace is
+        what keeps that instant from being drawn as an orphaned wake."""
+        self.live_run()
+        self.fixture.wake(age_seconds=WITHIN_GRACE_SECONDS)
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("no waiter", line)
+
+    def test_one_live_waiter_among_several_names_is_a_waiter(self):
+        """A run carries as many waiters as `/crew` has been typed at it, and one still blocking
+        is one that will print this snapshot — whichever line of the record names it."""
+        self.live_run()
+        self.fixture.wake()
+        self.fixture.waiter_record(self.fixture.dead_pid(), os.getpid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertNotIn("no waiter", line)
+
+    def test_a_record_of_names_that_have_all_gone_is_no_waiter(self):
+        """Every waiter the run ever had was reaped, and none of them could take its own name
+        away: a record full of processes that are gone is a wake with nobody behind it."""
+        self.live_run()
+        self.fixture.wake()
+        self.fixture.waiter_record(self.fixture.dead_pid(), self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    def test_a_record_that_is_not_a_pid_is_no_waiter_at_all(self):
+        """A file nothing can be judged from names no live process, so the banner still goes up."""
+        self.live_run()
+        self.fixture.wake()
+        (self.fixture.run_dir / WAITER_RECORD).write_text("not a pid\n")
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+
+    # --- one slot ------------------------------------------------------------------------------
+
+    def test_a_dead_driver_and_a_missing_waiter_never_render_together(self):
+        """One slot, and the dead driver owns it: a run with no driver has no wake coming."""
+        self.live_run()
+        self.fixture.wake()
+        self.fixture.driver_record(pid=self.fixture.dead_pid())
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(DRIVER_DEAD.format(run=self.fixture.run_dir.resolve().parent), line)
+        self.assertNotIn("no waiter", line)
+
+    def test_a_halted_wave_and_a_missing_waiter_never_render_together(self):
+        """The banner owns the slot the ruling marker uses, exactly as the dead driver does."""
+        self.live_run()
+        self.fixture.append(BLOCKED_TS, "advance", wave=1, decision="escalated")
+        self.fixture.wake()
+
+        line = self.summary_line(self.fixture.dashboard("--no-color"))
+
+        self.assertIn(self.banner(), line)
+        self.assertNotIn(AWAITING_RULING, line)
+
+    def test_the_banner_is_painted_red_where_a_terminal_can_show_it(self):
+        """The same one segment of the summary line the dead-driver banner is painted in."""
+        self.live_run()
+        self.fixture.wake()
+        self.fixture.pin()
+
+        result = self.fixture.pin_frame()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{RED}{self.banner()}{RESET}", result.stdout.splitlines()[0])
+
+    def test_the_tick_does_nothing_about_a_missing_waiter_but_say_so(self):
+        """#87: the render path is a reader. Nothing here re-attaches, clears or respawns."""
+        self.live_run()
+        wake = self.fixture.wake()
+        record = self.fixture.waiter_record(self.fixture.dead_pid())
+        self.fixture.pin()
+
+        self.fixture.pin_frame("--no-color")
+
+        self.assertTrue(wake.exists(), "the tick cleared the run's wake snapshot")
+        self.assertTrue(record.exists(), "the tick removed the run's waiter record")
 
 
 class PinTests(MonitorTestCase):

@@ -36,14 +36,31 @@ def run_dir(argv):
     return pathlib.Path(feature).resolve() / ".crew" if feature else None
 
 
+def waiter(directory):
+    """What the run directory said about its waiter when this driver started, or None.
+
+    A real driver asks the same question of the same file before every wake it writes, so what a
+    driver could have read is recorded here rather than inferred from timing afterwards.
+    """
+    if directory is None:
+        return None
+    try:
+        return (directory / "waiter.pid").read_text().strip() or None
+    except OSError:
+        return None
+
+
 def main():
     argv = sys.argv[1:]
     state_dir = pathlib.Path(os.environ["AGENTCREW_STUB_DIR"])
+    directory = run_dir(argv)
     with (state_dir / "driver-calls.jsonl").open("a") as handle:
-        handle.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "pid": os.getpid()}) + "\n")
+        handle.write(json.dumps({
+            "argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
+            "waiter": waiter(directory),
+        }) + "\n")
     print(STDOUT_LINE, flush=True)
 
-    directory = run_dir(argv)
     if directory is None or not directory.is_dir():
         return int(os.environ.get("AGENTCREW_STUB_DRIVER_EXIT") or 0)
     (directory / "driver.pid").write_text(f"{os.getpid()}\n")

@@ -22,6 +22,7 @@ import subprocess
 import sys
 
 
+PANE_PREFIX = "%"
 ANSWER_KEYS = set("0123456789") | {"Up", "Down", "Left", "Right", "Enter", "S-Enter"}
 
 
@@ -101,6 +102,24 @@ def new_window(argv):
     return 0
 
 
+def loose_pane(target):
+    """Returns that target where it is a pane this server answers for, or None where it is not.
+
+    A real tmux server holds panes the run never opened as windows: the pane the coordinator
+    itself is sitting in, which the driver re-types `/crew` into when a wake finds no waiter, and
+    which reaches this stub only as a `-t` target it has no window for. Recording one on first use
+    gives it a composer of its own, flagged so `list-windows` never reports it as a window of the
+    run. Everything else — a window id that has gone — stays the error it was.
+    """
+    if not isinstance(target, str) or not target.startswith(PANE_PREFIX):
+        return None
+    table = windows()
+    if target not in table:
+        table[target] = {"name": None, "target": target, "pane": True, "composer": ""}
+        save_windows(table)
+    return target
+
+
 def list_windows(argv):
     template = flag(argv, "-F") or "#{window_id}"
     target = flag(argv, "-t")
@@ -108,6 +127,8 @@ def list_windows(argv):
         print(f"can't find session: {target}", file=sys.stderr)
         return 1
     for window_id, window in windows().items():
+        if window.get("pane"):
+            continue
         if target is not None and window.get("target") not in (None, target):
             continue
         print(fill(template, window_id, window))
@@ -136,6 +157,8 @@ def send_keys(argv):
     target = flag(argv, "-t")
     sent = argv[argv.index(target) + 1:]
     keys = [value for value in sent if value != "Enter"]
+    if target not in windows():
+        loose_pane(target)
     table = windows()
     if target not in table:
         # What a real tmux answers for a window that has gone, which is how a run learns that the
@@ -201,6 +224,8 @@ def main():
         return send_keys(argv)
     if command == "capture-pane":
         target = flag(argv, "-t")
+        if target not in windows():
+            loose_pane(target)
         if target not in windows():
             print(f"can't find window: {target}", file=sys.stderr)
             return 1

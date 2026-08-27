@@ -154,6 +154,15 @@ LOG_NAME = "log.jsonl"
 # its stdout belongs to that pane and to the log beside it — the one JSON object the coordinator
 # rules on is left here instead, where the waiter `/crew` leaves behind blocks on it (#103).
 WAKE_NAME = "wake.json"
+# What a wake with no waiter left to carry it types into the coordinator's own pane: exactly the
+# command the operator would have typed, which is the one action that recovered the run this
+# behaviour comes from (#127).
+RESUME_TYPED = "/crew {feature}"
+COORDINATOR_PANE_HELP = (
+    "the tmux pane the coordinator itself is sitting in, which a wake reaching no waiter is"
+    " re-typed into; the launcher reads it out of its own environment, and a driver given none"
+    " types nothing"
+)
 TABLE_NAME = "wave-table.json"
 LAUNCH_DIR_NAME = "launch"
 CODEX_DIR_NAME = "codex"
@@ -398,6 +407,21 @@ class Wake(Exception):
 # the process: a driver drives one run, from the moment it takes it up until it puts it down.
 _run_in_hand = None
 
+# The tmux pane the coordinator itself is sitting in, or None while this process does not know it.
+# A pane and not the run's session: `-t` on a session resolves to the active pane of whichever
+# window is current there, so an operator who switched to a child's window or the dashboard's would
+# have the run's own recovery typed into it. Only the launcher can name the pane — it is the one
+# process of the run that runs inside it — so it reads it out of its own environment and hands it
+# down. Module state for the same reason the run in hand is: it is one fact about this process, and
+# the wake that needs it is written from a function with no run and no arguments to carry it.
+_coordinator_pane = None
+
+
+def attend_coordinator(pane):
+    """Record the pane a wake with no waiter is re-typed into; returns nothing."""
+    global _coordinator_pane
+    _coordinator_pane = pane or None
+
 
 def take_up_run(run_dir):
     """Take up that run: name this process as its driver, and open its wake channel.
@@ -463,9 +487,42 @@ def snapshot(reason, ticket=None, pointer=None, **fields):
         os.replace(temporary, path)
     except OSError as error:
         # The snapshot is on stdout either way, and the driver's own pane and log keep it. A wake
-        # channel that could not be written is said where a wake cannot be: on stderr.
+        # channel that could not be written is said where a wake cannot be: on stderr. Nothing is
+        # typed at the coordinator either: `/crew` would put a driver on the run and a waiter on a
+        # snapshot that is not there, and the coordinator would be woken by neither.
         temporary.unlink(missing_ok=True)
         print(f"crew: the wake snapshot could not be left in {path}: {error}",
+              file=sys.stderr, flush=True)
+        return
+    re_type_resume(run_dir)
+
+
+def re_type_resume(run_dir):
+    """Type `/crew <feature-dir>` into the coordinator's pane where no waiter is left; returns
+    nothing.
+
+    The one human action that recovered the run this exists for, done by the driver that knows the
+    wake has nowhere to go. It is judged on the waiter's own record, the same `kill -0` the
+    dashboard makes: a waiter still blocking will print this snapshot itself, and typing at the
+    coordinator underneath it would be a second command it never asked for.
+
+    Once, and never retried. This is the last thing the process does, so a wake is one line at
+    most by construction — and a failure to type it is said on stderr rather than raised, because
+    the snapshot has already been written and nothing is served by losing the exit over the
+    courtesy that follows it.
+    """
+    pane = _coordinator_pane
+    if run_dir is None or pane is None or monitor.live_waiter(run_dir) is not None:
+        return
+    line = RESUME_TYPED.format(feature=run_dir.parent)
+    try:
+        type_into_pane(
+            pane, line,
+            f"the coordinator could not be reached at {pane}",
+            f"{line} remained in the composer at {pane}",
+        )
+    except DriverError as error:
+        print(f"crew: this wake reached no waiter and could not be re-typed: {error}",
               file=sys.stderr, flush=True)
 
 
@@ -689,6 +746,26 @@ def tmux(arguments, message):
     if result.returncode != 0:
         raise DriverError(f"{message}: {(result.stderr or result.stdout).strip()}")
     return result.stdout
+
+
+def type_into_pane(window, text, unreachable, stuck):
+    """Type one instruction into a pane's composer and submit it; returns nothing.
+
+    The whole of what a script can do to a Claude session: text goes in literally, line by line,
+    with S-Enter between lines so a multi-line instruction stays one message, and Enter at the
+    end. One Enter is retried, because the composer sometimes still holds the line after the
+    first; a second that also leaves it standing is `stuck` rather than a message anyone received.
+    """
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        tmux(["send-keys", "-t", window, "-l", "--", line], unreachable)
+        if index < len(lines) - 1:
+            tmux(["send-keys", "-t", window, "S-Enter"], unreachable)
+    for _attempt in range(2):
+        tmux(["send-keys", "-t", window, "Enter"], unreachable)
+        if not composer_holds(window, text):
+            return
+    raise DriverError(stuck)
 
 
 def composer_holds(window, text):
@@ -1650,6 +1727,7 @@ def run_start(args):
     args.codex_bridge = resolved(args.codex_bridge)
     repo = repository_root(feature_dir, args.repo_root)
     args.tmux_session = tmux_session(args.tmux_session)
+    attend_coordinator(args.coordinator_pane)
     clear_notice(args.tmux_session)
 
     # Before anything else this driver does in this repo, and before it can matter whether the run
@@ -2255,28 +2333,11 @@ class Loop:
                     f"{ticket} could not be reached at {window}",
                 )
             if text is not None:
-                lines = text.split("\n")
-                for index, line in enumerate(lines):
-                    tmux(
-                        ["send-keys", "-t", window, "-l", "--", line],
-                        f"{ticket} could not be reached at {window}",
-                    )
-                    if index < len(lines) - 1:
-                        tmux(
-                            ["send-keys", "-t", window, "S-Enter"],
-                            f"{ticket} could not be reached at {window}",
-                        )
-                for _attempt in range(2):
-                    tmux(
-                        ["send-keys", "-t", window, "Enter"],
-                        f"{ticket} could not be reached at {window}",
-                    )
-                    if not composer_holds(window, text):
-                        break
-                else:
-                    raise DriverError(
-                        f"{ticket}'s instruction remained in the composer at {window}"
-                    )
+                type_into_pane(
+                    window, text,
+                    f"{ticket} could not be reached at {window}",
+                    f"{ticket}'s instruction remained in the composer at {window}",
+                )
         except DriverError as error:
             raise Unreachable(str(error), ticket=ticket, pointer=str(self.log)) from error
         recorded = " ".join(keys or ())
@@ -3188,6 +3249,7 @@ def run_resume(args):
         )
     repo = repository_root(feature_dir, args.repo_root)
     args.tmux_session = tmux_session(args.tmux_session)
+    attend_coordinator(args.coordinator_pane)
     take_up_run(run_dir)
     print(f"crew resumed, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table)
@@ -3261,6 +3323,7 @@ def build_parser():
     start.add_argument(
         "--tmux-session", help="the session this run's windows live in (default: the driver's own)"
     )
+    start.add_argument("--coordinator-pane", help=COORDINATOR_PANE_HELP)
     start.add_argument(
         "--codex-bridge", help=f"the bridge Codex children are launched and watched through"
                                f" (default: {CODEX_BRIDGE})",
@@ -3286,6 +3349,7 @@ def build_parser():
     resume.add_argument(
         "--tmux-session", help="the session this run's windows live in (default: the driver's own)"
     )
+    resume.add_argument("--coordinator-pane", help=COORDINATOR_PANE_HELP)
     add_loop_arguments(resume)
 
     answer = commands.add_parser(

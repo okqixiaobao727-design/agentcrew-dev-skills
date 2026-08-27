@@ -32,7 +32,9 @@ directory, prints it, and ends. A killed waiter loses no run fact — the driver
 the harness reaps a main session's background shells under memory pressure, and until another
 waiter is attached no wake reaches the coordinator (#127). So the waiter records its liveness as
 the driver does, and a driver that wakes with no live waiter re-types `/crew <feature-dir>` into
-the coordinator's pane itself; the dashboard says so until one attaches.
+the coordinator's pane itself; the dashboard says so until one attaches. Which pane that is, this
+process is the only one that can say — it is the only part of the run that runs inside it — so it
+reads `$TMUX_PANE` out of its own environment and hands it to the driver.
 
 That makes the command idempotent in one more way than before. A run whose driver is already alive
 — named in the run directory, and answering to a signal — is attached to rather than started
@@ -83,6 +85,9 @@ DRIVER_LOCK_NAME = "driver.lock"
 DRIVER_WINDOW_NAME = "crew-driver"
 TMUX = "tmux"
 TMUX_SESSION = ("display-message", "-p", "#{session_id}")
+# tmux's own name for the pane a process is running in, exported into every pane it opens. It is
+# how this script names the coordinator's pane for the driver, because this script runs in it.
+TMUX_PANE_VARIABLE = "TMUX_PANE"
 
 # How long a spawned driver is given to name itself in the run directory before the launch is
 # called failed. It is the first thing its loop does, so this is generous rather than tuned; the
@@ -266,10 +271,22 @@ def resolve(args):
     return pid, name, mode
 
 
+def coordinator_pane():
+    """The tmux pane this process is running in, or None where it is running in none.
+
+    That pane is the coordinator's own: this script is a background shell of the coordinator's
+    session, so it inherits the environment of the pane the operator typed `/crew` in. Nothing
+    else in the run can name it — asked of tmux instead, a pane id would be whichever pane is
+    current when the question is put, which is the driver's own window as often as not. So it is
+    read here, at the one boundary that has it, and handed down; a driver given none types nothing.
+    """
+    return os.environ.get(TMUX_PANE_VARIABLE) or None
+
+
 def driver_command(args, session, resolved):
     """The driver command line this run starts on, `start` because start is what adopts."""
     pid, name, mode = resolved
-    return [
+    command = [
         sys.executable, str(pathlib.Path(args.driver).resolve()), START_COMMAND,
         "--feature-dir", str(pathlib.Path(args.run_dir).resolve()),
         "--coordinator-name", name,
@@ -277,6 +294,8 @@ def driver_command(args, session, resolved):
         "--permission-mode", mode,
         "--tmux-session", session,
     ]
+    pane = coordinator_pane()
+    return command + ["--coordinator-pane", pane] if pane else command
 
 
 # --- the driver's own window ------------------------------------------------------------------
@@ -437,6 +456,11 @@ def wait_for_wake(run_dir):
     used to. A driver that put the run down and left no wake ended without asking for anything: an
     interrupt in its own window is the ordinary reason, and a wake it could not write is the other,
     so the line says both and points at the log that tells them apart.
+
+    All three endings are reached by running code, and `main` releases the run's waiter record on
+    each of them. The harness reaps a main session's background shells under memory pressure, and
+    nothing runs on the way out of that — so a record left standing over a process that is gone is
+    a waiter that was killed, and it is the only thing that can say so (#127).
     """
     settled = None
     while True:
@@ -492,10 +516,24 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+def attach_waiter(run_dir):
+    """Name this process as the run's waiter; returns nothing.
+
+    Said and carried on where it fails. A waiter that cannot name itself still carries this run's
+    wake back, which is the thing it exists to do; what it loses is the dashboard's banner and the
+    driver's own re-type, and stopping here to protect those would cost the coordinator the very
+    ruling it is waiting for.
+    """
     try:
-        run_dir = run_directory(args)
+        monitor.record_waiter(run_dir, os.getpid())
+    except monitor.MonitorError as error:
+        print(f"crew: this waiter could not name itself in {run_dir}: {error}",
+              file=sys.stderr, flush=True)
+
+
+def carry_the_wake(args, run_dir):
+    """Put a driver on that run if it has none, and carry its wake back; returns the exit code."""
+    try:
         start_driver(args, run_dir)
     except LaunchError as error:
         print(f"launch: {error}", file=sys.stderr)
@@ -503,6 +541,23 @@ def main(argv=None):
     # Everything after this point is disposable. The run belongs to the driver's own window now,
     # and this process only carries its wake back — so whatever ends it, ends nothing.
     return wait_for_wake(run_dir)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        run_dir = run_directory(args)
+    except LaunchError as error:
+        print(f"launch: {error}", file=sys.stderr)
+        return LAUNCH_ERROR_EXIT
+    # Named before any driver exists, and not at the point this starts blocking: a driver that
+    # reached its wake first — a preflight failure is over well inside the handshake — would read
+    # an empty record and re-type `/crew` at a coordinator that already has a waiter coming (#127).
+    attach_waiter(run_dir)
+    try:
+        return carry_the_wake(args, run_dir)
+    finally:
+        monitor.release_waiter(run_dir, os.getpid())
 
 
 if __name__ == "__main__":

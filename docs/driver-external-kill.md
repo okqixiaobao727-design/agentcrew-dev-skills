@@ -199,6 +199,34 @@ Rejected alternatives, with reasons:
   dodge the reap, but it also dodges the wake channel that makes the driver's snapshot reach the
   coordinator, which is the whole transport ADR-0010 rests on.
 
+## What the reap took next: the waiter, on 2.1.247 (#127)
+
+The driver is out of reach of this now — it runs in its own tmux window (#103), where no session's
+task management can touch it. What is left inside the coordinator's session is the **waiter**: the
+process `/crew` leaves behind, blocking until the driver writes the run's wake snapshot and
+printing it. It is a main-session background shell, so it is armed by exactly the guard quoted
+above, and during `crewtask/66` (2026-08-24, plugin v0.9.1, Claude Code **2.1.247**) it was reaped
+three times — status `killed`, output exactly `[killed]`. The driver and the children went on
+working throughout. Only the wake channel was gone, and ticket 125's `CREW ASK` sat unanswered
+until the operator saw it on screen and re-typed `/crew crewtask/66`.
+
+The remedy is in the plugin, not in the environment: the waiter records its liveness in
+`<run-dir>/waiter.pid` the way the driver records its own, a driver that writes a wake with no live
+waiter types `/crew <feature-dir>` into the coordinator's pane once, and the dashboard carries
+`✖ no waiter — /crew <feature-dir> to re-attach` until one attaches
+(`docs/monitor-dashboard.md`, ADR-0010's #127 amendment).
+
+The per-session mitigation from the recommendation above still stands and is still the operator's
+own: starting the coordinator with
+
+```
+CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1 claude
+```
+
+disarms the reap for that session. It remains an undocumented internal variable — read here out of
+2.1.233 and unchanged in 2.1.247 — that may change without notice, so AgentCrew neither checks it
+nor sets it, and nothing in the plugin's behaviour depends on whether it is set.
+
 ## Open questions
 
 - Whether Bun's `memoryPressure` event fires on `warning` as well as `critical` levels, and with

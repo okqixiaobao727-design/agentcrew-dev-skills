@@ -30,8 +30,13 @@ STUB_STDOUT = "stub driver ran\n"
 # The window the driver is put in, and the tmux session the stub server answers with.
 DRIVER_WINDOW = "crew-driver"
 TMUX_SESSION = "$9"
+# tmux's own name for the pane a process runs in, and the pane this fixture's coordinator sits in.
+# It is what the launcher hands the driver as the one target a wake with no waiter is typed into.
+TMUX_PANE = "TMUX_PANE"
+COORDINATOR_PANE = "%4"
 # The three files this end of the run reads and writes in the run directory.
 DRIVER_RECORD = "driver.pid"
+WAITER_RECORD = "waiter.pid"
 WAKE_NAME = "wake.json"
 DRIVER_LOG = "driver.log"
 # The wake the stub driver ends on unless a test names another, and how long a launch is given
@@ -95,6 +100,35 @@ class Fixture:
         """The pid the run directory names as its driver, or None where it names none."""
         path = self.crew_dir / DRIVER_RECORD
         return int(path.read_text().strip()) if path.exists() else None
+
+    def record_waiter(self, pid):
+        """Add a process to this run's waiter record, as a second `/crew` adds the one it attaches.
+
+        Appended rather than written over, because the record names every waiter blocking on the
+        run: a second one attaching does not unname the first.
+        """
+        self.crew_dir.mkdir(parents=True, exist_ok=True)
+        with (self.crew_dir / WAITER_RECORD).open("a") as handle:
+            handle.write(f"{pid}\n")
+
+    def recorded_waiters(self):
+        """Every pid the run directory names as a waiter, in the order they attached."""
+        path = self.crew_dir / WAITER_RECORD
+        if not path.exists():
+            return []
+        return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+    def recorded_waiter(self):
+        """The one pid the record names, or None where it names none — the ordinary case.
+
+        A test that means to read a run with two waiters on it reads `recorded_waiters`; this is
+        for the runs that have one, and it fails loudly rather than picking a name out of several.
+        """
+        named = self.recorded_waiters()
+        if not named:
+            return None
+        assert len(named) == 1, f"the run names {len(named)} waiters: {named}"
+        return int(named[0]) if named[0].isdigit() else named[0]
 
     def wake(self, snapshot):
         """Leave a wake snapshot in the run directory, as a driver's deliberate exit does.
@@ -187,6 +221,9 @@ class Fixture:
         for name in list(environment):
             if name.startswith("AGENTCREW_STUB_DRIVER_"):
                 del environment[name]
+        # Taken out rather than inherited: whether this suite runs inside tmux is not what decides
+        # which pane the driver is told about. The one case that wants a pane names one.
+        environment.pop(TMUX_PANE, None)
         environment.update(overrides or {})
         return environment
 
@@ -473,6 +510,24 @@ class DetachmentTests(unittest.TestCase):
         self.assertEqual(flag(argv, "-n"), DRIVER_WINDOW)
         self.assertEqual(flag(argv, "-t"), TMUX_SESSION)
 
+    def test_the_driver_is_told_the_pane_this_command_was_typed_in(self):
+        """The coordinator's own pane, which only this process can name: it is the one part of the
+        run that runs inside it. A wake that reaches no waiter is typed there and nowhere else."""
+        result = self.fixture.launch(env_overrides={TMUX_PANE: COORDINATOR_PANE})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call, = self.fixture.driver_calls()
+        self.assertEqual(flag(call["argv"], "--coordinator-pane"), COORDINATOR_PANE)
+
+    def test_a_launcher_in_no_pane_at_all_names_none(self):
+        """Nothing is invented. A pane that cannot be named is a driver that types nothing, and
+        the dashboard's own banner is what tells the operator instead."""
+        result = self.fixture.launch()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call, = self.fixture.driver_calls()
+        self.assertNotIn("--coordinator-pane", call["argv"])
+
     def test_the_driver_is_told_the_session_its_own_window_is_in(self):
         """One session holds the driver's window, the dashboard's, and every child's."""
         result = self.fixture.launch()
@@ -651,6 +706,149 @@ class DetachmentTests(unittest.TestCase):
         self.assertIn("without leaving a wake snapshot", result.stdout)
         self.assertIn(DRIVER_LOG, result.stdout)
         self.assertIn(f"/crew {self.fixture.run_dir}", result.stdout)
+
+
+class WaiterLivenessTests(unittest.TestCase):
+    """The waiter's own record of itself, on the protocol the driver already keeps (#127).
+
+    A waiter is a background task of the coordinator's main session, and the harness reaps those
+    under memory pressure: it died three times in one run, and the `CREW ASK` it would have
+    carried sat unanswered until a human re-typed `/crew`. Nothing on disk said a waiter was
+    missing. Now one file does — written while it blocks, taken away on each of its three
+    endings, and left standing by a kill, because nothing runs on the way out of one.
+    """
+
+    def setUp(self):
+        self.fixture = Fixture()
+        self.addCleanup(self.fixture.close)
+        self.fixture.registry(os.getpid())
+        self.fixture.transcript([PERMISSION_MODE])
+
+    def blocking_waiter(self):
+        """A waiter attached to a live run and blocked on its wake; returns the process."""
+        # A process that does nothing but exist, named as this run's driver: the launch attaches
+        # to it rather than starting one, so the waiter is the only thing this fixture is running.
+        standing = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        self.addCleanup(standing.wait)
+        self.addCleanup(standing.kill)
+        self.fixture.record_driver(standing.pid)
+        self.driver = standing
+        waiter = self.fixture.start_launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.recorded_waiter() is not None),
+            "the waiter never named itself in the run directory",
+        )
+        return waiter
+
+    def ended(self, waiter):
+        """What that waiter printed, once it has ended of its own accord."""
+        out, err = waiter.communicate(timeout=LAUNCH_TIMEOUT)
+        self.assertEqual(waiter.returncode, 0, err)
+        return out
+
+    def assertReleased(self):
+        self.assertIsNone(
+            self.fixture.recorded_waiter(), "a deliberate ending left the waiter's pid standing"
+        )
+
+    # --- while it blocks -----------------------------------------------------------------------
+
+    def test_a_blocking_waiter_names_its_own_process_in_the_run_directory(self):
+        waiter = self.blocking_waiter()
+
+        self.assertEqual(self.fixture.recorded_waiter(), waiter.pid)
+
+    def test_the_waiter_is_named_before_the_driver_it_starts_can_read_the_record(self):
+        """Ordering, because the driver acts on this record. A start that failed preflight is over
+        well inside the handshake, and a driver that read an empty record would type `/crew` at a
+        coordinator whose waiter was only a moment away — and start the failure over again."""
+        result = self.fixture.launch()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.fixture.driver_calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIsNotNone(
+            calls[0]["waiter"], "the driver started before a waiter had named itself"
+        )
+
+    # --- the three deliberate endings ----------------------------------------------------------
+
+    def test_the_snapshot_ending_takes_the_record_away(self):
+        waiter = self.blocking_waiter()
+
+        self.fixture.wake(DEFAULT_WAKE)
+
+        self.assertEqual(json.loads(self.ended(waiter)), DEFAULT_WAKE)
+        self.assertReleased()
+
+    def test_the_killed_driver_ending_takes_the_record_away(self):
+        """No snapshot was left, so the waiter says so and lets the run go all the same."""
+        waiter = self.blocking_waiter()
+
+        self.driver.kill()
+        # Reaped, because a killed process this fixture is the parent of stays in the process
+        # table until it is, and `kill -0` cannot tell a zombie from a running driver.
+        self.driver.wait()
+
+        self.assertIn("was killed", self.ended(waiter))
+        self.assertReleased()
+
+    def test_the_no_wake_ending_takes_the_record_away(self):
+        """The driver put the run down and asked for nothing: still an ending the waiter ran."""
+        waiter = self.fixture.start_launch(env_overrides={
+            "AGENTCREW_STUB_DRIVER_STOPPED": "1", "AGENTCREW_STUB_DRIVER_HOLD": "1",
+        })
+
+        self.assertIn("without leaving a wake snapshot", self.ended(waiter))
+        self.assertReleased()
+
+    # --- two waiters on one run -------------------------------------------------------------------
+
+    def test_a_waiter_that_ends_leaves_the_record_of_the_one_that_replaced_it(self):
+        """`/crew` typed twice puts a second waiter on one run — nothing but the launch lock stops
+        it, and the lock only guards the driver. The newer waiter owns the record, so the older one
+        ending must not take the name of a waiter that is still blocking away: a run read as having
+        none would have `/crew` typed at a coordinator whose wake is already on its way.
+
+        The replacement here is this test process, named in the record as a second waiter would
+        name itself — a process that is certainly alive when the first one ends.
+        """
+        first = self.blocking_waiter()
+        self.fixture.record_waiter(os.getpid())
+
+        self.fixture.wake(DEFAULT_WAKE)
+
+        self.assertEqual(json.loads(self.ended(first)), DEFAULT_WAKE)
+        self.assertEqual(self.fixture.recorded_waiter(), os.getpid())
+
+    def test_a_waiter_reaped_after_a_later_one_attached_hides_neither(self):
+        """One name could not hold two waiters. A second `/crew` attaching and then being reaped
+        left the record naming a process that was gone, while the first was still blocking — and a
+        driver reading that record typed `/crew` at a coordinator whose wake was already coming.
+        Every waiter is named, so a dead name never speaks for a live one."""
+        first = self.blocking_waiter()
+        reaped = self.fixture.dead_pid()
+        self.fixture.record_waiter(reaped)
+
+        self.assertEqual(
+            self.fixture.recorded_waiters(), [str(first.pid), str(reaped)]
+        )
+
+        self.fixture.wake(DEFAULT_WAKE)
+        self.assertEqual(json.loads(self.ended(first)), DEFAULT_WAKE)
+        self.assertEqual(self.fixture.recorded_waiters(), [str(reaped)])
+
+    # --- the one ending that is not deliberate --------------------------------------------------
+
+    def test_a_killed_waiter_leaves_its_record_standing(self):
+        """The stall this exists for: the harness reaps the waiter, nothing runs on its way out,
+        and the file naming a process that is gone is all that is left to say so."""
+        waiter = self.blocking_waiter()
+
+        waiter.kill()
+        waiter.communicate()
+
+        self.assertEqual(self.fixture.recorded_waiter(), waiter.pid)
 
 
 if __name__ == "__main__":

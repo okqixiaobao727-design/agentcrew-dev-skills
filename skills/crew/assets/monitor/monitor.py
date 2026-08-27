@@ -191,7 +191,23 @@ AWAITING_RULING = "⚠ awaiting your ruling"
 # painted red, carrying the command that puts the run back.
 DRIVER_RECORD_NAME = "driver.pid"
 DRIVER_DEAD = "✖ driver dead — /crew {run} to resume"
-DRIVER_DEAD_COLOUR = "31"
+# The SGR red every liveness banner is painted in, whichever of them holds the slot.
+LIVENESS_BANNER_COLOUR = "31"
+# The same protocol one file over, for the process at the other end of the wake channel. The
+# coordinator's waiter is a background task of a main session, and the harness reaps those under
+# memory pressure — the driver and its children go on working while the snapshot nobody printed
+# sits in the run directory (#127). So the waiter records itself the way the driver does, and a
+# wake standing over no live waiter is a wake nobody will carry back. One pid per line rather than
+# the driver's single name: the launch lock keeps a run to one driver, and nothing keeps a second
+# `/crew` from attaching a second waiter beside the first.
+WAITER_RECORD_NAME = "waiter.pid"
+WAKE_RECORD_NAME = "wake.json"
+NO_WAITER = "✖ no waiter — /crew {run} to re-attach"
+# How long a standing wake is left alone before its missing waiter is believed. A waiter prints
+# its snapshot and removes its record while that snapshot is still on disk, so for an instant
+# every ordinary wake looks orphaned; this only has to outlast that instant, which is why it is
+# seconds rather than milliseconds and the same shape as the launcher's own release grace.
+WAITER_GRACE_SECONDS = 3.0
 
 COLUMNS = ("WAVE", "TICKET", "TITLE", "EXECUTOR", "STATE", "ELAPSED")
 # The one column that has no natural width — it is given whatever the window has left over — and
@@ -940,15 +956,16 @@ def cut(text, width):
     return text[: width - 1].rstrip() + ELLIPSIS
 
 
-def summary(rows, run_id, waves, moment, awaiting_ruling=False, dead_driver=None):
+def summary(rows, run_id, waves, moment, awaiting_ruling=False, banner=None):
     """The one line above the table: which run, how far through its waves, and how it stands.
 
     A run halted on a ruling says so between its counts and its clock: the frame is still being
     drawn, and what stopped moving is the run rather than the renderer.
 
-    A run whose driver was killed says that instead, in the same slot. The two are mutually
-    exclusive by the blanking rule — a driver that halted a wave on purpose released its record on
-    the way out — and the slot is written that way so that they can never both be believed.
+    A liveness banner says that instead, in the same slot — a driver that was killed, or a wake
+    standing with no waiter left to carry it back. The slot holds one sentence, so the three can
+    never be believed at once, and a run halted on a ruling that also lost a process is drawn as
+    the lost process: that is the reading the operator has to act on.
     """
     counts = {state: 0 for state in STATE_ORDER}
     for row in rows:
@@ -957,7 +974,7 @@ def summary(rows, run_id, waves, moment, awaiting_ruling=False, dead_driver=None
     parts = [
         f"wave {len({row['wave'] for row in rows if row['launched']})}/{waves}",
         " ".join(f"{state}={counts[state]}" for state in STATE_ORDER if counts[state]),
-        dead_driver or (AWAITING_RULING if awaiting_ruling else ""),
+        banner or (AWAITING_RULING if awaiting_ruling else ""),
         f"elapsed {elapsed(min(started) if started else None, moment)}",
     ]
     return f"crew {run_id} — " + " · ".join(part for part in parts if part)
@@ -1030,7 +1047,7 @@ def fit_rows(rows, row_blocks, available, width):
 
 def render(
     rows, run_id, waves, moment, width=None, colour=False, max_lines=None, awaiting_ruling=False,
-    dead_driver=None,
+    banner=None,
 ):
     """The whole frame: the summary line, the header, and each row with its annotations."""
     width = width or terminal_width()
@@ -1057,8 +1074,8 @@ def render(
         return block_lines
 
     lines = [paint_segment(
-        cut(summary(rows, run_id, waves, moment, awaiting_ruling, dead_driver), width),
-        dead_driver, DRIVER_DEAD_COLOUR, colour,
+        cut(summary(rows, run_id, waves, moment, awaiting_ruling, banner), width),
+        banner, LIVENESS_BANNER_COLOUR, colour,
     )]
     header_lines = block(0, cells[0])
     row_blocks = [block(index, values) for index, values in enumerate(cells[1:], 1)]
@@ -1188,7 +1205,7 @@ def draw(args, run_dir, moment):
         render(
             rows, run_dir.name, len(plan.waves), moment,
             colour=colour_wanted(args), awaiting_ruling=projection.halted,
-            dead_driver=dead_driver_banner(run_dir),
+            banner=liveness_banner(run_dir, moment),
         ),
         flush=True,
     )
@@ -1531,9 +1548,19 @@ def alive(pid):
     return True
 
 
-def driver_record_path(run_dir):
-    """The file the run directory names its driver in, absolute (ADR-0007)."""
-    return pathlib.Path(run_dir).resolve() / DRIVER_RECORD_NAME
+def liveness_record_path(run_dir, name):
+    """The file the run directory names one of its two processes in, absolute (ADR-0007)."""
+    return pathlib.Path(run_dir).resolve() / name
+
+
+def release_process(run_dir, name):
+    """Take that record away, which is what makes an exit a deliberate one; returns nothing.
+
+    Every ending a process reaches by running its own code passes through here, and no kill does.
+    A run with no record to take away has already been released.
+    """
+    with contextlib.suppress(OSError):
+        liveness_record_path(run_dir, name).unlink(missing_ok=True)
 
 
 def record_driver(run_dir, pid):
@@ -1542,7 +1569,7 @@ def record_driver(run_dir, pid):
     Written by rename, like the pin, because a launcher reading it half-written would read no pid
     for a driver that is very much alive and start a second one.
     """
-    path = driver_record_path(run_dir)
+    path = liveness_record_path(run_dir, DRIVER_RECORD_NAME)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_text(f"{int(pid)}\n", encoding="utf-8")
@@ -1554,14 +1581,9 @@ def record_driver(run_dir, pid):
 
 
 def release_driver(run_dir):
-    """Take that record away, which is what makes an exit a deliberate one; returns nothing.
-
-    Every way a driver ends on purpose passes through here — a wake handing judgment over, a
-    driver error, the run finishing, an operator's own interrupt in the driver's window — and no
-    kill does. A run with no record to take away has already been released.
-    """
-    with contextlib.suppress(OSError):
-        driver_record_path(run_dir).unlink(missing_ok=True)
+    """Put the run down: a wake handing judgment over, a driver error, the run finishing, an
+    operator's own interrupt in the driver's window. Returns nothing."""
+    release_process(run_dir, DRIVER_RECORD_NAME)
 
 
 def recorded_driver(run_dir):
@@ -1572,7 +1594,9 @@ def recorded_driver(run_dir):
     about somebody else's process group entirely.
     """
     try:
-        text = driver_record_path(run_dir).read_text(encoding="utf-8").strip()
+        text = liveness_record_path(run_dir, DRIVER_RECORD_NAME).read_text(
+            encoding="utf-8"
+        ).strip()
     except (OSError, UnicodeError):
         return None
     return int(text) if text.isdigit() and int(text) > 0 else None
@@ -1582,6 +1606,131 @@ def live_driver(run_dir):
     """The pid of the driver still driving this run, or None where none is."""
     pid = recorded_driver(run_dir)
     return pid if pid is not None and alive(pid) else None
+
+
+def attached_waiters(text):
+    """Every pid one waiter record names, in the order they attached and without repeats.
+
+    A real pid or nothing, line by line, on the same reading the driver's own record gets: a
+    half-written line, a pid with a sign, a zero, are all process ids nobody can ask about.
+    """
+    found = []
+    for line in text.splitlines():
+        named = line.strip()
+        if named.isdigit() and int(named) > 0 and int(named) not in found:
+            found.append(int(named))
+    return found
+
+
+@contextlib.contextmanager
+def waiter_record_held(run_dir):
+    """Hold this run's waiter record for one read-modify-write; yields the open file at its start.
+
+    A pid per line rather than one pid, because a run can carry more than one waiter: `/crew`
+    typed twice attaches a second, and the launch lock guards only the driver. One name would let
+    the newer waiter hide a live older one — and a record naming a process that has gone is what
+    the driver and the dashboard read as no waiter at all. Locked because two waiters attaching at
+    once are two read-modify-writes over one file.
+    """
+    path = liveness_record_path(run_dir, WAITER_RECORD_NAME)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            yield handle
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def rewrite_waiters(run_dir, handle, pids):
+    """Leave the record naming exactly `pids`, or take it away where there are none; returns none.
+
+    An empty record and no record say the same thing, so the last waiter out leaves the run
+    directory as it found it — which is what makes `waiter.pid` present mean somebody is waiting.
+    """
+    if not pids:
+        release_process(run_dir, WAITER_RECORD_NAME)
+        return
+    handle.seek(0)
+    handle.truncate()
+    handle.write("".join(f"{pid}\n" for pid in pids))
+    handle.flush()
+
+
+def record_waiter(run_dir, pid):
+    """Name this process among those blocking on this run's wake; returns the record's path.
+
+    The names of waiters that have gone are dropped as this one is added: a reaped waiter cannot
+    take its own name away, and leaving it would answer for a process nobody is waiting behind.
+    """
+    try:
+        with waiter_record_held(run_dir) as handle:
+            attached = [
+                named for named in attached_waiters(handle.read())
+                if named != int(pid) and alive(named)
+            ]
+            rewrite_waiters(run_dir, handle, attached + [int(pid)])
+    except OSError as error:
+        raise MonitorError(f"the run's waiter could not be recorded: {error}")
+    return liveness_record_path(run_dir, WAITER_RECORD_NAME)
+
+
+def release_waiter(run_dir, pid):
+    """Take this process out of the record: the snapshot printed, or either ending that is not a
+    snapshot. Returns nothing.
+
+    Its own name and no other. A waiter that ended while another is still blocking must leave the
+    other one named, or the run reads as having no waiter while its wake is already on its way.
+    """
+    with contextlib.suppress(OSError):
+        with waiter_record_held(run_dir) as handle:
+            attached = [named for named in attached_waiters(handle.read()) if named != int(pid)]
+            rewrite_waiters(run_dir, handle, attached)
+
+
+def recorded_waiters(run_dir):
+    """Every pid the run directory names as a waiter, or none where it names none it can read."""
+    try:
+        text = liveness_record_path(run_dir, WAITER_RECORD_NAME).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    return attached_waiters(text)
+
+
+def live_waiter(run_dir):
+    """The pid of a waiter still blocking on this run's wake, or None where none is."""
+    return next((pid for pid in recorded_waiters(run_dir) if alive(pid)), None)
+
+
+def wake_record_path(run_dir):
+    """The file the driver leaves its one wake snapshot in, which is what a waiter carries back."""
+    return liveness_record_path(run_dir, WAKE_RECORD_NAME)
+
+
+def standing_wake_age(run_dir, moment):
+    """How long this run's wake snapshot has been standing at `moment`, or None where none is.
+
+    Negative where the file is newer than the moment being drawn, which is a wake written while
+    this frame was being composed and so newer than any grace could make it.
+    """
+    try:
+        written = wake_record_path(run_dir).stat().st_mtime
+    except OSError:
+        return None
+    return moment.timestamp() - written
+
+
+def no_waiter_banner(run_dir, moment):
+    """What the summary line says about a wake nobody is left to carry back, or None.
+
+    Three things have to hold together: a snapshot is standing, no live waiter is recorded, and it
+    has stood long enough that the instant between a waiter printing its snapshot and the next
+    `/crew` clearing it cannot be what is being read.
+    """
+    age = standing_wake_age(run_dir, moment)
+    if age is None or age < WAITER_GRACE_SECONDS or live_waiter(run_dir) is not None:
+        return None
+    return NO_WAITER.format(run=pathlib.Path(run_dir).resolve().parent)
 
 
 def dead_driver_banner(run_dir):
@@ -1594,6 +1743,15 @@ def dead_driver_banner(run_dir):
     if pid is None or alive(pid):
         return None
     return DRIVER_DEAD.format(run=pathlib.Path(run_dir).resolve().parent)
+
+
+def liveness_banner(run_dir, moment):
+    """The one liveness banner this frame carries, or None where the run has neither problem.
+
+    One slot and one sentence in it. A run whose driver was killed has no wake coming at all, so
+    that reading is the more fundamental of the two and takes the slot whenever both hold.
+    """
+    return dead_driver_banner(run_dir) or no_waiter_banner(run_dir, moment)
 
 
 def pin_directory(args):
@@ -1665,7 +1823,7 @@ def pin_frame_data(args, run_dir, moment):
     frame = render(
         rows, run_dir.name, len(plan.waves), moment,
         colour=pin_colour(args), max_lines=pin_line_budget(args),
-        awaiting_ruling=projection.halted, dead_driver=dead_driver_banner(run_dir),
+        awaiting_ruling=projection.halted, banner=liveness_banner(run_dir, moment),
     )
     return frame, rows
 

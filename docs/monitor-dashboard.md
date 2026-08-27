@@ -92,7 +92,7 @@ next `advance` — the wave carrying on once the coordinator has ruled — takes
 
 ### The driver's own liveness
 
-The same slot carries one other thing, in red, and the two never appear together:
+The same slot carries a liveness banner instead, in red, and no two of them ever appear together:
 
 ```
 crew crew-run-3 — wave 2/5 · pending=6 · ✖ driver dead — /crew feat/x to resume · elapsed 01:12:44
@@ -122,6 +122,55 @@ made from a new session are refused by children launched under the old one. Deta
 is what made that state reachable, and closing it means re-anchoring the run's children as well as
 its driver — tracked in #112. Until then a run whose coordinator has exited is cleared and
 restarted rather than adopted.
+
+### The waiter's liveness, and the wake nobody carried back
+
+The same slot carries one more thing, in the same red, and no two of the three ever appear
+together:
+
+```
+crew crew-run-3 — wave 2/5 · pending=6 · ✖ no waiter — /crew feat/x to re-attach · elapsed 01:12:44
+```
+
+The **waiter** is the coordinator's one background task while a run is live: it blocks until the
+driver leaves a wake snapshot in the run directory, prints it, and ends. It is a background shell
+of a main session, and Claude Code reaps those under OS memory pressure — so it dies while the
+driver and every child go on working, and the `CREW ASK` it would have carried sits in
+`<run-dir>/wake.json` unread (#127, and `docs/driver-external-kill.md` for the mechanism).
+
+It records itself the way the driver does: `<run-dir>/waiter.pid` on the way in, its own name taken
+out again on each of its three endings — the snapshot printed, the driver found killed, the driver
+gone without a wake — and left standing by a kill, because nothing runs on the way out of one. The
+record holds one pid per line, not the driver's single name: the launch lock keeps a run to one
+driver, and nothing keeps a second `/crew` from attaching a second waiter beside the first. One
+name would let the newer waiter hide a live older one, and the last one out would take away a name
+that was still answering. So each waiter adds its own line under a lock, drops the names of waiters
+that have gone as it does, and removes only its own; the last one out leaves no file, so the file
+being there means somebody is waiting.
+
+The banner goes up when all three of these hold at once: a wake snapshot is standing, no pid in
+`waiter.pid` is still running, and the wake has stood longer than a short grace. The grace is there
+because an ordinary wake passes through exactly that state for an instant — the waiter takes its
+name out while the snapshot it just printed is still on disk — and a frame drawn in that instant is
+not an orphaned wake.
+
+`✖ driver dead` wins the slot whenever both hold: a run with no driver has no wake coming at all,
+which is the more fundamental reading of the two. And as with the dead driver, nothing here acts:
+the render path is a reader, and it neither re-attaches a waiter nor clears the wake (#87).
+
+The driver does act, once. Every wake it writes is followed by the same `kill -0` on `waiter.pid`,
+and where no waiter answers it types `/crew <feature-dir>` into the coordinator's own pane — the
+tmux `send-keys` channel it already reaches a child through — so the recovery that used to need a
+human reading the screen happens on its own. Once per wake and never repeated: writing the wake is
+the driver's last act, so one wake is one line by construction. A wake that could not be written is
+not typed either — a `/crew` answering a snapshot that is not there wakes nobody.
+
+The pane is a pane and not the run's session, because `-t` on a session resolves to the active pane
+of whichever window is current there: an operator who had switched to a child's window, or to the
+dashboard's, would have the run's own recovery typed into it. Only the launcher can name that pane
+— it is the one part of the run that runs inside it — so it reads `$TMUX_PANE` out of its own
+environment and passes it down as `--coordinator-pane`. A driver given none types nothing, and the
+banner is what tells the operator instead.
 
 ### States
 
