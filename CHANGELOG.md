@@ -7,6 +7,18 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- A reaped waiter no longer strands the run. The waiter — the process `/crew` leaves blocking on
+  the run's wake snapshot — is a main-session background shell, and Claude Code reaps those under
+  OS memory pressure: it died three times in one run while the driver and its children carried on,
+  and a `CREW ASK` sat unanswered until a human noticed and re-typed `/crew`. It now records its
+  liveness the way the driver does (`<run-dir>/waiter.pid`, one pid per line so a second `/crew`
+  attaching cannot hide the waiter already there, written before the driver starts and each name
+  taken out again on that waiter's own endings), a driver that writes a wake with no live waiter
+  types `/crew <feature-dir>` into the coordinator's own pane once, and the dashboard carries
+  `✖ no waiter — /crew <feature-dir> to re-attach` in the driver-dead slot until one attaches
+  (#127).
+
 ## [0.9.6] - 2026-08-27
 
 ### Changed

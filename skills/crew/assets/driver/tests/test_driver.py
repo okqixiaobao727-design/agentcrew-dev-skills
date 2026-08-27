@@ -29,6 +29,7 @@ from harness import (
     CODEX_MODEL,
     CODEX_ROUTING,
     COORDINATOR_NAME,
+    COORDINATOR_PANE,
     COORDINATOR_PID,
     DASHBOARD_WINDOW,
     DIRECT_ROUTING,
@@ -51,6 +52,7 @@ from harness import (
     TRACKER,
     TRIAGE,
     UNREWRITABLE,
+    WAITER_RECORD,
     WAKE_NAME,
     WITNESS_BRIEF,
     WITNESS_BUDGET_USD,
@@ -2588,6 +2590,146 @@ class DriverLifecycleTests(DriverTestCase):
         self.assertReleased()
 
         self.woken(process, "judgment-needed")
+
+
+class WakeWithNoWaiterTests(DriverTestCase):
+    """A wake nobody is left to carry back is typed into the coordinator's own pane instead.
+
+    The harness reaps the coordinator's waiter under memory pressure. The run is untouched, but
+    the snapshot sits unread until a human re-types `/crew` — which is what this does for them,
+    once per wake, on the same tmux channel a child is reached through (#127).
+    """
+
+    def start(self, ticket="01"):
+        """A run with its first wave up and its loop running."""
+        self.fixture.ticket(ticket, f"thing {ticket}")
+        self.fixture.commit_feature()
+        process = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.verified_launch(ticket) is not None
+            ),
+            f"{ticket} never launched",
+        )
+        return process
+
+    def waiter_record(self, pid):
+        """Name a process as this run's waiter, as the launcher names itself while it blocks."""
+        path = self.fixture.run_dir / WAITER_RECORD
+        path.write_text(f"{pid}\n")
+        return path
+
+    def dead_pid(self):
+        """A pid that has certainly gone: a process this test started and then reaped."""
+        process = subprocess.Popen([sys.executable, "-c", ""])
+        process.wait()
+        return process.pid
+
+    def re_typed(self):
+        """Every literal line the driver typed into the coordinator's pane, as tmux recorded it."""
+        typed = []
+        for call in self.fixture.tmux_calls():
+            argv = call["argv"]
+            if argv[:1] != ["send-keys"] or "-l" not in argv:
+                continue
+            if argv[argv.index("-t") + 1] != COORDINATOR_PANE:
+                continue
+            typed.append(argv[-1])
+        return typed
+
+    def resume_line(self):
+        """The command a human would have re-typed, which is the one line this replaces."""
+        return f"/crew {self.fixture.feature_dir}"
+
+    # --- the wake with nobody waiting on it -----------------------------------------------------
+
+    def test_a_wake_with_no_waiter_re_types_crew_into_the_coordinators_pane(self):
+        """No record at all is no waiter: nothing was ever attached, or one was killed early."""
+        process = self.start()
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.re_typed(), [self.resume_line()])
+
+    def test_a_waiter_record_naming_a_process_that_is_gone_is_no_waiter(self):
+        """A reaped waiter cannot remove its own record, so the file is not the judgment."""
+        process = self.start()
+        self.waiter_record(self.dead_pid())
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.re_typed(), [self.resume_line()])
+
+    def test_a_run_that_finishes_with_no_waiter_is_re_typed_too(self):
+        """Every wake reaches the coordinator, and a finished run's report is one of them."""
+        process = self.start()
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.re_typed(), [self.resume_line()])
+
+    def test_the_line_goes_to_the_coordinators_pane_and_never_to_the_runs_session(self):
+        """A session target is the active pane of whichever window is current there, so an
+        operator watching a child or the dashboard would have the run's own recovery typed into
+        it. The pane the launcher named is the only target that survives switching windows."""
+        process = self.start()
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        typed = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+            and call["argv"][-1] == self.resume_line()
+        ]
+        self.assertEqual(len(typed), 1, typed)
+        self.assertEqual(typed[0][typed[0].index("-t") + 1], COORDINATOR_PANE)
+
+    def test_a_driver_told_no_pane_types_nothing_and_still_wakes(self):
+        """Nothing is guessed. Where the launcher could not name the coordinator's pane there is
+        no pane to type into, and the dashboard's own banner is what says so."""
+        self.fixture.ticket("01", "thing 01")
+        self.fixture.commit_feature()
+        process = self.fixture.launch(extra=["--coordinator-pane", ""])
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "01 never launched",
+        )
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.re_typed(), [])
+
+    # --- the wake somebody is waiting on --------------------------------------------------------
+
+    def test_a_wake_with_a_live_waiter_types_nothing_at_all(self):
+        """The ordinary case: a waiter is blocked on this run, and it will print the snapshot."""
+        process = self.start()
+        self.waiter_record(os.getpid())
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.re_typed(), [])
+
+    # --- once per wake, never more ---------------------------------------------------------------
+
+    def test_a_second_wake_of_the_same_run_re_types_once_again_and_no_more(self):
+        """Once per wake is the whole rule: two wakes are two lines, never three."""
+        process = self.start()
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+        self.assertEqual(self.re_typed(), [self.resume_line()])
+
+        resumed = self.fixture.resume()
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(self.re_typed(), [self.resume_line(), self.resume_line()])
 
 
 class AnswerTests(DriverTestCase):

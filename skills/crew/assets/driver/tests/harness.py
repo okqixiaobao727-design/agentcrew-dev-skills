@@ -44,6 +44,9 @@ COORDINATOR_NAME = "crew-coordinator-1f"
 COORDINATOR_PID = 1504
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
+# The pane the coordinator itself is sitting in, as tmux names one and as the launcher reads it
+# out of its own environment: a wake that reaches no waiter is re-typed here, and nowhere else.
+COORDINATOR_PANE = "%3"
 
 PREFLIGHT_WINDOW = "crew-preflight"
 DASHBOARD_WINDOW = "crew-dashboard"
@@ -52,6 +55,9 @@ RUN_DIR_NAME = ".crew"
 # The two files the run directory gains: the driver's own pid while its loop runs, and the wake
 # snapshot the coordinator's waiter reads instead of the driver's stdout.
 DRIVER_RECORD = "driver.pid"
+# The coordinator waiter's own record beside it: written by the launcher while it blocks on the
+# run's wake, and read by the driver to decide whether anyone is left to carry that wake back.
+WAITER_RECORD = "waiter.pid"
 # The file every armed wake monitor carries the path of, which is how one is told from another
 # run's on the process table, and the script's own name beside it.
 PARKED_PATHS = "parked-paths"
@@ -348,6 +354,7 @@ class Fixture:
             "--coordinator-pid", str(COORDINATOR_PID),
             "--permission-mode", PERMISSION_MODE,
             "--tmux-session", TMUX_SESSION,
+            "--coordinator-pane", COORDINATOR_PANE,
             "--codex-bridge", str(self.codex_bridge),
             "--poll-seconds", POLL_SECONDS,
             "--timeout", LOOP_TIMEOUT,
@@ -384,6 +391,7 @@ class Fixture:
                 "--feature-dir", str(self.feature_dir),
                 "--coordinator-pid", str(COORDINATOR_PID),
                 "--tmux-session", TMUX_SESSION,
+                "--coordinator-pane", COORDINATOR_PANE,
                 "--poll-seconds", POLL_SECONDS,
                 "--timeout", LOOP_TIMEOUT,
                 *extra,
