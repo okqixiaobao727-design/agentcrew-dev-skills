@@ -225,8 +225,21 @@ and run without `--resume-session`. If that axis fails again, escalate with its 
 
 For every trusted axis, do exactly what its `next` field permits and no other action. When it
 requires a resumed review, reuse the command, replace `--axis both` with that axis's own name, and
-add `--resume-session <reviewSessionId>` using that axis's `reviewSessionId`. When `next` says
-`escalate`, send `CREW ASK <NN> doc-conflict` carrying both positions to your coordinator.
+add both `--resume-session <reviewSessionId>` using that axis's `reviewSessionId` and
+`--response <path>`. The two go together: a resume without `--response` is an ordinary
+command-line error that spends no round, so you simply call again with the file.
+
+`--response` takes a path to a file, never the disposition text itself. Write that file before you
+call, under the system temporary directory and named after the handle, at
+`/tmp/review-response-<reviewSessionId>.md`. Never write it inside the checkout under review: the
+Spec brief lists that checkout's untracked files, so a Response written there is handed to the
+reviewer as a file to review. Its contents are one line per finding of the round just delivered, in
+the order that axis's `reportFile` lists them, identified by a short quote:
+
+N. <short quote from the finding> - fixed <where> | declined <why> | deferred <ticket>
+
+When `next` says `escalate`, send `CREW ASK <NN> doc-conflict` carrying both positions to your
+coordinator.
 
 Any other top-level `status`, including `refused`, is not a report: send `CREW ASK <NN> stuck`
 carrying its `next` and reason. Do not start or resume another review.
