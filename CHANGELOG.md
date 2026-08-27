@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Review instructions now follow each Review-Switch result's `next` and `nextCall` instead of
+  copying its flags, timeout, recovery semantics, and report-validity rules. AgentCrew retains
+  only its caller-owned run-again budget and its `CREW ASK` mappings, so future Bridge protocol
+  changes stay behind the installed command's result boundary (#139).
+
 ## [0.9.5] - 2026-08-26
 
 ### Fixed

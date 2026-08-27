@@ -5,6 +5,9 @@ supersedes: ADR-0009
 
 # Review-Switch owns the review, AgentCrew owns the reviewer
 
+_Amended 2026-08-27 by #139 after review-switch#39 and its ADR-0009 made the caller's
+run-again budget explicit._
+
 Review-Switch is called across a process boundary (its ADR-0002), so this repo ships no review
 implementation. Its installed command owns the protocol, recovery and round policy; AgentCrew
 supplies only the run-specific arguments and Lifecycle Hook commands that the process boundary
@@ -21,8 +24,10 @@ knows: the ticket's base commit, the ticket's path, and where in the ticket a re
 - The `review` event's writer changes; its shape does not. The bridge wrote it because it alone
   knew both ends of a review deterministically, and that argument survives — so the writer
   becomes a Lifecycle Hook this repo configures: a command in config, not code here.
-- The `[review]` rounds paragraph in `shapes.toml` goes. The cap is enforced upstream and the
-  next permitted action arrives with each result, which is also how it reaches a Codex child.
-  `CREW ASK` stays this repo's word for the escalating act.
+- The `[review]` hand-written rounds paragraph in `shapes.toml` goes. Review-Switch owns the
+  protocol and names the next permitted action with each result, which is also how it reaches a
+  Codex child. What stays is the caller's budget, stated once in `[review]`: A `run again` axis is
+  run again at most once during this ticket's only review; past that the child sends `CREW ASK
+  <NN> stuck` with its reason. `CREW ASK` stays this repo's word for the escalating act.
 - Cross review is unchanged. Choosing a reviewer from the other vendor is a routing decision,
   and routing did not move.

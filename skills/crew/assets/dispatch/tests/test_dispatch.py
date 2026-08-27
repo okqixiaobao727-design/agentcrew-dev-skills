@@ -38,6 +38,10 @@ COORDINATOR_PID = 1504
 BASE_COMMIT = "b614ec84712aa8c351fe30ec69000e2e12518aeb"
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
+RENDERED_RUN_AGAIN_BUDGET = (
+    "A `run again` axis is run again at most once during this ticket's only review; past that "
+    "the child sends `CREW ASK 06 stuck` with its reason"
+)
 # The two halves of a row's account binding, spelled as the wave table spells them: a ticket that
 # named an account selects that configuration home explicitly, and a ticket that named none
 # inherits the environment the run was started in (ADR-0014).
@@ -559,6 +563,10 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertEqual(len(agents), 1, agents)
         return next(iter(agents.values()))["initialPrompt"]
 
+    def review_block(self):
+        prompt = self.initial_prompt()
+        return prompt.split("Review: ", 1)[1].split("\n\nYour coordinator is", 1)[0]
+
     def test_the_launch_json_defines_one_agent_the_cli_can_register(self):
         agents = self.fixture.agent_json("06")
         definition = next(iter(agents.values()))
@@ -605,7 +613,10 @@ class ClaudeRenderTests(DispatchTestCase):
     def test_the_first_turn_follows_next_and_sends_a_typed_doc_conflict(self):
         prompt = self.initial_prompt()
         flattened = " ".join(prompt.split())
-        self.assertIn("do exactly what its `next` field permits", flattened)
+        self.assertIn(
+            "For each axis do exactly what its `next` permits and nothing else", flattened
+        )
+        self.assertIn("`reportFile` and `preparation.responseFile`", flattened)
         self.assertIn(
             "send `CREW ASK 06 doc-conflict` carrying both positions to your coordinator",
             flattened,
@@ -618,29 +629,48 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertIn("`run_in_background: true`", prompt)
         self.assertIn("foreground Bash call is killed at ten minutes", prompt)
 
-    def test_the_first_turn_selects_the_returned_axis_when_it_resumes(self):
+    def test_the_first_turn_follows_the_next_call_without_translating_it(self):
         prompt = " ".join(self.initial_prompt().split())
-        self.assertIn("replace `--axis both` with that axis's own name", prompt)
-        self.assertIn("`--resume-session <reviewSessionId>`", prompt)
+        self.assertIn("Where `nextCall.responseFile` is non-null", prompt)
+        self.assertIn("write the Response to `nextCall.responseFile`", prompt)
+        self.assertIn("in the shape `nextCall.responseFormat` shows", prompt)
+        self.assertIn("one line per finding, in report order", prompt)
+        self.assertIn("Run every `nextCall.argv` exactly as given", prompt)
+
+    def test_the_first_turn_caps_the_callers_run_again_budget(self):
+        prompt = " ".join(self.initial_prompt().split())
+        self.assertIn(RENDERED_RUN_AGAIN_BUDGET, prompt)
 
     def test_the_first_turn_recovers_a_lost_result_before_starting_another_review(self):
         prompt = " ".join(self.initial_prompt().split())
-        self.assertIn("add `--recover-session`", prompt)
-        self.assertIn("Exit code 3", prompt)
-        self.assertIn("only result that permits a fresh review", prompt)
+        self.assertIn(
+            "run the same command with `--recover-session` before starting another review",
+            prompt,
+        )
+        self.assertIn("`review-bridge --help` is the rule for what its exit codes permit", prompt)
 
-    def test_the_first_turn_retries_only_a_failed_axis_as_a_fresh_single_axis_review(self):
-        prompt = " ".join(self.initial_prompt().split())
-        self.assertIn("Keep every completed axis", prompt)
-        self.assertIn("rerun only each failed axis once as a fresh single-axis review", prompt)
-        self.assertIn("without `--resume-session`", prompt)
-        self.assertIn("If that axis fails again, escalate", prompt)
+    def test_the_review_template_contains_no_copy_of_the_bridge_protocol(self):
+        review_template = dispatch_module.load_templates()["review"]["block"]
+        for copied_constant in (
+            "--resume-session", "--response", "/tmp/", "two hours", "finalMessage",
+        ):
+            with self.subTest(copied_constant=copied_constant):
+                self.assertNotIn(copied_constant, review_template)
 
-    def test_the_first_turn_sends_a_typed_stuck_ask_for_other_top_level_statuses(self):
+    def test_the_first_turn_sends_a_typed_stuck_ask_for_a_refusal(self):
         prompt = " ".join(self.initial_prompt().split())
-        self.assertIn("Any other top-level `status`, including `refused`", prompt)
+        self.assertIn("A `refused` result is not a report", prompt)
         self.assertIn("send `CREW ASK 06 stuck` carrying its `next` and reason", prompt)
-        self.assertIn("Do not start or resume another review", prompt)
+        self.assertIn("start or resume nothing", prompt)
+
+    def test_the_review_block_fills_every_value_the_dispatcher_owns(self):
+        prompt = self.review_block()
+        for placeholder in (
+            "<review vendor>", "<review model>", "<review effort>", "<review account>",
+            "<review cwd>", "<review base>", "<review spec>", "<review hooks>",
+        ):
+            with self.subTest(placeholder=placeholder):
+                self.assertNotIn(placeholder, prompt)
 
     def test_the_first_turn_carries_the_coordinator_trust_anchor(self):
         self.assertIn(
@@ -1019,8 +1049,8 @@ class BareVerbLineTests(DispatchTestCase):
             self.prompt_for("--log", str(self.machine_log), workflow="acceptance", review=None),
         )
 
-class ReviewRoundOwnershipTests(DispatchTestCase):
-    """The Bridge owns its round cap; AgentCrew carries only the returned next action."""
+class ReviewCallerBudgetTests(DispatchTestCase):
+    """Both review lanes receive the caller budget AgentCrew owns."""
 
     def prompt_for(self, **overrides):
         table = self.fixture.table([self.fixture.ticket("06", "reviewed", **overrides)])
@@ -1028,18 +1058,18 @@ class ReviewRoundOwnershipTests(DispatchTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.fixture.turn("06")
 
-    def test_the_codex_review_lane_restates_no_round_rule(self):
+    def test_the_codex_review_lane_carries_the_callers_budget(self):
         prompt = self.prompt_for()
         self.assertNotIn("Rounds.", prompt)
-        self.assertIn("`next` field", prompt)
+        self.assertIn(RENDERED_RUN_AGAIN_BUDGET, " ".join(prompt.split()))
 
-    def test_the_claude_review_lane_restates_no_round_rule(self):
+    def test_the_claude_review_lane_carries_the_callers_budget(self):
         prompt = self.prompt_for(
             workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
         )
         self.assertNotIn("Rounds.", prompt)
-        self.assertIn("`next` field", prompt)
+        self.assertIn(RENDERED_RUN_AGAIN_BUDGET, " ".join(prompt.split()))
 
 
 class WorkflowShapeTests(DispatchTestCase):

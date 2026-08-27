@@ -312,7 +312,9 @@ write `returned` at all. So the end hook runs on every exit path Review-Switch c
 that failed or was interrupted included. A run with no log passes no commands, and a command that
 cannot write changes neither Review-Switch's exit status nor the result the child reads. Each call
 that reaches `review-start` writes one pair; a preparation failure opens no review and writes only
-`returned`.
+`returned`. Following a result's `nextCall.argv` starts another Bridge invocation, so it writes
+another pair for the same ticket. The caller's run-again budget changes only how many pairs may be
+written; the event shape and the rule that the last line holds are unchanged.
 
 ### `witness` — one fact-check of a child escalation
 
