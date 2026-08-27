@@ -226,7 +226,7 @@ block = '''
 Review: <review vendor> at model <review model>, effort <review effort>. Once the work is in place
 and before you commit it, run the installed Review-Switch command as a background or long-running
 command and wait for its result. In Claude Bash, set `run_in_background: true`; a foreground Bash
-call is killed at ten minutes, while Review-Switch permits a review to run for two hours.
+call is killed at ten minutes.
 
 review-bridge \
   --reviewer <review vendor> --cwd <review cwd> \
@@ -236,23 +236,21 @@ review-bridge \
 This command is the ticket's only review; it satisfies every review step any skill you invoke
 asks of you.
 
-Read the one JSON object through `axes`. Trust an axis report only when its `status` is `completed`
-and its `finalMessage` is non-empty. Keep every completed axis. On `partially_completed`, rerun only
-each failed axis once as a fresh single-axis review: replace `--axis both` with that axis's own name
-and run without `--resume-session`. If that axis fails again, escalate with its reason and report.
+Read the one JSON object through `axes`. For each axis do exactly what its `next` permits and
+nothing else. Where `nextCall.responseFile` is non-null, write the Response to
+`nextCall.responseFile` in the shape `nextCall.responseFormat` shows — one line per finding, in
+report order. Run every `nextCall.argv` exactly as given.
 
-For every trusted axis, do exactly what its `next` field permits and no other action. When it
-requires a resumed review, reuse the command, replace `--axis both` with that axis's own name, and
-add `--resume-session <reviewSessionId>` using that axis's `reviewSessionId`. When `next` says
-`escalate`, send `CREW ASK <NN> doc-conflict` carrying both positions to your coordinator.
+A `run again` axis is run again at most once during this ticket's only review; past that the child
+sends `CREW ASK <NN> stuck` with its reason. When `next` is `escalate`, send
+`CREW ASK <NN> doc-conflict` carrying both positions to your coordinator: `reportFile` and
+`preparation.responseFile`.
 
-Any other top-level `status`, including `refused`, is not a report: send `CREW ASK <NN> stuck`
-carrying its `next` and reason. Do not start or resume another review.
+A `refused` result is not a report: send `CREW ASK <NN> stuck` carrying its `next` and reason, and
+start or resume nothing.
 
-If the JSON object never reaches you, add `--recover-session` to the same command instead of
-starting another review. It waits for every live axis or returns an undelivered report. Exit code 3
-means there is nothing to recover and is the only result that permits a fresh review. Any other
-recovery failure gets one retry, then an escalation carrying the command's output.
+If the JSON object never reaches you, run the same command with `--recover-session` before
+starting another review; `review-bridge --help` is the rule for what its exit codes permit.
 '''
 
 # Review-Switch fires these commands at the lifecycle points it owns. They use the run's own copy
