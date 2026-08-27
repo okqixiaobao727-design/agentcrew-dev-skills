@@ -213,11 +213,25 @@ monitor re-arming, and the report. It drives the existing scripts at their publi
 and holds no state of its own — every count it acts on is read back out of the machine log,
 which is what makes adopting an unfinished run the same code path as carrying one on.
 
+**Waiter** — The coordinator's one background task while a run is live: it blocks until the
+driver leaves a wake snapshot in the run directory, prints that snapshot unchanged, and ends. It
+holds no state and composes nothing, so a killed waiter loses no run fact — but until another is
+attached, no wake reaches the coordinator (#127). Re-typing `/crew <feature-dir>` attaches one.
+_Avoid_: wake monitor (the per-child watchers), listener, poller
+
 **Wake surface** — The exhaustive list of what reaches the coordinator mid-run: a `CREW ASK` of any
 kind, a semantic merge conflict a child has bounced back a second time, and any state the rule table
 has no row for (a driver crash, a timeout, an unknown status, a permission prompt, a failed
 monitor). Each arrives as one JSON **wake snapshot** the driver prints as it exits, carrying the
 reason, the ticket, a pointer for the ruling, and the command that resumes the loop.
+
+**Vanished** — A launched, unsettled child whose lane's live source was read successfully and
+does not list it: a tmux pane that is not in the pane list, a session that is not in the sessions
+list. Only a successful observation can say it. A read that failed — a tmux call that did not run,
+a state file that could not be read, a list fetched from the wrong account — says nothing about the
+child and is `unknown`, never `vanished` (#110, #140). The driver settles a vanished child `failed`
+on one reading, because the word is only ever used when the source itself answered.
+_Avoid_: gone, dead child, missing (the words a failed read tempts)
 
 **Child agent** — An execution session in its own tmux window and its own worktree, one window per
 ticket, with model and effort assigned per ticket by the routing. It is a full interactive session:

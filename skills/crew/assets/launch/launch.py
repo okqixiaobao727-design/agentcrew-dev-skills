@@ -28,8 +28,11 @@ of the coordinator's session is a driver the harness may end at any moment — i
 (#103). So the driver is put in its own tmux window, through the same windowing machinery every
 child of the run is launched through, where no session-level task management can reach it, and
 this process stays behind as a waiter: it blocks until the run's wake snapshot appears in the run
-directory, prints it, and ends. A killed waiter costs nothing, because the driver is untouched and
-re-typing `/crew <run-dir>` puts another waiter back.
+directory, prints it, and ends. A killed waiter loses no run fact — the driver is untouched — but
+the harness reaps a main session's background shells under memory pressure, and until another
+waiter is attached no wake reaches the coordinator (#127). So the waiter records its liveness as
+the driver does, and a driver that wakes with no live waiter re-types `/crew <feature-dir>` into
+the coordinator's pane itself; the dashboard says so until one attaches.
 
 That makes the command idempotent in one more way than before. A run whose driver is already alive
 — named in the run directory, and answering to a signal — is attached to rather than started

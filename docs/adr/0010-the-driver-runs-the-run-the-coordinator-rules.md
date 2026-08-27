@@ -51,6 +51,21 @@ Children's ASKs keep arriving by cross-session messaging, authenticated as befor
 > the run nothing. See
 > [`docs/monitor-dashboard.md`](../monitor-dashboard.md#the-drivers-own-liveness).
 
+> **Amended (#127).** "A killed waiter costs the run nothing" was half right. The harness reaps
+> a main session's background shells on OS memory pressure, so the waiter died three times in one
+> run while the driver and its children went on working; the run's facts were intact, but a
+> `CREW ASK` sat unanswered until a human saw it and re-typed `/crew`. The remedy is that one
+> human action, done by the driver: the waiter records its own liveness the way the driver does
+> (`waiter.pid`, written on the way in and removed on every deliberate exit), and a driver that
+> writes a wake snapshot with no live waiter types `/crew <feature-dir>` once into the
+> coordinator's own tmux pane — the channel it already uses to reach a child — after which the
+> dashboard carries `✖ no waiter — /crew <feature-dir> to re-attach` in the driver-dead slot until
+> one attaches. Rejected: a waiter-side acknowledgement file (a second liveness protocol beside the
+> one that exists), a cheap Claude session that messages the coordinator (tokens on every wake, and
+> no session exists for a driver error or run completion), and depending on the harness's
+> undocumented `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP` switch — which an operator may still set
+> on the coordinator's own launch command as a version-noted mitigation, never as the design.
+
 **The rule table settles everything a written rule already decides.** It is a transcription of the
 predecessor skill document's settlement prose, not a new invention: verify on `CREW COMPLETE` and
 settle in silence; one re-ask on an invalid receipt and failed on the second; parked and failed
