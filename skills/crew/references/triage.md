@@ -20,6 +20,50 @@ on the lines *above* the verb line. The receipt verb is matched as a whole line;
 a child append prose to it produces a receipt the run refuses, which the driver bounces once and
 then settles `failed` (ADR-0015).
 
+## Place leftovers
+
+A `wrap-up` is ruled line by line: every leftover the child listed gets one of the three placements
+the Contract names, and the ruling is one message back on the child's channel. Write it so the
+report can set each line beside its placement — repeat the leftover's own line, then the placement:
+
+```
+<leftover line as the child wrote it> — this ticket
+<leftover line as the child wrote it> — opened <ticket reference>
+<leftover line as the child wrote it> — dropped
+```
+
+A line ruled *this ticket* keeps the child running: it makes the edit and sends its receipt when
+done. A line ruled *opened* names the ticket you opened (below) before the ruling is sent, so the
+child's receipt and the report both carry the reference. The ruling hook copies the message
+verbatim, so the placements need no second write.
+
+## Open a ticket
+
+You open follow-up tickets yourself, during the run, through the tracker convention the repository
+names in `docs/agents/issue-tracker.md` — that document holds the command, and
+[`references/trackers.md`](../../../references/trackers.md) names the operations both skills call
+on it. Seed the ticket from the wrap-up line: its body carries the leftover as the child stated it
+and every pointer the child cited, so the evidence travels with the ticket rather than with your
+memory of the run. Once the Tracker module lands
+([ADR-0019](../../../docs/adr/0019-tracker-owns-ticket-operations-callers-own-workflow.md), #123),
+creating a ticket goes through its create operation on either tracker; until then the convention
+document's command is the path.
+
+## Rule on an acceptance run
+
+Whether a ticket's acceptance runs at all is your ruling, and the ruling is the whole of it — a
+per-run word from the human is never part of the path. Rule it as any reversible action: approve,
+and write the exact undo inside the ruling. Credentials come from the project's own convention,
+which the child reads; a run whose credential the run lacks is parked, as in *Park* below, and
+the human supplies it on their own time.
+
+## Speak to the human
+
+The Contract names exactly four decisions that are the human's — product direction, a material
+change of architecture, a widening of product scope, an action with no undo. One of those reaches
+them as one message carrying the decision and its options; everything else is silent, and status
+is theirs to ask for.
+
 ## Answer an ASK
 
 Reply to a Claude child by SendMessage to its recorded name, ending with `ts=<unix time>` —
