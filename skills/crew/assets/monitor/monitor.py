@@ -132,6 +132,8 @@ FINAL_STATES = (MERGED, FAILED)
 # `unknown`, because both describe what the agents list did, not where the ticket is.
 DUPLICATE = "duplicate"
 UNKNOWN = "unknown"
+# Unreadable Codex files are keyed by ticket, separately from successful worktree-keyed states.
+UNREADABLE_CODEX_STATE = "unreadable-codex-state"
 
 # Every settling event and the word it settles a ticket into. A ticket keeps travelling after a
 # receipt — a landable branch is merged next — so the last settling line the log carries wins.
@@ -489,8 +491,8 @@ def codex_states(run_dir, timeout=None):
 
     A Codex child is invisible to `claude agents --json`, so its bridge state file is the only
     thing that knows it is alive: read nothing here and every Codex ticket of a run is drawn
-    `vanished` from the first frame. A file that cannot be read is not a child that stopped, so it
-    is passed over rather than counted as one.
+    `vanished` from the first frame. A file that cannot be read is not a child that stopped, so its
+    ticket is marked unknown rather than passed over as an absent child.
 
     The whole read is bounded by `timeout`, as the other lane's is: a source that has spent its
     budget answers None — the lane a caller draws `unknown` — rather than holding up the frame.
@@ -503,6 +505,7 @@ def codex_states(run_dir, timeout=None):
         try:
             state = json.loads(read_without_blocking(path))
         except (OSError, ValueError):
+            states[(UNREADABLE_CODEX_STATE, path.stem)] = UNKNOWN
             continue
         cwd = state.get("cwd") if isinstance(state, dict) else None
         if not cwd:
@@ -814,6 +817,9 @@ def live_state(launch, sources, binding=None):
     if states is None:
         return RUNNING, (UNKNOWN, f"{LIVE_SOURCES[executor]} could not be read"), None
     status = states.get(worktree_key(launch.get("worktree")))
+    unreadable = (UNREADABLE_CODEX_STATE, str(launch.get("ticket")))
+    if status is None and executor == CODEX and unreadable in states:
+        return RUNNING, (UNKNOWN, f"{LIVE_SOURCES[executor]} could not be read"), None
     if status is None:
         return VANISHED, None, None
     if status == DUPLICATE:

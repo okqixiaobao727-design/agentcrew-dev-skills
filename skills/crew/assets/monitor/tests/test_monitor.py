@@ -1439,6 +1439,26 @@ class DashboardTests(MonitorTestCase):
             result.stdout,
         )
 
+    def test_an_unreadable_codex_bridge_state_is_unknown_not_vanished(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy"})
+        state = self.fixture.codex_state("07")
+        state.unlink()
+        state.mkdir()
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED, width=7),
+            result.stdout,
+        )
+        self.assertIn(f"{CODEX_UNREADABLE}\n", result.stdout)
+        self.assertNotIn(
+            row("1", "07", TITLES["07"], CODEX_LANE, "vanished", LIVE_ELAPSED, width=8),
+            result.stdout,
+        )
+        self.assertEqual(self.fixture.toasts(), [])
+
     def test_a_codex_child_the_bridge_calls_stopped_is_vanished(self):
         self.launch_wave_one()
         self.fixture.live({"06": "busy", "07": "stopped"})

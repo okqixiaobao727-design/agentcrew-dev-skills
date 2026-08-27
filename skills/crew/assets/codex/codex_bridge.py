@@ -104,6 +104,16 @@ def read_state(path):
 
 
 def pane_exists(pane_id):
+    """Whether tmux's pane list holds `pane_id`; raises where that list could not be read.
+
+    Only a successful observation can say a child is gone (#140). A tmux call that did not run —
+    a client killed by a signal, a server momentarily unreachable, no tmux on PATH at all — knows
+    nothing about the pane, and answering `False` there told every caller the window had exited.
+    The failure is raised as an `OSError`, which is the family `cmd_watch` already counts and
+    retries, so a look that failed costs a poll instead of a ticket.
+
+    A `False` therefore has one meaning left: the pane list was read and this pane is not in it.
+    """
     # display-message -t on a dead pane exits 0 on tmux >= 3.6, so test
     # membership in the full pane list instead.
     result = subprocess.run(
@@ -112,7 +122,12 @@ def pane_exists(pane_id):
         capture_output=True,
         check=False,
     )
-    return result.returncode == 0 and pane_id in result.stdout.split()
+    if result.returncode != 0:
+        raise OSError(
+            f"tmux list-panes exited {result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    return pane_id in result.stdout.split()
 
 
 def kill_window(window_id):

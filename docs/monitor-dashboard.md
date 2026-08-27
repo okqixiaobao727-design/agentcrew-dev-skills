@@ -188,7 +188,7 @@ never reads an internal word:
 | `settling` | `landable`, in a wave every ticket of which has settled, in a run that is not over |
 | `merged` | a `merge` result of `clean`, `resolved` or `repaired`, or an `outcome` of `completed` |
 | `failed` | a `receipt` verdict or an `outcome` of `failed` |
-| `vanished` | it was launched, nothing settled it, and its lane has no live entry for it |
+| `vanished` | a successful lane read has no live entry after launch and before settlement |
 
 Two of those words are the intervals the run used to have no vocabulary for, and both exist
 because a frozen-looking row is read as a hung run. A child sent the merge driver's rework
@@ -227,7 +227,10 @@ The abnormal states are `waiting`, `reworking`, `failed` and `vanished`: a row i
 the operator that last line, and every other row stays quiet.
 
 `duplicate` and `unknown` are annotations rather than states: both say what a reading did, not
-where the ticket got to, so the row keeps the state its own log lines justify.
+where the ticket got to, so the row keeps the state its own log lines justify. For a Codex child,
+an absent bridge state file or one that says `stopped` is a successful `vanished` observation; a
+bridge state file that exists but cannot be read keeps the row `running` with the `unknown`
+annotation and emits no vanished toast.
 
 The `review` event is written by the Lifecycle Hook commands the reviewed child passes to
 Review-Switch — `running` at review start and `returned` on every exit path it controls — so the

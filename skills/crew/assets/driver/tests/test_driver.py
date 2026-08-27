@@ -1880,6 +1880,16 @@ class LoopTests(DriverTestCase):
         self.assertIn("vanished", self.events("receipt", ticket="01")[-1]["detail"])
         self.assertEqual(self.events("ruling", ticket="01"), [])
 
+    def test_a_failed_codex_pane_read_is_a_driver_error_that_settles_no_ticket(self):
+        (self.fixture.stub_dir / "codex-watch-fails").write_text("yes\n")
+
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+        snapshot = self.woken(process, "driver-error")
+
+        self.assertIn("could not read tmux's pane list", snapshot["detail"])
+        self.assertIsNone(self.verdict("01"))
+        self.assertEqual(self.events("receipt", ticket="01"), [])
+
     def test_a_child_waiting_at_a_permission_prompt_wakes_the_coordinator(self):
         process = self.start(("01", ()))
 

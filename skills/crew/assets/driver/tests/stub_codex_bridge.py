@@ -30,6 +30,9 @@ def main():
         handle.write(json.dumps({"argv": argv}) + "\n")
 
     if argv[:1] == ["watch"]:
+        if (state_dir / "codex-watch-fails").exists():
+            print("the Codex bridge could not read tmux's pane list", file=sys.stderr)
+            return 1
         print(json.dumps({"sessions": []}))
         return 0
 

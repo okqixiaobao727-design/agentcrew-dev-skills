@@ -26,7 +26,22 @@ WORK=$(mktemp -d -t codex-bridge-test)
 BIN="$WORK/bin"
 mkdir -p "$BIN"
 
-printf '#!/bin/sh\nexec "%s" -L codex-bridge-test "$@"\n' "$REAL_TMUX" > "$BIN/tmux"
+TMUX_LIST_PANES_FAILURES="$WORK/tmux-list-panes-failures"
+TMUX_LIST_PANES_FAILED="$WORK/tmux-list-panes-failed"
+export TMUX_LIST_PANES_FAILURES TMUX_LIST_PANES_FAILED
+
+printf '#!/bin/sh
+if [ "$1" = list-panes ] && [ -f "$TMUX_LIST_PANES_FAILURES" ]; then
+  remaining=$(cat "$TMUX_LIST_PANES_FAILURES")
+  if [ "$remaining" -gt 0 ]; then
+    printf "%%s\\n" "$((remaining - 1))" > "$TMUX_LIST_PANES_FAILURES"
+    printf "failed\\n" >> "$TMUX_LIST_PANES_FAILED"
+    printf "tmux list-panes test failure\\n" >&2
+    exit 71
+  fi
+fi
+exec "%s" -L codex-bridge-test "$@"
+' "$REAL_TMUX" > "$BIN/tmux"
 printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$PYTHON" "$STUB" > "$BIN/codex"
 chmod +x "$BIN/tmux" "$BIN/codex"
 export PATH="$BIN:$PATH"
@@ -186,6 +201,24 @@ launch_with_options() { # <dir> <state-file> <window-name> <out-file> [launch op
 watch() { # <out-file> <state-file...>
   local out="$1"; shift
   "$PYTHON" "$BRIDGE" watch --interval 0.3 --timeout 30 "$@" > "$out" 2>"$out.err"
+}
+
+fail_next_pane_reads() { # <count>
+  printf '%s\n' "$1" > "$TMUX_LIST_PANES_FAILURES"
+  : > "$TMUX_LIST_PANES_FAILED"
+}
+
+wait_for_failed_pane_reads() { # <count>
+  local expected="$1" attempt=0
+  while [ "$attempt" -lt 100 ]; do
+    if [ -f "$TMUX_LIST_PANES_FAILED" ] \
+        && [ "$(wc -l < "$TMUX_LIST_PANES_FAILED")" -ge "$expected" ]; then
+      return 0
+    fi
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 # --- Test 1: receipt turn reaches idle/completed with the receipt message ---
@@ -498,6 +531,48 @@ test_vanished() {
     && ok "vanished: killed window detected" || fail "vanished: status wrong"
 }
 
+# --- Test 22: failed pane observations are retried without reporting vanished ---
+test_transient_pane_read_failures() {
+  local dir; dir=$(make_child t22 slow)
+  local sf="$WORK/t22.state.json" snap="$WORK/t22.watch.json"
+  launch "$dir" "$sf" 22 "$WORK/t22.launch.json" \
+    || { fail "pane-retry: launch exited $?"; return; }
+  fail_next_pane_reads 2
+  watch "$snap" "$sf" &
+  local watch_pid=$!
+  wait_for_failed_pane_reads 2 \
+    || { fail "pane-retry: watch did not retry failed pane reads"
+         kill "$watch_pid" 2>/dev/null
+         wait "$watch_pid" 2>/dev/null
+         return; }
+  touch "$dir/stub-release"
+  wait "$watch_pid" \
+    || { fail "pane-retry: watch exited $? ($(cat "$snap.err"))"; return; }
+  [ "$(json_field "$snap" sessions 0 status)" = "idle" ] \
+    || fail "pane-retry: recovered child was not reported idle"
+  grep -q '"vanished"' "$snap" \
+    && fail "pane-retry: a failed observation reported vanished" \
+    || ok "pane-retry: failed observations said nothing"
+}
+
+# --- Test 23: the retry limit makes a failed pane source a bridge error ---
+test_pane_read_failure_limit() {
+  local dir; dir=$(make_child t23 slow)
+  local sf="$WORK/t23.state.json" snap="$WORK/t23.watch.json"
+  launch "$dir" "$sf" 23 "$WORK/t23.launch.json" \
+    || { fail "pane-limit: launch exited $?"; return; }
+  fail_next_pane_reads 3
+  if watch "$snap" "$sf"; then
+    fail "pane-limit: watch accepted three failed pane reads"
+    return
+  fi
+  grep -q "unreachable but its window is alive" "$snap.err" \
+    && ok "pane-limit: watch surfaced a bridge error" \
+    || fail "pane-limit: wrong error ($(cat "$snap.err"))"
+  grep -q '"vanished"' "$snap" \
+    && fail "pane-limit: a failed observation reported vanished"
+}
+
 # --- Test 5: a failed turn surfaces as idle with turnStatus failed ---
 test_failed_turn() {
   local dir; dir=$(make_child t5 failed-turn)
@@ -590,6 +665,8 @@ test_unusable_resume_state
 test_question_send
 test_wave_wakeup
 test_vanished
+test_transient_pane_read_failures
+test_pane_read_failure_limit
 test_failed_turn
 test_tui_exit
 test_no_server
