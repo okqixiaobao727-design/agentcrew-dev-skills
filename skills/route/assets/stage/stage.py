@@ -682,11 +682,15 @@ def tracker_kind(repo, config):
     """The tracker this repository's config names; raises Blocked where it names none usable."""
     run = {
         "repair_model": driver.config_value(config, driver.REPAIR_MODEL_KEYS),
+        "witness_model": driver.config_value(config, driver.WITNESS_MODEL_KEYS),
+        "witness_budget_usd": driver.config_value(config, driver.WITNESS_BUDGET_KEYS),
         "tracker": driver.config_value(config, driver.TRACKER_KIND_KEYS),
     }
     problems = run_plan.configuration_problems(
         repo,
         run["repair_model"],
+        run["witness_model"],
+        run["witness_budget_usd"],
         run["tracker"],
     )
     if run["tracker"] not in run_plan.TRACKERS:

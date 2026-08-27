@@ -131,6 +131,14 @@ def block(text):
     return text.strip("\n")
 
 
+def render_witness_prompt(escalation, templates=None):
+    """One escalation filled into the library's public `[witness].prompt` template."""
+    templates = templates or load_templates()
+    return block(templates["witness"]["prompt"]).replace(
+        "<escalation>", str(escalation).strip()
+    )
+
+
 def ticket_slug(ticket):
     if ticket.slug:
         return ticket.slug

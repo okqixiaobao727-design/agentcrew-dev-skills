@@ -113,6 +113,10 @@ SURFACES = ("window", "pin", "both")
 # so it is refused on the same alias rule.
 REPAIR = "repair"
 REPAIR_MODEL = "model"
+# The escalation fact-checker's independently inheritable model and hard budget cap.
+WITNESS = "witness"
+WITNESS_MODEL = "model"
+WITNESS_BUDGET = "budget_usd"
 # The tracker a run closes its merged tickets in. Two are exercised end to end
 # (`references/trackers.md`), and a run on any other would reach a CLI nobody named.
 # The account names a repository declares, and nothing else: the name-to-profile mapping is a
@@ -310,7 +314,9 @@ def check_config_text(text, label, complete, aliases, problems):
         problems.append(f"{label}: unparsable: {error}")
         return
 
-    expected = {"implementer", "reviewer", "hooks", ACCOUNTS, DASHBOARD, REPAIR, TRACKER}
+    expected = {
+        "implementer", "reviewer", "hooks", ACCOUNTS, DASHBOARD, REPAIR, WITNESS, TRACKER,
+    }
     for section in sorted(set(config) - expected):
         problems.append(f"{label}: unknown section [{section}]")
 
@@ -331,10 +337,41 @@ def check_config_text(text, label, complete, aliases, problems):
     check_hook(config, label, complete, problems)
     check_accounts(config, label, problems)
     check_dashboard(config, label, complete, problems)
+    check_witness(config, label, complete, aliases, problems)
     # Not governed by `complete`: neither of these is inheritable, so both are required of every
     # config this validates, the shipped defaults and a project file alike.
     check_repair(config, label, aliases, problems)
     check_tracker(config, label, problems)
+
+
+def check_witness(config, label, complete, aliases, problems):
+    """The independently inheritable witness model and its positive hard budget cap."""
+    witness = config.get(WITNESS)
+    if witness is None:
+        if complete:
+            problems.append(f"{label}: missing [{WITNESS}] defaults")
+        return
+    if not isinstance(witness, dict):
+        problems.append(f"{label}: [{WITNESS}] must be a table")
+        return
+    model = witness.get(WITNESS_MODEL)
+    budget = witness.get(WITNESS_BUDGET)
+    if model is not None or complete:
+        if not isinstance(model, str) or not model.strip():
+            problems.append(f"{label}: [{WITNESS}] needs a non-empty {WITNESS_MODEL}")
+        elif is_alias(model, aliases):
+            problems.append(
+                f"{label}: [{WITNESS}] {WITNESS_MODEL} {model!r} is an alias, not a full model ID"
+            )
+    if budget is not None or complete:
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or budget <= 0
+        ):
+            problems.append(f"{label}: [{WITNESS}] needs a positive {WITNESS_BUDGET}")
+    for field in sorted(set(witness) - {WITNESS_MODEL, WITNESS_BUDGET}):
+        problems.append(f"{label}: [{WITNESS}] carries an unknown field {field!r}")
 
 
 def check_repair(config, label, aliases, problems):
