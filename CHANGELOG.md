@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-08-28
+
 ### Added
 - Codex turns whose opening line invokes a skill now carry the matching installed `SKILL.md` as a
   first-class app-server input item. The bridge resolves the path from `codex plugin list`, reports
