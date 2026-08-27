@@ -12,6 +12,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -39,8 +40,8 @@ BASE_COMMIT = "b614ec84712aa8c351fe30ec69000e2e12518aeb"
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
 RENDERED_RUN_AGAIN_BUDGET = (
-    "A `run again` axis is run again at most once during this ticket's only review; past that "
-    "the child sends `CREW ASK 06 stuck` with its reason"
+    "A review that cannot run or returns `refused`, or that names `run again` for an axis this "
+    "review already reran, is also `stuck`."
 )
 # The two halves of a row's account binding, spelled as the wave table spells them: a ticket that
 # named an account selects that configuration home explicitly, and a ticket that named none
@@ -51,7 +52,12 @@ CONFIG_HOME_VARIABLE = "CLAUDE_CONFIG_DIR"
 
 
 def review_command_argv(prompt):
-    """The one installed Review-Switch command rendered into a child's first turn."""
+    """The installed Review-Switch command named by, or rendered in, a child's first turn."""
+    script = re.search(r"`(bash [^`]+)`", prompt)
+    if script:
+        script_argv = shlex.split(script.group(1))
+        if len(script_argv) == 2 and script_argv[1].endswith(".review.sh"):
+            prompt = pathlib.Path(script_argv[1]).read_text()
     lines = prompt.splitlines()
     starts = [index for index, line in enumerate(lines) if line == "review-bridge \\"]
     if len(starts) != 1:
@@ -272,8 +278,13 @@ class ManualRolesTests(DispatchTestCase):
 
     def test_the_developer_prompt_reuses_the_first_turn_escalation_clause(self):
         ticket = self.fixture.ticket("136", "manual-roles")
-        escalation = dispatch_module.block(
-            dispatch_module.load_templates()["turn"]["escalate"]
+        templates = dispatch_module.load_templates()
+        escalation = dispatch_module.fill(
+            dispatch_module.block(templates["turn"]["escalate"]),
+            {
+                "<review caller budget>":
+                    f"\n  {dispatch_module.block(templates['review']['caller_budget'])}",
+            },
         )
 
         result = self.fixture.run_roles(ticket["path"])
@@ -286,8 +297,13 @@ class ManualRolesTests(DispatchTestCase):
 
     def test_manual_and_first_turn_render_the_same_clause_for_their_known_values(self):
         ticket = self.fixture.ticket("136", "manual-roles")
-        shared = dispatch_module.block(
-            dispatch_module.load_templates()["turn"]["escalate"]
+        templates = dispatch_module.load_templates()
+        shared = dispatch_module.fill(
+            dispatch_module.block(templates["turn"]["escalate"]),
+            {
+                "<review caller budget>":
+                    f"\n  {dispatch_module.block(templates['review']['caller_budget'])}",
+            },
         )
 
         manual = self.fixture.run_roles(ticket["path"])
@@ -298,6 +314,22 @@ class ManualRolesTests(DispatchTestCase):
         self.assertEqual(first_turn.returncode, 0, first_turn.stderr)
         self.assertIn(shared, manual.stdout)
         self.assertIn(shared.replace("<NN>", "136"), self.fixture.turn("136"))
+
+    def test_manual_developer_and_child_share_one_coordinator_sentence(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        expected = (
+            f"Your coordinator is the Claude session `{COORDINATOR_NAME}`; reply with SendMessage"
+            " to it, ending every message with `ts=<unix time>`."
+        )
+
+        manual = self.fixture.run_roles(ticket["path"])
+        table = self.fixture.table([ticket])
+        first_turn = self.fixture.run_dispatch("render", table)
+
+        self.assertEqual(manual.returncode, 0, manual.stderr)
+        self.assertEqual(first_turn.returncode, 0, first_turn.stderr)
+        self.assertEqual(" ".join(manual.stdout.split()).count(expected), 1)
+        self.assertEqual(" ".join(self.fixture.turn("136").split()).count(expected), 1)
 
     def test_the_developer_prompt_fills_the_configured_witness_command(self):
         ticket = self.fixture.ticket("136", "manual-roles")
@@ -563,10 +595,6 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertEqual(len(agents), 1, agents)
         return next(iter(agents.values()))["initialPrompt"]
 
-    def review_block(self):
-        prompt = self.initial_prompt()
-        return prompt.split("Review: ", 1)[1].split("\n\nYour coordinator is", 1)[0]
-
     def test_the_launch_json_defines_one_agent_the_cli_can_register(self):
         agents = self.fixture.agent_json("06")
         definition = next(iter(agents.values()))
@@ -577,20 +605,49 @@ class ClaudeRenderTests(DispatchTestCase):
     def test_the_first_turn_opens_on_the_ticket_and_points_at_the_spec(self):
         prompt = self.initial_prompt()
         self.assertTrue(prompt.startswith(f"/implement {self.ticket_path}\n"), prompt[:200])
-        self.assertIn(f"\nSpec: {self.fixture.spec_path}\n", prompt)
         self.assertIn(
-            "Your scope is this worktree and branch only; every path you write resolves inside it.",
-            prompt,
+            f"\nSpec: {self.fixture.spec_path}. Scope: this worktree and branch only.\n", prompt
         )
 
     def test_the_first_turn_carries_the_workflow_shape(self):
         self.assertIn(
-            "Workflow: tdd. Base commit for the review: %s.\n"
-            "Every expected value in a test derives from the ticket or the spec. A value read off"
-            " your own\nimplementation's output restates the implementation and tests nothing."
-            % self.fixture.base_commit,
-            self.initial_prompt(),
+            "2. Workflow: tdd. Base commit: %s. Expected values come from the ticket or the spec;"
+            " a value neither pins is a `design` decision point." % self.fixture.base_commit,
+            " ".join(self.initial_prompt().split()),
         )
+
+    def test_the_tdd_first_turn_is_the_five_step_brief_in_work_order(self):
+        prompt = self.initial_prompt()
+        numbered_steps = re.findall(r"^([1-5])\. ", prompt, flags=re.MULTILINE)
+
+        self.assertEqual(numbered_steps, ["1", "2", "3", "4", "5"])
+        self.assertIn(
+            "1. Before your first edit: send this phase's decision points as one `design`"
+            " escalation and wait for the ruling.",
+            " ".join(prompt.split()),
+        )
+        self.assertIn(
+            "A seam or public interface /tdd would have you confirm with the user is one.",
+            prompt,
+        )
+        self.assertIn(
+            f"2. Workflow: tdd. Base commit: {self.fixture.base_commit}. Expected values come from"
+            " the ticket or the spec; a value neither pins is a `design` decision point.",
+            " ".join(prompt.split()),
+        )
+        self.assertIn(
+            f"3. Before committing, run `bash {self.fixture.out_dir / '06.review.sh'}` as a"
+            " long-running command. In Claude Bash, set `run_in_background: true`. This is the"
+            " ticket's only review. Do what the result's `next` names.",
+            " ".join(prompt.split()),
+        )
+        self.assertIn("4. Commit.", prompt)
+        self.assertIn("5. If leftovers remain, escalate them as `wrap-up`", prompt)
+        for restatement in (
+            "nextCall.responseFile", "--recover-session", "foreground Bash call",
+        ):
+            with self.subTest(restatement=restatement):
+                self.assertNotIn(restatement, prompt)
 
     def test_the_first_turn_calls_review_switch_with_the_approved_review_and_scope(self):
         prompt = self.initial_prompt()
@@ -610,44 +667,57 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertNotIn("tui_review_bridge.py", prompt)
         self.assertNotIn("claude_review_bridge.py", prompt)
 
-    def test_the_first_turn_follows_next_and_sends_a_typed_doc_conflict(self):
+    def test_the_first_turn_names_one_review_script_instead_of_inlining_its_command(self):
+        prompt = self.initial_prompt()
+        review_script = self.fixture.out_dir / "06.review.sh"
+
+        self.assertIn(f"`bash {review_script}`", prompt)
+        self.assertTrue(review_script.is_file())
+        self.assertNotIn("review-bridge \\", prompt)
+
+    def test_a_review_script_path_with_spaces_is_one_shell_argument(self):
+        out_dir = self.fixture.root / "rendered launch"
+
+        result = self.fixture.run_dispatch("render", self.table, out_dir=out_dir)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = (out_dir / "06.turn.txt").read_text()
+        review_script = out_dir / "06.review.sh"
+        self.assertIn(f"`{shlex.join(['bash', str(review_script)])}`", prompt)
+        self.assertEqual(review_command_argv(prompt)[0], "review-bridge")
+
+    def test_the_first_turn_follows_next_and_maps_escalate_to_doc_conflict(self):
         prompt = self.initial_prompt()
         flattened = " ".join(prompt.split())
+        self.assertIn("Do what the result's `next` names", flattened)
         self.assertIn(
-            "For each axis do exactly what its `next` permits and nothing else", flattened
-        )
-        self.assertIn("`reportFile` and `preparation.responseFile`", flattened)
-        self.assertIn(
-            "send `CREW ASK 06 doc-conflict` carrying both positions to your coordinator",
+            "doc-conflict: the spec, ticket and code disagree in any pair, or a review result's"
+            " `next` is `escalate`",
             flattened,
         )
-        self.assertNotIn("Rounds.", prompt)
 
     def test_the_first_turn_keeps_long_reviews_out_of_the_foreground_bash_limit(self):
         prompt = " ".join(self.initial_prompt().split())
-        self.assertIn("background or long-running command", prompt)
+        self.assertIn("as a long-running command", prompt)
         self.assertIn("`run_in_background: true`", prompt)
-        self.assertIn("foreground Bash call is killed at ten minutes", prompt)
+        self.assertNotIn("foreground Bash call", prompt)
 
-    def test_the_first_turn_follows_the_next_call_without_translating_it(self):
+    def test_the_first_turn_leaves_next_call_details_to_review_switch(self):
         prompt = " ".join(self.initial_prompt().split())
-        self.assertIn("Where `nextCall.responseFile` is non-null", prompt)
-        self.assertIn("write the Response to `nextCall.responseFile`", prompt)
-        self.assertIn("in the shape `nextCall.responseFormat` shows", prompt)
-        self.assertIn("one line per finding, in report order", prompt)
-        self.assertIn("Run every `nextCall.argv` exactly as given", prompt)
+        self.assertIn("Do what the result's `next` names", prompt)
+        for restatement in ("nextCall.responseFile", "nextCall.responseFormat", "nextCall.argv"):
+            with self.subTest(restatement=restatement):
+                self.assertNotIn(restatement, prompt)
 
     def test_the_first_turn_caps_the_callers_run_again_budget(self):
         prompt = " ".join(self.initial_prompt().split())
         self.assertIn(RENDERED_RUN_AGAIN_BUDGET, prompt)
+        self.assertEqual(prompt.count(RENDERED_RUN_AGAIN_BUDGET), 1)
 
-    def test_the_first_turn_recovers_a_lost_result_before_starting_another_review(self):
+    def test_the_first_turn_leaves_recovery_to_review_switch(self):
         prompt = " ".join(self.initial_prompt().split())
-        self.assertIn(
-            "run the same command with `--recover-session` before starting another review",
-            prompt,
-        )
-        self.assertIn("`review-bridge --help` is the rule for what its exit codes permit", prompt)
+        self.assertNotIn("--recover-session", prompt)
+        self.assertNotIn("review-bridge --help", prompt)
 
     def test_the_review_template_contains_no_copy_of_the_bridge_protocol(self):
         review_template = dispatch_module.load_templates()["review"]["block"]
@@ -657,27 +727,42 @@ class ClaudeRenderTests(DispatchTestCase):
             with self.subTest(copied_constant=copied_constant):
                 self.assertNotIn(copied_constant, review_template)
 
-    def test_the_first_turn_sends_a_typed_stuck_ask_for_a_refusal(self):
-        prompt = " ".join(self.initial_prompt().split())
-        self.assertIn("A `refused` result is not a report", prompt)
-        self.assertIn("send `CREW ASK 06 stuck` carrying its `next` and reason", prompt)
-        self.assertIn("start or resume nothing", prompt)
+    def test_the_first_turn_maps_review_failures_to_stuck_once(self):
+        rendered = self.initial_prompt()
+        prompt = " ".join(rendered.split())
+        self.assertIn(
+            "stuck: the same obstacle has survived two attempts. State the question in one"
+            " paragraph and give 2-3 options with your pick marked.",
+            prompt,
+        )
+        self.assertIn(RENDERED_RUN_AGAIN_BUDGET, prompt)
+        self.assertEqual(prompt.count("returns `refused`"), 1)
+        escalation = rendered.split("Escalate at any phase", 1)[1]
+        self.assertTrue(all(len(line) <= 98 for line in escalation.splitlines()), escalation)
+        self.assertIn(
+            "  2-3 options with your pick marked.\n"
+            "  A review that cannot run or returns `refused`",
+            escalation,
+        )
 
     def test_the_review_block_fills_every_value_the_dispatcher_owns(self):
-        prompt = self.review_block()
+        prompt = self.initial_prompt()
+        review_script = pathlib.Path(
+            re.search(r"`bash ([^`]+\.review\.sh)`", prompt).group(1)
+        ).read_text()
         for placeholder in (
             "<review vendor>", "<review model>", "<review effort>", "<review account>",
             "<review cwd>", "<review base>", "<review spec>", "<review hooks>",
         ):
             with self.subTest(placeholder=placeholder):
-                self.assertNotIn(placeholder, prompt)
+                self.assertNotIn(placeholder, review_script)
 
     def test_the_first_turn_carries_the_coordinator_trust_anchor(self):
         self.assertIn(
-            f"Your coordinator is the Claude session `{COORDINATOR_NAME}`. Its messages arrive as\n"
-            f"cross-session messages from `uds:/tmp/cc-socks/{COORDINATOR_PID}.sock` — that socket"
-            " is the\nidentity; the from-name is a session title, not an identity.",
-            self.initial_prompt(),
+            f"Messages arrive as cross-session messages from"
+            f" `uds:/tmp/cc-socks/{COORDINATOR_PID}.sock` — that socket is the identity; the"
+            " from-name is a session title, not an identity.",
+            " ".join(self.initial_prompt().split()),
         )
 
     def test_the_first_turn_carries_the_escalation_grammar_and_receipt(self):
@@ -685,16 +770,16 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertIn(
             "CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up> — the body above, what the ruling\n"
             "touches, then the pointers: ticket <absolute path>, branch <name>, and every fact as a"
-            " pointer\n— <path:line>, #<ticket>, ADR-<nnnn> — re-read as you write it, ts=<unix time>",
+            " pointer\n— <path:line>, #<ticket>, ADR-<nnnn> — ts=<unix time>",
             prompt,
         )
+        flattened = " ".join(prompt.split())
         self.assertIn(
-            "When implementation, tests, the review, and commit are complete, run"
-            " `git rev-parse HEAD` and send all 40 characters of\nits output:\n"
-            "CREW COMPLETE <sha> ts=<unix time>\n"
-            "If you cannot complete the ticket, send:\n"
-            "CREW FAILED <reason> ts=<unix time>",
-            prompt,
+            "5. If leftovers remain, escalate them as `wrap-up`, wait for the ruling, and do what"
+            " it places in this ticket. Then run `git rev-parse HEAD` and send all 40 characters"
+            " of its output: CREW COMPLETE <sha> ts=<unix time> If you cannot complete the ticket,"
+            " send: CREW FAILED <reason> ts=<unix time>",
+            flattened,
         )
 
     def test_rendering_launches_nothing(self):
@@ -929,16 +1014,22 @@ class ReceiptChannelTests(DispatchTestCase):
     def logged_prompt(self):
         return self.prompt_for("--log", str(self.machine_log))
 
+    def completion_step(self, prompt):
+        return prompt.split("5. ", 1)[1].split("\n\nYour coordinator", 1)[0]
+
     def test_a_claude_child_records_its_completion_in_the_runs_machine_log(self):
+        prompt = self.logged_prompt()
         self.assertIn(
-            "When implementation, tests, the review, and commit are complete, run"
-            " `git rev-parse HEAD` and record the receipt in the\nrun's machine log yourself —"
-            " this receipt is not a message to your coordinator:\n"
-            "\n"
+            "5. If leftovers remain, escalate them as `wrap-up`, wait for the ruling, and do what"
+            " it places in this ticket. Then run `git rev-parse HEAD` and record the receipt in"
+            " the run's machine log:",
+            " ".join(prompt.split()),
+        )
+        self.assertIn(
             "python3 %s --log %s message \\\n"
             "  --role child --ticket 06 --message 'CREW COMPLETE <sha> ts=<unix time>'"
             % (self.log_script, self.machine_log),
-            self.logged_prompt(),
+            prompt,
         )
 
     def test_a_claude_child_records_its_failure_the_same_way(self):
@@ -948,20 +1039,18 @@ class ReceiptChannelTests(DispatchTestCase):
             self.logged_prompt(),
         )
 
-    def test_a_claude_child_is_told_not_to_send_its_receipts(self):
-        self.assertIn(
-            "Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is"
-            " woken for.",
-            self.logged_prompt(),
-        )
+    def test_a_claude_receipt_carries_no_codex_channel_instructions(self):
+        completion = self.completion_step(self.logged_prompt())
+
+        self.assertNotIn("SendMessage", completion)
+        self.assertNotIn("final line", completion)
 
     def test_a_claude_child_records_a_parked_receipt_too(self):
         prompt = self.prompt_for(
             "--log", str(self.machine_log), workflow="acceptance", review=None,
         )
         self.assertIn(
-            "Commit your preparation and the checklist, then park: record the receipt in the run's"
-            " machine log\nyourself — this receipt is not a message to your coordinator:\n"
+            "4. Park by recording the receipt in the run's machine log:\n"
             "\n"
             "python3 %s --log %s message \\\n"
             "  --role child --ticket 06 --message"
@@ -975,10 +1064,11 @@ class ReceiptChannelTests(DispatchTestCase):
     def test_a_claude_child_keeps_the_coordinator_channel_for_crew_ask(self):
         prompt = self.logged_prompt()
         self.assertIn(
-            f"Reply with SendMessage to\n`{COORDINATOR_NAME}`; ListAgents shows the ref to attach"
-            " on first send.",
-            prompt,
+            f"Your coordinator is the Claude session `{COORDINATOR_NAME}`; reply with SendMessage"
+            " to it, ending every message with `ts=<unix time>`.",
+            " ".join(prompt.split()),
         )
+        self.assertIn("ListAgents shows the ref to attach on first send", " ".join(prompt.split()))
         self.assertIn("CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up>", prompt)
 
     def test_a_codex_child_keeps_the_sendable_receipt_its_bridge_reads(self):
@@ -989,12 +1079,11 @@ class ReceiptChannelTests(DispatchTestCase):
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
         )
         self.assertIn(
-            "When characterization tests, refactor, the review, and commit are complete, run"
-            " `git rev-parse HEAD` and send all 40 characters of\nits output:\n"
-            "CREW COMPLETE <sha> ts=<unix time>\n"
-            "If you cannot complete the ticket, send:\n"
-            "CREW FAILED <reason> ts=<unix time>",
-            prompt,
+            "5. If leftovers remain, escalate them as `wrap-up`, wait for the ruling, and do what"
+            " it places in this ticket. Then run `git rev-parse HEAD` and send all 40 characters"
+            " of its output: CREW COMPLETE <sha> ts=<unix time> If you cannot complete the ticket,"
+            " send: CREW FAILED <reason> ts=<unix time>",
+            " ".join(prompt.split()),
         )
         self.assertNotIn("--role child", prompt)
         self.assertIn("CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up>", prompt)
@@ -1004,10 +1093,10 @@ class ReceiptChannelTests(DispatchTestCase):
         prompt = self.prompt_for()
         self.assertNotIn("machine_log.py", prompt)
         self.assertIn(
-            "When implementation, tests, the review, and commit are complete, run"
-            " `git rev-parse HEAD` and send all 40 characters of\nits output:\n"
-            "CREW COMPLETE <sha> ts=<unix time>",
-            prompt,
+            "5. If leftovers remain, escalate them as `wrap-up`, wait for the ruling, and do what"
+            " it places in this ticket. Then run `git rev-parse HEAD` and send all 40 characters"
+            " of its output: CREW COMPLETE <sha> ts=<unix time>",
+            " ".join(prompt.split()),
         )
 
 
@@ -1037,14 +1126,14 @@ class BareVerbLineTests(DispatchTestCase):
     def test_a_sendable_receipt_is_taught_the_bare_line(self):
         self.assertIn(self.SENTENCE, self.prompt_for())
 
-    def test_a_recorded_receipt_is_taught_the_bare_line(self):
-        self.assertIn(self.SENTENCE, self.prompt_for("--log", str(self.machine_log)))
+    def test_a_recorded_claude_receipt_drops_the_codex_bare_line_instruction(self):
+        self.assertNotIn(self.SENTENCE, self.prompt_for("--log", str(self.machine_log)))
 
     def test_a_parking_workflow_is_taught_the_bare_line_on_both_channels(self):
         self.assertIn(
             self.SENTENCE, self.prompt_for(workflow="acceptance", review=None)
         )
-        self.assertIn(
+        self.assertNotIn(
             self.SENTENCE,
             self.prompt_for("--log", str(self.machine_log), workflow="acceptance", review=None),
         )
@@ -1058,18 +1147,25 @@ class ReviewCallerBudgetTests(DispatchTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.fixture.turn("06")
 
-    def test_the_codex_review_lane_carries_the_callers_budget(self):
-        prompt = self.prompt_for()
-        self.assertNotIn("Rounds.", prompt)
-        self.assertIn(RENDERED_RUN_AGAIN_BUDGET, " ".join(prompt.split()))
-
-    def test_the_claude_review_lane_carries_the_callers_budget(self):
-        prompt = self.prompt_for(
-            workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
-            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+    def test_both_review_lanes_carry_the_callers_budget_once(self):
+        cases = (
+            ("codex", {}),
+            ("claude", {
+                "workflow": "refactor",
+                "executor": "codex",
+                "model": CODEX_MODEL,
+                "effort": CODEX_EFFORT,
+                "review": {
+                    "vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT,
+                },
+            }),
         )
-        self.assertNotIn("Rounds.", prompt)
-        self.assertIn(RENDERED_RUN_AGAIN_BUDGET, " ".join(prompt.split()))
+
+        for reviewer, overrides in cases:
+            with self.subTest(reviewer=reviewer):
+                flattened = " ".join(self.prompt_for(**overrides).split())
+                self.assertIn(RENDERED_RUN_AGAIN_BUDGET, flattened)
+                self.assertEqual(flattened.count(RENDERED_RUN_AGAIN_BUDGET), 1)
 
 
 class WorkflowShapeTests(DispatchTestCase):
@@ -1081,16 +1177,19 @@ class WorkflowShapeTests(DispatchTestCase):
 
     def test_a_workflow_without_a_lane_carries_no_review_block(self):
         prompt = self.prompt_for(workflow="direct", review=None)
-        self.assertIn("Workflow: direct. Implement it and commit", prompt)
+        self.assertIn("2. Workflow: direct. Implement it with no test-first cycle", prompt)
         self.assertNotIn("Review:", prompt)
         self.assertNotIn("Rounds.", prompt)
-        self.assertIn("When implementation and commit are complete", prompt)
+        self.assertIn("3. Commit.", prompt)
+        self.assertIn("4. If leftovers remain", prompt)
+        self.assertNotIn("returns `refused`", prompt)
+        self.assertFalse((self.fixture.out_dir / "06.review.sh").exists())
 
     def test_acceptance_parks_by_receipt_instead_of_completing(self):
         prompt = self.prompt_for(workflow="acceptance", review=None)
-        self.assertIn("Workflow: acceptance. This ticket closes with a human", prompt)
+        self.assertIn("2. Workflow: acceptance. This ticket closes with a human", prompt)
         self.assertIn(
-            "Commit your preparation and the checklist, then park: send\n"
+            "4. Park by sending\n"
             "CREW PARKED <absolute checklist path> ts=<unix time>",
             prompt,
         )
@@ -1101,12 +1200,109 @@ class WorkflowShapeTests(DispatchTestCase):
             workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
         )
-        self.assertIn(
-            f"Review: claude at model {CLAUDE_MODEL}, effort {CLAUDE_EFFORT}.", prompt
-        )
         self.assertEqual(
             review_command_argv(prompt)[0:3], ["review-bridge", "--reviewer", "claude"]
         )
+
+
+class WorkflowMatrixTests(DispatchTestCase):
+    EXPECTED_STEPS = {
+        "tdd": ["1", "2", "3", "4", "5"],
+        "refactor": ["1", "2", "3", "4", "5"],
+        "direct": ["1", "2", "3", "4"],
+        "spike": ["1", "2", "3", "4"],
+        "ops": ["1", "2", "3", "4"],
+        "acceptance": ["1", "2", "3", "4"],
+    }
+    OPENING = {
+        "tdd": {"claude": "/implement", "codex": "$implement"},
+        "refactor": {"claude": "Refactor per", "codex": "Refactor per"},
+        "direct": {"claude": "Implement", "codex": "Implement"},
+        "spike": {"claude": "Investigate", "codex": "Investigate"},
+        "ops": {"claude": "Implement", "codex": "Implement"},
+        "acceptance": {"claude": "Prepare", "codex": "Prepare"},
+    }
+    WORK_BRIEF_MARKER = {
+        "tdd": "Expected values come from the ticket or the spec",
+        "refactor": "Write characterization tests that pin today's behaviour",
+        "direct": "Write tests only where the ticket names them as part of the deliverable",
+        "spike": "Every claim carries a source",
+        "ops": "Record in the commit message the commands you ran",
+        "acceptance": "The checklist is resumable",
+    }
+
+    def test_every_workflow_and_lane_renders_its_ordered_first_turn(self):
+        machine_log = self.fixture.root / "run" / "log.jsonl"
+        cases = []
+        for index, (workflow, executor) in enumerate(
+            (workflow, executor)
+            for workflow in self.EXPECTED_STEPS
+            for executor in ("claude", "codex")
+        ):
+            reviewed = workflow in ("tdd", "refactor")
+            cases.append((
+                f"{index + 10:02}", workflow, executor,
+                self.fixture.ticket(
+                    f"{index + 10:02}", f"{workflow}-{executor}", workflow=workflow,
+                    executor=executor,
+                    model=CLAUDE_MODEL if executor == "claude" else CODEX_MODEL,
+                    effort=CLAUDE_EFFORT if executor == "claude" else CODEX_EFFORT,
+                    review=(
+                        {"vendor": "codex", "model": CODEX_MODEL, "effort": CODEX_EFFORT}
+                        if reviewed and executor == "claude" else
+                        {"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT}
+                        if reviewed else None
+                    ),
+                ),
+            ))
+        table = self.fixture.table([ticket for _, _, _, ticket in cases])
+
+        result = self.fixture.run_dispatch(
+            "render", table, extra=("--log", str(machine_log)),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for number, workflow, executor, ticket in cases:
+            with self.subTest(workflow=workflow, executor=executor):
+                prompt = self.fixture.turn(number)
+                self.assertTrue(
+                    prompt.startswith(f"{self.OPENING[workflow][executor]} {ticket['path']}\n")
+                )
+                self.assertEqual(
+                    re.findall(r"^([1-5])\. ", prompt, flags=re.MULTILINE),
+                    self.EXPECTED_STEPS[workflow],
+                )
+                self.assertIn(f"2. Workflow: {workflow}.", prompt)
+                self.assertIn(self.WORK_BRIEF_MARKER[workflow], " ".join(prompt.split()))
+                for placeholder in (
+                    "<design bridge>", "<review step>", "<review block>",
+                    "<review script>", "<review background>", "<review caller budget>",
+                ):
+                    self.assertNotIn(placeholder, prompt)
+                review_script = self.fixture.out_dir / f"{number}.review.sh"
+                self.assertEqual(review_script.exists(), workflow in ("tdd", "refactor"))
+                completion_step = "5" if workflow in ("tdd", "refactor") else "4"
+                completion = prompt.split(
+                    f"{completion_step}. ", 1
+                )[1].split("\n\nYour coordinator", 1)[0]
+                if executor == "claude":
+                    self.assertNotIn("final line", completion)
+                else:
+                    self.assertIn("final line", completion)
+                if workflow in ("tdd", "refactor"):
+                    self.assertIn("returns `refused`", prompt)
+                else:
+                    self.assertNotIn("returns `refused`", prompt)
+                if workflow == "direct":
+                    invocation = (
+                        "$mattpocock-skills:writing-for-agents"
+                        if executor == "codex" else
+                        "/mattpocock-skills:writing-for-agents"
+                    )
+                    self.assertIn(invocation, prompt)
+                if workflow == "acceptance":
+                    self.assertIn("CREW PARKED <absolute checklist path>", completion)
+                    self.assertNotIn("CREW COMPLETE", completion)
 
 
 class CodexRenderTests(DispatchTestCase):
@@ -1123,6 +1319,7 @@ class CodexRenderTests(DispatchTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         turn = self.fixture.turn("07")
+        self.assertTrue(turn.startswith(f"$implement {self.ticket['path']}\n"), turn[:200])
         self.assertIn(
             "Your coordinator is outside your session and reads the final message of every turn"
             " you end —\nnever anything you print mid-turn.",
@@ -1255,7 +1452,7 @@ class DispatchLaunchTests(DispatchTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertTrue((self.worktree / "landed.md").is_file())
-        self.assertIn(f"Base commit for the review: {landed}.", self.fixture.turn("06"))
+        self.assertIn(f"Base commit: {landed}.", self.fixture.turn("06"))
 
     def test_the_guard_assets_are_installed_with_the_worktree_path_filled_in(self):
         self.fixture.run_dispatch("dispatch", self.table)

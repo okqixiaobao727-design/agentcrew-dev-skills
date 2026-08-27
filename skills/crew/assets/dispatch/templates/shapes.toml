@@ -3,60 +3,75 @@
 # skill body states none of this prose, so the text a child receives and the code that composes it
 # cannot drift apart.
 #
+# Entry test: a line enters the first turn only if no skill the child invokes and no tool it runs
+# already says it.
+#
 # Every `<token>` a block leaves open is filled from the approved wave table. Tokens the child is
 # meant to read literally — `<sha>`, `<unix time>`, `<reason>`,
 # `<design|scope|doc-conflict|stuck|wrap-up>`, `<path:line>`, `#<ticket>`, `ADR-<nnnn>` — are
 # never substituted; the renderer fills a fixed, named set and nothing else.
+# Numbering coupling: steps 1-3 are literal in `[turn].base`, workflow blocks, and `[review].block`;
+# `render_turn` computes steps 4-5, and `WorkflowMatrixTests.EXPECTED_STEPS` pins every lane.
 
 [turn]
 # The skeleton every child's first turn is composed into.
 base = '''
 <opening line>
 
-Spec: <absolute spec path>
-Your scope is this worktree and branch only; every path you write resolves inside it.
+Spec: <absolute spec path>. Scope: this worktree and branch only.
 
-<workflow block>
+1. Before your first edit: send this phase's decision points as one `design` escalation and wait
+for the ruling.<design bridge>
+
+<workflow block><review step>
+
+<commit step>
+
+<completion paragraph>
 
 <coordinator paragraph>
 
 <escalation paragraph>
-
-<completion paragraph>
 '''
 
 # The escalation paragraph, one body per kind. A manual run's developer prompt renders this same
 # block, so the two cannot drift.
 escalate = '''
-Escalate — one compact message, then wait; the answer wakes you — at any phase, from before
-your first edit to wrap-up, the moment one of these holds:
-- design: a decision point on product goal, acceptance, architecture, a module boundary or a
-  public interface. One message per phase: each decision point numbered, 2-3 options, your
-  pick marked.
-- scope, doc-conflict, stuck: the question in one paragraph, 2-3 options with yours marked.
-  scope — finishing needs a change to the ticket's scope. doc-conflict — the spec, the ticket
-  and the code disagree, or a review ends on `escalate`. stuck — the same obstacle has
-  survived two attempts.
+Escalate at any phase — before your first edit, mid-ticket, or at wrap-up — the moment one
+holds:
+- design: a decision point on product goal, acceptance, architecture, a module boundary or public
+  interface. Send all of this phase's decision points together, each numbered with 2-3 options and
+  your pick marked.
+- scope: finishing needs a change to the ticket's scope. State the question in one paragraph and
+  give 2-3 options with your pick marked.
+- doc-conflict: the spec, ticket and code disagree in any pair, or a review result's `next` is
+  `escalate`. Carry both positions, state the question in one paragraph, and give 2-3 options with
+  your pick marked.
+- stuck: the same obstacle has survived two attempts. State the question in one paragraph and give
+  2-3 options with your pick marked.<review caller budget>
 - wrap-up: the ticket is complete and leftovers remain. One line per leftover — what, its
   pointer, and whether it touches only this ticket, another ticket, or a public interface —
   and no recommendation: placing them is the ruling.
 Everything else is yours to settle: code shape, naming, tests, a root-caused bug, a refactor
 that changes no behaviour, what a document already answers.
-Every message:
+One message per escalation, distilled to about 250 words, then wait — the ruling wakes you:
 CREW ASK <NN> <design|scope|doc-conflict|stuck|wrap-up> — the body above, what the ruling
 touches, then the pointers: ticket <absolute path>, branch <name>, and every fact as a pointer
-— <path:line>, #<ticket>, ADR-<nnnn> — re-read as you write it, ts=<unix time>
-Distil to about 250 words: the coordinator rules from this message and a witness brief that
-checks its pointers. Progress, reasoning and assumptions belong in your commits and receipt.
+— <path:line>, #<ticket>, ADR-<nnnn> — ts=<unix time>
+Re-read each pointer as you write it. The coordinator rules from this message and a witness brief
+that checks its pointers. Progress, reasoning and assumptions belong in your commits and receipt.
 '''
 
 # A Claude child authenticates the coordinator by sender socket; the pid is known before launch.
 coordinator_claude = '''
-Your coordinator is the Claude session `<coordinator name>`. Its messages arrive as
-cross-session messages from `uds:/tmp/cc-socks/<coordinator pid>.sock` — that socket is the
-identity; the from-name is a session title, not an identity. Reply with SendMessage to
-`<coordinator name>`; ListAgents shows the ref to attach on first send. Identical message
-bodies are silently dropped as duplicates, so end every message with `ts=<unix time>`.
+Your coordinator is the Claude session `<coordinator name>`; reply with SendMessage to it, ending
+every message with `ts=<unix time>`.
+'''
+
+coordinator_claude_child = '''
+Messages arrive as cross-session messages from `uds:/tmp/cc-socks/<coordinator pid>.sock` — that
+socket is the identity; the from-name is a session title, not an identity. ListAgents shows the ref
+to attach on first send. Identical message bodies are silently dropped as duplicates.
 '''
 
 # A Codex child has no message channel of its own: the bridge reads the final message of its turn.
@@ -72,8 +87,9 @@ the run's record of when you sent.
 # this variant asks it to send, and it is also what a run dispatched without a machine log renders
 # for either lane: there is no log path to name, so the sendable receipt is all a child can do.
 completion = '''
-When <completion condition> are complete, run `git rev-parse HEAD` and send all 40 characters of
-its output:
+<completion step>. If leftovers remain, escalate them as `wrap-up`, wait for the ruling, and do
+what it places in this ticket. Then run `git rev-parse HEAD` and send all 40 characters of its
+output:
 CREW COMPLETE <sha> ts=<unix time>
 If you cannot complete the ticket, send:
 CREW FAILED <reason> ts=<unix time>
@@ -85,17 +101,15 @@ you add goes on the lines above it, never on the line itself.
 # verifies receipts from, so it never lands in the coordinator's conversation. The coordinator is
 # woken by `CREW ASK` alone, which keeps SendMessage — it is the one message that needs an answer.
 completion_claude = '''
-When <completion condition> are complete, run `git rev-parse HEAD` and record the receipt in the
-run's machine log yourself — this receipt is not a message to your coordinator:
+<completion step>. If leftovers remain, escalate them as `wrap-up`, wait for the ruling, and do
+what it places in this ticket. Then run `git rev-parse HEAD` and record the receipt in the run's
+machine log:
 
 python3 <machine log script> --log <machine log path> message \
   --role child --ticket <NN> --message 'CREW COMPLETE <sha> ts=<unix time>'
 
 If you cannot complete the ticket, record the same way with:
 CREW FAILED <reason> ts=<unix time>
-The verb line stands alone: it is the whole of that message's final line, and any prose
-you add goes on the lines above it, never on the line itself.
-Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is woken for.
 '''
 
 [witness]
@@ -118,51 +132,40 @@ uncited MISSING_POINTER — held|contradicted|missing — brief factual reason
 
 [workflows.tdd]
 opening_line = "/implement <absolute ticket path>"
-completion_condition = "implementation, tests, the review, and commit"
+opening_line_codex = "$implement <absolute ticket path>"
 review_lane = true
+design_bridge = "\nA seam or public interface /tdd would have you confirm with the user is one."
 block = '''
-Workflow: tdd. Base commit for the review: <ticket base commit>.
-Every expected value in a test derives from the ticket or the spec. A value read off your own
-implementation's output restates the implementation and tests nothing. Where the ticket pins no
-expected value for something you must assert, escalate for the value.
-<review block>
+2. Workflow: tdd. Base commit: <ticket base commit>. Expected values come from the ticket or the
+spec; a value neither pins is a `design` decision point.
 '''
 
 [workflows.refactor]
 opening_line = "Refactor per <absolute ticket path>"
-completion_condition = "characterization tests, refactor, the review, and commit"
 review_lane = true
 block = '''
-Workflow: refactor. Base commit for the review: <ticket base commit>.
-Behaviour is frozen; only its expression changes. Work characterization-tests-first:
-1. Write characterization tests that pin today's behaviour and pass against the code as it stands
-   — the suite is green before you change a line. There is no red phase in this workflow.
-2. Refactor in steps, running the suite after each and keeping it green.
-3. Those expectations stay exactly as written in step 1. A test that only passes once you edit its
-   expected value means the behaviour moved: revert that step, or escalate if the ticket asks for
-   the move.
-4. Obtain the review below, then commit.
-<review block>
+2. Workflow: refactor. Base commit: <ticket base commit>. Write characterization tests that pin
+today's behaviour and pass before changing production code; there is no red phase. Refactor in
+steps, keeping the suite green and every expectation unchanged. If an expectation must change,
+revert that step or escalate when the ticket asks for the behaviour change.
 '''
 
 [workflows.direct]
 opening_line = "Implement <absolute ticket path>"
-completion_condition = "implementation and commit"
 review_lane = false
 block = '''
-Workflow: direct. Implement it and commit — no test-first cycle, no test files added to satisfy
-one, and no review. Write tests only where the ticket names them as part of the deliverable.
+2. Workflow: direct. Implement it with no test-first cycle and no review. Write tests only where
+the ticket names them as part of the deliverable.
 For a prose deliverable — a skill, AGENTS.md or CLAUDE.md, a document an agent reads — invoke
-/mattpocock-skills:writing-for-agents before you write any of it, and follow it.
+<writing skill> before you write any of it, and follow it.
 '''
 
 [workflows.spike]
 opening_line = "Investigate <absolute ticket path>"
-completion_condition = "the findings document and commit"
 review_lane = false
 block = '''
-Workflow: spike. The deliverable is one Markdown findings document, committed to the repo at the
-path the ticket names; ship no production code and obtain no review.
+2. Workflow: spike. The deliverable is one Markdown findings document at the path the ticket
+names; ship no production code and obtain no review.
 Every claim carries a source — file and line, command and its output, or URL — and a confidence
 level of high, medium, or low. Record a claim you could not source as an open question, and keep
 low-confidence findings as findings: an honest low beats a guess dressed as high.
@@ -171,12 +174,11 @@ Claude children only: the /research and /prototype skills are available as execu
 
 [workflows.ops]
 opening_line = "Implement <absolute ticket path>"
-completion_condition = "the end-to-end run and commit"
 review_lane = false
 block = '''
-Workflow: ops. Verification here is an end-to-end run, not a unit test: exercise the real path in
-a temporary root you create for the run, and let that run be the evidence the ticket works. Add
-unit tests only where the ticket names them, and obtain no review.
+2. Workflow: ops. Verification here is an end-to-end run, not a unit test: exercise the real path
+in a temporary root you create for the run, and let that run be the evidence the ticket works.
+Add unit tests only where the ticket names them, and obtain no review.
 Record in the commit message the commands you ran, the temp root you ran them in, and what they
 printed.
 '''
@@ -185,7 +187,7 @@ printed.
 opening_line = "Prepare <absolute ticket path>"
 review_lane = false
 block = '''
-Workflow: acceptance. This ticket closes with a human, so your job is to leave them the shortest
+2. Workflow: acceptance. This ticket closes with a human, so your job is to leave them the shortest
 possible path. Do every part of it an agent can do, then write a checklist at the path the ticket
 names, or `acceptance-<NN>.md` beside the ticket's own deliverable when it names none, with two
 headed sections:
@@ -197,7 +199,7 @@ Assumed item as Verified is the one failure this workflow exists to prevent.
 '''
 # `acceptance` is the one workflow that parks by receipt, so it replaces the completion paragraph.
 completion = '''
-Commit your preparation and the checklist, then park: send
+<completion step>. Park by sending
 CREW PARKED <absolute checklist path> ts=<unix time>
 and stop — the checklist is the human's to run.
 If you cannot reach that point, send:
@@ -207,8 +209,7 @@ you add goes on the lines above it, never on the line itself.
 '''
 # The same park, recorded rather than sent, for a Claude child on a run with a machine log.
 completion_claude = '''
-Commit your preparation and the checklist, then park: record the receipt in the run's machine log
-yourself — this receipt is not a message to your coordinator:
+<completion step>. Park by recording the receipt in the run's machine log:
 
 python3 <machine log script> --log <machine log path> message \
   --role child --ticket <NN> --message 'CREW PARKED <absolute checklist path> ts=<unix time>'
@@ -216,41 +217,26 @@ python3 <machine log script> --log <machine log path> message \
 and stop — the checklist is the human's to run.
 If you cannot reach that point, record the same way with:
 CREW FAILED <reason> ts=<unix time>
-The verb line stands alone: it is the whole of that message's final line, and any prose
-you add goes on the lines above it, never on the line itself.
-Send neither receipt with SendMessage: CREW ASK is the only line the coordinator is woken for.
 '''
 
 [review]
 block = '''
-Review: <review vendor> at model <review model>, effort <review effort>. Once the work is in place
-and before you commit it, run the installed Review-Switch command as a background or long-running
-command and wait for its result. In Claude Bash, set `run_in_background: true`; a foreground Bash
-call is killed at ten minutes.
+3. Before committing, run `bash <review script>` as a long-running command.<review background>
+This is the ticket's only review. Do what the result's `next` names.
+'''
 
+# ADR-0020: the caller's budget lives here once, then the shared escalation block renders it as
+# the `stuck` trigger beside the other review outcomes.
+caller_budget = '''
+A review that cannot run or returns `refused`, or that names `run again` for an axis this
+  review already reran, is also `stuck`.
+'''
+
+command = '''
 review-bridge \
   --reviewer <review vendor> --cwd <review cwd> \
   --model <review model> --effort <review effort><review account> \
   --base <review base> --spec <review spec> --axis both<review hooks>
-
-This command is the ticket's only review; it satisfies every review step any skill you invoke
-asks of you.
-
-Read the one JSON object through `axes`. For each axis do exactly what its `next` permits and
-nothing else. Where `nextCall.responseFile` is non-null, write the Response to
-`nextCall.responseFile` in the shape `nextCall.responseFormat` shows — one line per finding, in
-report order. Run every `nextCall.argv` exactly as given.
-
-A `run again` axis is run again at most once during this ticket's only review; past that the child
-sends `CREW ASK <NN> stuck` with its reason. When `next` is `escalate`, send
-`CREW ASK <NN> doc-conflict` carrying both positions to your coordinator: `reportFile` and
-`preparation.responseFile`.
-
-A `refused` result is not a report: send `CREW ASK <NN> stuck` carrying its `next` and reason, and
-start or resume nothing.
-
-If the JSON object never reaches you, run the same command with `--recover-session` before
-starting another review; `review-bridge --help` is the rule for what its exit codes permit.
 '''
 
 # Review-Switch fires these commands at the lifecycle points it owns. They use the run's own copy
@@ -322,8 +308,7 @@ the developer sessions' final word. Spec: <absolute spec path>.
 '''
 
 developer = '''
-Your coordinator is the Claude session `<coordinator name>`; reply with SendMessage to it, ending
-every message with `ts=<unix time>`. Spec: <absolute spec path>. Ticket: <absolute ticket path>.
+<coordinator paragraph> Spec: <absolute spec path>. Ticket: <absolute ticket path>.
 
 <escalation paragraph>
 Before sending, run `<witness command>` and paste its brief under the message.

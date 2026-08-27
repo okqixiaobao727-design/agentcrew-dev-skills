@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 
@@ -23,6 +24,8 @@ PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "skills" / "crew" / "assets" / "machine_log.py"
 BOUNDED_SCRIPT = SCRIPT.with_name("bounded_read.py")
 CREW_DIR = SCRIPT.parent.parent
+GLOSSARY = PLUGIN_ROOT / "docs" / "glossary.md"
+SHAPES = PLUGIN_ROOT / "skills" / "crew" / "assets" / "dispatch" / "templates" / "shapes.toml"
 COORDINATOR_SESSION = "9d1f4c2a-0000-4000-8000-000000000133"
 sys.path.insert(0, str(SCRIPT.parent))
 import machine_log  # noqa: E402
@@ -101,6 +104,27 @@ class EscalationGrammarTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(machine_log.final_verb(line), (None, None))
                 self.assertEqual(machine_log.malformed_receipt(line), line)
+
+    def test_the_glossary_defines_protocol_and_work_brief(self):
+        glossary = GLOSSARY.read_text()
+
+        self.assertIn(
+            "**Protocol** — The text that never varies by workflow and is rendered into every "
+            "child's first turn",
+            " ".join(glossary.split()),
+        )
+        self.assertIn(
+            "**Work brief** — The per-workflow delta in a child's first turn",
+            " ".join(glossary.split()),
+        )
+
+    def test_the_first_turn_escalation_block_names_the_machine_logs_five_kinds(self):
+        with SHAPES.open("rb") as handle:
+            escalation = tomllib.load(handle)["turn"]["escalate"]
+
+        rendered_kinds = tuple(re.findall(r"^- ([a-z-]+):", escalation, flags=re.MULTILINE))
+
+        self.assertEqual(rendered_kinds, machine_log.ESCALATION_KINDS)
 
     def test_an_ask_allows_the_protocol_timestamp_after_its_kind_or_body(self):
         messages = (
