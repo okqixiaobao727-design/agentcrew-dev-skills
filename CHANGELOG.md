@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Codex turns whose opening line invokes a skill now carry the matching installed `SKILL.md` as a
+  first-class app-server input item. The bridge resolves the path from `codex plugin list`, reports
+  a missing skill instead of silently dropping it, and keeps ordinary prompts unchanged (#150).
+
+### Changed
+- Child first turns now contain one shared protocol plus a concise workflow brief in the order the
+  child works. Review commands are rendered into per-ticket scripts, repeated skill guidance is
+  removed, and Codex lanes open with an explicit `$skill` invocation (#147).
+
 ### Fixed
 - A reaped waiter no longer strands the run. The waiter — the process `/crew` leaves blocking on
   the run's wake snapshot — is a main-session background shell, and Claude Code reaps those under
@@ -18,6 +28,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
   types `/crew <feature-dir>` into the coordinator's own pane once, and the dashboard carries
   `✖ no waiter — /crew <feature-dir> to re-attach` in the driver-dead slot until one attaches
   (#127).
+- A failed Codex tmux query no longer becomes a false `vanished` verdict. Failed pane reads use the
+  bridge's existing bounded retry and driver-error path, while the dashboard renders an unreadable
+  state as annotated `unknown`; only a successful pane-list read can prove absence (#140).
+- The bounded-read hook now receives the coordinator's session ID explicitly on fresh launches,
+  adoption and re-anchoring, so other sessions in the same repository are not bounded (#148).
+- Driver re-ask, nudge, bounce and merge instructions now tell Claude children to record receipts
+  through the run-local machine log while Codex children retain send-based instructions (#149).
 
 ## [0.9.6] - 2026-08-27
 
