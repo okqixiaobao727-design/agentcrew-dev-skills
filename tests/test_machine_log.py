@@ -74,6 +74,57 @@ def run_hook(payload, log=None, role="child", ticket=None):
     )
 
 
+class EscalationGrammarTests(unittest.TestCase):
+    """An ask is a verb only when it names one of the protocol's five kinds."""
+
+    def test_the_escalation_grammar_exports_and_accepts_exactly_five_kinds(self):
+        expected_kinds = ("design", "scope", "doc-conflict", "stuck", "wrap-up")
+
+        self.assertEqual(machine_log.ESCALATION_KINDS, expected_kinds)
+        for kind in expected_kinds:
+            line = f"CREW ASK 07 {kind}"
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    machine_log.final_verb(line),
+                    (machine_log.ESCALATION_VERB, line),
+                )
+
+        malformed = (
+            "CREW ASK 07 progress",
+            "CREW ASK 07",
+            "CREW ASK 07 scope extra",
+        )
+        for line in malformed:
+            with self.subTest(line=line):
+                self.assertEqual(machine_log.final_verb(line), (None, None))
+                self.assertEqual(machine_log.malformed_receipt(line), line)
+
+    def test_an_ask_allows_the_protocol_timestamp_after_its_kind_or_body(self):
+        messages = (
+            "CREW ASK 07 stuck ts=1755060042",
+            "CREW ASK 07 wrap-up — place this leftover ts=1755060042",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    machine_log.final_verb(message),
+                    (machine_log.ESCALATION_VERB, message),
+                )
+
+    def test_an_ask_refuses_a_non_numeric_ticket_and_other_body_separators(self):
+        malformed = (
+            "CREW ASK nonsense stuck",
+            "CREW ASK 07 design: which option?",
+            "CREW ASK 07 stuck - the fixture never came up",
+        )
+
+        for line in malformed:
+            with self.subTest(line=line):
+                self.assertEqual(machine_log.final_verb(line), (None, None))
+                self.assertEqual(machine_log.malformed_receipt(line), line)
+
+
 def send_message_event(message, to="crew-coordinator", cwd="/tmp/worktree"):
     """A PostToolUse payload for a SendMessage call that has just been made.
 
@@ -991,6 +1042,23 @@ class HookTests(MachineLogTestCase):
         entry = self.only_line()
         self.assertEqual(entry["event"], "escalation")
         self.assertEqual(entry["message"], BUNDLED_ESCALATION)
+
+    def test_wrap_up_is_classified_as_the_same_escalation_event_as_design(self):
+        for kind in ("design", "wrap-up"):
+            message = f"CREW ASK 07 {kind} — which option should I take? ts=1755060042"
+            result = run_hook(
+                send_message_event(message, to="agentcrew-dev-skills-1f"),
+                log=self.log,
+                role="child",
+                ticket="07",
+            )
+            with self.subTest(kind=kind):
+                self.assertEqual(result.returncode, 0)
+
+        self.assertEqual(
+            [entry["event"] for entry in self.lines()],
+            ["escalation", "escalation"],
+        )
 
     def test_a_verb_quoted_inside_a_line_is_not_read_as_one(self):
         """The verbs are anchored to a whole line, so prose that names one has not spoken it."""

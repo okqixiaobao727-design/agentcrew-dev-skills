@@ -1316,17 +1316,37 @@ class LoopTests(DriverTestCase):
         self.assertIn("never resent", failed[-1]["detail"])
 
     def test_a_malformed_ask_is_bounced_with_the_shape_an_ask_takes(self):
-        """A near miss is not always a receipt: the answer names every verb's shape, not three."""
+        """An ask bounce names every kind, its body separator and the protocol timestamp."""
         process = self.start(("01", ()))
 
-        self.fixture.says("01", "CREW ASK")
+        self.fixture.says("01", "CREW ASK 01 progress")
         instruction = self.wait_for_instruction("01", "CREW RESEND")
         self.fixture.completes("01")
         self.woken(process, "run-complete")
 
-        self.assertIn("CREW ASK", instruction)
+        self.assertIn(
+            "CREW ASK <NN> <design|scope|doc-conflict|stuck|wrap-up>"
+            " [— <body>] [ts=<unix>]",
+            instruction,
+        )
         self.assertEqual(self.events("escalation", ticket="01"), [])
         self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_second_unknown_ask_kind_settles_the_ticket_failed(self):
+        """The bounce is the unknown kind's only retry before the written failed outcome."""
+        process = self.start(("01", ()))
+
+        malformed = "CREW ASK 01 progress"
+        self.fixture.says("01", malformed)
+        self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.says("01", malformed)
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW RESEND")), 1)
+        self.assertEqual(self.events("escalation", ticket="01"), [])
+        failed = self.events("receipt", ticket="01", verdict="failed")
+        self.assertIn(malformed, failed[-1]["detail"])
 
     def test_a_message_that_speaks_no_verb_at_all_is_not_bounced(self):
         """Conversation is still conversation; only a near miss is answered."""
@@ -1645,6 +1665,18 @@ class LoopTests(DriverTestCase):
         self.assertIn("which table?", snapshot["detail"])
         self.assertIn("resume", snapshot)
         self.assertIsNone(self.verdict("01"), "an answered ASK is not an outcome")
+
+    def test_a_wrap_up_crew_ask_wakes_the_coordinator_carrying_the_ticket_and_ask(self):
+        """Wrap-up is an ordinary escalation rather than a settling receipt."""
+        process = self.start(("01", ()))
+
+        message = "CREW ASK 01 wrap-up — should this leftover become a ticket? ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn(message, snapshot["detail"])
+        self.assertIsNone(self.verdict("01"), "a wrap-up ASK is not an outcome")
 
     def test_a_second_escalation_after_a_ruling_wakes_the_coordinator_again(self):
         """A resume steps past the ASK it was run for, and past nothing else that ticket says."""

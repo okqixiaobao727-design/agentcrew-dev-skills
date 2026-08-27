@@ -65,6 +65,7 @@ CHILD = "child"
 # `CREW COMPLETE` is a claim, and only the verifying script's `receipt` event says whether it
 # held, so the two must never share an event name in the log.
 ESCALATION_VERB = "CREW ASK"
+ESCALATION_KINDS = ("design", "scope", "doc-conflict", "stuck", "wrap-up")
 COMPLETE_VERB = "CREW COMPLETE"
 PARKED_VERB = "CREW PARKED"
 FAILED_VERB = "CREW FAILED"
@@ -86,13 +87,19 @@ TIMESTAMP_SUFFIX = r"(?: ts=\d+)?"
 # Anchored to a whole line, because a child composes its final turn freely: the receipt is as
 # often bundled under a summary as sent bare, and only a whole-line match tells the verb apart
 # from the same words quoted out of the instructions that taught them. `CREW COMPLETE` carries a
-# full 40-character sha for the same reason — the one verb whose argument has a shape, spelled in
-# full so prose about a receipt cannot pass for one.
+# full 40-character sha, and `CREW ASK` carries one of the closed escalation kinds, so prose about
+# either cannot pass for the verb.
 VERB_GRAMMAR = (
     (COMPLETE_VERB, re.compile(rf"{COMPLETE_VERB} [0-9a-fA-F]{{40}}{TIMESTAMP_SUFFIX}")),
     (PARKED_VERB, re.compile(rf"{PARKED_VERB} \S.*")),
     (FAILED_VERB, re.compile(rf"{FAILED_VERB} \S.*")),
-    (ESCALATION_VERB, re.compile(rf"{ESCALATION_VERB} \S.*")),
+    (
+        ESCALATION_VERB,
+        re.compile(
+            rf"{ESCALATION_VERB} \d+ (?:{'|'.join(map(re.escape, ESCALATION_KINDS))})"
+            rf"(?: — .*?)?{TIMESTAMP_SUFFIX}"
+        ),
+    ),
 )
 
 LIVE = "live"
