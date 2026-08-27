@@ -6,6 +6,8 @@
               on the model the table approved — a Claude child from its entry in the live
               agents list and the model its own transcript records, a Codex child from the
               model the bridge pinned into its state file
+    roles     print the manual advisor and developer prompts for one spec and ticket, naming
+              the coordinator session the developer answers
 
 Every artifact path is recorded absolute, whatever spelling `--out-dir` was given: the launch line
 runs in the child's own worktree, so a relative path recorded here would resolve to nothing there.
@@ -86,6 +88,8 @@ import time
 import tomllib
 
 TEMPLATES = pathlib.Path(__file__).resolve().parent / "templates" / "shapes.toml"
+SKILL_DOCUMENT = pathlib.Path(__file__).resolve().parents[2] / "SKILL.md"
+WITNESS_SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "witness.py"
 # The log's own writer: the event shape and its closed sets stay the log's alone.
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 
@@ -115,6 +119,10 @@ class LaunchError(Exception):
     """One child could not be launched or could not be verified after launch."""
 
 
+class RoleRenderError(Exception):
+    """The manual role prompts could not be rendered from their source documents."""
+
+
 def load_templates():
     with TEMPLATES.open("rb") as handle:
         return tomllib.load(handle)
@@ -137,6 +145,99 @@ def render_witness_prompt(escalation, templates=None):
     return block(templates["witness"]["prompt"]).replace(
         "<escalation>", str(escalation).strip()
     )
+
+
+def contract_text():
+    """The body of the crew skill's `## Contract` section, unchanged."""
+    document = SKILL_DOCUMENT
+    try:
+        lines = document.read_text().splitlines()
+    except OSError as error:
+        raise RoleRenderError(
+            f"cannot read the crew skill document {document}: {error}"
+        ) from error
+    try:
+        start = lines.index("## Contract") + 1
+    except ValueError as error:
+        raise RoleRenderError(
+            f"the crew skill document {document} has no ## Contract section"
+        ) from error
+    end = next(
+        (index for index in range(start, len(lines)) if lines[index].startswith("## ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end]).strip()
+
+
+def project_witness_routing(ticket):
+    """Return the ticket repository's configured witness model and budget."""
+    ticket = pathlib.Path(ticket).resolve()
+    result = subprocess.run(
+        ["git", "-C", str(ticket.parent), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise RoleRenderError(
+            f"the ticket {ticket} is not inside a Git repository: {result.stderr.strip()}"
+        )
+    config_path = pathlib.Path(result.stdout.strip()) / run_plan.PROJECT_CONFIG_NAME
+    config = {}
+    if config_path.exists():
+        try:
+            config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise RoleRenderError(
+                f"the project config {config_path} is unreadable: {error}"
+            ) from error
+    witness = config.get("witness") if isinstance(config, dict) else None
+    witness = witness if isinstance(witness, dict) else {}
+    try:
+        model, budget = run_plan.witness_routing(
+            witness.get("model"), witness.get("budget_usd")
+        )
+    except run_plan.RunPlanError as error:
+        raise RoleRenderError("; ".join(error.problems)) from error
+    sources = (
+        f"project config and shipped defaults ({config_path}, {run_plan.DEFAULT_CONFIG})"
+    )
+    fault = run_plan.model_problem("`[witness] model`", model)
+    if fault:
+        raise RoleRenderError(f"{sources}: {fault}")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        raise RoleRenderError(
+            f"{sources} name no positive [witness] budget_usd"
+        )
+    return model, budget
+
+
+def render_roles(spec, ticket, coordinator_name, templates):
+    """Return the manual advisor and developer prompts rendered from their shared blocks."""
+    witness_model, witness_budget = project_witness_routing(ticket)
+    advisor = block(templates["manual"]["advisor"])
+    advisor = fill(
+        advisor,
+        {
+            "<absolute spec path>": spec,
+            "<contract>": contract_text(),
+        },
+    )
+    developer = fill(
+        block(templates["manual"]["developer"]),
+        {
+            "<coordinator name>": coordinator_name,
+            "<absolute spec path>": spec,
+            "<absolute ticket path>": ticket,
+            "<escalation paragraph>": block(templates["turn"]["escalate"]),
+            "<witness command>": shlex.join([
+                "python3", str(WITNESS_SCRIPT),
+                "--escalation", "-", "--worktree", ".",
+                "--model", witness_model,
+                "--budget-usd", f"{witness_budget:g}",
+            ]),
+        },
+    )
+    return f"{advisor}\n\n{developer}"
 
 
 def ticket_slug(ticket):
@@ -802,10 +903,13 @@ def dispatch_wave(run, tickets, rendered, timeouts, log=None):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("render", "dispatch"))
-    parser.add_argument("--table", required=True, help="the approved wave table, as JSON")
-    parser.add_argument("--wave", required=True, type=int, help="which wave of it to render")
-    parser.add_argument("--out-dir", required=True, help="where launch artifacts are written")
+    parser.add_argument("command", choices=("render", "dispatch", "roles"))
+    parser.add_argument("--table", help="the approved wave table, as JSON")
+    parser.add_argument("--wave", type=int, help="which wave of it to render")
+    parser.add_argument("--out-dir", help="where launch artifacts are written")
+    parser.add_argument("--spec", help="the spec path for manual role prompts")
+    parser.add_argument("--ticket", help="the ticket path for the manual developer prompt")
+    parser.add_argument("--coordinator-name", help="the session name the manual developer answers")
     parser.add_argument(
         "--log", help="the run's machine log, where each launched child's `launch` event is"
                       " appended and which every rendered review command is pointed at; without"
@@ -824,12 +928,31 @@ def parse_args(argv):
         "--hook-timeout", type=float, default=DEFAULT_HOOK_TIMEOUT_SECONDS,
         help="how long the project's on-child-launch hook is given before it is abandoned",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    required = {
+        "render": ("table", "wave", "out_dir"),
+        "dispatch": ("table", "wave", "out_dir"),
+        "roles": ("spec", "ticket", "coordinator_name"),
+    }[args.command]
+    missing = [f"--{name.replace('_', '-')}" for name in required if getattr(args, name) is None]
+    if missing:
+        parser.error(f"{args.command} requires {' '.join(missing)}")
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     templates = load_templates()
+    if args.command == "roles":
+        try:
+            rendered = render_roles(
+                args.spec, args.ticket, args.coordinator_name, templates
+            )
+        except RoleRenderError as error:
+            print(error, file=sys.stderr)
+            return 1
+        print(rendered)
+        return 0
     try:
         plan = run_plan.load(args.table)
         if args.base_commit:

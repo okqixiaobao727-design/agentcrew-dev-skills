@@ -7,6 +7,8 @@ the rendered launch JSON, the turn files, the composed launch command, the confi
 the exit code.
 """
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
@@ -28,6 +31,8 @@ CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
 CODEX_MODEL = "gpt-5.6-luna"
 CODEX_EFFORT = "max"
+WITNESS_MODEL = "claude-sonnet-5"
+WITNESS_BUDGET_USD = 2.5
 COORDINATOR_NAME = "crew-coordinator-1f"
 COORDINATOR_PID = 1504
 BASE_COMMIT = "b614ec84712aa8c351fe30ec69000e2e12518aeb"
@@ -82,6 +87,10 @@ class Fixture:
         self.feature_dir.mkdir(parents=True)
         self.spec_path = self.feature_dir / "spec.md"
         self.spec_path.write_text("# spec\n")
+        self.config_path = self.repo / "agentcrew.toml"
+        self.config_path.write_text(
+            f'[witness]\nmodel = "{WITNESS_MODEL}"\nbudget_usd = {WITNESS_BUDGET_USD}\n'
+        )
 
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
@@ -178,6 +187,20 @@ class Fixture:
             cwd=str(cwd) if cwd else None,
         )
 
+    def roles_arguments(self, ticket):
+        return [
+            "roles",
+            "--spec", str(self.spec_path),
+            "--ticket", str(ticket),
+            "--coordinator-name", COORDINATOR_NAME,
+        ]
+
+    def run_roles(self, ticket):
+        return subprocess.run(
+            [sys.executable, str(DISPATCH), *self.roles_arguments(ticket)],
+            capture_output=True, text=True,
+        )
+
     def log_records(self, path):
         path = pathlib.Path(path)
         if not path.exists():
@@ -229,6 +252,143 @@ class DispatchTestCase(unittest.TestCase):
     def setUp(self):
         self.fixture = Fixture()
         self.addCleanup(self.fixture.cleanup)
+
+
+class ManualRolesTests(DispatchTestCase):
+    def test_the_advisor_prompt_heads_the_skill_contract_with_the_spec_path(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        skill = (CREW_SKILL_DIR / "SKILL.md").read_text()
+        contract = skill.split("## Contract\n", 1)[1].split("\n## ", 1)[0].strip()
+
+        result = self.fixture.run_roles(ticket["path"])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Spec: {self.fixture.spec_path}.", result.stdout)
+        self.assertIn(contract, result.stdout)
+
+    def test_the_developer_prompt_reuses_the_first_turn_escalation_clause(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        escalation = dispatch_module.block(
+            dispatch_module.load_templates()["turn"]["escalate"]
+        )
+
+        result = self.fixture.run_roles(ticket["path"])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(escalation, result.stdout)
+        self.assertIn(COORDINATOR_NAME, result.stdout)
+        self.assertIn(str(self.fixture.spec_path), result.stdout)
+        self.assertIn(ticket["path"], result.stdout)
+
+    def test_manual_and_first_turn_render_the_same_clause_for_their_known_values(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        shared = dispatch_module.block(
+            dispatch_module.load_templates()["turn"]["escalate"]
+        )
+
+        manual = self.fixture.run_roles(ticket["path"])
+        table = self.fixture.table([ticket])
+        first_turn = self.fixture.run_dispatch("render", table)
+
+        self.assertEqual(manual.returncode, 0, manual.stderr)
+        self.assertEqual(first_turn.returncode, 0, first_turn.stderr)
+        self.assertIn(shared, manual.stdout)
+        self.assertIn(shared.replace("<NN>", "136"), self.fixture.turn("136"))
+
+    def test_the_developer_prompt_fills_the_configured_witness_command(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        expected = shlex.join([
+            "python3", str(CREW_SKILL_DIR / "assets" / "witness.py"),
+            "--escalation", "-", "--worktree", ".",
+            "--model", WITNESS_MODEL,
+            "--budget-usd", f"{WITNESS_BUDGET_USD:g}",
+        ])
+
+        result = self.fixture.run_roles(ticket["path"])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(expected, result.stdout)
+
+    def test_an_aliased_configured_witness_model_is_an_error(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        self.fixture.config_path.write_text(
+            f'[witness]\nmodel = "sonnet"\nbudget_usd = {WITNESS_BUDGET_USD}\n'
+        )
+
+        result = self.fixture.run_roles(ticket["path"])
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(self.fixture.config_path), result.stderr)
+        self.assertIn("alias", result.stderr)
+
+    def test_invalid_shipped_fallbacks_name_both_sources_and_the_config_key(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        self.fixture.config_path.unlink()
+        cases = (
+            ('model = "sonnet"\nbudget_usd = 2.0', "`[witness] model`", "alias"),
+            ('model = "claude-sonnet-5"\nbudget_usd = 0', "[witness] budget_usd", "positive"),
+        )
+
+        for witness, key, reason in cases:
+            with self.subTest(key=key):
+                defaults = self.fixture.root / "agentcrew.default.toml"
+                defaults.write_text(f"[witness]\n{witness}\n")
+                errors = io.StringIO()
+                with mock.patch.object(dispatch_module.run_plan, "DEFAULT_CONFIG", defaults):
+                    with contextlib.redirect_stderr(errors):
+                        status = dispatch_module.main(
+                            self.fixture.roles_arguments(ticket["path"])
+                        )
+
+                self.assertEqual(status, 1)
+                self.assertIn("project config and shipped defaults", errors.getvalue())
+                self.assertIn(key, errors.getvalue())
+                self.assertIn(reason, errors.getvalue())
+
+    def test_a_skill_without_a_contract_names_that_document_as_an_error(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+        document = self.fixture.root / "crew-without-contract.md"
+        document.write_text("# AgentCrew\n")
+        errors = io.StringIO()
+        arguments = self.fixture.roles_arguments(ticket["path"])
+
+        with mock.patch.object(dispatch_module, "SKILL_DOCUMENT", document):
+            with contextlib.redirect_stderr(errors):
+                status = dispatch_module.main(arguments)
+
+        self.assertEqual(status, 1)
+        self.assertIn(str(document), errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_renderer_slots_are_filled_and_child_literal_tokens_survive(self):
+        ticket = self.fixture.ticket("136", "manual-roles")
+
+        result = self.fixture.run_roles(ticket["path"])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for filled in (
+            "<contract>", "<absolute spec path>", "<absolute ticket path>",
+            "<coordinator name>", "<escalation paragraph>", "<witness command>",
+        ):
+            self.assertNotIn(filled, result.stdout)
+        for literal in (
+            "<NN>", "<unix time>", "<path:line>", "#<ticket>", "ADR-<nnnn>",
+            "<design|scope|doc-conflict|stuck|wrap-up>",
+        ):
+            self.assertIn(literal, result.stdout)
+
+    def test_usage_lists_roles_and_each_of_its_arguments(self):
+        result = subprocess.run(
+            [sys.executable, str(DISPATCH), "--help"],
+            capture_output=True, text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("roles", result.stdout)
+        for argument in (
+            "--spec", "--ticket", "--coordinator-name",
+        ):
+            self.assertIn(argument, result.stdout)
 
 
 class WitnessPromptTests(unittest.TestCase):
