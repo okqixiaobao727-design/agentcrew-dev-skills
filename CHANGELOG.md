@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- v0.9.7 broke every Codex launch by asking the TUI to resume a thread before its first turn had
+  materialised. The pane now posts and confirms the structured first turn before attaching the
+  TUI, then reports one atomic bootstrap result so `launch` cannot return success before the TUI
+  survives startup; failed launches preserve their app-server log (#155).
+
 ## [0.9.7] - 2026-08-28
 
 ### Added

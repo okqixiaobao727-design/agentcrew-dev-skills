@@ -59,6 +59,7 @@ import time
 
 STUB_SHA = "1234567890abcdef1234567890abcdef12345678"
 TURN_DELAY_SECONDS = float(os.environ.get("CODEX_STUB_DELAY", "0.3"))
+MATERIALIZED_THREADS_FILE = pathlib.Path("stub-materialized-threads")
 
 
 def scenario():
@@ -88,15 +89,17 @@ def first_turn_result(active_scenario):
 
 
 class StubThread:
-    def __init__(self, thread_id="stub-thread-1"):
+    def __init__(self, thread_id="stub-thread-1", materialized=False):
         self.id = thread_id
         self.preview = ""
         self.turns = []
+        self.materialized = materialized
 
     def start_turn(self, text):
         kind = "first" if not self.turns else "followup"
         if not self.preview:
             self.preview = text
+        self.materialized = True
         self.turns.append(
             {"kind": kind, "text": text, "created": time.monotonic()}
         )
@@ -167,38 +170,53 @@ class StubServer:
         if self.thread is not None:
             self.thread.absorb_typed_turn()
 
+    def materialized_thread_ids(self):
+        try:
+            return set(MATERIALIZED_THREADS_FILE.read_text(encoding="utf-8").splitlines())
+        except FileNotFoundError:
+            return set()
+
+    def remember_materialized_thread(self, thread_id):
+        known = self.materialized_thread_ids()
+        if thread_id in known:
+            return
+        known.add(thread_id)
+        MATERIALIZED_THREADS_FILE.write_text(
+            "".join(f"{item}\n" for item in sorted(known)),
+            encoding="utf-8",
+        )
+
     def handle(self, method, params):
         self.ensure_thread()
         with pathlib.Path("stub-requests.jsonl").open("a", encoding="utf-8") as stream:
             json.dump({"method": method, "params": params}, stream)
             stream.write("\n")
-        # Model a TUI gone before list can find it, while read follows its real exit.
-        turn_marker_visible = (
-            self.scenario != "tui-exit"
-            or pathlib.Path(TUI_EXIT_MARKER).is_file()
-        )
         if method == "initialize":
             return {}
         if method == "thread/start":
             self.thread = StubThread()
             return {"thread": {"id": self.thread.id}}
         if method == "thread/resume":
-            if self.thread is None:
-                self.thread = StubThread(thread_id=params["threadId"])
+            thread_id = params["threadId"]
+            if self.thread is not None and self.thread.id == thread_id:
+                if not self.thread.materialized:
+                    raise ValueError(f"no rollout found for thread id {thread_id}")
+            elif thread_id in self.materialized_thread_ids():
+                self.thread = StubThread(thread_id=thread_id, materialized=True)
+            else:
+                raise ValueError(f"no rollout found for thread id {thread_id}")
             return {"thread": {"id": self.thread.id}}
         if method == "thread/list":
             data = []
             if self.thread is not None:
-                preview = "" if self.scenario == "tui-exit" else self.thread.preview
-                data.append({"id": self.thread.id, "preview": preview})
+                data.append({"id": self.thread.id, "preview": self.thread.preview})
             return {"data": data}
         if method == "thread/read":
             if self.thread is None or params.get("threadId") != self.thread.id:
                 raise ValueError("unknown thread")
-            thread = self.thread.render(self.scenario)
-            if not turn_marker_visible:
-                thread["turns"] = []
-            return {"thread": thread}
+            if not self.thread.materialized:
+                raise ValueError(f"thread {self.thread.id} is not materialized yet")
+            return {"thread": self.thread.render(self.scenario)}
         if method == "turn/start":
             if self.thread is None or params.get("threadId") != self.thread.id:
                 raise ValueError("unknown thread")
@@ -206,6 +224,7 @@ class StubServer:
                 part.get("text", "") for part in params.get("input") or []
             )
             index = self.thread.start_turn(text)
+            self.remember_materialized_thread(self.thread.id)
             return {"turn": {"id": f"stub-turn-{index}", "status": "inProgress"}}
         raise ValueError(f"unsupported method: {method}")
 
@@ -260,9 +279,60 @@ def app_server_main(argv):
     return 0
 
 
+async def resume_tui_thread(remote, thread_id):
+    from aiohttp import ClientSession, UnixConnector, WSMsgType
+
+    connector = UnixConnector(path=remote.removeprefix("unix://"))
+    async with ClientSession(connector=connector) as session:
+        async with session.ws_connect("http://localhost/") as websocket:
+            request_id = 1
+
+            async def request(method, params):
+                nonlocal request_id
+                current_id = request_id
+                request_id += 1
+                await websocket.send_json(
+                    {"id": current_id, "method": method, "params": params}
+                )
+                while True:
+                    message = await websocket.receive()
+                    if message.type != WSMsgType.TEXT:
+                        raise RuntimeError(
+                            f"unexpected app-server WebSocket message type: {message.type}"
+                        )
+                    payload = json.loads(message.data)
+                    if payload.get("id") != current_id:
+                        continue
+                    if payload.get("error"):
+                        error = payload["error"]
+                        raise RuntimeError(error.get("message", str(error)))
+                    return payload.get("result", {})
+
+            await request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "stub_codex_tui",
+                        "title": "Stub Codex TUI",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {"experimentalApi": False},
+                },
+            )
+            await websocket.send_json({"method": "initialized", "params": {}})
+            await request("thread/resume", {"threadId": thread_id})
+
+
 def tui_main(argv):
     if scenario() == "tui-exit":
         print("stub TUI exiting immediately", file=sys.stderr)
+        return 1
+    remote = argv[argv.index("--remote") + 1]
+    thread_id = argv[argv.index("resume") + 1]
+    try:
+        asyncio.run(resume_tui_thread(remote, thread_id))
+    except Exception as error:
+        print(f"stub TUI resume failed: {error}", file=sys.stderr, flush=True)
         return 1
     try:
         while True:

@@ -382,3 +382,9 @@ _Avoid_: retry, restart
 **Codex bridge** — `codex_bridge.py`, the Codex-side transport, written and maintained here rather
 than installed as a separate skill.
 _Avoid_: vendored codex bridge — the word said this repo may not edit it, and this repo owns it.
+
+**Bootstrap result** — The Codex pane's one atomic completion receipt to the outer `launch`
+process.  Success carries the prepared thread id; failure carries its cause and preserved log
+path.  The outer process trusts this result instead of reconstructing completion from separate
+marker, pane-liveness, and thread-list observations
+([ADR-0021](adr/0021-the-codex-pane-reports-one-bootstrap-result.md)).

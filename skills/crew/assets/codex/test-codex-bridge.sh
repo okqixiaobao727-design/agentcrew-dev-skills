@@ -23,6 +23,7 @@ TYPED_TURN_MESSAGE="Ruling applied and the work is committed.
 CREW COMPLETE $STUB_SHA"
 
 WORK=$(mktemp -d -t codex-bridge-test)
+TUI_EXIT_RUNTIME_ROOT=$(mktemp -d /tmp/codex-tui-exit.XXXXXX)
 BIN="$WORK/bin"
 PLUGIN_ROOT="$WORK/mattpocock-skills"
 SKILL_DIR="$PLUGIN_ROOT/skills/engineering/implement"
@@ -60,7 +61,7 @@ export PATH="$BIN:$PATH"
 
 cleanup() {
   tmux kill-server 2>/dev/null
-  rm -rf "$WORK"
+  rm -rf "$WORK" "$TUI_EXIT_RUNTIME_ROOT"
 }
 trap cleanup EXIT
 
@@ -485,9 +486,19 @@ assert_unusable_resume_state() { # <name> <state-content> <window-name>
   local name="$1" state_content="$2" window_name="$3"
   local dir; dir=$(make_child "$name" receipt)
   local sf="$WORK/$name.state.json" out="$WORK/$name.launch.json"
+  local initial_out="$WORK/$name.initial.json"
+  launch "$dir" "$sf" "$window_name-initial" "$initial_out" \
+    || { fail "$name: could not materialize the thread before relaunch"; return; }
+  local thread_id; thread_id=$(json_field "$sf" threadId)
+  local window_id; window_id=$(json_field "$sf" windowId)
+  tmux kill-window -t "$window_id" || {
+    fail "$name: could not stop the initial launch"
+    return
+  }
+  sleep 0.2
   printf '%s' "$state_content" > "$sf"
   launch_with_options "$dir" "$sf" "$window_name" "$out" \
-    --thread-id stub-thread-1 \
+    --thread-id "$thread_id" \
     || { fail "$name: unusable state blocked relaunch"; return; }
   [ "$(json_field "$out" ok)" = "True" ] \
     && ok "$name: relaunch succeeded without inherited pins" \
@@ -648,6 +659,32 @@ test_launch_missing_skill_path_is_reported() {
     || fail "launch-missing-skill: missing path detail lost"
 }
 
+# --- Test 28: a new thread receives its first turn before the TUI resumes it ---
+test_launch_request_order() {
+  local dir; dir=$(make_child t28 receipt)
+  local sf="$WORK/t28.state.json" out="$WORK/t28.launch.json" launch_status
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 30 --state-file "$sf" --startup-timeout 15 \
+    --prompt x > "$out" 2> "$out.err"
+  launch_status=$?
+  "$PYTHON" - "$dir/stub-requests.jsonl" "$launch_status" <<'PY' \
+    && ok "launch-order: turn started before TUI resume" \
+    || fail "launch-order: request order or launch result was wrong"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+ordered_methods = [
+    request["method"]
+    for request in requests
+    if request["method"] in {"thread/start", "turn/start", "thread/resume"}
+]
+assert ordered_methods == ["thread/start", "turn/start", "thread/resume"], ordered_methods
+assert int(sys.argv[2]) == 0, f"launch exited {sys.argv[2]}"
+PY
+}
+
 # --- Test 3: watch stays armed while all busy, wakes on first idle child ---
 test_wave_wakeup() {
   local d1 d2; d1=$(make_child t3a slow); d2=$(make_child t3b slow)
@@ -732,12 +769,24 @@ test_failed_turn() {
 # --- Test 6: TUI that dies during startup fails the launch ---
 test_tui_exit() {
   local dir; dir=$(make_child t6 tui-exit)
-  if launch "$dir" "$WORK/t6.state.json" 07 "$WORK/t6.launch.json"; then
+  local runtime_root="$TUI_EXIT_RUNTIME_ROOT" out="$WORK/t6.launch.json" log_path
+  if TMPDIR="$runtime_root" launch "$dir" "$WORK/t6.state.json" 07 "$out"; then
     fail "tui-exit: launch unexpectedly succeeded"
   else
     ok "tui-exit: launch failed as expected"
   fi
   [ -f "$WORK/t6.state.json" ] && fail "tui-exit: state file written on failure"
+  log_path=$(find "$runtime_root" -name app-server.log -type f -print -quit)
+  if [ -z "$log_path" ]; then
+    fail "tui-exit: app-server.log was removed"
+  elif grep -q "Codex TUI exited before the turn was confirmed" "$log_path"; then
+    ok "tui-exit: startup failure log was preserved"
+  else
+    fail "tui-exit: preserved log lost the startup failure detail ($(cat "$log_path"))"
+  fi
+  grep -q "Codex TUI exited before the turn was confirmed" "$out.err" \
+    && ok "tui-exit: launch reported the pane's startup failure" \
+    || fail "tui-exit: launch stderr lost the pane's startup failure ($(cat "$out.err"))"
 }
 
 # --- Test 7: app-server that never opens its socket fails the launch ---
@@ -814,6 +863,7 @@ test_plain_prompt_has_no_skill_input
 test_missing_skill_path_is_reported
 test_launch_missing_skill_path_is_reported
 test_skill_source_fallback
+test_launch_request_order
 test_wave_wakeup
 test_vanished
 test_transient_pane_read_failures
