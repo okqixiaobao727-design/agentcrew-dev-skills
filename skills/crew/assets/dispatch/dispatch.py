@@ -214,6 +214,7 @@ def project_witness_routing(ticket):
 def render_roles(spec, ticket, coordinator_name, templates):
     """Return the manual advisor and developer prompts rendered from their shared blocks."""
     witness_model, witness_budget = project_witness_routing(ticket)
+    caller_budget = f"\n  {block(templates['review']['caller_budget'])}"
     advisor = block(templates["manual"]["advisor"])
     advisor = fill(
         advisor,
@@ -225,10 +226,17 @@ def render_roles(spec, ticket, coordinator_name, templates):
     developer = fill(
         block(templates["manual"]["developer"]),
         {
+            "<coordinator paragraph>": fill(
+                block(templates["turn"]["coordinator_claude"]),
+                {"<coordinator name>": coordinator_name},
+            ),
             "<coordinator name>": coordinator_name,
             "<absolute spec path>": spec,
             "<absolute ticket path>": ticket,
-            "<escalation paragraph>": block(templates["turn"]["escalate"]),
+            "<escalation paragraph>": fill(
+                block(templates["turn"]["escalate"]),
+                {"<review caller budget>": caller_budget},
+            ),
             "<witness command>": shlex.join([
                 "python3", str(WITNESS_SCRIPT),
                 "--escalation", "-", "--worktree", ".",
@@ -339,9 +347,34 @@ def completion_template(shape, turn, ticket, log):
     return shape.get("completion") or turn["completion"]
 
 
-def render_turn(run, ticket, templates, log=None):
+def render_review_script(run, ticket, templates, log=None):
+    """The complete installed Review-Switch command this ticket runs before committing."""
+    review = ticket.review
+    return fill(
+        block(templates["review"]["command"]),
+        {
+            "<review vendor>": shlex.quote(review.vendor),
+            "<review model>": shlex.quote(review.model),
+            "<review effort>": shlex.quote(review.effort),
+            "<review cwd>": shlex.quote(str(worktree_path(run, ticket))),
+            "<review base>": shlex.quote(base_commit(run, ticket)),
+            "<review spec>": shlex.quote(ticket.path),
+            "<review account>": review_account_flag(ticket, review.vendor),
+            "<review hooks>": review_hook_flags(templates, ticket, log),
+        },
+    ) + "\n"
+
+
+def render_turn(run, ticket, templates, review_script, log=None):
     shape = templates["workflows"][ticket.workflow]
     turn = templates["turn"]
+    has_review = review_script is not None
+    caller_budget = block(templates["review"]["caller_budget"])
+    writing_skill = (
+        "$mattpocock-skills:writing-for-agents"
+        if ticket.executor == "codex"
+        else "/mattpocock-skills:writing-for-agents"
+    )
     values = {
         "<absolute ticket path>": ticket.path,
         "<absolute spec path>": run.spec_path,
@@ -353,38 +386,45 @@ def render_turn(run, ticket, templates, log=None):
         "<coordinator pid>": run.coordinator_pid,
         "<machine log path>": log or "",
         "<machine log script>": run_log_script(log),
+        "<design bridge>": shape.get("design_bridge", ""),
+        "<review caller budget>": f"\n  {caller_budget}" if has_review else "",
+        "<writing skill>": writing_skill,
+        "<commit step>": f"{4 if has_review else 3}. Commit.",
+        "<completion step>": 5 if has_review else 4,
     }
 
     workflow_block = block(shape["block"])
-    if shape["review_lane"]:
-        review = ticket.review
-        review_block = fill(
+    review_block = ""
+    if has_review:
+        review_block = "\n\n" + fill(
             block(templates["review"]["block"]),
             {
-                "<review vendor>": shlex.quote(review.vendor),
-                "<review model>": shlex.quote(review.model),
-                "<review effort>": shlex.quote(review.effort),
-                "<review cwd>": shlex.quote(str(worktree_path(run, ticket))),
-                "<review base>": shlex.quote(base_commit(run, ticket)),
-                "<review spec>": shlex.quote(ticket.path),
-                "<review account>": review_account_flag(ticket, review.vendor),
-                "<review hooks>": review_hook_flags(templates, ticket, log),
+                "<review script>": shlex.quote(str(review_script)),
+                "<review background>": (
+                    "\nIn Claude Bash, set `run_in_background: true`."
+                    if ticket.executor == "claude" else ""
+                ),
             },
         )
-        workflow_block = workflow_block.replace("<review block>", review_block)
 
     completion = block(completion_template(shape, turn, ticket, log))
-    completion = completion.replace(
-        "<completion condition>", shape.get("completion_condition", "")
-    )
-    coordinator = block(
-        turn["coordinator_claude"] if ticket.executor == "claude"
-        else turn["coordinator_codex"]
-    )
+    if ticket.executor == "claude":
+        coordinator = "\n".join((
+            block(turn["coordinator_claude"]),
+            block(turn["coordinator_claude_child"]),
+        ))
+    else:
+        coordinator = block(turn["coordinator_codex"])
 
+    opening_line = (
+        shape.get("opening_line_codex", shape["opening_line"])
+        if ticket.executor == "codex"
+        else shape["opening_line"]
+    )
     text = block(turn["base"])
-    text = text.replace("<opening line>", block(shape["opening_line"]))
+    text = text.replace("<opening line>", block(opening_line))
     text = text.replace("<workflow block>", workflow_block)
+    text = text.replace("<review step>", review_block)
     text = text.replace("<coordinator paragraph>", coordinator)
     text = text.replace("<escalation paragraph>", block(turn["escalate"]))
     text = text.replace("<completion paragraph>", completion)
@@ -407,7 +447,12 @@ def render_wave(run, tickets, templates, out_dir, log=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     rendered = []
     for ticket in tickets:
-        turn = render_turn(run, ticket, templates, log)
+        shape = templates["workflows"][ticket.workflow]
+        review_script = None
+        if shape["review_lane"]:
+            review_script = out_dir / f"{ticket.id}.review.sh"
+            review_script.write_text(render_review_script(run, ticket, templates, log))
+        turn = render_turn(run, ticket, templates, review_script, log)
         turn_file = out_dir / f"{ticket.id}.turn.txt"
         turn_file.write_text(turn)
         launch_json = None

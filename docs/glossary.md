@@ -188,6 +188,13 @@ missing, so tracker configuration stays in its one canonical place.
 
 ## Roles and messages
 
+**Protocol** — The text that never varies by workflow and is rendered into every child's first
+turn and the manual `developer` prompt from shared blocks: coordinator identity, the five
+escalation kinds with their message shape, and the receipt.
+
+**Work brief** — The per-workflow delta in a child's first turn: the base commit, whether a review
+runs, and which tests the ticket names. Method belongs to the skill the opening line invokes.
+
 **Coordinator** — The session in the main tmux window that runs `/crew`, and the run's **oracle**:
 its whole job is judgment. It launches the driver, rules on what children escalate and on what the
 rule table has no row for, and points at the report. It writes no product code and opens no run
