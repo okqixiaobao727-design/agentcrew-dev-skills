@@ -451,25 +451,33 @@ worktree, alongside the guard hooks:
 machine_log.py --log <path> install   --settings <settings.json> --role child --ticket NN
 machine_log.py --log <path> install   --settings <settings.json> --role coordinator
 machine_log.py --log <path> uninstall --settings <settings.json>
+# Manual advisor: m=machine-log script, c=crew dir, s=settings, l=log, i=session ID.
+$m --log $l install --settings $s --role coordinator --crew-dir $c --session-id $i
+$m --log $l uninstall --settings $s
 ```
 
 `--role` says which side is being installed; `--ticket` is added where that side knows one — the
 coordinator's hook serves every child at once and omits it. Installing twice replaces the entry
 instead of doubling it — the log an entry writes is what identifies it as this run's, whichever
-version of this script it runs — and every other hook already in the file is left where it is.
+version of this script it runs — and every other hook already in the file is left where it is. A
+coordinator install atomically adds the bounded-read `PreToolUse` hook in the same settings write;
+a child install does not. `--session-id` confines that hook to one coordinator or advisor session.
+The two manual-advisor lines use that same coordinator path; their explicit `--crew-dir` remains
+correct even if the command is later run from the version-independent copy beside the log.
 
-The command registered runs the run's own copy of this script, written beside the log the first
-time a run installs and refreshed on every install after it. The plugin is installed one directory
-per version, so an entry naming the plugin's own copy stops working at the next upgrade; the run
-directory carries no version and outlives every one of them (#37). A caller that keeps its own
-copy names it with `--hook-script`, and that path is registered exactly as it was given.
+The commands registered run the run's own copies of this script and the bounded-read script,
+written beside the log the first time a run installs and refreshed on every install after it. The
+plugin is installed one directory per version, so an entry naming the plugin's own copy stops
+working at the next upgrade; the run directory carries no version and outlives every one of them
+(#37). A caller that keeps its own machine-log copy names it with `--hook-script`, and that path is
+registered exactly as it was given.
 
-`uninstall` removes every entry installed for the `--log` it is given, and nothing else — an entry
-an older plugin version wrote for that run included, which is what keeps an upgrade from leaving
-two writers on one log. It is called when the run ends, once for the coordinator's settings file
-and once for each launched child's, and again when the run is cleared, so a finished run leaves no
-hook behind. It is idempotent: a settings file carrying none of ours is left byte for byte as it
-was found, and a block emptied of its only entry goes with it.
+`uninstall` removes every message or bounded-read entry installed for the `--log` it is given, and
+nothing else — including an entry an older plugin version wrote for that run. That keeps an
+upgrade from leaving stale hooks behind. It is called when the run ends, once for the coordinator's
+settings file and once for each launched child's, and again when the run is cleared, so a finished
+run leaves no hook behind. It is idempotent: a settings file carrying none of ours is left byte for
+byte as it was found, and a block emptied of its only entry goes with it.
 
 A missing or empty settings file is a fresh document to write — and nothing to uninstall from; a
 file with content that does not parse, or whose `hooks` are not the shape this writes through, is

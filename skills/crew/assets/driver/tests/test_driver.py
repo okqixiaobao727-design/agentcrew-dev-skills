@@ -852,13 +852,14 @@ class LaunchTests(DriverTestCase):
             sorted(path.name for path in self.fixture.run_dir.iterdir()),
             sorted([
                 "wave-table.json", "log.jsonl", "launch", "parked-paths",
-                "dashboard-window", "dashboard-window.lock", "machine_log.py",
+                "bounded_read.py", "dashboard-window", "dashboard-window.lock", "machine_log.py",
                 DRIVER_RECORD,
             ]),
         )
 
     def test_the_coordinator_and_the_child_carry_this_run_s_hooks(self):
-        self.start_a_run()
+        session = "fixture-coordinator-session"
+        self.start_a_run(env_overrides={"CLAUDE_CODE_SESSION_ID": session})
 
         log = str(self.fixture.run_dir / "log.jsonl")
         coordinator = json.dumps(
@@ -870,9 +871,12 @@ class LaunchTests(DriverTestCase):
         ))
         self.assertIn(log, coordinator)
         self.assertIn("--role coordinator", coordinator)
+        self.assertIn("bounded_read.py", coordinator)
+        self.assertIn(f"--session-id {session}", coordinator)
         self.assertIn(log, child)
         self.assertIn("--role child", child)
         self.assertIn("--ticket 01", child)
+        self.assertNotIn("bounded_read.py", child)
 
     def test_the_dashboard_is_started_on_the_run(self):
         self.start_a_run()
@@ -1001,6 +1005,8 @@ class LoopTests(DriverTestCase):
             [record["decision"] for record in self.events("advance")], ["launched", "complete"]
         )
         self.assertEqual(self.events("ruling"), [], "a clean run instructed a child")
+        settings = self.fixture.settings(self.fixture.repo / ".claude" / "settings.local.json")
+        self.assertNotIn("bounded_read.py", json.dumps(settings))
 
     def test_a_completed_run_writes_the_report_and_names_it_in_the_final_snapshot(self):
         process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
@@ -1068,6 +1074,7 @@ class LoopTests(DriverTestCase):
             self.fixture.repo / ".claude" / "settings.local.json"
         )
         self.assertNotIn(log, json.dumps(coordinator_settings))
+        self.assertNotIn("bounded_read.py", json.dumps(coordinator_settings))
         child_settings = self.fixture.worktree("01") / ".claude" / "settings.local.json"
         self.assertNotIn(log, json.dumps(self.fixture.settings(child_settings)))
 
@@ -2522,6 +2529,18 @@ class AdoptionTests(DriverTestCase):
         self.assertEqual(self.fixture.table()["run"], run, "the adopted run was started afresh")
         self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    def test_adopting_an_interrupted_run_leaves_one_bounded_read_hook(self):
+        self.interrupted(("01", ()))
+
+        adopted = self.fixture.launch()
+        adopted.stdout.readline()
+        settings_path = self.fixture.repo / ".claude" / "settings.local.json"
+        installed = json.dumps(self.fixture.settings(settings_path))
+
+        self.assertEqual(installed.count("bounded_read.py"), 1)
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
 
     def test_a_settled_ticket_is_not_dispatched_again_by_the_run_that_adopts_it(self):
         self.interrupted(("01", ()), ("02", ()))
