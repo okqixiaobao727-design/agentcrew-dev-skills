@@ -31,6 +31,7 @@ from harness import (
     COORDINATOR_NAME,
     COORDINATOR_PANE,
     COORDINATOR_PID,
+    COORDINATOR_SESSION,
     DASHBOARD_WINDOW,
     DIRECT_ROUTING,
     DRIVER,
@@ -40,6 +41,7 @@ from harness import (
     INHERITED,
     INTEGRATION_BRANCH,
     LAUNCH,
+    MACHINE_LOG,
     MONITOR_WAVE_NAME,
     PARKED_PATHS,
     PERMISSION_MODE,
@@ -1017,6 +1019,7 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(run["return_branch"], BASE_BRANCH)
         self.assertEqual(run["coordinator_name"], COORDINATOR_NAME)
         self.assertEqual(run["coordinator_pid"], COORDINATOR_PID)
+        self.assertEqual(run["coordinator_session"], COORDINATOR_SESSION)
         self.assertEqual(run["tmux_session"], TMUX_SESSION)
         self.assertEqual(run["permission_mode"], PERMISSION_MODE)
         self.assertEqual(run["repair_model"], REPAIR_MODEL)
@@ -1072,7 +1075,7 @@ class LaunchTests(DriverTestCase):
 
     def test_the_coordinator_and_the_child_carry_this_run_s_hooks(self):
         session = "fixture-coordinator-session"
-        self.start_a_run(env_overrides={"CLAUDE_CODE_SESSION_ID": session})
+        self.start_a_run(extra=("--coordinator-session", session))
 
         log = str(self.fixture.run_dir / "log.jsonl")
         coordinator = json.dumps(
@@ -1090,6 +1093,15 @@ class LaunchTests(DriverTestCase):
         self.assertIn("--role child", child)
         self.assertIn("--ticket 01", child)
         self.assertNotIn("bounded_read.py", child)
+
+    def test_an_empty_coordinator_session_stops_before_installing_hooks(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+
+        result = self.fixture.start(extra=("--coordinator-session", ""))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_nothing_launched()
 
     def test_the_dashboard_is_started_on_the_run(self):
         self.start_a_run()
@@ -1167,10 +1179,10 @@ class LoopTests(DriverTestCase):
             git(self.fixture.repo, "add", "shared.txt")
         self.fixture.commit_feature()
 
-    def start(self, *tickets, shared=None, env_overrides=None, routing=ROUTING):
+    def start(self, *tickets, shared=None, extra=(), env_overrides=None, routing=ROUTING):
         """A run with its first wave up and its loop running."""
         self.feature(*tickets, shared=shared, routing=routing)
-        process = self.fixture.launch(env_overrides=env_overrides)
+        process = self.fixture.launch(extra=extra, env_overrides=env_overrides)
         for number, _ in tickets:
             if not _:
                 self.assertTrue(
@@ -1195,6 +1207,13 @@ class LoopTests(DriverTestCase):
             f"{ticket} was never sent a {marker}",
         )
         return self.instructions(ticket, marker)[-1]["message"]
+
+    def assert_claude_receipt_command(self, instruction):
+        run_machine_log = self.fixture.run_dir / MACHINE_LOG.name
+        self.assertIn(f"python3 {run_machine_log}", instruction)
+        self.assertIn(f"--log {self.fixture.run_dir / 'log.jsonl'}", instruction)
+        self.assertNotIn("SendMessage", instruction)
+        self.assertNotRegex(instruction, r"(?i)\bsend\b")
 
     # --- a whole run, with nothing outside the table in it ------------------------------------
 
@@ -1302,7 +1321,10 @@ class LoopTests(DriverTestCase):
     def test_the_cost_pass_reads_the_coordinator_transcript_into_its_own_row(self):
         session = "fixture-coordinator-session"
         self.fixture.coordinator_transcript(session)
-        process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": session})
+        process = self.start(
+            ("01", ()), extra=("--coordinator-session", session),
+            env_overrides={"CLAUDE_CODE_SESSION_ID": "unrelated-detached-window-session"},
+        )
 
         self.fixture.completes("01")
         self.woken(process, "run-complete")
@@ -1528,6 +1550,8 @@ class LoopTests(DriverTestCase):
         self.assertIn("01", instruction)
         self.assertIn("0" * 40, instruction)
         self.assertIn("CREW COMPLETE", instruction)
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("send a new CREW COMPLETE", instruction)
         self.assertEqual(len(self.instructions("01", "CREW RECHECK")), 1)
         self.assertEqual(self.verdict("01"), "completed")
 
@@ -1607,6 +1631,8 @@ class LoopTests(DriverTestCase):
             " [— <body>] [ts=<unix>]",
             instruction,
         )
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("Send it in exactly the shape shown", instruction)
         self.assertEqual(self.events("escalation", ticket="01"), [])
         self.assertEqual(self.verdict("01"), "completed")
 
@@ -1625,6 +1651,28 @@ class LoopTests(DriverTestCase):
         self.assertEqual(self.events("escalation", ticket="01"), [])
         failed = self.events("receipt", ticket="01", verdict="failed")
         self.assertIn(malformed, failed[-1]["detail"])
+
+    def test_a_codex_child_is_still_told_to_send_a_bounced_receipt(self):
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+
+        self.fixture.says("01", "CREW ASK 01 progress")
+        instruction = self.wait_for_instruction("01", "CREW RESEND")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_codex_child_is_still_told_to_send_a_rechecked_receipt(self):
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+
+        self.fixture.says("01", "CREW COMPLETE " + "0" * 40)
+        instruction = self.wait_for_instruction("01", "CREW RECHECK")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
+        self.assertEqual(self.verdict("01"), "completed")
 
     def test_a_message_that_speaks_no_verb_at_all_is_not_bounced(self):
         """Conversation is still conversation; only a near miss is answered."""
@@ -1749,7 +1797,20 @@ class LoopTests(DriverTestCase):
         self.woken(process, "run-complete")
 
         self.assertIn("CREW COMPLETE", instruction)
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("Send CREW COMPLETE", instruction)
         self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
+    def test_a_codex_child_is_still_told_to_send_a_nudged_receipt(self):
+        self.fixture.codex_goes("01", "idle")
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
+
+        instruction = self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
+        self.assertEqual(self.verdict("01"), "completed")
 
     def test_a_child_awaiting_a_handed_over_ruling_is_not_nudged_until_it_is_answered(self):
         """A nudge to a child waiting on an answer races an answered ask into a parked receipt.
@@ -2150,9 +2211,24 @@ class LoopTests(DriverTestCase):
 
         self.assertIn(INTEGRATION_BRANCH, instruction)
         self.assertIn("CREW COMPLETE", instruction)
+        self.assert_claude_receipt_command(instruction)
+        self.assertNotIn("send a new CREW COMPLETE", instruction)
         self.assertIn(
             "semantic", self.events("merge", ticket="02", result="conflict")[-1]["detail"]
         )
+
+    def test_a_codex_child_is_still_told_to_send_a_merge_receipt(self):
+        self.fixture.codex_goes("01", "busy")
+        self.fixture.codex_goes("02", "busy")
+        process = self.start(
+            ("01", ()), ("02", ()), shared="one\n", routing=CODEX_ROUTING
+        )
+
+        self.fixture.completes("01", "01 rewrote\n", name="shared.txt")
+        self.fixture.completes("02", "02 rewrote\n", name="shared.txt")
+        instruction = self.wait_for_instruction("02", "CREW MERGE")
+
+        self.assertRegex(instruction, r"(?i)\bsend\b")
 
     def test_the_merge_rework_instruction_scopes_re_verification_to_the_conflict(self):
         """The rework instruction has never fired in a run, so its text is pinned before it does.
@@ -3259,7 +3335,12 @@ class AdoptionTests(DriverTestCase):
     def test_a_coordinator_that_restarted_re_anchors_the_run_and_its_live_children(self):
         """A restarted coordinator has a new pid, and the socket a child trusts is the old one."""
         self.interrupted(("01", ()), ("02", ("01",)))
-        restarted = ("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
+        restarted_session = "3ed70d86-fa21-4d9c-adf2-b4073f60fbb6"
+        restarted = (
+            "--coordinator-name", "crew-coordinator-2a",
+            "--coordinator-pid", "2601",
+            "--coordinator-session", restarted_session,
+        )
 
         adopted = self.fixture.launch(extra=restarted)
         self.assertTrue(
@@ -3267,6 +3348,10 @@ class AdoptionTests(DriverTestCase):
             "the live child was never re-anchored",
         )
         anchor = self.events("ruling", ticket="01")
+        installed = json.dumps(self.fixture.settings(
+            self.fixture.repo / ".claude" / "settings.local.json"
+        ))
+        self.assertIn(f"--session-id {restarted_session}", installed)
         self.fixture.completes("01")
         self.assertTrue(
             self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
@@ -3278,6 +3363,9 @@ class AdoptionTests(DriverTestCase):
         self.assertEqual(
             self.fixture.table()["run"]["coordinator_name"], "crew-coordinator-2a"
         )
+        self.assertEqual(
+            self.fixture.table()["run"]["coordinator_session"], restarted_session
+        )
         self.assertEqual(len(anchor), 1, f"01 was not re-anchored once: {anchor}")
         self.assertIn("uds:/tmp/cc-socks/2601.sock", anchor[0]["message"])
         self.assertIn("crew-coordinator-2a", anchor[0]["message"])
@@ -3288,14 +3376,24 @@ class AdoptionTests(DriverTestCase):
         self.assertEqual(len(launched), 1, "02 was not launched once")
         self.assertIn("uds:/tmp/cc-socks/2601.sock", json.dumps(launched[0]))
 
-    def test_a_run_adopted_by_the_coordinator_that_started_it_re_anchors_nobody(self):
+    def test_a_same_pid_new_session_adoption_updates_the_hook_without_reanchoring_children(self):
         self.interrupted(("01", ()))
+        restarted_session = "4fd70d86-fa21-4d9c-adf2-b4073f60fbb6"
 
-        adopted = self.fixture.launch()
+        adopted = self.fixture.launch(extra=("--coordinator-session", restarted_session))
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.table()["run"]["coordinator_session"] == restarted_session
+            ),
+            "the adopted run kept the old coordinator session",
+        )
         self.fixture.completes("01")
         self.woken(adopted, "run-complete")
 
         self.assertEqual(self.fixture.table()["run"]["coordinator_pid"], COORDINATOR_PID)
+        self.assertEqual(
+            self.fixture.table()["run"]["coordinator_session"], restarted_session
+        )
         self.assertEqual(self.events("ruling", ticket="01"), [])
 
     def test_a_codex_child_is_not_re_anchored_because_its_channel_is_a_file(self):

@@ -53,12 +53,12 @@ python3 <crew-skill-dir>/assets/launch/launch.py <run-dir>
 ```
 
 `<crew-skill-dir>` is the absolute directory this `SKILL.md` loaded from. The launch script reads
-your pid, your session name, and your permission mode off the harness's own records, puts the
+your pid, session name, session ID, and permission mode off the harness's own records, puts the
 driver in a tmux window of its own, and stays behind as a waiter that blocks until the run has
-something to say — so this step costs one tool call. Where it cannot read one of the three values
-it stops and names the flag that supplies the value by hand: get that value from the user, because
-a wrong pid or name strands every ruling you make, and a wrong mode launches every child of the run
-outside the mode a message can cross.
+something to say — so this step costs one tool call. Where it cannot read one of the four values,
+it stops and names the flag that supplies the value by hand: get that value from the user, because a
+wrong pid or name strands every ruling, a wrong session ID scopes coordinator-only hooks to the
+wrong session, and a wrong mode launches every child outside the mode a message can cross.
 
 The background task you are left holding is only the waiter. The driver is not yours to lose:
 whatever happens to that task — an interrupt, a compaction, this session ending — the run carries

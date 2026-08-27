@@ -42,6 +42,7 @@ CODEX_MODEL = "gpt-5.6-luna"
 CODEX_EFFORT = "max"
 COORDINATOR_NAME = "crew-coordinator-1f"
 COORDINATOR_PID = 1504
+COORDINATOR_SESSION = "2cd60d75-fa21-4d9c-adf2-b4073f60fbb6"
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
 # The pane the coordinator itself is sitting in, as tmux names one and as the launcher reads it
@@ -352,6 +353,7 @@ class Fixture:
             "--feature-dir", str(self.feature_dir),
             "--coordinator-name", COORDINATOR_NAME,
             "--coordinator-pid", str(COORDINATOR_PID),
+            "--coordinator-session", COORDINATOR_SESSION,
             "--permission-mode", PERMISSION_MODE,
             "--tmux-session", TMUX_SESSION,
             "--coordinator-pane", COORDINATOR_PANE,
@@ -520,6 +522,13 @@ class Fixture:
             if os.path.realpath(agent.get("cwd", "")) == worktree:
                 agent["status"] = status
         self.set_agents(agents, home)
+
+    def codex_goes(self, ticket, status):
+        """Set the status the next Codex watch reports for one ticket."""
+        path = self.stub_dir / "codex-statuses.json"
+        statuses = json.loads(path.read_text()) if path.exists() else {}
+        statuses[ticket] = status
+        path.write_text(json.dumps(statuses))
 
     def vanishes(self, ticket):
         """Take that child's session off its account's list, as a session that died leaves it.
