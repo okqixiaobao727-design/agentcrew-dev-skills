@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-08-27
+
 ### Changed
 - Review instructions now follow each Review-Switch result's `next` and `nextCall` instead of
   copying its flags, timeout, recovery semantics, and report-validity rules. AgentCrew retains
