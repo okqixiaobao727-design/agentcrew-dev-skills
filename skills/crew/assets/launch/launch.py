@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Start a crew run from a run directory alone: resolve the coordinator, then launch the driver.
 
-The driver's `start` needs three facts about the session driving it — the pid a child
-authenticates a ruling against, the name a child answers to, and the permission mode every child
-launches under. A coordinator session cannot see any of them from inside itself, and the turns it
-spends hunting for them are the whole of `/crew`'s start-up cost. This script reads them off the
-harness's own on-disk records instead:
+The driver's `start` needs four facts about the session driving it — the pid a child authenticates
+a ruling against, the name a child answers to, the session ID that scopes coordinator hooks, and
+the permission mode every child launches under. A coordinator session cannot see any of them from
+inside itself, and the turns it spends hunting for them are the whole of `/crew`'s start-up cost.
+This script reads them off the harness's own on-disk records instead:
 
 - **pid** — the invoking shell's parent, found by walking up the process ancestry to the first
   process the harness has a session registry entry for. The shell in between is why the walk
   exists: the coordinator is never the launcher's own parent.
 - **name** — that registry entry's `name`, which is what the harness itself calls the session.
-- **permission mode** — the newest entry of that session's transcript that records one. The
+- **session ID** — that registry entry's `sessionId`, which scopes hooks to this coordinator.
+- **permission mode** — the newest registry-session transcript entry that records one. The
   transcript is the only on-disk source that follows a mid-session mode switch, and the mode is
   the one fact here that must be current rather than merely correct.
 
@@ -39,7 +40,7 @@ That makes the command idempotent in one more way than before. A run whose drive
 again, so `/crew` stays safe to type at any moment and no run is ever driven twice.
 
     python3 launch.py <run-dir> [--coordinator-pid N] [--coordinator-name NAME]
-                                [--permission-mode MODE] [--driver PATH]
+                                [--coordinator-session ID] [--permission-mode MODE] [--driver PATH]
 """
 
 import argparse
@@ -193,15 +194,15 @@ def coordinator(given_pid, unresolved):
     )
 
 
-def session_name(entry, pid):
-    """The name that session answers to, out of its registry entry."""
-    name = entry.get(REGISTRY_NAME)
-    if not isinstance(name, str) or not name.strip():
+def registry_string(entry, pid, key, flag):
+    """Return one required non-empty string from a session registry entry, or raise."""
+    value = entry.get(key)
+    if not isinstance(value, str) or not value.strip():
         raise LaunchError(
             f"the session registry entry for {pid} in {harness_directory(SESSION_REGISTRY)}"
-            f" records no {REGISTRY_NAME}: pass --coordinator-name explicitly"
+            f" records no {key}: pass {flag} explicitly"
         )
-    return name
+    return value
 
 
 def transcripts(session):
@@ -252,28 +253,42 @@ def permission_mode(entry, pid):
 
 
 def resolve(args):
-    """The three values the driver's start requires, each given by hand or read off the harness.
+    """The four values the driver's start requires, each given by hand or read off the harness.
 
-    Every one of the three is resolved or the launch fails: a value the harness cannot supply and
+    Every one of the four is resolved or the launch fails: a value the harness cannot supply and
     the operator did not pass is not a value to hand the driver empty.
     """
-    pid, name, mode = args.coordinator_pid, args.coordinator_name, args.permission_mode
-    if pid is None or name is None or mode is None:
-        given = {"--coordinator-pid": pid, "--coordinator-name": name, "--permission-mode": mode}
+    pid = args.coordinator_pid
+    name = args.coordinator_name
+    session = args.coordinator_session
+    mode = args.permission_mode
+    if pid is None or name is None or session is None or mode is None:
+        given = {
+            "--coordinator-pid": pid,
+            "--coordinator-name": name,
+            "--coordinator-session": session,
+            "--permission-mode": mode,
+        }
         pid, entry = coordinator(pid, [flag for flag, value in given.items() if value is None])
-        name = name if name is not None else session_name(entry, pid)
+        name = name if name is not None else registry_string(
+            entry, pid, REGISTRY_NAME, "--coordinator-name"
+        )
+        session = session if session is not None else registry_string(
+            entry, pid, REGISTRY_SESSION, "--coordinator-session"
+        )
         mode = mode if mode is not None else permission_mode(entry, pid)
-    return pid, name, mode
+    return pid, name, session, mode
 
 
 def driver_command(args, session, resolved):
     """The driver command line this run starts on, `start` because start is what adopts."""
-    pid, name, mode = resolved
+    pid, name, coordinator_session, mode = resolved
     return [
         sys.executable, str(pathlib.Path(args.driver).resolve()), START_COMMAND,
         "--feature-dir", str(pathlib.Path(args.run_dir).resolve()),
         "--coordinator-name", name,
         "--coordinator-pid", str(pid),
+        "--coordinator-session", coordinator_session,
         "--permission-mode", mode,
         "--tmux-session", session,
     ]
@@ -482,6 +497,10 @@ def build_parser():
     parser.add_argument(
         "--coordinator-name",
         help="the coordinator's session name, where the registry entry cannot be read",
+    )
+    parser.add_argument(
+        "--coordinator-session",
+        help="the coordinator's session ID, where the registry entry cannot be read",
     )
     parser.add_argument(
         "--permission-mode",

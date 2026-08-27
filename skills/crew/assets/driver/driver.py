@@ -823,7 +823,7 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
         "integration_base_commit": base_commit,
         "coordinator_name": args.coordinator_name,
         "coordinator_pid": args.coordinator_pid,
-        "coordinator_session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+        "coordinator_session": args.coordinator_session,
         "crew_skill_dir": str(CREW_SKILL_DIR),
         "tmux_session": args.tmux_session,
         "permission_mode": args.permission_mode,
@@ -906,14 +906,16 @@ def prepare_branches(repo, base_branch, integration_branch, pull, gate):
     return return_branch, git_output(repo, "rev-parse", "HEAD"), None
 
 
-def install_hook(log, settings, role, ticket=None):
-    """Register this run's log hook in that settings file, through the log's own operation."""
+def install_hook(log, settings, role, ticket=None, session_id=None):
+    """Register one side's log hook; session_id scopes the coordinator's bounded-read hook."""
     arguments = [
         sys.executable, MACHINE_LOG, "--log", log, "install",
         "--settings", settings, "--role", role,
     ]
     if ticket:
         arguments += ["--ticket", ticket]
+    if session_id is not None:
+        arguments += ["--session-id", session_id]
     run_command(arguments, f"the {role} hook could not be installed in {settings}")
 
 
@@ -1697,7 +1699,9 @@ def run_start(args):
         raise DriverError(str(error), pointer=str(feature_dir)) from error
 
     record_base_gate(log, gate)
-    install_hook(log, repo / SETTINGS_PATH, "coordinator")
+    install_hook(
+        log, repo / SETTINGS_PATH, "coordinator", session_id=run["coordinator_session"]
+    )
     dispatch_wave(table_path, log, launch_dir, run_dir)
     children = launched_children(log)
     for child in children:
@@ -2813,7 +2817,10 @@ class Loop:
         """
         records = self.records()
         projection = machine_log.project(records)
-        install_hook(self.log, self.repo / SETTINGS_PATH, COORDINATOR_ROLE)
+        install_hook(
+            self.log, self.repo / SETTINGS_PATH, COORDINATOR_ROLE,
+            session_id=self.args.coordinator_session,
+        )
         for ticket, facts in sorted(projection.tickets.items()):
             launch = facts.launch
             if launch is None:
@@ -2829,8 +2836,10 @@ class Loop:
 
         A coordinator that restarted has a new pid, so every Claude child of the run is holding a
         trust anchor on a dead socket — and its refusal of the new socket's messages is that anchor
-        working. The run's own record is rewritten first, because the
-        identity it carries is the one every ticket dispatched from here on is handed.
+        working. The run's own record is rewritten first, including a changed session ID that
+        scopes its coordinator hook. Children are re-anchored only when name or pid changes,
+        because their channel is the pid-keyed socket rather than the hook's session scope. The
+        identity the run record carries is the one every ticket dispatched from here on is handed.
 
         A Codex child is not re-anchored: its channel is a state file on disk, which the new
         coordinator opens exactly as the old one did. Neither is a child that cannot be reached —
@@ -2839,12 +2848,25 @@ class Loop:
         instruction that landed and could not be recorded is a driver error, and it wakes the
         coordinator here as it does everywhere else.
         """
-        name, pid = self.args.coordinator_name, self.args.coordinator_pid
-        if (self.run.coordinator_name, self.run.coordinator_pid) == (name, pid):
+        name = self.args.coordinator_name
+        pid = self.args.coordinator_pid
+        session = self.args.coordinator_session
+        if (
+            self.run.coordinator_name,
+            self.run.coordinator_pid,
+            self.run.coordinator_session,
+        ) == (name, pid, session):
             return
-        self.run = replace(self.run, coordinator_name=name, coordinator_pid=pid)
+        channel_changed = (self.run.coordinator_name, self.run.coordinator_pid) != (name, pid)
+        self.run = replace(
+            self.run, coordinator_name=name, coordinator_pid=pid,
+            coordinator_session=session,
+        )
         self.plan = replace(self.plan, run=self.run)
         self.plan.write(self.table_path)
+        # A session-only restart moves the hook scope, while the pid-keyed child socket stays put.
+        if not channel_changed:
+            return
         for ticket, facts in sorted(projection.tickets.items()):
             launch = facts.launch
             if launch is None:
@@ -3235,6 +3257,13 @@ def run_answer(args):
 # --- entry point ------------------------------------------------------------------------------
 
 
+def non_empty_session_id(value):
+    """Return a non-empty coordinator session ID for the hook boundary, or raise."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("coordinator session ID is empty")
+    return value
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3248,6 +3277,10 @@ def build_parser():
     start.add_argument(
         "--coordinator-pid", required=True, type=int,
         help="its pid — the trust anchor a child authenticates a ruling against",
+    )
+    start.add_argument(
+        "--coordinator-session", required=True, type=non_empty_session_id,
+        help="its session ID — the scope of coordinator-only hooks",
     )
     start.add_argument(
         "--permission-mode", required=True, help="the mode children launch under, which is its own"

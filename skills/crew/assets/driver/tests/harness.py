@@ -42,6 +42,7 @@ CODEX_MODEL = "gpt-5.6-luna"
 CODEX_EFFORT = "max"
 COORDINATOR_NAME = "crew-coordinator-1f"
 COORDINATOR_PID = 1504
+COORDINATOR_SESSION = "2cd60d75-fa21-4d9c-adf2-b4073f60fbb6"
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
 
@@ -346,6 +347,7 @@ class Fixture:
             "--feature-dir", str(self.feature_dir),
             "--coordinator-name", COORDINATOR_NAME,
             "--coordinator-pid", str(COORDINATOR_PID),
+            "--coordinator-session", COORDINATOR_SESSION,
             "--permission-mode", PERMISSION_MODE,
             "--tmux-session", TMUX_SESSION,
             "--codex-bridge", str(self.codex_bridge),
