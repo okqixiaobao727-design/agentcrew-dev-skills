@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-08-28
+
 ### Fixed
 - v0.9.7 and v0.9.8 could not launch a Codex child in a git working directory: both transferred a
   thread from an app-server client to the TUI through an asynchronously written rollout, and the
