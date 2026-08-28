@@ -765,9 +765,16 @@ async def cmd_launch(args):
             await client.__aexit__(None, None, None)
     except Exception as error:
         detail = read_log_tail(runtime_dir / "app-server.log")
+        try:
+            pane_is_alive = pane_exists(pane_id)
+        except OSError:
+            pane_is_alive = None
         kill_window(window_id)
-        if detail and "Codex opening skill assertion failed:" in detail:
-            raise BridgeError(detail) from error
+        if pane_is_alive is False:
+            raise BridgeError(
+                "Codex TUI window exited before creating its thread"
+                + (f": {detail}" if detail else "")
+            ) from error
         raise
 
     state = build_state(args, runtime_dir, window_id, pane_id, thread_id, marker)

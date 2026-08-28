@@ -17,7 +17,9 @@ guesses at the cause.
 ## Requirements
 
 - **Python 3.11 or newer.** The config validator reads TOML with `tomllib`, which arrived in 3.11.
-- **No Python package install.** The test gate and validator use the standard library only.
+- The validator and most test suites use only the Python standard library.
+- The Codex bridge suite requires `aiohttp`, the same product dependency used to run Codex
+  tickets; install it with `python3 -m pip install -r requirements-test.txt`.
 
 Running the skills themselves needs more than this (Claude Code, tmux, optionally the Codex CLI);
 see the README's Requirements section. Contributing to the Python code does not.

@@ -24,6 +24,7 @@ runs one work item at a time.
 import argparse
 import collections
 import concurrent.futures
+import importlib.util
 import os
 import pathlib
 import sys
@@ -35,6 +36,8 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ASSET_SUITES = "skills/*/assets/**/tests"
 ROOT_SUITE = "root"
+ROOT_REQUIREMENT = "aiohttp"
+TEST_REQUIREMENTS_FILE = "requirements-test.txt"
 
 
 def suites(root):
@@ -235,6 +238,17 @@ def die(message):
     return 2
 
 
+def missing_root_requirement(chosen):
+    if not any(name == ROOT_SUITE for name, _ in chosen):
+        return None
+    if importlib.util.find_spec(ROOT_REQUIREMENT) is not None:
+        return None
+    return (
+        f"the {ROOT_SUITE} suite requires Python package {ROOT_REQUIREMENT!r}; "
+        f"install test dependencies with: python3 -m pip install -r {TEST_REQUIREMENTS_FILE}"
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Run every test suite, or the one suite belonging to a named asset.",
@@ -270,6 +284,9 @@ def main(argv=None):
     chosen, unselectable = select(inventory, args.asset)
     if unselectable:
         return die(unselectable)
+    missing_requirement = missing_root_requirement(chosen)
+    if missing_requirement:
+        return die(missing_requirement)
 
     # Bounded by the cores the machine has, whatever was asked for: these tests measure real
     # processes against absolute wall-clock timeouts, so oversubscribing does not merely slow the

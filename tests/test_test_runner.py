@@ -166,6 +166,13 @@ class TreeFixture:
             text=True,
         )
 
+    def run_without_site_packages(self, *args):
+        return subprocess.run(
+            [sys.executable, "-S", str(SCRIPT), "--root", str(self.root), *args],
+            capture_output=True,
+            text=True,
+        )
+
 
 class RunnerCLITests(unittest.TestCase):
     """What the caller gets back for each way of naming — or not naming — what to run."""
@@ -210,6 +217,21 @@ class RunnerCLITests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("root: 1 tests in", run.stderr)
         self.assertNotIn("alpha:", run.stderr)
+
+    def test_the_root_suite_fails_clearly_without_aiohttp(self):
+        run = self.tree.run_without_site_packages("--asset", "root")
+
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("aiohttp", run.stderr)
+        self.assertIn("requirements-test.txt", run.stderr)
+        self.assertNotIn("root: 1 tests in", run.stderr)
+
+    def test_an_unrelated_focused_suite_does_not_require_aiohttp(self):
+        run = self.tree.run_without_site_packages("--asset", "alpha")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("alpha: 1 tests in", run.stderr)
+        self.assertNotIn("aiohttp", run.stderr)
 
     def test_an_unknown_asset_names_the_suites_it_could_have_been(self):
         run = self.tree.run("--asset", "gamma")
