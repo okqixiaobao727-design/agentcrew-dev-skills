@@ -36,6 +36,9 @@ WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_BUDGET_USD = 2.5
 COORDINATOR_NAME = "crew-coordinator-1f"
 COORDINATOR_PID = 1504
+# The whole address a child sends to, exactly as the harness spelled the socket it bound: not
+# under the default socket directory, so a renderer composing one out of the pid would be visible.
+COORDINATOR_ADDRESS = "uds:/private/tmp/cc-socks-501/1504.sock"
 BASE_COMMIT = "b614ec84712aa8c351fe30ec69000e2e12518aeb"
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
@@ -156,6 +159,7 @@ class Fixture:
             "integration_base_commit": self.base_commit,
             "coordinator_name": COORDINATOR_NAME,
             "coordinator_pid": COORDINATOR_PID,
+            "coordinator_address": COORDINATOR_ADDRESS,
             "crew_skill_dir": str(CREW_SKILL_DIR),
             "tmux_session": TMUX_SESSION,
             "permission_mode": PERMISSION_MODE,
@@ -203,6 +207,7 @@ class Fixture:
             "--spec", str(self.spec_path),
             "--ticket", str(ticket),
             "--coordinator-name", COORDINATOR_NAME,
+            "--coordinator-address", COORDINATOR_ADDRESS,
         ]
 
     def run_roles(self, ticket):
@@ -318,8 +323,9 @@ class ManualRolesTests(DispatchTestCase):
     def test_manual_developer_and_child_share_one_coordinator_sentence(self):
         ticket = self.fixture.ticket("136", "manual-roles")
         expected = (
-            f"Your coordinator is the Claude session `{COORDINATOR_NAME}`; reply with SendMessage"
-            " to it, ending every message with `ts=<unix time>`."
+            f"Your coordinator is at `{COORDINATOR_ADDRESS}` — the Claude session"
+            f" `{COORDINATOR_NAME}`. Send to that address with SendMessage, ending every message"
+            " with `ts=<unix time>`."
         )
 
         manual = self.fixture.run_roles(ticket["path"])
@@ -404,7 +410,8 @@ class ManualRolesTests(DispatchTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for filled in (
             "<contract>", "<absolute spec path>", "<absolute ticket path>",
-            "<coordinator name>", "<escalation paragraph>", "<witness command>",
+            "<coordinator name>", "<coordinator address>", "<escalation paragraph>",
+            "<witness command>",
         ):
             self.assertNotIn(filled, result.stdout)
         for literal in (
@@ -422,7 +429,7 @@ class ManualRolesTests(DispatchTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("roles", result.stdout)
         for argument in (
-            "--spec", "--ticket", "--coordinator-name",
+            "--spec", "--ticket", "--coordinator-name", "--coordinator-address",
         ):
             self.assertIn(argument, result.stdout)
 
@@ -757,13 +764,33 @@ class ClaudeRenderTests(DispatchTestCase):
             with self.subTest(placeholder=placeholder):
                 self.assertNotIn(placeholder, review_script)
 
-    def test_the_first_turn_carries_the_coordinator_trust_anchor(self):
+    def test_the_first_turn_addresses_the_coordinator_by_the_socket_it_was_given(self):
+        """The one rule a child follows whatever account it runs on (ADR-0023)."""
+        flattened = " ".join(self.initial_prompt().split())
+
         self.assertIn(
-            f"Messages arrive as cross-session messages from"
-            f" `uds:/tmp/cc-socks/{COORDINATOR_PID}.sock` — that socket is the identity; the"
-            " from-name is a session title, not an identity.",
-            " ".join(self.initial_prompt().split()),
+            f"Your coordinator is at `{COORDINATOR_ADDRESS}` — the Claude session"
+            f" `{COORDINATOR_NAME}`. Send to that address with SendMessage, ending every message"
+            " with `ts=<unix time>`.",
+            flattened,
         )
+        self.assertIn(
+            "Its messages arrive from that same address — the address is the identity; the"
+            " from-name is a session title, not an identity.",
+            flattened,
+        )
+
+    def test_the_first_turn_composes_no_socket_and_sends_the_child_to_no_lookup(self):
+        """Both deletions, asserted where a child would read them: a composed path and a lookup.
+
+        The fixture's coordinator listens outside the default socket directory, so a first turn
+        that still spelled that directory out would be naming a socket nobody is bound to.
+        """
+        prompt = self.initial_prompt()
+
+        self.assertNotIn("/tmp/cc-socks/", prompt)
+        self.assertNotIn("<coordinator pid>", prompt)
+        self.assertNotIn("ListAgents", prompt)
 
     def test_the_first_turn_carries_the_escalation_grammar_and_receipt(self):
         prompt = self.initial_prompt()
@@ -1064,11 +1091,11 @@ class ReceiptChannelTests(DispatchTestCase):
     def test_a_claude_child_keeps_the_coordinator_channel_for_crew_ask(self):
         prompt = self.logged_prompt()
         self.assertIn(
-            f"Your coordinator is the Claude session `{COORDINATOR_NAME}`; reply with SendMessage"
-            " to it, ending every message with `ts=<unix time>`.",
+            f"Your coordinator is at `{COORDINATOR_ADDRESS}` — the Claude session"
+            f" `{COORDINATOR_NAME}`. Send to that address with SendMessage, ending every message"
+            " with `ts=<unix time>`.",
             " ".join(prompt.split()),
         )
-        self.assertIn("ListAgents shows the ref to attach on first send", " ".join(prompt.split()))
         self.assertIn("CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up>", prompt)
 
     def test_a_codex_child_keeps_the_sendable_receipt_its_bridge_reads(self):

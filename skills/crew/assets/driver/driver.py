@@ -271,9 +271,6 @@ HANDED_OVER_MARKER = machine_log.HANDED_OVER_MARKER
 # accidentally become an unsupported tmux key sequence.
 ANSWER_KEYS = tuple("0123456789") + ("Up", "Down", "Left", "Right", "Enter", "S-Enter")
 
-# The socket a Claude child authenticates its coordinator by, spelled as the first turn spells it.
-COORDINATOR_SOCKET = "uds:/tmp/cc-socks/{pid}.sock"
-
 HANDED_OVER = (
     "{marker} {ticket} — this escalation was handed to the coordinator, which is where it is"
     " answered. An answer sent as tmux keys passes no hook and so reaches no log; this line is"
@@ -298,9 +295,9 @@ NUDGE_TEMPLATE = (
 )
 ANCHOR_TEMPLATE = (
     "{marker} {ticket} — this run is driven by a coordinator session that has restarted, so the"
-    " socket your first turn told you to trust is dead. Your coordinator is the Claude session"
-    " `{name}` now, and its messages arrive from `{socket}` — that socket is the identity. Reply"
-    " with SendMessage to `{name}`; nothing else about your ticket has changed."
+    " address your first turn told you to trust is dead. Your coordinator is at `{address}` now"
+    " — the Claude session `{name}` — and that address is the identity. Send to it with"
+    " SendMessage; nothing else about your ticket has changed."
 )
 # The rework instruction is scoped to the conflict rather than to the whole workflow: the work it
 # asks for is a resolution, and re-running everything the ticket already ran green buys nothing the
@@ -895,6 +892,10 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
         "coordinator_name": args.coordinator_name,
         "coordinator_pid": args.coordinator_pid,
         "coordinator_session": args.coordinator_session,
+        # The one address a child sends to, whatever account it runs on (ADR-0023). Carried here
+        # rather than composed downstream so a resumed run cannot address a coordinator other than
+        # the one its start resolved.
+        "coordinator_address": args.coordinator_address,
         "crew_skill_dir": str(CREW_SKILL_DIR),
         "tmux_session": args.tmux_session,
         "permission_mode": args.permission_mode,
@@ -2955,12 +2956,13 @@ class Loop:
     def reanchor(self, projection):
         """Point the run and its live children at the coordinator driving it now; returns nothing.
 
-        A coordinator that restarted has a new pid, so every Claude child of the run is holding a
-        trust anchor on a dead socket — and its refusal of the new socket's messages is that anchor
-        working. The run's own record is rewritten first, including a changed session ID that
-        scopes its coordinator hook. Children are re-anchored only when name or pid changes,
-        because their channel is the pid-keyed socket rather than the hook's session scope. The
-        identity the run record carries is the one every ticket dispatched from here on is handed.
+        A coordinator that restarted binds a new socket, so every Claude child of the run is
+        holding a trust anchor on a dead address — and its refusal of the new socket's messages is
+        that anchor working. The run's own record is rewritten first, including a changed session
+        ID that scopes its coordinator hook. Children are re-anchored only when the address
+        changes, because the address is the whole of what a child was told to trust and the hook's
+        session scope reaches no child at all. The identity the run record carries is the one every
+        ticket dispatched from here on is handed.
 
         A Codex child is not re-anchored: its channel is a state file on disk, which the new
         coordinator opens exactly as the old one did. Neither is a child that cannot be reached —
@@ -2972,20 +2974,22 @@ class Loop:
         name = self.args.coordinator_name
         pid = self.args.coordinator_pid
         session = self.args.coordinator_session
+        address = self.args.coordinator_address
         if (
             self.run.coordinator_name,
             self.run.coordinator_pid,
             self.run.coordinator_session,
-        ) == (name, pid, session):
+            self.run.coordinator_address,
+        ) == (name, pid, session, address):
             return
-        channel_changed = (self.run.coordinator_name, self.run.coordinator_pid) != (name, pid)
+        channel_changed = self.run.coordinator_address != address
         self.run = replace(
             self.run, coordinator_name=name, coordinator_pid=pid,
-            coordinator_session=session,
+            coordinator_session=session, coordinator_address=address,
         )
         self.plan = replace(self.plan, run=self.run)
         self.plan.write(self.table_path)
-        # A session-only restart moves the hook scope, while the pid-keyed child socket stays put.
+        # A restart that moves only the hook scope leaves the address a child sends to standing.
         if not channel_changed:
             return
         for ticket, facts in sorted(projection.tickets.items()):
@@ -2996,8 +3000,7 @@ class Loop:
                 continue
             with contextlib.suppress(Unreachable):
                 self.deliver(ticket, launch, ANCHOR_TEMPLATE.format(
-                    marker=ANCHOR_MARKER, ticket=ticket, name=name,
-                    socket=COORDINATOR_SOCKET.format(pid=pid),
+                    marker=ANCHOR_MARKER, ticket=ticket, name=name, address=address,
                 ))
 
     # --- the loop itself ----------------------------------------------------------------------
@@ -3386,6 +3389,16 @@ def non_empty_session_id(value):
     return value
 
 
+def non_empty_address(value):
+    """Return a non-empty coordinator address for the first turn, or raise.
+
+    Taken exactly as spelled and never normalised (ADR-0023): the receiver bound that literal.
+    """
+    if not value.strip():
+        raise argparse.ArgumentTypeError("coordinator address is empty")
+    return value
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3398,11 +3411,15 @@ def build_parser():
     )
     start.add_argument(
         "--coordinator-pid", required=True, type=int,
-        help="its pid — the trust anchor a child authenticates a ruling against",
+        help="its pid — what the dashboard pins the run to and a restart is detected by",
     )
     start.add_argument(
         "--coordinator-session", required=True, type=non_empty_session_id,
         help="its session ID — the scope of coordinator-only hooks",
+    )
+    start.add_argument(
+        "--coordinator-address", required=True, type=non_empty_address,
+        help="its whole `uds:` inbox address — the one thing a child of any account sends to",
     )
     start.add_argument(
         "--permission-mode", required=True, help="the mode children launch under, which is its own"

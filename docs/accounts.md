@@ -126,6 +126,25 @@ own terms, rather than discovered as a machine missing a profile.
 | A wave split across two accounts | Each child is launched in a tmux window whose own environment carries its account, so a `claude` you type into that window by hand stays on it too. Verification, the dashboard's liveness reads and the cost rollup each read the account that child's row names, and the machine log's `launch` line records it. One wake monitor is armed per account, each polling the live-agents list of the account its children actually run under — a list belongs to one login, and a child asked after in another account's list is a live child reported `vanished`. The coordinator need not be logged into any account it dispatches into. |
 | A `codex` ticket | Unaffected. It launches on its own vendor's credentials and its launch event records no account. |
 
+## Escalation across accounts
+
+A ticket on another account keeps a working `CREW ASK` channel. Which subscription pays does not
+decide whether a child can ask a question, and the coordinator answers that child directly rather
+than the operator selecting an option in a tmux pane by hand.
+
+That works because a child is told to send to its coordinator's **socket address**, not to its
+session name — the same rule on one account or two
+([ADR-0023](adr/0023-the-coordinator-is-addressed-by-socket-not-by-name.md)). The name lookup that
+cannot work across accounts is not attempted. The socket transport is machine-wide; only the name
+registry is per-account.
+
+**One operator prerequisite.** Run the coordinator in a permission mode that does not prompt for
+inbound peer messages, or set `crossSessionInbound` to `accept` in your own session's settings. A
+coordinator that prompts holds each child's message behind an approval dialog, and that approval
+expires — a held message then looks exactly like a lost one. The crew cannot settle this for you:
+the settings file it installs belongs to the child's worktree, not to your session. This has
+nothing to do with accounts and applies to a single-account run just as much.
+
 ## No login check is performed
 
 Registration and directory existence are the whole of the check. Whether that profile is *logged

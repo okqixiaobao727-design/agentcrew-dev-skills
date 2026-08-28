@@ -7,7 +7,7 @@
               agents list and the model its own transcript records, a Codex child from the
               model the bridge pinned into its state file
     roles     print the manual advisor and developer prompts for one spec and ticket, naming
-              the coordinator session the developer answers
+              the coordinator address the developer sends to
 
 Every artifact path is recorded absolute, whatever spelling `--out-dir` was given: the launch line
 runs in the child's own worktree, so a relative path recorded here would resolve to nothing there.
@@ -38,8 +38,10 @@ The wave table is one JSON object:
         "spec_path":               absolute path to the spec every child is pointed at
         "integration_branch":      the branch completed tickets land on
         "integration_base_commit": the commit ticket worktrees and reviews are based on
-        "coordinator_name":        the coordinator session's name
-        "coordinator_pid":         its pid — the trust anchor a child authenticates against
+        "coordinator_name":        the coordinator session's name, a label a child reads
+        "coordinator_pid":         its pid — what the dashboard pins the run to
+        "coordinator_address":     its whole `uds:` inbox address — the one thing a child sends
+                                   to, on its own account or another (ADR-0023)
         "crew_skill_dir":          absolute path to the installed crew skill
         "tmux_session":            the session every child's window is created in
         "permission_mode":         the mode children launch under
@@ -211,7 +213,7 @@ def project_witness_routing(ticket):
     return model, budget
 
 
-def render_roles(spec, ticket, coordinator_name, templates):
+def render_roles(spec, ticket, coordinator_name, coordinator_address, templates):
     """Return the manual advisor and developer prompts rendered from their shared blocks."""
     witness_model, witness_budget = project_witness_routing(ticket)
     caller_budget = f"\n  {block(templates['review']['caller_budget'])}"
@@ -228,9 +230,13 @@ def render_roles(spec, ticket, coordinator_name, templates):
         {
             "<coordinator paragraph>": fill(
                 block(templates["turn"]["coordinator_claude"]),
-                {"<coordinator name>": coordinator_name},
+                {
+                    "<coordinator name>": coordinator_name,
+                    "<coordinator address>": coordinator_address,
+                },
             ),
             "<coordinator name>": coordinator_name,
+            "<coordinator address>": coordinator_address,
             "<absolute spec path>": spec,
             "<absolute ticket path>": ticket,
             "<escalation paragraph>": fill(
@@ -383,7 +389,7 @@ def render_turn(run, ticket, templates, review_script, log=None):
         "<crew-skill-dir>": run.crew_skill_dir,
         "<NN>": ticket.id,
         "<coordinator name>": run.coordinator_name,
-        "<coordinator pid>": run.coordinator_pid,
+        "<coordinator address>": run.coordinator_address,
         "<machine log path>": log or "",
         "<machine log script>": run_log_script(log),
         "<design bridge>": shape.get("design_bridge", ""),
@@ -956,6 +962,10 @@ def parse_args(argv):
     parser.add_argument("--ticket", help="the ticket path for the manual developer prompt")
     parser.add_argument("--coordinator-name", help="the session name the manual developer answers")
     parser.add_argument(
+        "--coordinator-address",
+        help="the whole `uds:` inbox address the manual developer sends to",
+    )
+    parser.add_argument(
         "--log", help="the run's machine log, where each launched child's `launch` event is"
                       " appended and which every rendered review command is pointed at; without"
                       " it a dispatch launches and records nothing",
@@ -977,7 +987,7 @@ def parse_args(argv):
     required = {
         "render": ("table", "wave", "out_dir"),
         "dispatch": ("table", "wave", "out_dir"),
-        "roles": ("spec", "ticket", "coordinator_name"),
+        "roles": ("spec", "ticket", "coordinator_name", "coordinator_address"),
     }[args.command]
     missing = [f"--{name.replace('_', '-')}" for name in required if getattr(args, name) is None]
     if missing:
@@ -991,7 +1001,8 @@ def main(argv=None):
     if args.command == "roles":
         try:
             rendered = render_roles(
-                args.spec, args.ticket, args.coordinator_name, templates
+                args.spec, args.ticket, args.coordinator_name, args.coordinator_address,
+                templates,
             )
         except RoleRenderError as error:
             print(error, file=sys.stderr)

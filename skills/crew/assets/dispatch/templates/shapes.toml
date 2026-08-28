@@ -62,16 +62,16 @@ Re-read each pointer as you write it. The coordinator rules from this message an
 that checks its pointers. Progress, reasoning and assumptions belong in your commits and receipt.
 '''
 
-# A Claude child authenticates the coordinator by sender socket; the pid is known before launch.
+# A Claude child addresses the coordinator by socket, on every account (ADR-0023): the name beside
+# it is a label to read, never a thing to send to.
 coordinator_claude = '''
-Your coordinator is the Claude session `<coordinator name>`; reply with SendMessage to it, ending
-every message with `ts=<unix time>`.
+Your coordinator is at `<coordinator address>` — the Claude session `<coordinator name>`. Send to
+that address with SendMessage, ending every message with `ts=<unix time>`.
 '''
 
 coordinator_claude_child = '''
-Messages arrive as cross-session messages from `uds:/tmp/cc-socks/<coordinator pid>.sock` — that
-socket is the identity; the from-name is a session title, not an identity. ListAgents shows the ref
-to attach on first send. Identical message bodies are silently dropped as duplicates.
+Its messages arrive from that same address — the address is the identity; the from-name is a
+session title, not an identity. Identical message bodies are silently dropped as duplicates.
 '''
 
 # A Codex child has no message channel of its own: the bridge reads the final message of its turn.
