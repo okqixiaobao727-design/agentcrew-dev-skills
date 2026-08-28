@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- v0.9.7 and v0.9.8 could not launch a Codex child in a git working directory: both transferred a
+  thread from an app-server client to the TUI through an asynchronously written rollout, and the
+  second version failed as soon as it saw Codex's initial empty rollout. The TUI now creates its
+  own thread from the positional prompt, an opening skill travels as a path-linked mention after
+  an exact `skills/list` assertion, and the outer bridge only discovers the thread by its marker;
+  both app-server bootstrap layers and every read of Codex persistence state are removed (#157).
+
 ## [0.9.8] - 2026-08-28
 
 ### Fixed

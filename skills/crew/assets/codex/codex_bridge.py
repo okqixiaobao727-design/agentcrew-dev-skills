@@ -5,7 +5,7 @@ Every Codex session (child or integrator) is launched as a tmux window running
 the Codex TUI attached to a private `codex app-server` unix socket. The
 orchestrator talks to the session through this CLI:
 
-    launch  start app-server + TUI window, submit the first turn, write a state file
+    launch  start app-server + TUI window with the first turn, write a state file
     send    submit a follow-up turn (answer, fix-up request) to a session
     watch   block while every watched session is busy; exit with a JSON snapshot
             as soon as any session is idle (turn finished) or vanished
@@ -15,9 +15,8 @@ Each command prints one JSON object on stdout. Exit 0 on success, 1 on error.
 
 `watch` reads the thread's latest finished turn rather than the turn `send` started: a
 coordinator answers in the pane as readily as through this CLI, and a turn that carries no marker
-of ours is still the session speaking. The launch marker is only the pane's proof that the first
-turn it posted has materialised before the TUI attaches; thread identity comes from the pane's
-single bootstrap result.
+of ours is still the session speaking. The launch marker lets the outer process discover the
+thread the TUI created; the bridge never reads Codex's rollout persistence state during launch.
 What is copied to the machine log is keyed on the message rather than on the busy-to-idle edge
 that carried it, because an edge is seen only by the watch that happens to be polling either side
 of it, and one missed edge used to drop a child's last word for good.
@@ -52,11 +51,8 @@ TERMINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 60
 DEFAULT_WATCH_TIMEOUT_SECONDS = 7200
 DEFAULT_WATCH_INTERVAL_SECONDS = 2.0
-TUI_STARTUP_LIVENESS_SECONDS = 0.25
-PROCESS_POLL_INTERVAL_SECONDS = 0.05
 CONSECUTIVE_FAILURE_LIMIT = 3
 MARKER_PREFIX = "agentcrew"
-BOOTSTRAP_RESULT_NAME = "bootstrap-result.json"
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 SKILL_PLUGIN_NAME = "mattpocock-skills"
 
@@ -159,21 +155,8 @@ def wait_for_path(path, timeout_seconds):
     while time.monotonic() < deadline:
         if os.path.exists(path):
             return True
-        time.sleep(PROCESS_POLL_INTERVAL_SECONDS)
+        time.sleep(0.05)
     return False
-
-
-def process_exit_within(process, timeout_seconds):
-    """Return the process's exit code if it dies within the bounded startup window."""
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        exit_code = process.poll()
-        if exit_code is not None:
-            return exit_code
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        time.sleep(min(PROCESS_POLL_INTERVAL_SECONDS, remaining))
 
 
 def terminate_process(process):
@@ -290,36 +273,53 @@ def final_agent_message(turn):
     return fallback[-1] if fallback else ""
 
 
-async def wait_for_turn_marker(
-    client,
-    thread_id,
-    marker,
-    timeout_seconds,
-):
-    """Wait until a prepared thread contains the newly submitted launch marker."""
+async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
+    """Connect to the pane's app-server once its socket accepts clients."""
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    while time.monotonic() < deadline:
+        if not pane_exists(pane_id):
+            detail = read_log_tail(log_path)
+            raise BridgeError(
+                "Codex TUI window exited during startup"
+                + (f": {detail}" if detail else "")
+            )
+        if os.path.exists(socket_path):
+            try:
+                client = AppServerClient(socket_path)
+                return await client.__aenter__()
+            except (OSError, aiohttp.ClientError, AppServerError) as error:
+                last_error = error
+        await asyncio.sleep(0.1)
+    detail = read_log_tail(log_path)
+    suffix = detail or str(last_error or "socket unavailable")
+    raise BridgeError(f"Timed out connecting to Codex app-server: {suffix}")
+
+
+async def find_thread(client, cwd, marker, pane_id, timeout_seconds, log_path):
+    """Return the fresh thread whose preview contains the launch marker."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        try:
-            result = await client.request(
-                "thread/read", {"threadId": thread_id, "includeTurns": True}
+        if not pane_exists(pane_id):
+            detail = read_log_tail(log_path)
+            raise BridgeError(
+                "Codex TUI window exited before creating its thread"
+                + (f": {detail}" if detail else "")
             )
-        except AppServerError as error:
-            if "not materialized yet" not in str(error):
-                raise
-            await asyncio.sleep(0.25)
-            continue
-        thread = result.get("thread") or {}
-        for turn in thread.get("turns") or []:
-            for item in turn.get("items") or []:
-                if item.get("type") != "userMessage":
-                    continue
-                text = "".join(
-                    part.get("text", "") for part in item.get("content") or []
-                )
-                if marker in text:
-                    return
+        result = await client.request(
+            "thread/list",
+            {
+                "cwd": cwd,
+                "limit": 50,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            },
+        )
+        for thread in result.get("data") or []:
+            if marker in (thread.get("preview") or ""):
+                return thread
         await asyncio.sleep(0.25)
-    raise BridgeError("Timed out waiting for the Codex launch turn")
+    raise BridgeError("Timed out waiting for the Codex TUI thread")
 
 
 def read_prompt(args):
@@ -334,6 +334,17 @@ def opening_skill_name(prompt):
     """Return the skill named at the start of the prompt, if one is present."""
     match = re.match(r"^\$([A-Za-z0-9][A-Za-z0-9_-]*)\b", prompt)
     return match.group(1) if match else None
+
+
+def launch_prompt(marker, message):
+    """Return the TUI prompt and the linked opening skill path, if any."""
+    skill_name = opening_skill_name(message)
+    if not skill_name:
+        return f"{marker}\n{message}", None
+    skill_path = resolve_skill_path(skill_name)
+    remainder = message[len(skill_name) + 1 :]
+    linked_mention = f"[${skill_name}]({skill_path})"
+    return f"{marker}\n{linked_mention}{remainder}", skill_path
 
 
 def resolve_skill_path(skill_name):
@@ -421,97 +432,37 @@ def turn_input(marker, message):
     return inputs
 
 
-async def prepare_launch_thread(socket_path, args):
-    """Return the thread id after creating or resuming the launch thread."""
+async def assert_opening_skill(client, cwd, skill_path):
+    """Raise unless one enabled skill at `skill_path` is visible from `cwd`."""
+    result = await client.request(
+        "skills/list",
+        {
+            "cwds": [cwd],
+            "forceReload": True,
+        },
+    )
+    expected_path = str(skill_path)
+    matches = [
+        skill
+        for entry in result.get("data") or []
+        for skill in entry.get("skills") or []
+        if skill.get("enabled") is True and skill.get("path") == expected_path
+    ]
+    if len(matches) != 1:
+        raise BridgeError(
+            f"Opening skill {expected_path!r} did not resolve to exactly one enabled skill "
+            f"for cwd {cwd!r}; found {len(matches)}"
+        )
+
+
+async def check_opening_skill(socket_path, cwd, skill_path):
+    """Check one opening skill through a short-lived app-server client."""
     client = AppServerClient(socket_path)
     await client.__aenter__()
     try:
-        if args.thread_id:
-            await client.request("thread/resume", {"threadId": args.thread_id})
-            thread_id = args.thread_id
-        else:
-            result = await client.request(
-                "thread/start",
-                {
-                    "cwd": args.cwd,
-                    "approvalPolicy": args.approval,
-                    "sandbox": args.sandbox,
-                },
-            )
-            thread_id = result["thread"]["id"]
-        return thread_id
+        await assert_opening_skill(client, cwd, skill_path)
     finally:
         await client.__aexit__(None, None, None)
-
-
-async def post_launch_turn(socket_path, thread_id, marker, inputs, timeout_seconds):
-    """Start the prepared launch turn and wait until its rollout is readable."""
-    client = AppServerClient(socket_path)
-    await client.__aenter__()
-    try:
-        await client.request(
-            "turn/start",
-            {
-                "threadId": thread_id,
-                "input": inputs,
-            },
-        )
-        await wait_for_turn_marker(
-            client,
-            thread_id,
-            marker,
-            timeout_seconds,
-        )
-    finally:
-        await client.__aexit__(None, None, None)
-
-
-def bootstrap_error(result, default_log_path):
-    """Return the pane's failed bootstrap as one caller-facing error message."""
-    message = result.get("error") or "Codex pane bootstrap failed"
-    log_path = result.get("logPath") or default_log_path
-    detail = read_log_tail(log_path)
-    if detail and detail not in message:
-        message = f"{message}: {detail}"
-    return BridgeError(message)
-
-
-async def wait_for_bootstrap_result(result_path, pane_id, timeout_seconds, log_path):
-    """Return the pane's one atomic bootstrap result, or raise its recorded failure."""
-    result_path = pathlib.Path(result_path)
-    deadline = time.monotonic() + timeout_seconds
-    last_pane_error = None
-    while time.monotonic() < deadline:
-        if result_path.is_file():
-            break
-        try:
-            alive = pane_exists(pane_id)
-        except OSError as error:
-            last_pane_error = error
-        else:
-            if not alive:
-                if result_path.is_file():
-                    break
-                detail = read_log_tail(log_path)
-                raise BridgeError(
-                    detail or "Codex pane exited before reporting its bootstrap result"
-                )
-        await asyncio.sleep(PROCESS_POLL_INTERVAL_SECONDS)
-    else:
-        detail = read_log_tail(log_path)
-        suffix = detail or str(last_pane_error or "no result was written")
-        raise BridgeError(f"Timed out waiting for Codex pane bootstrap: {suffix}")
-
-    try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise BridgeError(f"Unreadable Codex pane bootstrap result: {result_path}") from error
-    if result.get("ok") is False:
-        raise bootstrap_error(result, log_path)
-    thread_id = result.get("threadId")
-    if result.get("ok") is not True or not isinstance(thread_id, str) or not thread_id:
-        raise BridgeError(f"Invalid Codex pane bootstrap result: {result_path}")
-    return result
 
 
 def log_message(state, role, message, log=None, ticket=None):
@@ -555,15 +506,15 @@ def model_config_overrides(args):
     return overrides
 
 
-def launch_window(args, runtime_dir, input_file):
+def launch_window(args, runtime_dir, prompt_file, skill_path):
     pane_command = [
         sys.executable,
         str(pathlib.Path(__file__).resolve()),
         "_pane",
         "--runtime-dir",
         str(runtime_dir),
-        "--input-file",
-        str(input_file),
+        "--prompt-file",
+        str(prompt_file),
         "--cwd",
         args.cwd,
         "--sandbox",
@@ -575,6 +526,8 @@ def launch_window(args, runtime_dir, input_file):
     ]
     if args.thread_id:
         pane_command.extend(["--thread-id", args.thread_id])
+    if skill_path is not None:
+        pane_command.extend(["--skill-path", str(skill_path)])
     if args.model:
         pane_command.extend(["--model", args.model])
     if args.effort:
@@ -616,12 +569,9 @@ def run_pane(args):
     runtime_dir = pathlib.Path(args.runtime_dir)
     socket_path = runtime_dir / "app-server.sock"
     log_path = runtime_dir / "app-server.log"
-    result_path = runtime_dir / BOOTSTRAP_RESULT_NAME
-    inputs = json.loads(pathlib.Path(args.input_file).read_text(encoding="utf-8"))
-    marker = inputs[0]["text"].splitlines()[0]
+    prompt = pathlib.Path(args.prompt_file).read_text(encoding="utf-8")
     log_file = log_path.open("a", encoding="utf-8")
-    tui = None
-    launch_confirmed = False
+    tui_completed_successfully = False
     app_server_command = [
         "codex",
         "app-server",
@@ -639,38 +589,13 @@ def run_pane(args):
     )
 
     def cleanup(*_ignored):
-        if tui is not None:
-            terminate_process(tui)
         terminate_process(app_server)
-        if launch_confirmed:
+        if not log_file.closed:
+            log_file.close()
+        if tui_completed_successfully:
             shutil.rmtree(runtime_dir, ignore_errors=True)
 
-    def close_log():
-        if not log_file.closed:
-            log_file.flush()
-            log_file.close()
-
-    def publish_failure(message):
-        print(message, file=log_file, flush=True)
-        try:
-            write_json_atomic(
-                result_path,
-                {
-                    "ok": False,
-                    "error": message,
-                    "logPath": str(log_path.resolve()),
-                },
-            )
-        except Exception as error:
-            print(
-                f"Codex bootstrap failure result could not be written: {error}",
-                file=log_file,
-                flush=True,
-            )
-        return 1
-
     def stop_and_exit(signum, _frame):
-        close_log()
         cleanup()
         raise SystemExit(128 + signum)
 
@@ -681,25 +606,19 @@ def run_pane(args):
     try:
         if not wait_for_path(socket_path, args.startup_timeout):
             detail = read_log_tail(log_path) or "app-server socket did not appear"
-            return publish_failure(f"Codex app-server failed to start: {detail}")
+            print(f"Codex app-server failed to start: {detail}", file=sys.stderr)
+            return 1
 
-        try:
-            thread_id = asyncio.run(prepare_launch_thread(socket_path, args))
-        except Exception as error:
-            return publish_failure(f"Codex turn failed to start: {error}")
-
-        try:
-            asyncio.run(
-                post_launch_turn(
-                    socket_path,
-                    thread_id,
-                    marker,
-                    inputs,
-                    args.startup_timeout,
+        if args.skill_path:
+            try:
+                asyncio.run(check_opening_skill(socket_path, args.cwd, args.skill_path))
+            except Exception as error:
+                print(
+                    f"Codex opening skill assertion failed: {error}",
+                    file=log_file,
+                    flush=True,
                 )
-            )
-        except Exception as error:
-            return publish_failure(f"Codex turn failed to confirm: {error}")
+                return 1
 
         command = [
             "codex",
@@ -711,31 +630,21 @@ def run_pane(args):
             args.approval,
         ]
         command.extend(model_config_overrides(args))
-        command.extend(["resume", thread_id])
-        try:
-            tui = subprocess.Popen(command, cwd=args.cwd, text=True)
-        except Exception as error:
-            return publish_failure(f"Codex TUI failed to start: {error}")
-        tui_exit_code = process_exit_within(tui, TUI_STARTUP_LIVENESS_SECONDS)
-        if tui_exit_code is not None:
-            return publish_failure(
-                "Codex TUI exited before the turn was confirmed"
-                f" (exit code {tui_exit_code})"
+        if args.thread_id:
+            command.extend(["resume", args.thread_id, prompt])
+        else:
+            command.append(prompt)
+        result = subprocess.run(command, cwd=args.cwd, check=False)
+        if result.returncode != 0:
+            print(
+                "Codex TUI exited before creating its thread "
+                f"(exit code {result.returncode})",
+                file=log_file,
+                flush=True,
             )
-        try:
-            write_json_atomic(
-                result_path,
-                {
-                    "ok": True,
-                    "threadId": thread_id,
-                },
-            )
-        except Exception as error:
-            return publish_failure(f"Codex bootstrap result failed to write: {error}")
-        launch_confirmed = True
-        return tui.wait()
+        tui_completed_successfully = result.returncode == 0
+        return result.returncode
     finally:
-        close_log()
         cleanup()
 
 
@@ -791,28 +700,47 @@ async def cmd_launch(args):
     inherit_resume_pins(args)
     marker = new_marker()
     message = read_prompt(args)
-    inputs = turn_input(marker, message)
+    prompt, skill_path = launch_prompt(marker, message)
 
     runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="agentcrew-codex-"))
-    input_file = runtime_dir / "input.json"
-    input_file.write_text(json.dumps(inputs, ensure_ascii=False), encoding="utf-8")
+    prompt_file = runtime_dir / "prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
 
     try:
-        window_id, pane_id = launch_window(args, runtime_dir, input_file)
+        window_id, pane_id = launch_window(
+            args, runtime_dir, prompt_file, skill_path
+        )
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
 
     try:
-        result = await wait_for_bootstrap_result(
-            runtime_dir / BOOTSTRAP_RESULT_NAME,
+        client = await connect_when_ready(
+            runtime_dir / "app-server.sock",
             pane_id,
             args.startup_timeout,
             runtime_dir / "app-server.log",
         )
-        thread_id = result["threadId"]
-    except Exception:
+        try:
+            if args.thread_id:
+                thread_id = args.thread_id
+            else:
+                thread = await find_thread(
+                    client,
+                    args.cwd,
+                    marker,
+                    pane_id,
+                    args.startup_timeout,
+                    runtime_dir / "app-server.log",
+                )
+                thread_id = thread["id"]
+        finally:
+            await client.__aexit__(None, None, None)
+    except Exception as error:
+        detail = read_log_tail(runtime_dir / "app-server.log")
         kill_window(window_id)
+        if detail and "Codex opening skill assertion failed:" in detail:
+            raise BridgeError(detail) from error
         raise
 
     state = build_state(args, runtime_dir, window_id, pane_id, thread_id, marker)
@@ -1057,12 +985,13 @@ def build_parser():
 def build_pane_parser():
     pane_parser = argparse.ArgumentParser(add_help=False)
     pane_parser.add_argument("--runtime-dir", required=True)
-    pane_parser.add_argument("--input-file", required=True)
+    pane_parser.add_argument("--prompt-file", required=True)
     pane_parser.add_argument("--cwd", required=True)
     pane_parser.add_argument("--sandbox", required=True)
     pane_parser.add_argument("--approval", required=True)
     pane_parser.add_argument("--startup-timeout", type=float, required=True)
     pane_parser.add_argument("--thread-id")
+    pane_parser.add_argument("--skill-path")
     pane_parser.add_argument("--model")
     pane_parser.add_argument("--effort")
     return pane_parser

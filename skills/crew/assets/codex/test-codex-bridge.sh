@@ -559,7 +559,7 @@ assert pathlib.Path(skill["path"]).samefile(sys.argv[2]), turn
 PY
 }
 
-# --- Test 23: a launch opening with a skill posts the installed skill input item ---
+# --- Test 23: a launch opening with a skill passes a linked mention to the TUI ---
 test_launch_skill_input() {
   local dir; dir=$(make_child t23 receipt)
   local sf="$WORK/t23.state.json" out="$WORK/t23.launch.json"
@@ -567,64 +567,84 @@ test_launch_skill_input() {
     --window-name 25 --state-file "$sf" --startup-timeout 15 \
     --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
     || { fail "launch-skill: launch exited $? ($(cat "$out.err"))"; return; }
-  "$PYTHON" - "$dir/stub-requests.jsonl" "$CACHE_SKILL_PATH" <<'PY' \
-    && ok "launch-skill: installed skill input posted" \
-    || fail "launch-skill: installed skill input missing"
+  wait_for_stub_argv "$dir" 2 \
+    || { fail "launch-skill: TUI invocation was not recorded"; return; }
+  "$PYTHON" - "$dir/stub-argv.jsonl" "$CACHE_SKILL_PATH" <<'PY' \
+    && ok "launch-skill: linked mention passed in the TUI prompt" \
+    || fail "launch-skill: linked mention missing from the TUI prompt"
 import json
 import pathlib
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
-    requests = [json.loads(line) for line in stream if line.strip()]
-turn = [request for request in requests if request["method"] == "turn/start"][-1]
-skill = turn["params"]["input"][1]
-assert skill["type"] == "skill", turn
-assert skill["name"] == "implement", turn
-assert pathlib.Path(skill["path"]).samefile(sys.argv[2]), turn
+    invocations = [json.loads(line) for line in stream if line.strip()]
+tui = invocations[-1]
+prompt = tui[-1]
+marker, message = prompt.split("\n", 1)
+assert re.fullmatch(r"\[agentcrew:[^]]+\]", marker), prompt
+path = pathlib.Path(sys.argv[2]).resolve()
+assert message == f"[$implement]({path}) /tmp/ticket.md", prompt
 PY
 }
 
-# --- Test 27: an absent versioned cache falls back to the plugin source path ---
+# --- Test 27: an absent versioned cache links the plugin source path in the TUI prompt ---
 test_skill_source_fallback() {
   local dir; dir=$(make_child t27 receipt)
-  local sf="$WORK/t27.state.json" out="$WORK/t27.launch.json"
+  local sf="$WORK/t27.state.json" out="$WORK/t27.launch.json" launch_status
+  tmux set-environment -t bt CODEX_STUB_PLUGIN_VERSION 9.9.9
   CODEX_STUB_PLUGIN_VERSION=9.9.9 "$PYTHON" "$BRIDGE" launch \
     --cwd "$dir" --tmux-session 'bt:' --window-name 29 \
     --state-file "$sf" --startup-timeout 15 \
-    --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
-    || { fail "skill-source: launch exited $? ($(cat "$out.err"))"; return; }
-  "$PYTHON" - "$dir/stub-requests.jsonl" "$SKILL_PATH" <<'PY' \
-    && ok "skill-source: absent cache fell back to source path" \
-    || fail "skill-source: source path fallback missing"
+    --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err"
+  launch_status=$?
+  tmux set-environment -u -t bt CODEX_STUB_PLUGIN_VERSION
+  [ "$launch_status" -eq 0 ] \
+    || { fail "skill-source: launch exited $launch_status ($(cat "$out.err"))"; return; }
+  wait_for_stub_argv "$dir" 2 \
+    || { fail "skill-source: TUI invocation was not recorded"; return; }
+  "$PYTHON" - "$dir/stub-argv.jsonl" "$SKILL_PATH" <<'PY' \
+    && ok "skill-source: absent cache linked the source path" \
+    || fail "skill-source: source path link missing"
 import json
 import pathlib
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
-    requests = [json.loads(line) for line in stream if line.strip()]
-turn = [request for request in requests if request["method"] == "turn/start"][-1]
-skill = turn["params"]["input"][1]
-assert skill["type"] == "skill", turn
-assert skill["name"] == "implement", turn
-assert pathlib.Path(skill["path"]).samefile(sys.argv[2]), turn
+    invocations = [json.loads(line) for line in stream if line.strip()]
+prompt = invocations[-1][-1]
+_marker, message = prompt.split("\n", 1)
+path = pathlib.Path(sys.argv[2]).resolve()
+assert message == f"[$implement]({path}) /tmp/ticket.md", prompt
 PY
 }
 
-# --- Test 24: a prompt without a skill mention posts no skill input item ---
+# --- Test 24: a prompt without a skill mention passes unchanged in the TUI argv ---
 test_plain_prompt_has_no_skill_input() {
   local dir; dir=$(make_child t24 question)
   local sf="$WORK/t24.state.json" out="$WORK/t24.launch.json"
-  launch "$dir" "$sf" 26 "$out" || { fail "plain-input: launch exited $?"; return; }
-  "$PYTHON" - "$dir/stub-requests.jsonl" <<'PY' \
-    && ok "plain-input: no skill input posted" \
-    || fail "plain-input: unexpected skill input posted"
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 26 --state-file "$sf" --startup-timeout 15 \
+    --prompt $'plain prompt\nline two' > "$out" 2> "$out.err" \
+    || { fail "plain-input: launch exited $? ($(cat "$out.err"))"; return; }
+  wait_for_stub_argv "$dir" 2 \
+    || { fail "plain-input: TUI invocation was not recorded"; return; }
+  "$PYTHON" - "$dir/stub-argv.jsonl" "$dir/stub-requests.jsonl" <<'PY' \
+    && ok "plain-input: prompt passed unchanged without a skill query" \
+    || fail "plain-input: prompt or app-server requests changed"
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
+    invocations = [json.loads(line) for line in stream if line.strip()]
+prompt = invocations[-1][-1]
+marker, message = prompt.split("\n", 1)
+assert re.fullmatch(r"\[agentcrew:[^]]+\]", marker), prompt
+assert message == "plain prompt\nline two", prompt
+with open(sys.argv[2], encoding="utf-8") as stream:
     requests = [json.loads(line) for line in stream if line.strip()]
-turn = [request for request in requests if request["method"] == "turn/start"][-1]
-assert [item["type"] for item in turn["params"]["input"]] == ["text"], turn
+assert not [request for request in requests if request["method"] == "skills/list"], requests
 PY
 }
 
@@ -644,45 +664,63 @@ test_missing_skill_path_is_reported() {
     || fail "missing-skill: missing path was silently dropped"
 }
 
-# --- Test 26: a launch reports a missing installed SKILL.md path ---
-test_launch_missing_skill_path_is_reported() {
-  local dir; dir=$(make_child t26 receipt)
+# --- Test 26: a launch fails when skills/list cannot resolve its linked mention ---
+test_launch_unresolved_skill_is_reported() {
+  local dir; dir=$(make_child t26 skill-unresolved)
   local sf="$WORK/t26.state.json" out="$WORK/t26.launch.json"
   if "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
       --window-name 28 --state-file "$sf" --startup-timeout 15 \
-      --prompt '$missing /tmp/ticket.md' > "$out" 2> "$out.err"; then
-    fail "launch-missing-skill: launch unexpectedly succeeded"
+      --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err"; then
+    fail "launch-unresolved-skill: launch unexpectedly succeeded"
     return
   fi
-  grep -q "SKILL.md" "$out.err" \
-    && ok "launch-missing-skill: missing path reported" \
-    || fail "launch-missing-skill: missing path detail lost"
-}
-
-# --- Test 28: a new thread receives its first turn before the TUI resumes it ---
-test_launch_request_order() {
-  local dir; dir=$(make_child t28 receipt)
-  local sf="$WORK/t28.state.json" out="$WORK/t28.launch.json" launch_status
-  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
-    --window-name 30 --state-file "$sf" --startup-timeout 15 \
-    --prompt x > "$out" 2> "$out.err"
-  launch_status=$?
-  "$PYTHON" - "$dir/stub-requests.jsonl" "$launch_status" <<'PY' \
-    && ok "launch-order: turn started before TUI resume" \
-    || fail "launch-order: request order or launch result was wrong"
+  grep -q "exactly one enabled skill" "$out.err" \
+    || { fail "launch-unresolved-skill: clear failure detail missing ($(cat "$out.err"))"; return; }
+  tmux list-windows -t bt -F '#{window_name}' | grep -qx 28 \
+    && { fail "launch-unresolved-skill: failed window survived"; return; }
+  "$PYTHON" - "$dir/stub-requests.jsonl" "$dir" <<'PY' \
+    && ok "launch-unresolved-skill: exact child-cwd assertion failed closed" \
+    || fail "launch-unresolved-skill: skills/list request was wrong"
 import json
+import pathlib
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     requests = [json.loads(line) for line in stream if line.strip()]
-ordered_methods = [
-    request["method"]
-    for request in requests
-    if request["method"] in {"thread/start", "turn/start", "thread/resume"}
-]
-assert ordered_methods == ["thread/start", "turn/start", "thread/resume"], ordered_methods
-assert int(sys.argv[2]) == 0, f"launch exited {sys.argv[2]}"
+skills = [request for request in requests if request["method"] == "skills/list"]
+assert len(skills) == 1, skills
+cwd = str(pathlib.Path(sys.argv[2]).resolve())
+assert skills[0]["params"] == {"cwds": [cwd], "forceReload": True}, skills
 PY
+}
+
+# --- Test 28: a relaunch reports before its opening-skill assertion fails asynchronously ---
+test_relaunch_unresolved_skill_is_reported() {
+  local dir; dir=$(make_child t28 receipt)
+  local sf="$WORK/t28.state.json" out="$WORK/t28.launch.json"
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 30 --state-file "$sf" --startup-timeout 15 \
+    --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
+    || { fail "relaunch-unresolved: initial launch exited $? ($(cat "$out.err"))"; return; }
+  local thread_id; thread_id=$(json_field "$sf" threadId)
+  local window_id; window_id=$(json_field "$sf" windowId)
+  tmux kill-window -t "$window_id" \
+    || { fail "relaunch-unresolved: could not stop initial window"; return; }
+  sleep 0.2
+  printf '%s\n' skill-unresolved > "$dir/.codex-stub-scenario"
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 31 --state-file "$sf" --startup-timeout 15 \
+    --thread-id "$thread_id" --prompt '$implement /tmp/ticket.md' \
+    > "$WORK/t28.resume.json" 2> "$WORK/t28.resume.json.err" \
+    || { fail "relaunch-unresolved: relaunch did not return ok"; return; }
+  watch "$WORK/t28.watch.json" "$sf" \
+    || { fail "relaunch-unresolved: watch exited $?"; return; }
+  [ "$(json_field "$WORK/t28.watch.json" sessions 0 status)" = "vanished" ] \
+    || { fail "relaunch-unresolved: failed pane was not vanished"; return; }
+  local log_path; log_path="$(json_field "$sf" runtimeDir)/app-server.log"
+  grep -q "exactly one enabled skill" "$log_path" \
+    && ok "relaunch-unresolved: vanished pane kept its failure reason" \
+    || fail "relaunch-unresolved: failure reason was not preserved"
 }
 
 # --- Test 3: watch stays armed while all busy, wakes on first idle child ---
@@ -779,12 +817,12 @@ test_tui_exit() {
   log_path=$(find "$runtime_root" -name app-server.log -type f -print -quit)
   if [ -z "$log_path" ]; then
     fail "tui-exit: app-server.log was removed"
-  elif grep -q "Codex TUI exited before the turn was confirmed" "$log_path"; then
+  elif grep -q "Codex TUI exited before creating its thread" "$log_path"; then
     ok "tui-exit: startup failure log was preserved"
   else
     fail "tui-exit: preserved log lost the startup failure detail ($(cat "$log_path"))"
   fi
-  grep -q "Codex TUI exited before the turn was confirmed" "$out.err" \
+  grep -q "Codex TUI exited before creating its thread" "$out.err" \
     && ok "tui-exit: launch reported the pane's startup failure" \
     || fail "tui-exit: launch stderr lost the pane's startup failure ($(cat "$out.err"))"
 }
@@ -861,9 +899,9 @@ test_send_skill_input
 test_launch_skill_input
 test_plain_prompt_has_no_skill_input
 test_missing_skill_path_is_reported
-test_launch_missing_skill_path_is_reported
+test_launch_unresolved_skill_is_reported
+test_relaunch_unresolved_skill_is_reported
 test_skill_source_fallback
-test_launch_request_order
 test_wave_wakeup
 test_vanished
 test_transient_pane_read_failures

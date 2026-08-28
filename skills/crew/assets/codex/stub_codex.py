@@ -5,7 +5,7 @@ Emulates the two invocations codex_bridge.py makes:
 
     codex app-server --listen unix://<socket>
     codex --remote unix://<socket> --sandbox <s> --ask-for-approval <a> \
-        resume <thread-id>
+        [resume <thread-id>] <prompt>
 
 The scenario is read from `.codex-stub-scenario` in the working directory
 (falling back to $CODEX_STUB_SCENARIO, then "receipt"):
@@ -27,39 +27,17 @@ like from the outside. `stub-typed-turn-held` is the same turn still being worke
 completes, so the thread holds a finished turn behind an unfinished one.
 """
 
-import os
-import sys
-
-TUI_EXIT_MARKER = ".codex-stub-tui-exited"
-
-
-def exits_immediately():
-    argv = sys.argv[1:]
-    if (argv and argv[0] == "app-server") or argv[:3] == ["plugin", "list", "--json"]:
-        return False
-    try:
-        with open(".codex-stub-scenario", encoding="utf-8") as stream:
-            active_scenario = stream.read().strip()
-    except OSError:
-        active_scenario = os.environ.get("CODEX_STUB_SCENARIO", "receipt")
-    return active_scenario == "tui-exit"
-
-
-if exits_immediately():
-    print("stub TUI exiting immediately", file=sys.stderr, flush=True)
-    with open(TUI_EXIT_MARKER, "w", encoding="utf-8"):
-        pass
-    os._exit(1)
-
-
 import asyncio
 import json
+import os
 import pathlib
+import sys
 import time
+
+from aiohttp import web, WSMsgType
 
 STUB_SHA = "1234567890abcdef1234567890abcdef12345678"
 TURN_DELAY_SECONDS = float(os.environ.get("CODEX_STUB_DELAY", "0.3"))
-MATERIALIZED_THREADS_FILE = pathlib.Path("stub-materialized-threads")
 
 
 def scenario():
@@ -67,6 +45,32 @@ def scenario():
     if override.is_file():
         return override.read_text(encoding="utf-8").strip()
     return os.environ.get("CODEX_STUB_SCENARIO", "receipt")
+
+
+def listed_skill_path():
+    """Return the same test skill path that `resolve_skill_path` selects."""
+    version = os.environ.get("CODEX_STUB_PLUGIN_VERSION", "1.2.3")
+    cache_path = (
+        pathlib.Path(os.environ["CODEX_HOME"])
+        / "plugins"
+        / "cache"
+        / "mattpocock"
+        / "mattpocock-skills"
+        / version
+        / "skills"
+        / "engineering"
+        / "implement"
+        / "SKILL.md"
+    )
+    if cache_path.is_file():
+        return cache_path.resolve()
+    return (
+        pathlib.Path(os.environ["CODEX_STUB_PLUGIN_ROOT"])
+        / "skills"
+        / "engineering"
+        / "implement"
+        / "SKILL.md"
+    ).resolve()
 
 
 def receipt_message():
@@ -89,19 +93,16 @@ def first_turn_result(active_scenario):
 
 
 class StubThread:
-    def __init__(self, thread_id="stub-thread-1", materialized=False):
-        self.id = thread_id
-        self.preview = ""
-        self.turns = []
-        self.materialized = materialized
+    def __init__(self, prompt):
+        self.id = "stub-thread-1"
+        self.preview = prompt
+        self.turns = [
+            {"kind": "first", "text": prompt, "created": time.monotonic()}
+        ]
 
     def start_turn(self, text):
-        kind = "first" if not self.turns else "followup"
-        if not self.preview:
-            self.preview = text
-        self.materialized = True
         self.turns.append(
-            {"kind": kind, "text": text, "created": time.monotonic()}
+            {"kind": "followup", "text": text, "created": time.monotonic()}
         )
         return len(self.turns) - 1
 
@@ -162,29 +163,18 @@ class StubThread:
 
 
 class StubServer:
-    def __init__(self, active_scenario):
+    def __init__(self, socket_dir, active_scenario):
+        self.prompt_file = socket_dir / "tui-prompt.txt"
         self.scenario = active_scenario
         self.thread = None
 
     def ensure_thread(self):
+        if self.thread is None and self.prompt_file.is_file():
+            self.thread = StubThread(
+                self.prompt_file.read_text(encoding="utf-8")
+            )
         if self.thread is not None:
             self.thread.absorb_typed_turn()
-
-    def materialized_thread_ids(self):
-        try:
-            return set(MATERIALIZED_THREADS_FILE.read_text(encoding="utf-8").splitlines())
-        except FileNotFoundError:
-            return set()
-
-    def remember_materialized_thread(self, thread_id):
-        known = self.materialized_thread_ids()
-        if thread_id in known:
-            return
-        known.add(thread_id)
-        MATERIALIZED_THREADS_FILE.write_text(
-            "".join(f"{item}\n" for item in sorted(known)),
-            encoding="utf-8",
-        )
 
     def handle(self, method, params):
         self.ensure_thread()
@@ -193,19 +183,24 @@ class StubServer:
             stream.write("\n")
         if method == "initialize":
             return {}
-        if method == "thread/start":
-            self.thread = StubThread()
-            return {"thread": {"id": self.thread.id}}
-        if method == "thread/resume":
-            thread_id = params["threadId"]
-            if self.thread is not None and self.thread.id == thread_id:
-                if not self.thread.materialized:
-                    raise ValueError(f"no rollout found for thread id {thread_id}")
-            elif thread_id in self.materialized_thread_ids():
-                self.thread = StubThread(thread_id=thread_id, materialized=True)
-            else:
-                raise ValueError(f"no rollout found for thread id {thread_id}")
-            return {"thread": {"id": self.thread.id}}
+        if method == "skills/list":
+            skills = []
+            if self.scenario != "skill-unresolved":
+                skills.append(
+                    {
+                        "name": "mattpocock-skills:implement",
+                        "description": "test skill",
+                        "enabled": True,
+                        "path": str(listed_skill_path()),
+                        "scope": "user",
+                    }
+                )
+            return {
+                "data": [
+                    {"cwd": cwd, "skills": skills, "errors": []}
+                    for cwd in params.get("cwds") or []
+                ]
+            }
         if method == "thread/list":
             data = []
             if self.thread is not None:
@@ -214,8 +209,6 @@ class StubServer:
         if method == "thread/read":
             if self.thread is None or params.get("threadId") != self.thread.id:
                 raise ValueError("unknown thread")
-            if not self.thread.materialized:
-                raise ValueError(f"thread {self.thread.id} is not materialized yet")
             return {"thread": self.thread.render(self.scenario)}
         if method == "turn/start":
             if self.thread is None or params.get("threadId") != self.thread.id:
@@ -224,13 +217,10 @@ class StubServer:
                 part.get("text", "") for part in params.get("input") or []
             )
             index = self.thread.start_turn(text)
-            self.remember_materialized_thread(self.thread.id)
             return {"turn": {"id": f"stub-turn-{index}", "status": "inProgress"}}
         raise ValueError(f"unsupported method: {method}")
 
     async def websocket_handler(self, request):
-        from aiohttp import web, WSMsgType
-
         websocket = web.WebSocketResponse()
         await websocket.prepare(request)
         async for message in websocket:
@@ -240,6 +230,13 @@ class StubServer:
             if payload.get("id") is None:
                 continue
             try:
+                if (
+                    payload.get("method") == "skills/list"
+                    and self.scenario == "skill-unresolved"
+                ):
+                    # Leave the server responsive so a v0.9.6-style relaunch can report its
+                    # known thread id while the pane's opening-skill check is still in flight.
+                    await asyncio.sleep(0.2)
                 result = self.handle(payload.get("method"), payload.get("params") or {})
                 await websocket.send_json({"id": payload["id"], "result": result})
             except ValueError as error:
@@ -250,9 +247,7 @@ class StubServer:
 
 
 async def run_app_server(socket_path):
-    from aiohttp import web
-
-    server = StubServer(scenario())
+    server = StubServer(socket_path.parent, scenario())
     app = web.Application()
     app.router.add_get("/", server.websocket_handler)
     runner = web.AppRunner(app)
@@ -279,61 +274,14 @@ def app_server_main(argv):
     return 0
 
 
-async def resume_tui_thread(remote, thread_id):
-    from aiohttp import ClientSession, UnixConnector, WSMsgType
-
-    connector = UnixConnector(path=remote.removeprefix("unix://"))
-    async with ClientSession(connector=connector) as session:
-        async with session.ws_connect("http://localhost/") as websocket:
-            request_id = 1
-
-            async def request(method, params):
-                nonlocal request_id
-                current_id = request_id
-                request_id += 1
-                await websocket.send_json(
-                    {"id": current_id, "method": method, "params": params}
-                )
-                while True:
-                    message = await websocket.receive()
-                    if message.type != WSMsgType.TEXT:
-                        raise RuntimeError(
-                            f"unexpected app-server WebSocket message type: {message.type}"
-                        )
-                    payload = json.loads(message.data)
-                    if payload.get("id") != current_id:
-                        continue
-                    if payload.get("error"):
-                        error = payload["error"]
-                        raise RuntimeError(error.get("message", str(error)))
-                    return payload.get("result", {})
-
-            await request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "stub_codex_tui",
-                        "title": "Stub Codex TUI",
-                        "version": "0.1.0",
-                    },
-                    "capabilities": {"experimentalApi": False},
-                },
-            )
-            await websocket.send_json({"method": "initialized", "params": {}})
-            await request("thread/resume", {"threadId": thread_id})
-
-
 def tui_main(argv):
     if scenario() == "tui-exit":
         print("stub TUI exiting immediately", file=sys.stderr)
         return 1
     remote = argv[argv.index("--remote") + 1]
-    thread_id = argv[argv.index("resume") + 1]
-    try:
-        asyncio.run(resume_tui_thread(remote, thread_id))
-    except Exception as error:
-        print(f"stub TUI resume failed: {error}", file=sys.stderr, flush=True)
-        return 1
+    socket_dir = pathlib.Path(remote.removeprefix("unix://")).parent
+    prompt = argv[-1]
+    (socket_dir / "tui-prompt.txt").write_text(prompt, encoding="utf-8")
     try:
         while True:
             time.sleep(3600)
