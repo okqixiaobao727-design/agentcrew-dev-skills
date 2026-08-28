@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.10] - 2026-08-28
+
 ### Fixed
 - The Codex bridge end-to-end shell suite now gives `mktemp` a portable template on Linux and
   macOS.
