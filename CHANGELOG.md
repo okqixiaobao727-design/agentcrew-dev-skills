@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-08-28
+
 ### Fixed
 - v0.9.7 broke every Codex launch by asking the TUI to resume a thread before its first turn had
   materialised. The pane now posts and confirms the structured first turn before attaching the
