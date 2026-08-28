@@ -44,6 +44,12 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # be wrong.
 MESSAGE_TOOL = "SendMessage"
 HOOK_EVENT = "PostToolUse"
+# The harness exports every session's own inbox socket into that session's environment, so the
+# hook can name the sender without a lookup, a poll or a registry read of any kind. Under the
+# `uds:` scheme it is the same literal the receiver sees as the message's `from`, which is what
+# lets a ruling addressed to it be correlated back to the ticket that asked (ADR-0023).
+SENDER_SOCKET_VARIABLE = "CLAUDE_CODE_MESSAGING_SOCKET"
+ADDRESS_SCHEME = "uds:"
 BOUNDED_HOOK_EVENT = "PreToolUse"
 BOUNDED_TOOLS = "Read|Grep|Glob|Bash"
 # What a registered hook runs, and the subcommand that marks a registration as one of ours.
@@ -231,6 +237,12 @@ def project(records):
     )
     events_by_ticket = {}
     launches_by_ticket = {}
+    # Every address a child of this run has sent from. A coordinator replies to the address the
+    # message arrived from — the tool's own contract instructs copying the inbound `from` into
+    # `to`, and it is the one form that works whichever account the child runs on — so a ruling
+    # naming no ticket is correlated through it. Only a child's own sends are collected: the
+    # coordinator answers every ticket, so its address identifies none of them.
+    addresses_by_ticket = {}
     for record in frozen_records:
         if record.get("ticket") is None:
             continue
@@ -238,8 +250,15 @@ def project(records):
         events_by_ticket.setdefault(ticket, []).append(record)
         if record.get("event") == "launch":
             launches_by_ticket[ticket] = record
+        origin = record.get("from")
+        if record.get("role") == CHILD and isinstance(origin, str) and origin:
+            addresses_by_ticket.setdefault(origin, ticket)
 
-    ticket_by_child = {}
+    # A child is indexed by every identity this run knows it under: the name it was launched with,
+    # and the addresses above. The two key spaces are disjoint — an address carries its scheme —
+    # so a log written before addresses were recorded correlates through the name exactly as it
+    # always did.
+    ticket_by_child = dict(addresses_by_ticket)
     for ticket, launch in launches_by_ticket.items():
         child = launch.get("child")
         if isinstance(child, str) and child:
@@ -584,11 +603,15 @@ def message_event(message, role):
     return "message"
 
 
-def hook_record(payload, role, ticket):
+def hook_record(payload, role, ticket, sender=None):
     """The record for a hook payload, or None when the payload carries no sent message.
 
     A payload that is not a `SendMessage` call, or not the shape one has, is not an error: the
     hook's job is to copy what it recognises and stay out of the way of everything else.
+
+    `sender` is the address this side sends from, passed in by the entry point that read it rather
+    than read here: this function stays a pure function of its arguments, so the record it builds
+    is testable without an environment.
     """
     if not isinstance(payload, dict) or payload.get("tool_name") != MESSAGE_TOOL:
         return None
@@ -600,10 +623,23 @@ def hook_record(payload, role, ticket):
         message_event(arguments["message"], role),
         ticket=ticket,
         role=role,
+        # The identity behind the title: what the receiver of this message sees as its `from`,
+        # and so what a reply to it is addressed to.
+        **{"from": sender if isinstance(sender, str) and sender.strip() else None},
         to=recipient if isinstance(recipient, str) else None,
         # Verbatim: the argument the sender gave the tool, neither truncated nor reformatted.
         message=arguments["message"],
     )
+
+
+def sender_address(environment=None):
+    """The whole address this session receives at, or None where the harness exported none."""
+    socket = (environment if environment is not None else os.environ).get(
+        SENDER_SOCKET_VARIABLE
+    )
+    if not isinstance(socket, str) or not socket.strip():
+        return None
+    return ADDRESS_SCHEME + socket
 
 
 def sent_from_scope(payload, scope):
@@ -640,7 +676,7 @@ def run_hook(args):
         return 0
     if not isinstance(payload, dict) or not sent_from_scope(payload, args.scope):
         return 0
-    record = hook_record(payload, args.role, args.ticket)
+    record = hook_record(payload, args.role, args.ticket, sender_address())
     if record is None:
         return 0
     try:

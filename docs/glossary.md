@@ -302,6 +302,14 @@ machine. Escalations and answers travel this way; receipts do not. tmux is reser
 launching children, answering permission confirmations (a message cannot approve permissions on the
 receiver's behalf), and human takeover.
 
+**Coordinator address** — The whole `uds:` address of the socket the harness bound for the
+coordinator's session, and the one thing a Claude child sends to. It is the coordinator's identity
+on the message channel; the coordinator's session *name* is a label beside it, never an address.
+Read off the harness at start, carried on the run's metadata, and used verbatim — never composed,
+never normalised
+([ADR-0023](adr/0023-the-coordinator-is-addressed-by-socket-not-by-name.md)). It is what makes a
+child on a second account reach the same coordinator as a child on the first.
+
 **On-child-launch hook** — An optional config entry — a command plus optional extra environment
 variables for the child — run once per child at launch. Empty by default. It is the extension point
 for whatever notification or session-tracking system you already run.

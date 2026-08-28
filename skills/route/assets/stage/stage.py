@@ -638,6 +638,7 @@ def candidate_run(repo, directory, config):
         coordinator_name=LATER,
         coordinator_pid=os.getpid(),
         coordinator_session=LATER,
+        coordinator_address=LATER,
         tmux_session=LATER,
         permission_mode=LATER,
     )

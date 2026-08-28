@@ -65,7 +65,20 @@ def run_cli(*args, log=None):
     return subprocess.run([*command, *args], capture_output=True, text=True)
 
 
-def run_hook(payload, log=None, role="child", ticket=None):
+def hook_environment(sender=None):
+    """The environment a hook fires in: this one's own, with the sender's inbox socket settled.
+
+    Settled rather than inherited, because these tests run inside a Claude Code session of their
+    own and would otherwise record the socket of whichever session happened to run them.
+    """
+    environment = dict(os.environ)
+    environment.pop(machine_log.SENDER_SOCKET_VARIABLE, None)
+    if sender is not None:
+        environment[machine_log.SENDER_SOCKET_VARIABLE] = sender
+    return environment
+
+
+def run_hook(payload, log=None, role="child", ticket=None, sender=None):
     args = ["hook", "--role", role]
     if ticket is not None:
         args += ["--ticket", ticket]
@@ -77,6 +90,7 @@ def run_hook(payload, log=None, role="child", ticket=None):
         input=payload if isinstance(payload, str) else json.dumps(payload),
         capture_output=True,
         text=True,
+        env=hook_environment(sender),
     )
 
 
@@ -326,6 +340,62 @@ class RunProjectionTests(unittest.TestCase):
         eight = projection.ticket("8")
         self.assertTrue(eight.awaiting_ruling)
         self.assertEqual(eight.instruction_count("CREW RULED"), 1)
+
+    def test_a_ruling_addressed_by_socket_is_filed_against_the_ticket_that_asked(self):
+        """The coordinator replies to the address the ask arrived from, so that is the index."""
+        child = "uds:/private/tmp/cc-socks-501/2277.sock"
+        projection = machine_log.project([
+            {"event": "launch", "ticket": "7", "child": "seven-1f"},
+            {
+                "event": "escalation", "ticket": "7", "role": "child", "from": child,
+                "to": "uds:/private/tmp/cc-socks-501/1504.sock",
+                "message": "CREW ASK 7 design — which column",
+            },
+            {
+                "event": "ruling", "role": "coordinator", "to": child,
+                "message": "CREW NUDGE 7 keep the existing column",
+            },
+        ])
+
+        seven = projection.ticket("7")
+        self.assertEqual(seven.instruction_count("CREW NUDGE"), 1)
+        self.assertFalse(seven.awaiting_ruling)
+
+    def test_a_ruling_addressed_by_the_older_name_form_is_still_filed(self):
+        """A log written before addresses were recorded correlates after a resume, unchanged."""
+        projection = machine_log.project([
+            {"event": "launch", "ticket": "7", "child": "seven-1f"},
+            {
+                "event": "escalation", "ticket": "7", "role": "child",
+                "message": "CREW ASK 7 design — which column",
+            },
+            {
+                "event": "ruling", "role": "coordinator", "to": "seven-1f",
+                "message": "CREW NUDGE 7 keep the existing column",
+            },
+        ])
+
+        seven = projection.ticket("7")
+        self.assertEqual(seven.instruction_count("CREW NUDGE"), 1)
+        self.assertFalse(seven.awaiting_ruling)
+
+    def test_a_coordinators_own_address_is_not_read_as_a_childs_identity(self):
+        """Only a child's sending address indexes a ticket; the coordinator answers many."""
+        coordinator = "uds:/private/tmp/cc-socks-501/1504.sock"
+        projection = machine_log.project([
+            {"event": "launch", "ticket": "7", "child": "seven-1f"},
+            {
+                "event": "ruling", "ticket": "7", "role": "coordinator", "from": coordinator,
+                "to": "uds:/private/tmp/cc-socks-501/2277.sock",
+                "message": "CREW NUDGE 7 first",
+            },
+            {
+                "event": "ruling", "role": "coordinator", "to": coordinator,
+                "message": "CREW NUDGE 7 second",
+            },
+        ])
+
+        self.assertEqual(projection.ticket("7").instruction_count("CREW NUDGE"), 1)
 
     def test_a_witness_is_attached_only_to_the_escalation_it_checked(self):
         first = {
@@ -1223,6 +1293,28 @@ class HookTests(MachineLogTestCase):
         self.assertEqual(entry["to"], "agentcrew-dev-skills-1f")
         self.assertEqual(entry["message"], ESCALATION)
 
+    def test_a_copied_message_names_the_address_it_was_sent_from(self):
+        """The log reads as a conversation between identities, not between session titles."""
+        socket = "/private/tmp/cc-socks-501/2277.sock"
+
+        result = run_hook(
+            send_message_event(ESCALATION, to="uds:/private/tmp/cc-socks-501/1504.sock"),
+            log=self.log, role="child", ticket="07", sender=socket,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.only_line()["from"], f"uds:{socket}")
+
+    def test_a_session_the_harness_exported_no_socket_for_records_no_sender(self):
+        """Not recorded and recorded empty are different facts, and this one is not recorded."""
+        result = run_hook(
+            send_message_event(ESCALATION, to="agentcrew-dev-skills-1f"),
+            log=self.log, role="child", ticket="07",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("from", self.only_line())
+
     def test_an_escalation_bundled_after_a_summary_is_still_an_escalation(self):
         """A child that explains itself first has still asked, and the log must say so."""
         result = run_hook(
@@ -1627,13 +1719,14 @@ class InheritedSettingsTests(MachineLogTestCase):
             0,
         )
 
-    def send_from(self, cwd, message):
+    def send_from(self, cwd, message, sender=None):
         """Fire every hook an inheriting session sees: the repo root's and the worktree's."""
         payload = json.dumps(send_message_event(message, cwd=str(cwd)))
         for settings in (self.coordinator_settings, self.child_settings):
             for command in registered_commands(settings):
                 result = subprocess.run(
                     command, shell=True, input=payload, capture_output=True, text=True,
+                    env=hook_environment(sender),
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 

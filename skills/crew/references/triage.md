@@ -68,8 +68,10 @@ is theirs to ask for.
 
 ## Answer an ASK
 
-Reply to a Claude child by SendMessage to its recorded name, ending with `ts=<unix time>` —
-identical bodies are silently dropped as duplicates.
+Reply to a Claude child by SendMessage to the address its message arrived from — copy the
+inbound `from` attribute into `to` — ending with `ts=<unix time>`. That address is the child's
+identity, and it is the one form that works whichever account the child runs on; its from-name is
+a session title, not an address. Identical bodies are silently dropped as duplicates.
 
 A Codex child has no message channel: its answer is its next turn, delivered by the driver over
 whatever transport the child was launched on, so ruling never asks you which one that is.

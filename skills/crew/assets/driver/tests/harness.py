@@ -43,6 +43,9 @@ CODEX_EFFORT = "max"
 COORDINATOR_NAME = "crew-coordinator-1f"
 COORDINATOR_PID = 1504
 COORDINATOR_SESSION = "2cd60d75-fa21-4d9c-adf2-b4073f60fbb6"
+# The whole address a child of this run sends to, as the launcher reads it off the harness: the
+# socket the coordinator bound, under the `uds:` scheme, spelled exactly as the harness spelled it.
+COORDINATOR_ADDRESS = "uds:/tmp/cc-socks/1504.sock"
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
 # The pane the coordinator itself is sitting in, as tmux names one and as the launcher reads it
@@ -354,6 +357,7 @@ class Fixture:
             "--coordinator-name", COORDINATOR_NAME,
             "--coordinator-pid", str(COORDINATOR_PID),
             "--coordinator-session", COORDINATOR_SESSION,
+            "--coordinator-address", COORDINATOR_ADDRESS,
             "--permission-mode", PERMISSION_MODE,
             "--tmux-session", TMUX_SESSION,
             "--coordinator-pane", COORDINATOR_PANE,

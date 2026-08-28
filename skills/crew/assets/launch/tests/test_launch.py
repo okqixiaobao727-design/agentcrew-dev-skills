@@ -44,9 +44,13 @@ DRIVER_LOG = "driver.log"
 DEFAULT_WAKE = {"reason": "run-complete", "ticket": None, "pointer": "report.md"}
 LAUNCH_TIMEOUT = 60.0
 
-# What the harness's records hold for the coordinator this fixture stands for.
+# What the harness's records hold for the coordinator this fixture stands for. The socket is
+# spelled the way the harness spells it — a path under the directory it happened to bind in — and
+# the address the driver is handed is that path under the `uds:` scheme.
 COORDINATOR_NAME = "crew-coordinator-1f"
 SESSION_ID = "2cd60d75-fa21-4d9c-adf2-b4073f60fbb6"
+MESSAGING_SOCKET = "/private/tmp/cc-socks-501/1504.sock"
+COORDINATOR_ADDRESS = f"uds:{MESSAGING_SOCKET}"
 # The slug the harness names a project's transcript directory with: the session's cwd, flattened.
 PROJECT_SLUG = "-Users-someone-repo"
 PERMISSION_MODE = "acceptEdits"
@@ -172,9 +176,13 @@ class Fixture:
 
     # --- the harness's own records --------------------------------------------------------
 
-    def registry(self, pid, name=COORDINATOR_NAME, session=SESSION_ID, **fields):
+    def registry(self, pid, name=COORDINATOR_NAME, session=SESSION_ID,
+                 socket=MESSAGING_SOCKET, **fields):
         """The per-pid session registry entry the harness writes for a live session."""
-        entry = {"pid": pid, "sessionId": session, "cwd": str(self.root), "name": name}
+        entry = {
+            "pid": pid, "sessionId": session, "cwd": str(self.root), "name": name,
+            "messagingSocketPath": socket,
+        }
         entry.update(fields)
         for key, value in list(entry.items()):
             if value is None:
@@ -309,6 +317,7 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(flag(call["argv"], "--coordinator-pid"), str(os.getpid()))
         self.assertEqual(flag(call["argv"], "--coordinator-name"), COORDINATOR_NAME)
         self.assertEqual(flag(call["argv"], "--coordinator-session"), SESSION_ID)
+        self.assertEqual(flag(call["argv"], "--coordinator-address"), COORDINATOR_ADDRESS)
         self.assertEqual(flag(call["argv"], "--permission-mode"), PERMISSION_MODE)
         # The driver's own wake is what the coordinator reads, and this waiter adds nothing to it.
         self.assertEqual(json.loads(result.stdout), DEFAULT_WAKE)
@@ -342,13 +351,25 @@ class LaunchTests(unittest.TestCase):
 
         self.assertEqual(pathlib.Path(call["cwd"]).resolve(), self.fixture.root)
 
+    def test_the_socket_the_harness_spelled_is_the_address_passed_on_unnormalised(self):
+        """The receiver bound that literal; a realpath is an address nobody is listening on."""
+        self.fixture.registry(os.getpid(), socket="/tmp/cc-socks/1504.sock")
+        self.fixture.transcript([PERMISSION_MODE])
+
+        call = self.one_call(self.fixture.launch())
+
+        self.assertEqual(
+            flag(call["argv"], "--coordinator-address"), "uds:/tmp/cc-socks/1504.sock"
+        )
+
     # --- the values given explicitly ------------------------------------------------------
 
-    def test_the_four_values_given_explicitly_need_no_harness_records_at_all(self):
+    def test_the_five_values_given_explicitly_need_no_harness_records_at_all(self):
         """What the failure message instructs: passing them by hand is a complete substitute."""
         result = self.fixture.launch(extra=[
             "--coordinator-pid", "1504", "--coordinator-name", "given-by-hand",
             "--coordinator-session", SESSION_ID,
+            "--coordinator-address", "uds:/elsewhere/1504.sock",
             "--permission-mode", SWITCHED_MODE,
         ])
 
@@ -356,6 +377,7 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(flag(call["argv"], "--coordinator-pid"), "1504")
         self.assertEqual(flag(call["argv"], "--coordinator-name"), "given-by-hand")
         self.assertEqual(flag(call["argv"], "--coordinator-session"), SESSION_ID)
+        self.assertEqual(flag(call["argv"], "--coordinator-address"), "uds:/elsewhere/1504.sock")
         self.assertEqual(flag(call["argv"], "--permission-mode"), SWITCHED_MODE)
 
     def test_an_explicit_hook_session_does_not_redirect_the_permission_mode_lookup(self):
@@ -390,6 +412,18 @@ class LaunchTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--coordinator-session", result.stderr)
+        self.assertEqual(self.fixture.driver_calls(), [])
+
+    def test_a_registry_entry_carrying_no_socket_aborts_and_names_the_flag_to_pass(self):
+        """No address is composed from the pid: a harness binding elsewhere would be unreachable."""
+        self.fixture.registry(os.getpid(), socket=None)
+        self.fixture.transcript([PERMISSION_MODE])
+
+        result = self.fixture.launch()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--coordinator-address", result.stderr)
+        self.assertIn("messagingSocketPath", result.stderr)
         self.assertEqual(self.fixture.driver_calls(), [])
 
     def test_a_missing_transcript_aborts_and_names_the_flag_to_pass(self):

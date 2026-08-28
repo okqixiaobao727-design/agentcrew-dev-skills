@@ -63,6 +63,7 @@ class RunMetadata:
     permission_mode: str
     coordinator_config_home: str
     coordinator_session: str = ""
+    coordinator_address: str = ""
     base_branch: str | None = None
     return_branch: str | None = None
     feature_dir: str | None = None
@@ -540,6 +541,12 @@ def _metadata(values):
     coordinator_session = values.get("coordinator_session", "")
     if not isinstance(coordinator_session, str):
         raise RunPlanError(["run: coordinator_session is not a string"])
+    # Optional and defaulted for the same reason the session ID above is: a table written before
+    # the field existed must still load, and every start refreshes it off the launcher's arguments
+    # anyway, so a run already under way heals itself on its first resume rather than migrating.
+    coordinator_address = values.get("coordinator_address", "")
+    if not isinstance(coordinator_address, str):
+        raise RunPlanError(["run: coordinator_address is not a string"])
     optional = {
         key: _string(values, key, optional=True)
         for key in ("base_branch", "return_branch", "repair_model", "tracker")
@@ -595,6 +602,7 @@ def _metadata(values):
         permission_mode=permission_mode,
         coordinator_config_home=coordinator_config_home,
         coordinator_session=coordinator_session,
+        coordinator_address=coordinator_address,
         base_branch=optional["base_branch"],
         return_branch=optional["return_branch"],
         feature_dir=feature_dir,
@@ -617,6 +625,7 @@ def _metadata_object(run):
         "coordinator_name": run.coordinator_name,
         "coordinator_pid": run.coordinator_pid,
         "coordinator_session": run.coordinator_session,
+        "coordinator_address": run.coordinator_address,
         "crew_skill_dir": run.crew_skill_dir,
         "tmux_session": run.tmux_session,
         "permission_mode": run.permission_mode,

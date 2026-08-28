@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Start a crew run from a run directory alone: resolve the coordinator, then launch the driver.
 
-The driver's `start` needs four facts about the session driving it — the pid a child authenticates
-a ruling against, the name a child answers to, the session ID that scopes coordinator hooks, and
-the permission mode every child launches under. A coordinator session cannot see any of them from
-inside itself, and the turns it spends hunting for them are the whole of `/crew`'s start-up cost.
-This script reads them off the harness's own on-disk records instead:
+The driver's `start` needs five facts about the session driving it — the pid the dashboard pins
+and the driver detects a restart by, the name a child reads as a label, the address a child sends
+to, the session ID that scopes coordinator hooks, and the permission mode every child launches
+under. A coordinator session cannot see any of them from inside itself, and the turns it spends
+hunting for them are the whole of `/crew`'s start-up cost. This script reads them off the
+harness's own on-disk records instead:
 
 - **pid** — the invoking shell's parent, found by walking up the process ancestry to the first
   process the harness has a session registry entry for. The shell in between is why the walk
   exists: the coordinator is never the launcher's own parent.
 - **name** — that registry entry's `name`, which is what the harness itself calls the session.
+- **address** — that registry entry's `messagingSocketPath` under the `uds:` scheme, which is the
+  one address a child can reach this coordinator at whatever account the child runs on
+  (ADR-0023). Composing it out of the pid instead would name the default socket directory, and
+  the harness does not always bind there.
 - **session ID** — that registry entry's `sessionId`, which scopes hooks to this coordinator.
 - **permission mode** — the newest registry-session transcript entry that records one. The
   transcript is the only on-disk source that follows a mid-session mode switch, and the mode is
@@ -42,7 +47,8 @@ That makes the command idempotent in one more way than before. A run whose drive
 again, so `/crew` stays safe to type at any moment and no run is ever driven twice.
 
     python3 launch.py <run-dir> [--coordinator-pid N] [--coordinator-name NAME]
-                                [--coordinator-session ID] [--permission-mode MODE] [--driver PATH]
+                                [--coordinator-session ID] [--coordinator-address uds:PATH]
+                                [--permission-mode MODE] [--driver PATH]
 """
 
 import argparse
@@ -108,10 +114,14 @@ SESSION_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "sessions")
 TRANSCRIPTS = ("CLAUDE_CONFIG_DIR", ".claude", "projects")
 REGISTRY_SUFFIX = ".json"
 TRANSCRIPT_SUFFIX = ".jsonl"
-# The three fields read out of those records, in the harness's own spelling.
+# The four fields read out of those records, in the harness's own spelling.
 REGISTRY_NAME = "name"
 REGISTRY_SESSION = "sessionId"
+REGISTRY_SOCKET = "messagingSocketPath"
 PERMISSION_MODE = "permissionMode"
+# The scheme a socket path is an address under. It is prefixed exactly once, here, so that every
+# consumer downstream uses the whole address verbatim rather than assembling one of its own.
+ADDRESS_SCHEME = "uds:"
 
 # How far up the ancestry the coordinator is looked for. A shell, and a shell's own wrapper, are
 # what stand between this process and the session; anything further up is init, and a walk that
@@ -257,21 +267,37 @@ def permission_mode(entry, pid):
     )
 
 
-def resolve(args):
-    """The four values the driver's start requires, each given by hand or read off the harness.
+def registry_address(entry, pid):
+    """The coordinator's whole inbox address, out of the socket path the harness bound at.
 
-    Every one of the four is resolved or the launch fails: a value the harness cannot supply and
+    Composed rather than read whole because the registry records a path, and prefixing it is the
+    one assembly this value ever undergoes. The path itself is taken exactly as spelled — no
+    realpath, no normalisation (ADR-0023): the harness's own reply-address checks compare address
+    literals, and on macOS the default socket directory reaches the same place under two
+    spellings, so the receiver's own spelling is the only one certain to match.
+    """
+    return ADDRESS_SCHEME + registry_string(
+        entry, pid, REGISTRY_SOCKET, "--coordinator-address"
+    )
+
+
+def resolve(args):
+    """The five values the driver's start requires, each given by hand or read off the harness.
+
+    Every one of the five is resolved or the launch fails: a value the harness cannot supply and
     the operator did not pass is not a value to hand the driver empty.
     """
     pid = args.coordinator_pid
     name = args.coordinator_name
     session = args.coordinator_session
+    address = args.coordinator_address
     mode = args.permission_mode
-    if pid is None or name is None or session is None or mode is None:
+    if pid is None or name is None or session is None or address is None or mode is None:
         given = {
             "--coordinator-pid": pid,
             "--coordinator-name": name,
             "--coordinator-session": session,
+            "--coordinator-address": address,
             "--permission-mode": mode,
         }
         pid, entry = coordinator(pid, [flag for flag, value in given.items() if value is None])
@@ -281,8 +307,9 @@ def resolve(args):
         session = session if session is not None else registry_string(
             entry, pid, REGISTRY_SESSION, "--coordinator-session"
         )
+        address = address if address is not None else registry_address(entry, pid)
         mode = mode if mode is not None else permission_mode(entry, pid)
-    return pid, name, session, mode
+    return pid, name, session, address, mode
 
 
 def coordinator_pane():
@@ -299,13 +326,14 @@ def coordinator_pane():
 
 def driver_command(args, session, resolved):
     """The driver command line this run starts on, `start` because start is what adopts."""
-    pid, name, coordinator_session, mode = resolved
+    pid, name, coordinator_session, address, mode = resolved
     command = [
         sys.executable, str(pathlib.Path(args.driver).resolve()), START_COMMAND,
         "--feature-dir", str(pathlib.Path(args.run_dir).resolve()),
         "--coordinator-name", name,
         "--coordinator-pid", str(pid),
         "--coordinator-session", coordinator_session,
+        "--coordinator-address", address,
         "--permission-mode", mode,
         "--tmux-session", session,
     ]
@@ -525,6 +553,11 @@ def build_parser():
     parser.add_argument(
         "--coordinator-session",
         help="the coordinator's session ID, where the registry entry cannot be read",
+    )
+    parser.add_argument(
+        "--coordinator-address",
+        help="the coordinator's whole `uds:` inbox address — the one thing a child sends to —"
+             " where the registry entry cannot be read",
     )
     parser.add_argument(
         "--permission-mode",

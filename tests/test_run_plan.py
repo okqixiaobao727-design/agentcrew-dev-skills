@@ -40,6 +40,7 @@ class RunPlanTests(unittest.TestCase):
             "coordinator_name": "crew-coordinator",
             "coordinator_pid": 1234,
             "coordinator_session": "session-1",
+            "coordinator_address": "uds:/tmp/cc-socks/1234.sock",
             "crew_skill_dir": str(ASSETS.parent),
             "tmux_session": "$1:",
             "permission_mode": "acceptEdits",
@@ -186,6 +187,19 @@ class RunPlanTests(unittest.TestCase):
         replacement["waves"][0]["tickets"][0]["title"] = "Replaced"
         table_path.write_text(json.dumps(replacement), encoding="utf-8")
         self.assertEqual(run_plan.load(table_path).ticket("01").title, "Replaced")
+
+    def test_a_table_written_without_the_coordinator_address_still_loads(self):
+        """A run already under way when the address shipped resumes; it is not a required key."""
+        self.ticket("01", "Foundation")
+        table_path = self.root / "wave-table.json"
+        run_plan.build(self.feature, self.run).write(table_path)
+        written = json.loads(table_path.read_text(encoding="utf-8"))
+        del written["run"]["coordinator_address"]
+        table_path.write_text(json.dumps(written), encoding="utf-8")
+
+        loaded = run_plan.load(table_path)
+
+        self.assertEqual(loaded.run.coordinator_address, "")
 
     def test_build_rejects_incomplete_cycles_and_unresolvable_account_bindings(self):
         self.ticket("01", "Missing", blocked_by=("99",))
@@ -363,6 +377,10 @@ class RunPlanTests(unittest.TestCase):
             "noninteger coordinator pid": (
                 lambda value: value["run"].update(coordinator_pid="1504"),
                 "coordinator_pid.*positive integer",
+            ),
+            "nonstring coordinator address": (
+                lambda value: value["run"].update(coordinator_address=1504),
+                "coordinator_address.*string",
             ),
             "declared accounts object": (
                 lambda value: value["run"].update(declared_accounts={"work": True}),

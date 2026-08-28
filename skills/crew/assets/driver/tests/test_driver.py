@@ -29,6 +29,7 @@ from harness import (
     CODEX_EFFORT,
     CODEX_MODEL,
     CODEX_ROUTING,
+    COORDINATOR_ADDRESS,
     COORDINATOR_NAME,
     COORDINATOR_PANE,
     COORDINATOR_PID,
@@ -68,6 +69,10 @@ from harness import (
 
 sys.path.insert(0, str(DRIVER.parent))
 import driver as driver_module  # noqa: E402
+
+# The address a restarted coordinator binds: a second socket in a second directory, so a re-anchor
+# that composed one out of the new pid would produce something else and be visible.
+RESTARTED_ADDRESS = "uds:/private/tmp/cc-socks-501/2601.sock"
 
 
 class StubTmuxTests(DriverTestCase):
@@ -1046,6 +1051,7 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(run["coordinator_name"], COORDINATOR_NAME)
         self.assertEqual(run["coordinator_pid"], COORDINATOR_PID)
         self.assertEqual(run["coordinator_session"], COORDINATOR_SESSION)
+        self.assertEqual(run["coordinator_address"], COORDINATOR_ADDRESS)
         self.assertEqual(run["tmux_session"], TMUX_SESSION)
         self.assertEqual(run["permission_mode"], PERMISSION_MODE)
         self.assertEqual(run["repair_model"], REPAIR_MODEL)
@@ -3359,13 +3365,14 @@ class AdoptionTests(DriverTestCase):
             self.assertNotIn(str(self.fixture.run_dir / "codex" / "01.json"), watch["argv"])
 
     def test_a_coordinator_that_restarted_re_anchors_the_run_and_its_live_children(self):
-        """A restarted coordinator has a new pid, and the socket a child trusts is the old one."""
+        """A restarted coordinator binds a new socket, and a child trusts the old address."""
         self.interrupted(("01", ()), ("02", ("01",)))
         restarted_session = "3ed70d86-fa21-4d9c-adf2-b4073f60fbb6"
         restarted = (
             "--coordinator-name", "crew-coordinator-2a",
             "--coordinator-pid", "2601",
             "--coordinator-session", restarted_session,
+            "--coordinator-address", RESTARTED_ADDRESS,
         )
 
         adopted = self.fixture.launch(extra=restarted)
@@ -3392,17 +3399,21 @@ class AdoptionTests(DriverTestCase):
         self.assertEqual(
             self.fixture.table()["run"]["coordinator_session"], restarted_session
         )
+        self.assertEqual(
+            self.fixture.table()["run"]["coordinator_address"], RESTARTED_ADDRESS
+        )
         self.assertEqual(len(anchor), 1, f"01 was not re-anchored once: {anchor}")
-        self.assertIn("uds:/tmp/cc-socks/2601.sock", anchor[0]["message"])
+        self.assertIn(RESTARTED_ADDRESS, anchor[0]["message"])
         self.assertIn("crew-coordinator-2a", anchor[0]["message"])
         launched = [
             call for call in self.fixture.launches()
             if str(self.fixture.repo / ".claude" / "worktrees" / "02-02") in json.dumps(call)
         ]
         self.assertEqual(len(launched), 1, "02 was not launched once")
-        self.assertIn("uds:/tmp/cc-socks/2601.sock", json.dumps(launched[0]))
+        self.assertIn(RESTARTED_ADDRESS, json.dumps(launched[0]))
 
-    def test_a_same_pid_new_session_adoption_updates_the_hook_without_reanchoring_children(self):
+    def test_a_same_address_new_session_adoption_updates_the_hook_without_reanchoring(self):
+        """The condition is the address: what a child was told to trust has not moved."""
         self.interrupted(("01", ()))
         restarted_session = "4fd70d86-fa21-4d9c-adf2-b4073f60fbb6"
 
@@ -3422,12 +3433,32 @@ class AdoptionTests(DriverTestCase):
         )
         self.assertEqual(self.events("ruling", ticket="01"), [])
 
+    def test_a_coordinator_that_rebound_its_socket_re_anchors_on_the_same_pid(self):
+        """The condition names the address, not a proxy for it: only the address moved here."""
+        self.interrupted(("01", ()))
+        rebound = "uds:/private/tmp/cc-socks-501/1504.sock"
+
+        adopted = self.fixture.launch(extra=("--coordinator-address", rebound))
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.events("ruling", ticket="01")),
+            "the live child was never re-anchored",
+        )
+        anchor = self.events("ruling", ticket="01")
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(self.fixture.table()["run"]["coordinator_pid"], COORDINATOR_PID)
+        self.assertEqual(self.fixture.table()["run"]["coordinator_address"], rebound)
+        self.assertEqual(len(anchor), 1, f"01 was not re-anchored once: {anchor}")
+        self.assertIn(rebound, anchor[0]["message"])
+
     def test_a_codex_child_is_not_re_anchored_because_its_channel_is_a_file(self):
         self.interrupted(("01", ()), routing=CODEX_ROUTING)
 
-        adopted = self.fixture.launch(
-            extra=("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
-        )
+        adopted = self.fixture.launch(extra=(
+            "--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601",
+            "--coordinator-address", RESTARTED_ADDRESS,
+        ))
         self.assertTrue(
             self.fixture.wait_for(
                 lambda: self.fixture.table()["run"]["coordinator_pid"] == 2601
@@ -3448,9 +3479,10 @@ class AdoptionTests(DriverTestCase):
         self.kill_window(self.fixture.launch_record("01")["window"])
         self.fixture.vanishes("01")
 
-        adopted = self.fixture.launch(
-            extra=("--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601")
-        )
+        adopted = self.fixture.launch(extra=(
+            "--coordinator-name", "crew-coordinator-2a", "--coordinator-pid", "2601",
+            "--coordinator-address", RESTARTED_ADDRESS,
+        ))
         self.assertTrue(
             self.fixture.wait_for(lambda: self.events("ruling", ticket="02")),
             "the adopted run never re-anchored its live child",
@@ -3463,7 +3495,7 @@ class AdoptionTests(DriverTestCase):
         self.assertEqual(self.events("ruling", ticket="01"), [])
         anchor = self.events("ruling", ticket="02")
         self.assertEqual(len(anchor), 1, f"02 was not re-anchored once: {anchor}")
-        self.assertIn("uds:/tmp/cc-socks/2601.sock", anchor[0]["message"])
+        self.assertIn(RESTARTED_ADDRESS, anchor[0]["message"])
 
     def kill_window(self, window):
         subprocess.run(

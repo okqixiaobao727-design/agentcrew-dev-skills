@@ -22,9 +22,12 @@ Three contract promises change deliberately:
   can author a child's first turn, trust anchor included. On a single-user machine that
   is equivalent to filesystem write access, which already wins; we accept it.
 
-The coordinator's pid (the trust anchor) is known before launch, so no post-launch
-injection channel is needed. tmux `paste-buffer` was measured to submit one turn per
-pasted line — it shreds a multi-line brief — and is rejected as an injection route.
+The coordinator's identity (the trust anchor) is known before launch, so no post-launch
+injection channel is needed. It is the coordinator's socket address rather than its pid
+([ADR-0023](0023-the-coordinator-is-addressed-by-socket-not-by-name.md)); what matters here
+is only that it is known in time, which both forms are. tmux `paste-buffer` was measured to
+submit one turn per pasted line — it shreds a multi-line brief — and is rejected as an
+injection route.
 
 ## Amendment (ADR-0010)
 

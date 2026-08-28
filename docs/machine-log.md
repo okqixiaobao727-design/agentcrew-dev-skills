@@ -96,8 +96,11 @@ re-derive a named projection fact from them.
   `latest_settling_event` and in the append-only log. The two facts must not be collapsed.
 - `progress_event` is the latest recognised receipt, outcome or merge used by the monitor as input
   to its own Ticket state mapping. The projection does not produce Ticket state.
-- A ticketless ruling is correlated through `to` and the final latest-launch child mapping, exactly
-  as the Driver does today. Explicit `ticket` always wins.
+- A ticketless ruling is correlated through `to` and the child mapping, exactly as the Driver does
+  today. Explicit `ticket` always wins. The mapping holds every identity the run knows a child
+  under: the name of its final latest launch, and every address a child record of that ticket has
+  a `from` on. A launch name never loses to an address, so a log written before addresses were
+  recorded correlates unchanged.
 - `unanswered_child_message`, receipt/ruling waits, outstanding nudge, instruction counts,
   semantic-conflict detail and merge-rework request follow their ordered-event rules. A valid
   receipt claim remains unanswered until a receipt with the claimed SHA or a `CREW RECHECK` naming
@@ -165,7 +168,8 @@ through `read_records()`; the allowlisted scans above operate on that accepted r
 for the two deliberately strict Driver paths.
 
 The projection reduction is `O(records)` and a ticket lookup is `O(1)`. Two linear passes are
-allowed because a ticketless ruling is interpreted through the final latest-launch child mapping.
+allowed because a ticketless ruling is interpreted through the child mapping, which the first pass
+has to finish building before the second can read it.
 There is no cross-read cache. The existing re-evaluation point remains one run log around 5 MB;
 below that measured threshold an incremental reader has not earned its complexity.
 
@@ -425,7 +429,13 @@ review that never returned a result to read one from at all.
 
 Claude messages are written by the SendMessage hook below; Codex turn messages are written by
 `codex_bridge.py` through the same machine-log writer. Neither path writes by hand: `role`
-(`coordinator` or `child`), `to`, `message`, and `ticket` where the sender knows one.
+(`coordinator` or `child`), `from` and `to`, `message`, and `ticket` where the sender knows one.
+
+`from` is the sender's own address on the message channel — the socket the harness bound for that
+session, under the `uds:` scheme, read out of the sending session's environment by the hook. It is
+what the receiver sees as the message's `from` and so what a reply to it is addressed to
+([ADR-0023](adr/0023-the-coordinator-is-addressed-by-socket-not-by-name.md)). It is absent on a
+record the hook did not write, and on one written by a session the harness exported no socket for.
 
 `message` is the argument the sender gave the tool, byte for byte — no truncation, no
 reformatting, no summary. A structured message is recorded as the object it was.
