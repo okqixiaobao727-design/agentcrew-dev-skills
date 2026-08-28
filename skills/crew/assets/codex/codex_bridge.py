@@ -51,6 +51,10 @@ TERMINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 60
 DEFAULT_WATCH_TIMEOUT_SECONDS = 7200
 DEFAULT_WATCH_INTERVAL_SECONDS = 2.0
+PROCESS_POLL_INTERVAL_SECONDS = 0.05
+APP_SERVER_CONNECT_RETRY_INTERVAL_SECONDS = 0.1
+THREAD_DISCOVERY_INTERVAL_SECONDS = 0.25
+THREAD_DISCOVERY_LIMIT = 50
 CONSECUTIVE_FAILURE_LIMIT = 3
 MARKER_PREFIX = "agentcrew"
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
@@ -155,7 +159,7 @@ def wait_for_path(path, timeout_seconds):
     while time.monotonic() < deadline:
         if os.path.exists(path):
             return True
-        time.sleep(0.05)
+        time.sleep(PROCESS_POLL_INTERVAL_SECONDS)
     return False
 
 
@@ -273,27 +277,43 @@ def final_agent_message(turn):
     return fallback[-1] if fallback else ""
 
 
-async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
-    """Connect to the pane's app-server once its socket accepts clients."""
+async def connect_app_server(
+    socket_path,
+    pane_id,
+    timeout_seconds,
+    pane_failure,
+    timeout_failure,
+    log_path=None,
+):
+    """Connect to one live pane's app-server within a bounded retry window."""
     deadline = time.monotonic() + timeout_seconds
     last_error = None
     while time.monotonic() < deadline:
         if not pane_exists(pane_id):
-            detail = read_log_tail(log_path)
-            raise BridgeError(
-                "Codex TUI window exited during startup"
-                + (f": {detail}" if detail else "")
-            )
+            detail = read_log_tail(log_path) if log_path else ""
+            raise BridgeError(pane_failure + (f": {detail}" if detail else ""))
         if os.path.exists(socket_path):
             try:
                 client = AppServerClient(socket_path)
                 return await client.__aenter__()
             except (OSError, aiohttp.ClientError, AppServerError) as error:
                 last_error = error
-        await asyncio.sleep(0.1)
-    detail = read_log_tail(log_path)
+        await asyncio.sleep(APP_SERVER_CONNECT_RETRY_INTERVAL_SECONDS)
+    detail = read_log_tail(log_path) if log_path else ""
     suffix = detail or str(last_error or "socket unavailable")
-    raise BridgeError(f"Timed out connecting to Codex app-server: {suffix}")
+    raise BridgeError(f"{timeout_failure}: {suffix}")
+
+
+async def connect_when_ready(socket_path, pane_id, timeout_seconds, log_path):
+    """Connect to the pane's app-server once its socket accepts clients."""
+    return await connect_app_server(
+        socket_path,
+        pane_id,
+        timeout_seconds,
+        "Codex TUI window exited during startup",
+        "Timed out connecting to Codex app-server",
+        log_path,
+    )
 
 
 async def find_thread(client, cwd, marker, pane_id, timeout_seconds, log_path):
@@ -310,7 +330,7 @@ async def find_thread(client, cwd, marker, pane_id, timeout_seconds, log_path):
             "thread/list",
             {
                 "cwd": cwd,
-                "limit": 50,
+                "limit": THREAD_DISCOVERY_LIMIT,
                 "sortKey": "updated_at",
                 "sortDirection": "desc",
             },
@@ -318,7 +338,7 @@ async def find_thread(client, cwd, marker, pane_id, timeout_seconds, log_path):
         for thread in result.get("data") or []:
             if marker in (thread.get("preview") or ""):
                 return thread
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(THREAD_DISCOVERY_INTERVAL_SECONDS)
     raise BridgeError("Timed out waiting for the Codex TUI thread")
 
 
@@ -441,16 +461,23 @@ async def assert_opening_skill(client, cwd, skill_path):
             "forceReload": True,
         },
     )
-    expected_path = str(skill_path)
+    expected_path = pathlib.Path(skill_path).resolve(strict=True)
+
+    def is_expected_path(candidate):
+        try:
+            return pathlib.Path(candidate).resolve(strict=True) == expected_path
+        except (OSError, RuntimeError, TypeError):
+            return False
+
     matches = [
         skill
         for entry in result.get("data") or []
         for skill in entry.get("skills") or []
-        if skill.get("enabled") is True and skill.get("path") == expected_path
+        if skill.get("enabled") is True and is_expected_path(skill.get("path"))
     ]
     if len(matches) != 1:
         raise BridgeError(
-            f"Opening skill {expected_path!r} did not resolve to exactly one enabled skill "
+            f"Opening skill {str(expected_path)!r} did not resolve to exactly one enabled skill "
             f"for cwd {cwd!r}; found {len(matches)}"
         )
 
@@ -761,21 +788,12 @@ async def cmd_launch(args):
 
 
 async def connect_existing(state, timeout_seconds=3):
-    deadline = time.monotonic() + timeout_seconds
-    last_error = None
-    while time.monotonic() < deadline:
-        if not pane_exists(state["paneId"]):
-            raise BridgeError(
-                f"Session {state['name']} vanished: its tmux window is gone"
-            )
-        try:
-            client = AppServerClient(state["socketPath"])
-            return await client.__aenter__()
-        except (OSError, aiohttp.ClientError, AppServerError) as error:
-            last_error = error
-        await asyncio.sleep(0.1)
-    raise BridgeError(
-        f"Cannot reach app-server for session {state['name']}: {last_error}"
+    return await connect_app_server(
+        state["socketPath"],
+        state["paneId"],
+        timeout_seconds,
+        f"Session {state['name']} vanished: its tmux window is gone",
+        f"Cannot reach app-server for session {state['name']}",
     )
 
 
@@ -918,7 +936,7 @@ async def cmd_stop(args):
     kill_window(state["windowId"])
     deadline = time.monotonic() + 2
     while pane_exists(state["paneId"]) and time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(PROCESS_POLL_INTERVAL_SECONDS)
     shutil.rmtree(state["runtimeDir"], ignore_errors=True)
     state["status"] = "stopped"
     state["updatedAt"] = time.time()

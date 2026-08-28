@@ -24,6 +24,7 @@ CREW COMPLETE $STUB_SHA"
 
 WORK=$(mktemp -d -t codex-bridge-test)
 TUI_EXIT_RUNTIME_ROOT=$(mktemp -d /tmp/codex-tui-exit.XXXXXX)
+RELAUNCH_EARLY_RUNTIME_ROOT=$(mktemp -d /tmp/codex-relaunch-early.XXXXXX)
 BIN="$WORK/bin"
 PLUGIN_ROOT="$WORK/mattpocock-skills"
 SKILL_DIR="$PLUGIN_ROOT/skills/engineering/implement"
@@ -53,15 +54,26 @@ if [ "$1" = list-panes ] && [ -f "$TMUX_LIST_PANES_FAILURES" ]; then
     exit 71
   fi
 fi
+if [ "$1" = new-window ] && [ "${CODEX_STUB_DELAY_NEW_WINDOW_RETURN:-}" = 1 ]; then
+  output=$("%s" -L codex-bridge-test "$@")
+  status=$?
+  pane_id=$(printf "%%s\n" "$output" | cut -f 2)
+  while "%s" -L codex-bridge-test list-panes -a -F "#{pane_id}" \
+      | grep -Fx "$pane_id" >/dev/null; do
+    sleep 0.01
+  done
+  printf "%%s\n" "$output"
+  exit "$status"
+fi
 exec "%s" -L codex-bridge-test "$@"
-' "$REAL_TMUX" > "$BIN/tmux"
+' "$REAL_TMUX" "$REAL_TMUX" "$REAL_TMUX" > "$BIN/tmux"
 printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$PYTHON" "$STUB" > "$BIN/codex"
 chmod +x "$BIN/tmux" "$BIN/codex"
 export PATH="$BIN:$PATH"
 
 cleanup() {
   tmux kill-server 2>/dev/null
-  rm -rf "$WORK" "$TUI_EXIT_RUNTIME_ROOT"
+  rm -rf "$WORK" "$TUI_EXIT_RUNTIME_ROOT" "$RELAUNCH_EARLY_RUNTIME_ROOT"
 }
 trap cleanup EXIT
 
@@ -619,6 +631,17 @@ assert message == f"[$implement]({path}) /tmp/ticket.md", prompt
 PY
 }
 
+# --- Test 29: skills/list may spell the same SKILL.md through path aliases ---
+test_skill_path_alias() {
+  local dir; dir=$(make_child t29 skill-path-alias)
+  local sf="$WORK/t29.state.json" out="$WORK/t29.launch.json"
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 32 --state-file "$sf" --startup-timeout 15 \
+    --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
+    && ok "skill-path-alias: equivalent real path accepted" \
+    || fail "skill-path-alias: equivalent real path rejected ($(cat "$out.err"))"
+}
+
 # --- Test 24: a prompt without a skill mention passes unchanged in the TUI argv ---
 test_plain_prompt_has_no_skill_input() {
   local dir; dir=$(make_child t24 question)
@@ -694,10 +717,10 @@ assert skills[0]["params"] == {"cwds": [cwd], "forceReload": True}, skills
 PY
 }
 
-# --- Test 28: a relaunch reports before its opening-skill assertion fails asynchronously ---
-test_relaunch_unresolved_skill_is_reported() {
+# --- Test 28: a relaunch may return before its opening-skill assertion fails ---
+test_relaunch_late_skill_failure_is_reported() {
   local dir; dir=$(make_child t28 receipt)
-  local sf="$WORK/t28.state.json" out="$WORK/t28.launch.json"
+  local sf="$WORK/t28.state.json" out="$WORK/t28.launch.json" launch_pid
   "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
     --window-name 30 --state-file "$sf" --startup-timeout 15 \
     --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
@@ -705,22 +728,62 @@ test_relaunch_unresolved_skill_is_reported() {
   local thread_id; thread_id=$(json_field "$sf" threadId)
   local window_id; window_id=$(json_field "$sf" windowId)
   tmux kill-window -t "$window_id" \
-    || { fail "relaunch-unresolved: could not stop initial window"; return; }
+    || { fail "relaunch-late-failure: could not stop initial window"; return; }
   sleep 0.2
-  printf '%s\n' skill-unresolved > "$dir/.codex-stub-scenario"
+  printf '%s\n' skill-unresolved-after-launch > "$dir/.codex-stub-scenario"
   "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
     --window-name 31 --state-file "$sf" --startup-timeout 15 \
     --thread-id "$thread_id" --prompt '$implement /tmp/ticket.md' \
-    > "$WORK/t28.resume.json" 2> "$WORK/t28.resume.json.err" \
-    || { fail "relaunch-unresolved: relaunch did not return ok"; return; }
+    > "$WORK/t28.resume.json" 2> "$WORK/t28.resume.json.err" &
+  launch_pid=$!
+  if ! wait "$launch_pid"; then
+    fail "relaunch-late-failure: relaunch did not return ok"
+    return
+  fi
+  touch "$dir/stub-release-skill-check"
   watch "$WORK/t28.watch.json" "$sf" \
-    || { fail "relaunch-unresolved: watch exited $?"; return; }
+    || { fail "relaunch-late-failure: watch exited $?"; return; }
   [ "$(json_field "$WORK/t28.watch.json" sessions 0 status)" = "vanished" ] \
-    || { fail "relaunch-unresolved: failed pane was not vanished"; return; }
+    || { fail "relaunch-late-failure: failed pane was not vanished"; return; }
   local log_path; log_path="$(json_field "$sf" runtimeDir)/app-server.log"
-  grep -q "exactly one enabled skill" "$log_path" \
-    && ok "relaunch-unresolved: vanished pane kept its failure reason" \
-    || fail "relaunch-unresolved: failure reason was not preserved"
+  tail -n 1 "$log_path" | grep -q "^Codex opening skill assertion failed:.*exactly one enabled skill" \
+    && ok "relaunch-late-failure: vanished pane kept its final-line reason" \
+    || fail "relaunch-late-failure: final-line reason was not preserved"
+}
+
+# --- Test 30: a relaunch may observe the opening-skill failure directly ---
+test_relaunch_early_skill_failure_is_reported() {
+  local dir; dir=$(make_child t30 receipt)
+  local sf="$WORK/t30.state.json" out="$WORK/t30.launch.json"
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 33 --state-file "$sf" --startup-timeout 15 \
+    --prompt '$implement /tmp/ticket.md' > "$out" 2> "$out.err" \
+    || { fail "relaunch-early-failure: initial launch exited $?"; return; }
+  local thread_id; thread_id=$(json_field "$sf" threadId)
+  local window_id; window_id=$(json_field "$sf" windowId)
+  tmux kill-window -t "$window_id" \
+    || { fail "relaunch-early-failure: could not stop initial window"; return; }
+  sleep 0.2
+  printf '%s\n' skill-unresolved-before-launch > "$dir/.codex-stub-scenario"
+  if CODEX_STUB_DELAY_NEW_WINDOW_RETURN=1 TMPDIR="$RELAUNCH_EARLY_RUNTIME_ROOT" \
+      "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+      --window-name 34 --state-file "$sf" --startup-timeout 15 \
+      --thread-id "$thread_id" --prompt '$implement /tmp/ticket.md' \
+      > "$WORK/t30.resume.json" 2> "$WORK/t30.resume.json.err"; then
+    fail "relaunch-early-failure: relaunch unexpectedly returned ok"
+    return
+  fi
+  local log_path reason
+  log_path=$(find "$RELAUNCH_EARLY_RUNTIME_ROOT" -name app-server.log -type f -print -quit)
+  [ -n "$log_path" ] \
+    || { fail "relaunch-early-failure: failed runtime log was not retained"; return; }
+  reason=$(tail -n 1 "$log_path")
+  printf '%s\n' "$reason" | grep -q \
+    "^Codex opening skill assertion failed:.*exactly one enabled skill" \
+    || { fail "relaunch-early-failure: final-line reason was not preserved"; return; }
+  grep -Fq "$reason" "$WORK/t30.resume.json.err" \
+    && ok "relaunch-early-failure: launch and retained log share the reason" \
+    || fail "relaunch-early-failure: launch stderr lost the retained reason"
 }
 
 # --- Test 3: watch stays armed while all busy, wakes on first idle child ---
@@ -900,8 +963,10 @@ test_launch_skill_input
 test_plain_prompt_has_no_skill_input
 test_missing_skill_path_is_reported
 test_launch_unresolved_skill_is_reported
-test_relaunch_unresolved_skill_is_reported
+test_relaunch_late_skill_failure_is_reported
+test_relaunch_early_skill_failure_is_reported
 test_skill_source_fallback
+test_skill_path_alias
 test_wave_wakeup
 test_vanished
 test_transient_pane_read_failures

@@ -17,6 +17,9 @@ The scenario is read from `.codex-stub-scenario` in the working directory
                  `stub-release` appears in the working directory
     tui-exit     the TUI process exits immediately (vanished window)
     no-server    the app-server exits without creating its socket
+    skill-path-alias  skills/list returns an equivalent non-canonical path
+    skill-unresolved-before-launch  skills/list fails without waiting
+    skill-unresolved-after-launch   skills/list waits for the test to release it
 
 Follow-up turns started via turn/start always complete with a receipt.
 
@@ -185,13 +188,16 @@ class StubServer:
             return {}
         if method == "skills/list":
             skills = []
-            if self.scenario != "skill-unresolved":
+            if not self.scenario.startswith("skill-unresolved"):
+                skill_path = listed_skill_path()
+                if self.scenario == "skill-path-alias":
+                    skill_path = skill_path.parent / ".." / skill_path.parent.name / skill_path.name
                 skills.append(
                     {
                         "name": "mattpocock-skills:implement",
                         "description": "test skill",
                         "enabled": True,
-                        "path": str(listed_skill_path()),
+                        "path": str(skill_path),
                         "scope": "user",
                     }
                 )
@@ -230,13 +236,12 @@ class StubServer:
             if payload.get("id") is None:
                 continue
             try:
-                if (
-                    payload.get("method") == "skills/list"
-                    and self.scenario == "skill-unresolved"
+                if payload.get("method") == "skills/list" and (
+                    self.scenario == "skill-unresolved-after-launch"
                 ):
-                    # Leave the server responsive so a v0.9.6-style relaunch can report its
-                    # known thread id while the pane's opening-skill check is still in flight.
-                    await asyncio.sleep(0.2)
+                    release = pathlib.Path("stub-release-skill-check")
+                    while not release.is_file():
+                        await asyncio.sleep(0.01)
                 result = self.handle(payload.get("method"), payload.get("params") or {})
                 await websocket.send_json({"id": payload["id"], "result": result})
             except ValueError as error:

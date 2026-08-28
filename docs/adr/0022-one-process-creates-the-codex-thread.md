@@ -42,18 +42,19 @@ fails the launch with the retained log tail. A relaunch already knows its thread
 the v0.9.6 contract: once the app-server accepts a connection, the outer process writes state and
 returns that id without another pane-to-outer handshake.
 
-The relaunch skill assertion is consequently asynchronous. It may fail after outer `launch` has
-returned; the next `watch` then observes a successfully read pane list without that pane and
-reports `vanished`, while the same reason remains in `app-server.log`. This is deliberate. A
-ready-file receipt would recreate the bootstrap-result handoff in smaller form. Path or name
-mismatches are deterministic and the run's fresh launch has already failed closed on them;
-mid-run environment degradation can be reported by the existing liveness path.
+The relaunch skill assertion and the outer process's return have no ordering contract. The
+assertion can fail first and make `launch` fail, or outer `launch` can return first and the next
+`watch` can report `vanished`; both paths retain the same reason in `app-server.log`. This is
+deliberate. A ready-file receipt would recreate the bootstrap-result handoff in smaller form.
+Path or name mismatches are deterministic and the run's fresh launch has already failed closed
+on them; mid-run environment degradation can be reported by the existing liveness path. The
+absence of a handshake is a decision, not an omitted guarantee.
 
 ## Consequences
 
 - Thread identity comes from the TUI's own public preview, not Codex's private rollout state.
 - Opening skills remain first-class Codex inputs without transferring a thread between clients.
 - Fresh launches fail closed on silent skill-resolution failures; relaunches preserve the public
-  state, `send`, and `watch` schemas and accept asynchronous assertion failure.
+  state, `send`, and `watch` schemas and accept either direct or asynchronous assertion failure.
 - The failed-launch log retention from #155 remains, as does #140's rule that only a successful
   pane-list observation can report `vanished`; the bootstrap result and its atomic write do not.

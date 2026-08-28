@@ -15,6 +15,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
   an exact `skills/list` assertion, and the outer bridge only discovers the thread by its marker;
   both app-server bootstrap layers and every read of Codex persistence state are removed (#157).
 
+  Verified from the source checkout rather than the globally installed v0.9.8 plugin: three
+  direct launches in a temporary git worktree succeeded with codex-cli 0.150.1 on both sides and
+  one `<skill>` block per rollout; an isolated Claude `--plugin-dir` session then launched
+  GPT-VoiceCoding wave 1 with app-server 0.150.1, TUI 0.149.1, and one `<skill>` block. Repeating
+  that `/crew` launch after v0.9.9 is installed globally is a post-release check, not this merge
+  gate.
+
 ## [0.9.8] - 2026-08-28
 
 ### Fixed
