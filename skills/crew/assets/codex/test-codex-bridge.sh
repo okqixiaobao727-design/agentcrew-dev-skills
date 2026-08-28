@@ -22,7 +22,7 @@ ts=1755060070"
 TYPED_TURN_MESSAGE="Ruling applied and the work is committed.
 CREW COMPLETE $STUB_SHA"
 
-WORK=$(mktemp -d -t codex-bridge-test)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/codex-bridge-test.XXXXXX")
 TUI_EXIT_RUNTIME_ROOT=$(mktemp -d /tmp/codex-tui-exit.XXXXXX)
 RELAUNCH_EARLY_RUNTIME_ROOT=$(mktemp -d /tmp/codex-relaunch-early.XXXXXX)
 BIN="$WORK/bin"
