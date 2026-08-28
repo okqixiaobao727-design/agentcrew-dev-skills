@@ -59,6 +59,8 @@ CONSECUTIVE_FAILURE_LIMIT = 3
 MARKER_PREFIX = "agentcrew"
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 SKILL_PLUGIN_NAME = "mattpocock-skills"
+OPENING_SKILL_TERMINAL = "Codex opening skill assertion failed"
+TUI_EXIT_TERMINAL = "Codex TUI exited before creating its thread"
 
 
 class BridgeError(RuntimeError):
@@ -641,7 +643,7 @@ def run_pane(args):
                 asyncio.run(check_opening_skill(socket_path, args.cwd, args.skill_path))
             except Exception as error:
                 print(
-                    f"Codex opening skill assertion failed: {error}",
+                    f"{OPENING_SKILL_TERMINAL}: {error}",
                     file=log_file,
                     flush=True,
                 )
@@ -664,8 +666,7 @@ def run_pane(args):
         result = subprocess.run(command, cwd=args.cwd, check=False)
         if result.returncode != 0:
             print(
-                "Codex TUI exited before creating its thread "
-                f"(exit code {result.returncode})",
+                f"{TUI_EXIT_TERMINAL} (exit code {result.returncode})",
                 file=log_file,
                 flush=True,
             )
@@ -765,6 +766,16 @@ async def cmd_launch(args):
             await client.__aexit__(None, None, None)
     except Exception as error:
         detail = read_log_tail(runtime_dir / "app-server.log")
+        final_detail_line = detail.splitlines()[-1] if detail else ""
+        if final_detail_line.startswith(f"{OPENING_SKILL_TERMINAL}:"):
+            kill_window(window_id)
+            raise BridgeError(detail) from error
+        if final_detail_line.startswith(f"{TUI_EXIT_TERMINAL} "):
+            kill_window(window_id)
+            raise BridgeError(
+                "Codex TUI window exited before creating its thread"
+                + (f": {detail}" if detail else "")
+            ) from error
         try:
             pane_is_alive = pane_exists(pane_id)
         except OSError:

@@ -10,6 +10,7 @@ recorded, and the repository's own branch state.
 The fixture itself lives in `harness.py`, beside this file; here are only the tests.
 """
 
+import fcntl
 import json
 import os
 import pathlib
@@ -67,6 +68,31 @@ from harness import (
 
 sys.path.insert(0, str(DRIVER.parent))
 import driver as driver_module  # noqa: E402
+
+
+class StubTmuxTests(DriverTestCase):
+    """The process-per-command stub preserves one tmux server's serialized state changes."""
+
+    def test_a_second_command_waits_for_the_stub_server_lock(self):
+        lock_path = self.fixture.stub_dir / "tmux-command.lock"
+        with lock_path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = subprocess.Popen(
+                [str(self.fixture.bin_dir / "tmux"), "list-windows", "-t", TMUX_SESSION],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self.fixture.environment(),
+            )
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.wait(timeout=1.0)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+        stdout, stderr = process.communicate(timeout=5.0)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(stdout, "")
 
 
 class StrictLaunchReadTests(DriverTestCase):

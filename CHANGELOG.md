@@ -14,9 +14,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
   command when it is missing. v0.9.8 and v0.9.9 release CI was red after #155 first admitted the
   pre-existing suite because its Linux setup requirements were incomplete; product behavior was
   unaffected, and v0.9.9's bridge change passed its real Codex acceptance (#157).
-- A Codex TUI that exits between a successful pane check and thread discovery now reports its
-  retained startup log instead of leaking the app-server transport error. A failed pane-list read
+- A fresh Codex launch now treats the pane launcher's recognized final terminal log line as
+  authoritative before transient tmux pane liveness. Opening-skill assertion and TUI-exit details
+  therefore survive WebSocket shutdown races; without a terminal ruling, a failed pane-list read
   remains unknown rather than being mislabeled as a vanished TUI (#157).
+- Driver tests now serialize their process-per-command tmux stub like one tmux server, preventing
+  concurrent polling and answer delivery from losing composer state during the release gate.
 
 ## [0.9.9] - 2026-08-28
 

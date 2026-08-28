@@ -15,6 +15,7 @@ window's own command is recorded and never run: the dashboard's refresh loop wou
 outlive the test.
 """
 
+import fcntl
 import json
 import os
 import pathlib
@@ -201,7 +202,8 @@ def send_keys(argv):
     return result.returncode
 
 
-def main():
+def serve_one_command():
+    """Handle one client command while the stub server owns its shared state."""
     argv = sys.argv[1:]
     with (state_dir() / "tmux-calls.jsonl").open("a") as handle:
         handle.write(json.dumps({"argv": argv}) + "\n")
@@ -241,6 +243,13 @@ def main():
             print(path.read_text().strip())
         return 0
     return 0
+
+
+def main():
+    """Serialize process-per-command clients like one tmux server."""
+    with (state_dir() / "tmux-command.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return serve_one_command()
 
 
 if __name__ == "__main__":

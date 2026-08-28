@@ -38,9 +38,11 @@ structured skill input because the bridge is already their app-server client.
 
 The outer fresh `launch` connects to the pane's app-server and finds the new thread by its marker
 in `thread/list` preview, tolerating absence until the startup timeout. Pane exit before discovery
-fails the launch with the retained log tail. A relaunch already knows its thread id, so it keeps
-the v0.9.6 contract: once the app-server accepts a connection, the outer process writes state and
-returns that id without another pane-to-outer handshake.
+fails the launch with the retained log tail. The pane's final log line is its startup-failure
+ruling: outer `launch` reads a recognized bridge terminal line before consulting pane liveness.
+A relaunch already knows its thread id, so it keeps the v0.9.6 contract: once the app-server accepts
+a connection, the outer process writes state and returns that id without another pane-to-outer
+handshake.
 
 The relaunch skill assertion and the outer process's return have no ordering contract. The
 assertion can fail first and make `launch` fail, or outer `launch` can return first and the next

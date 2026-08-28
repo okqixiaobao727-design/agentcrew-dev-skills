@@ -70,18 +70,14 @@ class LaunchFailureTests(unittest.IsolatedAsyncioTestCase):
             window_name="test",
         )
 
-    async def launch_with_pane_observations(self, observations):
+    async def launch_with_pane_observations(self, observations, log_text="app-server noise\n"):
         client = mock.AsyncMock()
         client.request.side_effect = OSError("transport disconnected")
         runtime_dir = self.directory / "runtime"
         runtime_dir.mkdir()
 
         def launch_window(_args, runtime_dir, _prompt_file, _skill_path):
-            (runtime_dir / "app-server.log").write_text(
-                "stub TUI exiting immediately\n"
-                "Codex TUI exited before creating its thread (exit code 1)\n",
-                encoding="utf-8",
-            )
+            (runtime_dir / "app-server.log").write_text(log_text, encoding="utf-8")
             return "@1", "%1"
 
         with (
@@ -98,7 +94,7 @@ class LaunchFailureTests(unittest.IsolatedAsyncioTestCase):
             await self.launch_with_pane_observations([True, False])
 
         self.assertIn("Codex TUI window exited before creating its thread", str(raised.exception))
-        self.assertIn("exit code 1", str(raised.exception))
+        self.assertIn("app-server noise", str(raised.exception))
 
     async def test_a_transport_error_while_the_pane_is_alive_is_not_relabelled(self):
         with self.assertRaisesRegex(OSError, "transport disconnected"):
@@ -109,6 +105,32 @@ class LaunchFailureTests(unittest.IsolatedAsyncioTestCase):
             await self.launch_with_pane_observations(
                 [True, OSError("tmux list-panes unavailable")]
             )
+
+    async def test_an_opening_skill_terminal_log_outranks_a_still_live_pane(self):
+        detail = "Codex opening skill assertion failed: expected exactly one enabled skill\n"
+
+        with self.assertRaises(bridge.BridgeError) as raised:
+            await self.launch_with_pane_observations([True, True], detail)
+
+        self.assertEqual(str(raised.exception), detail.strip())
+
+    async def test_a_tui_exit_terminal_log_outranks_a_still_live_pane(self):
+        detail = "Codex TUI exited before creating its thread (exit code 1)\n"
+
+        with self.assertRaises(bridge.BridgeError) as raised:
+            await self.launch_with_pane_observations([True, True], detail)
+
+        self.assertIn("Codex TUI window exited before creating its thread", str(raised.exception))
+        self.assertIn(detail.strip(), str(raised.exception))
+
+    async def test_only_the_final_log_line_can_be_a_terminal_ruling(self):
+        detail = (
+            "Codex TUI exited before creating its thread (exit code 1)\n"
+            "ordinary app-server shutdown noise\n"
+        )
+
+        with self.assertRaisesRegex(OSError, "transport disconnected"):
+            await self.launch_with_pane_observations([True, True], detail)
 
 
 if __name__ == "__main__":
