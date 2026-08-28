@@ -86,7 +86,7 @@ Querying the app-server directly (`skills/list` with `cwds: ["/tmp/codex-researc
 
 ```
 'mattpocock-skills:implement'  enabled=True scope=user
-path=/Users/simon/.codex/plugins/cache/mattpocock/mattpocock-skills/1.2.3/skills/engineering/implement/SKILL.md
+path=/Users/<account>/.codex/plugins/cache/mattpocock/mattpocock-skills/1.2.3/skills/engineering/implement/SKILL.md
 ```
 
 `$implement` matches no skill name, so both resolvers correctly decline. The bridge's
