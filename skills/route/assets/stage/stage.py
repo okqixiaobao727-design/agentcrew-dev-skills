@@ -87,6 +87,7 @@ GH = "gh"
 GH_FIELDS = "number,title,body,state"
 GH_STATE_CLOSED = "CLOSED"
 GH_SUB_ISSUES = "repos/{owner}/{repo}/issues/%s/sub_issues"
+GH_BLOCKED_BY = "repos/{owner}/{repo}/issues/%s/dependencies/blocked_by"
 
 TICKET_NUMBER = re.compile(r"#(\d+)")
 
@@ -238,25 +239,55 @@ def json_documents(text):
         entries += page if isinstance(page, list) else [page]
 
 
-def sub_issue_numbers(repo, parent):
-    """The parent's native sub-issues, in the tracker's own list; raises Blocked where it cannot."""
+def github_relation(repo, endpoint, subject, relation):
+    """Issue objects from one paginated GitHub relation; raises Blocked where unreadable."""
     result = subprocess.run(
-        [GH, "api", "--paginate", GH_SUB_ISSUES % parent],
+        [GH, "api", "--paginate", endpoint],
         cwd=str(repo), capture_output=True, text=True,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().replace("\n", " ")
         raise Blocked([
-            f"parent {parent}: the tracker could not list its sub-issues — {detail}; check the"
+            f"{subject}: the tracker could not list its {relation} — {detail}; check the"
             " number, and that this checkout is the repository the issue belongs to"
         ])
     try:
-        listed = json_documents(result.stdout)
+        return json_documents(result.stdout)
     except ValueError as error:
         raise Blocked([
-            f"parent {parent}: the tracker's sub-issue list was not readable — {error}"
+            f"{subject}: the tracker's {relation} list was not readable — {error}"
         ]) from error
+
+
+def sub_issue_numbers(repo, parent):
+    """The parent's native sub-issue numbers, in the tracker's own order."""
+    listed = github_relation(
+        repo, GH_SUB_ISSUES % parent, f"parent {parent}", "sub-issue",
+    )
     return [str(entry["number"]) for entry in listed if entry.get("number") is not None]
+
+
+def github_blockers(repo, ticket):
+    """The ticket's native GitHub blocked-by issues, in tracker order."""
+    return github_relation(
+        repo,
+        GH_BLOCKED_BY % ticket["id"],
+        f"ticket {ticket['id']}",
+        "blocked-by",
+    )
+
+
+def ticket_blockers(kind, repo, ticket):
+    """Every blocker however this tracker records it, once each and in source order."""
+    body_blockers = run_plan.ticket_dependencies(ticket["text"])
+    if kind != driver.TRACKER_GITHUB:
+        return tuple(dict.fromkeys(body_blockers))
+    native = (
+        str(entry["number"])
+        for entry in github_blockers(repo, ticket)
+        if entry.get("number") is not None
+    )
+    return tuple(dict.fromkeys((*body_blockers, *native)))
 
 
 def outside_closed(kind, repo, number, sources):
@@ -292,10 +323,14 @@ def resolve_closure(kind, repo, tickets, sources):
     not met.
     """
     inside = {ticket["id"] for ticket in tickets}
+    dependencies = {
+        ticket["id"]: ticket_blockers(kind, repo, ticket)
+        for ticket in tickets
+    }
     stripped = set()
     problems = []
     for ticket in tickets:
-        for number in run_plan.ticket_dependencies(ticket["text"]):
+        for number in dependencies[ticket["id"]]:
             if number in inside or number in stripped:
                 continue
             if outside_closed(kind, repo, number, sources):
@@ -308,33 +343,61 @@ def resolve_closure(kind, repo, tickets, sources):
             )
     if problems:
         raise Blocked(problems)
-    return stripped
+    return dependencies, stripped
 
 
-def strip_edges(text, stripped):
-    """That ticket's text with its edges to `stripped` blockers spent rather than pending.
+def project_edges(text, dependencies, stripped):
+    """That staged ticket with the complete dependency set rendered in `Blocked by`.
 
-    Only the `Blocked by` section is touched, and the line keeps whatever the ticket said about the
-    edge: the child still reads why the dependency was there, and the driver's graph — which reads
-    `#<number>` tokens — no longer sees an edge to a ticket this run does not carry.
+    Existing body lines keep their explanation. Native-only edges gain the minimal Markdown line
+    the Run plan reads. Closed outside-set blockers lose their `#`, so their reason remains visible
+    while the Run plan no longer sees a pending edge.
     """
-    if not stripped:
+    existing = run_plan.ticket_dependencies(text)
+    dependencies = tuple(dict.fromkeys(dependencies))
+    if dependencies == existing and not stripped:
         return text
-    inside = False
-    written = []
-    for line in text.splitlines(keepends=True):
+
+    lines = text.splitlines(keepends=True)
+    start = None
+    end = len(lines)
+    for index, line in enumerate(lines):
         heading = run_plan.SECTION.match(line.rstrip("\n"))
-        if heading:
-            inside = heading.group(1).lower() == run_plan.BLOCKED_BY_SECTION
-        elif inside:
-            line = TICKET_NUMBER.sub(
-                lambda match: (
-                    f"{match.group(1)} (closed)" if match.group(1) in stripped else match.group(0)
-                ),
-                line,
-            )
-        written.append(line)
-    return "".join(written)
+        if not heading:
+            continue
+        if start is None and heading.group(1).lower() == run_plan.BLOCKED_BY_SECTION:
+            start = index + 1
+        elif start is not None:
+            end = index
+            break
+    if start is None:
+        suffix = "" if text.endswith("\n") else "\n"
+        rendered = "\n".join(
+            f"- {number} (closed)" if number in stripped else f"- #{number}"
+            for number in dependencies
+        )
+        return f"{text}{suffix}\n## Blocked by\n\n{rendered}\n"
+
+    seen = set()
+    section = lines[start:end] if existing else ["\n"]
+
+    def render(match):
+        number = match.group(1)
+        if number in seen:
+            return number
+        seen.add(number)
+        return f"{number} (closed)" if number in stripped else match.group(0)
+
+    section = [TICKET_NUMBER.sub(render, line) for line in section]
+    if section and section[-1].strip():
+        section.append("\n")
+    for number in dependencies:
+        if number in seen:
+            continue
+        suffix = " (closed)" if number in stripped else ""
+        marker = "" if number in stripped else "#"
+        section.append(f"- {marker}{number}{suffix}\n")
+    return "".join([*lines[:start], *section, *lines[end:]])
 
 
 # --- the tracker's edit, mark and comment operations ---------------------------------------------
@@ -610,7 +673,7 @@ def allocate(run_root, line):
     return number, run_root / str(number)
 
 
-def materialise(directory, spec, tickets, stripped):
+def materialise(directory, spec, tickets, dependencies, stripped):
     """Write the run directory's `spec.md` and one file per ticket; returns nothing.
 
     A directory being re-staged keeps its subdirectories: a run already started there holds its
@@ -623,7 +686,7 @@ def materialise(directory, spec, tickets, stripped):
     (directory / SPEC_NAME).write_text(spec, encoding="utf-8")
     for ticket in tickets:
         (directory / f"{ticket['id']}.md").write_text(
-            strip_edges(ticket["text"], stripped), encoding="utf-8"
+            project_edges(ticket["text"], dependencies[ticket["id"]], stripped), encoding="utf-8"
         )
 
 
@@ -650,18 +713,26 @@ def candidate_run(repo, directory, config):
 
 
 def self_check(repo, directory, config):
-    """Every blocking item the real run checks find in that directory, in their own words."""
+    """The checked Run plan and every blocking item, in the real run checks' own words."""
     run = candidate_run(repo, directory, config)
     problems = driver.dirty_tree_problems(repo)
+    plan = None
     base_branch = driver.default_base_branch(repo)
     if base_branch is None:
         # Fetch and fast-forward checks belong to run start; staging only checks default naming.
         problems += driver.base_branch_problems(repo, base_branch, (driver.UPSTREAM_ABSENT, ""))
     try:
-        run_plan.build(directory, run)
+        plan = run_plan.build(directory, run)
     except run_plan.RunPlanError as error:
         problems += list(error.problems)
-    return problems
+    return plan, problems
+
+
+def print_waves(plan):
+    """The derived wave layout, one operator-facing stderr line per wave."""
+    for wave in plan.waves:
+        tickets = ", ".join(f"#{ticket.id}" for ticket in wave.tickets)
+        print(f"wave {wave.number}: {tickets}", file=sys.stderr)
 
 
 # --- the command line ------------------------------------------------------------------------
@@ -796,15 +867,18 @@ def stage(args):
         tickets = [read_ticket(kind, repo, reference) for reference in references]
 
     write_routing(kind, repo, tickets, table)
-    stripped = resolve_closure(kind, repo, tickets, ticket_sources(kind, repo, references))
+    dependencies, stripped = resolve_closure(
+        kind, repo, tickets, ticket_sources(kind, repo, references)
+    )
     line = provenance(kind, args.parent, tickets)
     number, directory = allocate(repo / RUN_ROOT, line)
     spec = parent_page(line, parent) if parent else cover_page(line, tickets)
-    materialise(directory, spec, tickets, stripped)
+    materialise(directory, spec, tickets, dependencies, stripped)
 
-    problems = self_check(repo, directory, config)
+    plan, problems = self_check(repo, directory, config)
     if problems:
         raise Blocked(problems)
+    print_waves(plan)
 
     # Only now, with the self-check green, does the pickup point go on the tracker: a command that
     # would not start is one nobody should be able to find later. A staging given no approved

@@ -14,6 +14,8 @@ staging calls, over the issues in `AGENTCREW_STUB_DIR/gh-issues.json`, keyed by 
   the shape the REST endpoint answers with: an array of issues carrying at least `number`. An issue
   carrying a `page_size` has that list answered one JSON document per page, which is the other shape
   a paginated `gh api` call comes back in.
+- **dependency read** — `api repos/{owner}/{repo}/issues/<n>/dependencies/blocked_by`, answered
+  from the issue record's `blocked_by` list in the same issue-array and pagination shapes.
 
 An issue the table does not hold exits 1 with the message `gh` gives for one, because a ticket set
 naming an issue nobody can read is a case staging has to report rather than stage.
@@ -30,6 +32,7 @@ import sys
 
 
 SUB_ISSUES = re.compile(r"issues/(\d+)/sub_issues$")
+BLOCKED_BY = re.compile(r"issues/(\d+)/dependencies/blocked_by$")
 
 
 def state_dir():
@@ -120,7 +123,7 @@ def issue(argv):
 
 def api(argv):
     path = argv[-1]
-    match = SUB_ISSUES.search(path)
+    match = SUB_ISSUES.search(path) or BLOCKED_BY.search(path)
     if not match:
         print(f"no stub answer for {path}", file=sys.stderr)
         return 1
@@ -129,10 +132,11 @@ def api(argv):
     if record is None:
         print(f"could not resolve to an Issue with the number of {match.group(1)}", file=sys.stderr)
         return 1
+    relation = "sub_issues" if SUB_ISSUES.search(path) else "blocked_by"
     listed = [
         # The REST endpoint answers with whole issues, whose `state` is lowercase there.
         {"number": int(number), "state": table.get(str(number), {}).get("state", "OPEN").lower()}
-        for number in record.get("sub_issues", [])
+        for number in record.get(relation, [])
     ]
     # `gh --paginate` merges an array response's pages into one array; where it does not, each page
     # is its own JSON document on the same stream. `page_size` asks for the second shape, so a

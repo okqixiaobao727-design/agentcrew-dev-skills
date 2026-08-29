@@ -164,8 +164,8 @@ class Fixture:
 
     # --- the tracker's side ---------------------------------------------------------------
 
-    def issue(self, number, title=None, body=None, state="OPEN", blocked_by=(), sub_issues=(),
-              page_size=None):
+    def issue(self, number, title=None, body=None, state="OPEN", blocked_by=(),
+              native_blocked_by=(), sub_issues=(), page_size=None):
         """One ticket, written where this fixture's tracker keeps them."""
         title = TITLES.get(str(number), f"Ticket {number}") if title is None else title
         body = ticket_body(blocked_by) if body is None else body
@@ -174,6 +174,7 @@ class Fixture:
             table = json.loads(path.read_text())
             table[str(number)] = {
                 "title": title, "body": body, "state": state,
+                "blocked_by": [str(blocker) for blocker in native_blocked_by],
                 "sub_issues": [str(child) for child in sub_issues],
                 "page_size": page_size,
             }
@@ -343,6 +344,11 @@ class StagingTests(unittest.TestCase):
         result = self.stage_two()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"/crew {RUN_ROOT}/1\n")
+
+    def test_green_staging_prints_one_stderr_line_per_derived_wave(self):
+        result = self.stage_two()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["wave 1: #61", "wave 2: #62"])
 
     def test_green_staging_writes_a_spec_and_one_file_per_ticket_and_nothing_else(self):
         self.stage_two()
@@ -608,6 +614,98 @@ class LocalTrackerTests(StagingTests):
     """The same behaviour on the tracker whose tickets are files in the repository."""
 
     tracker = "local"
+
+    def test_dependency_staging_makes_no_github_api_call(self):
+        result = self.stage_two()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.fixture.stub_dir / "gh-calls.jsonl").exists())
+
+
+class GithubDependencyTests(unittest.TestCase):
+    """Dependency edges that exist only in GitHub's native relationship."""
+
+    def setUp(self):
+        self.fixture = Fixture("github")
+        self.addCleanup(self.fixture.cleanup)
+
+    def test_a_native_github_edge_reaches_the_staged_copy_and_wave_graph(self):
+        first = self.fixture.issue(61)
+        second = self.fixture.issue(62, native_blocked_by=("61",))
+
+        result = self.fixture.stage(first, second)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        read = parsed(self.fixture.run_dir(), self.fixture.environment())
+        self.assertEqual(read["tickets"][1]["blocked_by"], ["61"])
+        self.assertEqual(read["waves"], [["61"], ["62"]])
+
+    def test_body_and_paginated_native_edges_are_unioned_and_deduplicated(self):
+        first = self.fixture.issue(61)
+        outside = self.fixture.issue(70)
+        second = self.fixture.issue(
+            62,
+            blocked_by=("61",),
+            native_blocked_by=("61", "70"),
+            page_size=1,
+        )
+
+        result = self.fixture.stage(first, outside, second)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        read = parsed(self.fixture.run_dir(), self.fixture.environment())
+        ticket = next(ticket for ticket in read["tickets"] if ticket["id"] == "62")
+        self.assertEqual(ticket["blocked_by"], ["61", "70"])
+        staged = (self.fixture.run_dir() / "62.md").read_text()
+        self.assertEqual(staged.count("#61"), 1)
+        self.assertEqual(staged.count("#70"), 1)
+        self.assertEqual(read["waves"], [["61", "70"], ["62"]])
+
+    def test_a_body_only_edge_is_staged_byte_for_byte_as_before(self):
+        first = self.fixture.issue(61)
+        body = ticket_body(blocked_by=("61",))
+        second = self.fixture.issue(62, body=body)
+
+        result = self.fixture.stage(first, second)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = f"# {TITLES['62']}\n\n{body.rstrip()}\n"
+        self.assertEqual((self.fixture.run_dir() / "62.md").read_text(), expected)
+
+    def test_a_closed_native_outside_set_edge_is_spent_in_the_staged_copy(self):
+        self.fixture.issue(70, state="CLOSED")
+        ticket = self.fixture.issue(61, native_blocked_by=("70",))
+
+        result = self.fixture.stage(ticket)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        read = parsed(self.fixture.run_dir(), self.fixture.environment())
+        self.assertEqual(read["tickets"][0]["blocked_by"], [])
+        staged = (self.fixture.run_dir() / "61.md").read_text()
+        self.assertIn("70 (closed)", staged)
+        self.assertNotIn("#70", staged)
+
+    def test_an_open_native_outside_set_edge_is_a_named_blocking_item(self):
+        self.fixture.issue(70, state="OPEN")
+        ticket = self.fixture.issue(61, native_blocked_by=("70",))
+
+        result = self.fixture.stage(ticket)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("/crew ", result.stdout)
+        self.assertIn("70", result.stderr)
+        self.assertIn("61", result.stderr)
+
+    def test_native_dependency_projection_does_not_edit_the_tracker_body(self):
+        first = self.fixture.issue(61)
+        second = self.fixture.issue(62, native_blocked_by=("61",))
+        before = self.fixture.tracker_body("62")
+
+        result = self.fixture.stage(first, second)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.tracker_body("62"), before)
+        self.assertIn("#61", (self.fixture.run_dir() / "62.md").read_text())
 
 
 class ParentExpansionTests(unittest.TestCase):
