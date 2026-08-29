@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: deferred — decided but not built; #123 was closed 2026-08-28 without implementing Tracker
 ---
 
 # Tracker owns ticket operations; callers own workflow
