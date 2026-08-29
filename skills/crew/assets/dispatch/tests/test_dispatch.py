@@ -356,7 +356,7 @@ class ManualRolesTests(DispatchTestCase):
         ticket = self.fixture.ticket("136", "manual-roles")
         expected = shlex.join([
             "python3", str(CREW_SKILL_DIR / "assets" / "witness.py"),
-            "--escalation", "-", "--worktree", ".",
+            "check", "--escalation", "-", "--worktree", ".",
             "--model", WITNESS_MODEL,
             "--budget-usd", f"{WITNESS_BUDGET_USD:g}",
         ])

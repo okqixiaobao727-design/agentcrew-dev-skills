@@ -144,13 +144,16 @@ def block(text):
     return text.strip("\n")
 
 
-def render_witness_prompt(escalation, templates=None):
-    """One escalation filled into the library's public `[witness].prompt` template."""
+def render_witness_prompt(subject, templates=None, operation="check"):
+    """One operation filled into the library's shared Witness prompt."""
     templates = templates or load_templates()
-    return (
-        block(templates["witness"]["prompt"])
-        .replace("<ticket comment rule>", block(templates["ticket"]["comment_rule"]))
-        .replace("<escalation>", str(escalation).strip())
+    witness = templates["witness"]
+    return fill(
+        f"{block(witness['prompt'])}\n\n{block(witness[operation])}",
+        {
+            "<ticket comment rule>": block(templates["ticket"]["comment_rule"]),
+            f"<{operation} subject>": str(subject).strip(),
+        },
     )
 
 
@@ -250,7 +253,7 @@ def render_roles(spec, ticket, coordinator_name, coordinator_address, templates)
             ),
             "<witness command>": shlex.join([
                 "python3", str(WITNESS_SCRIPT),
-                "--escalation", "-", "--worktree", ".",
+                "check", "--escalation", "-", "--worktree", ".",
                 "--model", witness_model,
                 "--budget-usd", f"{witness_budget:g}",
             ]),

@@ -2577,7 +2577,7 @@ class Loop:
         try:
             result = subprocess.run(
                 [
-                    sys.executable, WITNESS, "--escalation", "-",
+                    sys.executable, WITNESS, "check", "--escalation", "-",
                     "--worktree", launch["worktree"],
                     "--model", witness_model,
                     "--budget-usd", f"{witness_budget_usd:g}",

@@ -96,19 +96,38 @@ def main():
     step = behaviour(attempt)
     if step == "fail":
         return 1
+    if step == "permission-denied":
+        print("permission denied for Bash(gh issue view:*)", file=sys.stderr)
+        return 7
+    if step == "witness-invalid-json":
+        print("{not json")
+        return 0
+    if step in ("witness-fail-write", "witness-timeout-write"):
+        (pathlib.Path(repo) / STRAY_FILE).write_text(f"{step} changed the worktree\n")
+        if step == "witness-fail-write":
+            print("session failed after writing", file=sys.stderr)
+            return 7
+        time.sleep(30)
+        return 0
     if step == "witness-timeout":
         time.sleep(30)
         return 0
-    if step in ("witness", "witness-write", "witness-rewrite"):
+    if step in (
+        "witness", "witness-write", "witness-rewrite", "witness-error",
+        "witness-partial-usage", "witness-no-usage",
+    ):
         if step == "witness-write":
             (pathlib.Path(repo) / STRAY_FILE).write_text("work nobody asked for\n")
         if step == "witness-rewrite":
             (pathlib.Path(repo) / "src" / "check.py").write_text("witness changed it\n")
-        print(json.dumps({
+        response = {
             "type": "result",
             "subtype": "success",
-            "is_error": False,
-            "result": os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
+            "is_error": step == "witness-error",
+            "result": os.environ.get(
+                "AGENTCREW_STUB_WITNESS_PROSE",
+                os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
+            ),
             "session_id": "witness-session",
             "usage": {
                 "input_tokens": 11,
@@ -116,7 +135,15 @@ def main():
                 "cache_read_input_tokens": 33,
                 "cache_creation_input_tokens": 44,
             },
-        }))
+        }
+        if step == "witness-partial-usage":
+            response["usage"].pop("cache_creation_input_tokens")
+        if step == "witness-no-usage":
+            response.pop("usage")
+        structured = os.environ.get("AGENTCREW_STUB_WITNESS_OUTPUT")
+        if structured is not None:
+            response["structured_output"] = json.loads(structured)
+        print(json.dumps(response))
         return 0
     if step == "noop":
         return 0

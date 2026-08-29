@@ -96,9 +96,17 @@ def main():
         }
         if os.environ.get("AGENTCREW_STUB_WITNESS_BEHAVIOUR") == "partial-usage":
             usage.pop("cache_creation_input_tokens")
+        cited = []
+        uncited = []
+        for line in os.environ["AGENTCREW_STUB_WITNESS_BRIEF"].splitlines():
+            target = uncited if line.startswith("uncited ") else cited
+            shaped = line.removeprefix("uncited ")
+            pointer, status, reason = shaped.split(" — ", 2)
+            target.append({"pointer": pointer, "status": status, "reason": reason})
         print(json.dumps({
             "is_error": False,
             "result": os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
+            "structured_output": {"cited": cited, "uncited": uncited},
             "usage": usage,
         }))
         return 0

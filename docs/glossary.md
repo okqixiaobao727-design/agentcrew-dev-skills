@@ -277,10 +277,11 @@ _Avoid_: question, ask (as a noun), progress report
 public interface that the child cannot make alone, most often before its first edit. All of a
 phase's decision points travel as one `design` escalation, the child's own pick marked on each.
 
-**Witness brief** — The fact-check a fresh, budget-capped cheap-model session attaches to one
-escalation: each pointered claim marked held, contradicted or missing, and no recommendation. A
-script launches it — the driver on a `CREW ASK`, or the child before sending in a run without a
-driver — so it reaches the coordinator beside the escalation without anyone choosing to ask for it.
+**Witness brief** — A pointer-backed, fact-only result from one fresh, read-only, budget-capped
+Witness session. An escalation `check` marks each cited pointer held, contradicted or missing and is
+launched automatically by the driver, or by the child before sending in a run without a driver. An
+`ask` is coordinator-initiated and returns independently stated factual claims, each with at least
+one pointer. Both carry no recommendation or ruling.
 _Avoid_: research, verification
 
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers

@@ -30,12 +30,19 @@ blocks known destructive command shapes; this rule stands where the hook misses.
 **Judgment material is read whole; facts are delegated** — read `<run-dir>/spec.md` whole at run
 start, before the first ruling: staging generated it as this run's **Reference index** to the
 maintainer-authored Markdown the coordinator may read whole. The hook compares physical locations.
-Code, tests and git remain facts for the witness brief, which checks every pointer the child cites
-and recommends nothing. Where the child
-and the brief state a fact differently, one bounded `Read` settles it: that pointer, an explicit
-offset, 80 lines at most. `Grep`, `Glob` and shell file reads are hunts and the hook refuses them;
-`gh issue view` stays open because the tracker is the ticket. A message lacking what a ruling needs
-is answered by asking its sender for exactly what it lacks.
+Code, tests and git remain facts for the witness brief. The driver checks every escalation pointer
+automatically. When a ruling needs an uncited fact, ask the same Witness directly:
+
+```bash
+python3 <crew-skill-dir>/assets/witness.py ask \
+  --run <run-dir> --ticket <NN> --question '<one factual question>'
+```
+
+Both operations return pointer-backed facts and no recommendation. Where the child and the brief
+state a fact differently, one bounded `Read` settles it: that pointer, an explicit offset, 80 lines
+at most. `Grep`, `Glob` and shell file reads are hunts and the hook refuses them; `gh issue view`
+stays open because the tracker is the ticket. A message lacking what a ruling needs is answered by
+asking its sender for exactly what it lacks.
 
 **A ruling is one decision and its action** — pick an option, redirect, or sketch pseudocode —
 and the child writes the edit: product code belongs to a child, merge-conflict resolution included.
