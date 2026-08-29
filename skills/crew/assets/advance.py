@@ -5,13 +5,13 @@
                        --out-dir <launch artifacts> --repair-model <full model ID>
 
 One settled wave in, one decision out. The wave is landed through the merge driver; when every
-ticket either came back `landable` and merged or is `parked` with no descendants, the next wave
-is launched through the dispatch renderer and the operator is toasted. Nobody is consulted on
-the way: the plan the user approved up front is the whole authority this needs (ADR-0001).
+ticket either came back `landable` and merged or is `parked` with no descendants, the following
+wave is returned to the Driver for activation. Nobody is consulted on the way: the plan the user
+approved up front is the whole authority this needs (ADR-0001, ADR-0024).
 
-The four decisions, each recorded once in the machine log as an `advance` event:
+The four decisions recorded in the machine log as `advance` events:
 
-    launched     the next wave is running, and the toast says so
+    launched     written by the Driver after the next wave activates successfully
     complete     that was the last wave; the run has nothing left to advance to
     escalated    a ticket failed, a parked ticket has descendants, or did not merge — the chain
                  stops here; the coordinator rules, woken by the child's own message rather than
@@ -29,7 +29,7 @@ run would start the same next wave again, in the worktrees the first one is work
 that escalated or was interrupted is not refused — re-running it is how the run carries on.
 
 An interrupt — SIGINT or SIGTERM, the operator's Ctrl-C in the run's window — is taken at the
-next step boundary. The merge or launch already in flight is left to finish, and is shielded from
+next step boundary. The merge already in flight is left to finish, and is shielded from
 the signal that reached this script, because a step torn down halfway is exactly the corrupted run
 state the operator interrupted to avoid.
 
@@ -37,7 +37,7 @@ One line per step is printed, the merge driver's own lines among them:
 
     06 clean 4f1c…
     07 clean 9ab2…
-    wave 2 launched 08, 09
+    wave 2 ready 08, 09
 
 Exit 0 when the run advanced or finished, 1 when it escalated, 130 when it was interrupted.
 """
@@ -48,8 +48,8 @@ import signal
 import subprocess
 import sys
 
-# The branch a ticket's worktree stands on is the dispatch renderer's naming, and the renderer is
-# what launches a wave, so both come from the one script that owns them.
+# The branch a ticket's worktree stands on is the dispatch renderer's naming, so it comes from the
+# one script that owns it.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
 import dispatch  # noqa: E402
 import machine_log  # noqa: E402
@@ -58,9 +58,6 @@ import run_plan  # noqa: E402
 ASSETS = pathlib.Path(__file__).resolve().parent
 MACHINE_LOG = ASSETS / "machine_log.py"
 MERGE_DRIVER = ASSETS / "merge_driver.py"
-DISPATCH = ASSETS / "dispatch" / "dispatch.py"
-
-TMUX_BIN = "tmux"
 
 LANDABLE = machine_log.LANDABLE
 COMPLETED = machine_log.COMPLETED
@@ -100,7 +97,7 @@ def run_shielded(command):
     """Run one step of the chain, shielded from the signal that stops the chain itself.
 
     A step gets its own session, so the interrupt an operator sends this script's process group
-    does not reach a merge or a launch that is already under way: the chain stops between steps,
+    does not reach a merge that is already under way: the chain stops between steps,
     with every step it took either finished or never started.
     """
     return subprocess.run(command, capture_output=True, text=True, start_new_session=True)
@@ -159,39 +156,6 @@ def land(table_path, wave, options):
         # driver's, printed where a caller reads it.
         raise AdvanceError((result.stderr or result.stdout).strip())
     return lines
-
-
-def launch(table_path, wave, base_commit, options):
-    """Launch the wave through the dispatch renderer, and return the lines it printed."""
-    result = run_shielded([
-        sys.executable, str(DISPATCH), "dispatch",
-        "--table", str(table_path), "--wave", str(wave),
-        "--out-dir", str(options["out_dir"]),
-        "--log", str(options["log"]),
-        "--base-commit", base_commit,
-    ])
-    return result.returncode == 0, (result.stdout + result.stderr).splitlines()
-
-
-def toast(text):
-    """Show one milestone in the operator's terminal, on the channel no model reads."""
-    try:
-        subprocess.run([TMUX_BIN, "display-message", text], capture_output=True, text=True)
-    except OSError:
-        # A run watched from outside tmux still advances; the toast is the operator's, not the
-        # run's.
-        pass
-
-
-def landed_head(run):
-    """The commit the integration branch stands at, which is what the next wave is cut from."""
-    result = subprocess.run(
-        ["git", "-C", run.repo_root, "rev-parse", run.integration_branch],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise AdvanceError(f"git rev-parse: {(result.stderr or result.stdout).strip()}")
-    return result.stdout.strip()
 
 
 # --- the decisions --------------------------------------------------------------------------------
@@ -254,7 +218,6 @@ def stop_short(wave, options, passed_over=()):
 
 def advance_wave(plan, table_path, wave, options, interrupt):
     """Advance the run past `wave`; returns `(the lines to print, the exit code)`."""
-    run = plan.run
     tickets = plan.wave(wave).tickets
 
     records = machine_log.read_records(options["log"])
@@ -317,22 +280,8 @@ def advance_wave(plan, table_path, wave, options, interrupt):
         record(options, wave, COMPLETE, detail)
         return lines + list(passed_over) + [f"wave {wave} {COMPLETE}"], 0
 
-    launched, launch_lines = launch(table_path, following, landed_head(run), options)
-    if not launched:
-        detail = decision_detail(
-            f"wave {following} did not launch: " + "; ".join(launch_lines), passed_over
-        )
-        record(options, following, ESCALATED, detail)
-        return (
-            lines + launch_lines + list(passed_over)
-            + [f"wave {following} {ESCALATED} {detail}"], ESCALATED_EXIT
-        )
-
     children = ", ".join(ticket.id for ticket in plan.wave(following).tickets)
-    detail = decision_detail(f"advanced from wave {wave}: {children}", passed_over)
-    record(options, following, LAUNCHED, detail)
-    toast(f"crew wave {following} {LAUNCHED}")
-    return lines + launch_lines + list(passed_over) + [f"wave {following} {LAUNCHED} {children}"], 0
+    return lines + list(passed_over) + [f"wave {following} ready {children}"], 0
 
 
 def parse_args(argv):
@@ -365,7 +314,6 @@ def main(argv=None):
 
     options = {
         "log": args.log,
-        "out_dir": args.out_dir,
         "repair_model": args.repair_model,
         "repair_budget": args.repair_budget_usd,
         "repair_attempts": args.repair_attempts,

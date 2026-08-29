@@ -37,6 +37,7 @@ The intended result shape is:
 @dataclass(frozen=True)
 class RunProjection:
     tickets: Mapping[str, TicketFacts]
+    latest_landed_merge: Mapping[str, object] | None
     current_wave: int
     ended: bool
     halted: bool
@@ -50,6 +51,7 @@ class TicketFacts:
     events: tuple[Mapping[str, object], ...]
     first_launch: Mapping[str, object] | None
     launch: Mapping[str, object] | None
+    launch_verification_failed: bool
     receipt: Mapping[str, object] | None
     latest_settling_event: Mapping[str, object] | None
     progress_event: Mapping[str, object] | None
@@ -80,8 +82,12 @@ re-derive a named projection fact from them.
 - Physical JSONL order is authoritative. A timestamp is data, never a sort key.
 - A snapshot never changes after construction. A caller explicitly reads again after an external
   action; in particular, advance keeps its read before landing and its second read afterwards.
+- `latest_landed_merge` is the last physical `merge` record whose result is `clean`, `resolved`,
+  or `repaired`, across the whole run. Its `sha` is the integration branch's code landing point.
 - First and latest launch remain distinct. The latest launch includes the verified amendment that
   follows a provisional launch; the first launch starts report duration.
+- `launch_verification_failed` is true only when `launch-failed` follows the latest `launch`.
+  It is false without a launch, and a newer launch clears it.
 - `escalation` and `witness` are the latest checked pair. A later escalation replaces the first
   and clears the second until its own witness event arrives, so an older fact-check cannot be
   paired with a newer escalation. The handed-over ruling consumes the pending message but retains
@@ -348,14 +354,15 @@ without this event remain readable and their report says `not recorded`.
 ### `advance` — what the run decided after a wave settled
 
 `wave`, `decision`, `detail`. The one event that carries no `ticket`: a decision is about a wave.
-`decision` is one of the four the advance driver reaches
-([`docs/wave-advance.md`](wave-advance.md)), or the fifth the wave loop appends itself:
+`decision` is in the existing closed set shared by the advance command and Driver
+([`docs/wave-advance.md`](wave-advance.md)). The command records landing outcomes; the Driver
+records `launched` only after activation succeeds, and records `escalated` when activation fails:
 
 | `decision` | Meaning |
 | --- | --- |
 | `launched` | the next wave is running; `wave` is the wave that started |
 | `complete` | that was the last wave of the run |
-| `escalated` | a ticket failed, parked or did not land, and the chain stopped |
+| `escalated` | landing or activation could not continue without recovery |
 | `interrupted` | the operator stopped the run |
 | `stopped` | the run ended on an escalation the rule table had already settled |
 

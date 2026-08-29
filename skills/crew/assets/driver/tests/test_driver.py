@@ -1252,10 +1252,19 @@ class LoopTests(DriverTestCase):
     def test_a_clean_run_settles_every_wave_and_ends_without_one_wake(self):
         process = self.start(("01", ()), ("02", ("01",)))
 
-        self.fixture.completes("01")
+        first_head = self.fixture.commit_work("01")
+        self.fixture.says("01", f"CREW COMPLETE {first_head}")
         self.assertTrue(
             self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
             "the run never advanced to wave 2",
+        )
+        self.assertEqual(
+            git(
+                self.fixture.worktree("02"),
+                "merge-base", "--is-ancestor", first_head, "HEAD",
+            ).returncode,
+            0,
+            "wave 2 was not cut from the integration state wave 1 landed",
         )
         self.fixture.completes("02")
         snapshot = self.woken(process, "run-complete")
@@ -1271,6 +1280,66 @@ class LoopTests(DriverTestCase):
         self.assertEqual(self.events("ruling"), [], "a clean run instructed a child")
         settings = self.fixture.settings(self.fixture.repo / ".claude" / "settings.local.json")
         self.assertNotIn("bounded_read.py", json.dumps(settings))
+
+    def test_next_wave_precedes_the_tracker_close_commit_and_outcome(self):
+        process = self.start(("01", ()), ("02", ("01",)))
+        first_head = self.fixture.commit_work("01")
+        self.fixture.says("01", f"CREW COMPLETE {first_head}")
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: (
+                    self.fixture.verified_launch("02") is not None
+                    and self.events("outcome", ticket="01", outcome="completed")
+                )
+            ),
+            "wave 2 activation and the later tracker close never completed",
+        )
+
+        integration_branch = self.fixture.table()["run"]["integration_branch"]
+        tracker_close = git(
+            self.fixture.repo, "rev-parse", integration_branch
+        ).stdout.strip()
+        wave_head = git(self.fixture.worktree("02"), "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(
+            git(
+                self.fixture.worktree("02"),
+                "merge-base", "--is-ancestor", first_head, wave_head,
+            ).returncode,
+            0,
+            "wave 2 does not contain wave 1's landed code",
+        )
+        self.assertNotEqual(wave_head, tracker_close)
+        self.assertNotEqual(
+            git(
+                self.fixture.worktree("02"),
+                "merge-base", "--is-ancestor", tracker_close, wave_head,
+            ).returncode,
+            0,
+            "wave 2 contains the later tracker-close commit",
+        )
+
+        records = self.fixture.log_records()
+        launch = max(
+            index for index, record in enumerate(records)
+            if record.get("event") == "launch" and record.get("ticket") == "02"
+        )
+        launched = next(
+            index for index, record in enumerate(records)
+            if record.get("event") == "advance"
+            and record.get("decision") == "launched"
+            and str(record.get("wave")) == "2"
+        )
+        completed = next(
+            index for index, record in enumerate(records)
+            if record.get("event") == "outcome"
+            and record.get("ticket") == "01"
+            and record.get("outcome") == "completed"
+        )
+        self.assertLess(launch, launched)
+        self.assertLess(launched, completed)
+
+        self.fixture.completes("02")
+        self.woken(process, "run-complete")
 
     def test_a_completed_run_writes_the_report_and_names_it_in_the_final_snapshot(self):
         process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
@@ -3193,6 +3262,211 @@ class AdoptionTests(DriverTestCase):
         }
         with (self.fixture.run_dir / "log.jsonl").open("a") as handle:
             handle.write(json.dumps(record) + "\n")
+
+    def test_a_true_pre_launch_failure_is_dispatched_by_the_next_start(self):
+        self.feature(("01", ()))
+        failure = self.fixture.stub_dir / "tmux-new-window-fails"
+        failure.write_text("yes\n")
+
+        first = self.fixture.start()
+
+        first_snapshot = self.snapshot(first)
+        self.assertEqual(first_snapshot["reason"], "driver-error")
+        self.assertIn("resume", first_snapshot)
+        self.assertEqual(self.events("launch", ticket="01"), [])
+
+        failure.unlink()
+        recovered = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "the next start never dispatched the ticket whose first launch never began",
+        )
+        self.fixture.completes("01")
+        self.woken(recovered, "run-complete")
+
+        self.assertEqual(len(self.events("launch", ticket="01")), 2)
+
+    def test_a_partial_next_wave_commits_only_after_missing_work_is_recovered(self):
+        self.feature(("01", ()), ("02", ("01",)), ("03", ("01",)))
+        process = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "wave 1 never launched",
+        )
+        failure = self.fixture.stub_dir / "tmux-new-window-fails-for"
+        failure.write_text("03\n")
+
+        self.fixture.completes("01")
+        first_snapshot = self.woken(process, "driver-error")
+
+        self.assertIn("resume", first_snapshot)
+        attempts = self.events("advance", wave="2")
+        self.assertEqual([event["decision"] for event in attempts], ["escalated"])
+        self.assertEqual(
+            driver_module.machine_log.project(self.fixture.log_records()).current_wave,
+            1,
+        )
+        self.assertIsNotNone(self.fixture.verified_launch("02"))
+        self.assertIsNone(self.fixture.launch_record("03"))
+        pure_code_base = git(self.fixture.worktree("02"), "rev-parse", "HEAD").stdout.strip()
+        tracker_close = git(
+            self.fixture.repo,
+            "rev-parse",
+            self.fixture.table()["run"]["integration_branch"],
+        ).stdout.strip()
+        self.assertNotEqual(pure_code_base, tracker_close)
+
+        failure.unlink()
+        recovered = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("03") is not None),
+            "the recovered activation never dispatched only the missing ticket",
+        )
+        recovered_base = git(self.fixture.worktree("03"), "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(recovered_base, pure_code_base)
+        self.assertNotEqual(recovered_base, tracker_close)
+        self.fixture.completes("02")
+        self.fixture.completes("03")
+        self.woken(recovered, "run-complete")
+
+        self.assertEqual(len(self.events("launch", ticket="02")), 2)
+        self.assertEqual(len(self.events("launch", ticket="03")), 2)
+        attempts = self.events("advance", wave="2")
+        self.assertEqual(
+            [event["decision"] for event in attempts], ["escalated", "launched", "complete"]
+        )
+        self.assertEqual(
+            driver_module.machine_log.project(self.fixture.log_records()).current_wave,
+            2,
+        )
+
+    def test_a_partial_dispatch_restores_one_current_hook_for_the_started_sibling(self):
+        self.feature(("01", ()), ("02", ("01",)), ("03", ("01",)))
+        process = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "wave 1 never launched",
+        )
+        (self.fixture.stub_dir / "tmux-new-window-fails-for").write_text("03\n")
+
+        self.fixture.completes("01")
+        snapshot = self.woken(process, "driver-error")
+
+        self.assertIn("resume", snapshot)
+        settings = self.fixture.settings(
+            self.fixture.worktree("02") / ".claude" / "settings.local.json"
+        )
+        current_hooks = [
+            hook["command"]
+            for block in settings.get("hooks", {}).get("PostToolUse", [])
+            for hook in block.get("hooks", [])
+            if str(self.fixture.run_dir / "log.jsonl") in hook.get("command", "")
+            and "--role child" in hook.get("command", "")
+            and "--ticket 02" in hook.get("command", "")
+        ]
+        self.assertEqual(len(current_hooks), 1, settings)
+
+    def test_an_unrecorded_observable_child_is_adopted_without_a_second_launch(self):
+        self.interrupted(("01", ()))
+        launches = list(self.fixture.launches())
+
+        self.fixture.edit_log(lambda records: [
+            record for record in records
+            if not (record.get("event") == "launch" and record.get("ticket") == "01")
+        ])
+        self.assertIsNone(self.fixture.launch_record("01"))
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.launch_record("01") is not None),
+            "activation never adopted the observable child into the Machine log",
+        )
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(self.fixture.launches(), launches, "the observed child was launched twice")
+        self.assertEqual(len(self.events("launch", ticket="01")), 1)
+
+    def test_a_launch_failed_child_is_reverified_and_adopted_without_redispatch(self):
+        self.feature(("01", ()))
+
+        first = self.fixture.start(env_overrides={
+            "AGENTCREW_STUB_TRANSCRIPT_MODEL": "claude-haiku-4-5-20251001",
+        })
+
+        first_snapshot = self.snapshot(first)
+        self.assertEqual(first_snapshot["reason"], "driver-error")
+        self.assertIn("resume", first_snapshot)
+        self.assertEqual(len(self.events("launch", ticket="01")), 1)
+        self.assertEqual(len(self.events("launch-failed", ticket="01")), 1)
+        launches = list(self.fixture.launches())
+        agent = json.loads(next(self.fixture.stub_dir.glob("agents-*.json")).read_text())[0]
+        transcript = next(
+            (self.fixture.config_dir / "projects").glob(f"*/{agent['sessionId']}.jsonl")
+        )
+        transcript.write_text(
+            transcript.read_text().replace("claude-haiku-4-5-20251001", CLAUDE_MODEL)
+        )
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.events("launch", ticket="01")) == 2),
+            "the failed launch's live child was not adopted after re-verification",
+        )
+        self.fixture.completes("01")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(self.fixture.launches(), launches, "launch-failed was redispatched")
+        ticket_events = [
+            event["event"] for event in self.fixture.log_records()
+            if event.get("ticket") == "01" and event.get("event") in ("launch", "launch-failed")
+        ]
+        self.assertEqual(ticket_events, ["launch", "launch-failed", "launch"])
+
+    def test_a_launch_failed_child_that_still_fails_verification_is_reported(self):
+        self.feature(("01", ()))
+        first = self.fixture.start(env_overrides={
+            "AGENTCREW_STUB_TRANSCRIPT_MODEL": "claude-haiku-4-5-20251001",
+        })
+        self.assertEqual(self.snapshot(first)["reason"], "driver-error")
+        launches = list(self.fixture.launches())
+
+        retried = self.fixture.start()
+
+        retried_snapshot = json.loads([
+            line for line in retried.stdout.splitlines() if line.strip()
+        ][-1])
+        self.assertEqual(retried_snapshot["reason"], "driver-error")
+        self.assertIn("resume", retried_snapshot)
+        self.assertIn("failed re-verification", retried_snapshot["detail"])
+        self.assertIn("model mismatch", retried_snapshot["detail"])
+        self.assertEqual(self.fixture.launches(), launches, "launch-failed was redispatched")
+        self.assertEqual(len(self.events("launch", ticket="01")), 1)
+
+    def test_an_unknown_live_source_dispatches_nothing_and_reports_resume(self):
+        self.feature(("01", ()))
+        failure = self.fixture.stub_dir / "tmux-new-window-fails"
+        failure.write_text("yes\n")
+        first = self.fixture.start()
+        self.assertEqual(self.snapshot(first)["reason"], "driver-error")
+        failure.unlink()
+
+        cache = self.fixture.config_dir / "agentcrew" / "agents-cache.json"
+        cache.unlink(missing_ok=True)
+        claude = self.fixture.bin_dir / "claude"
+        claude.write_text("#!/bin/sh\nexit 7\n")
+        claude.chmod(0o755)
+
+        retried = self.fixture.start()
+
+        snapshot = json.loads([
+            line for line in retried.stdout.splitlines() if line.strip()
+        ][-1])
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn("resume", snapshot)
+        self.assertIn("unknown", snapshot["detail"])
+        self.assertEqual(self.events("launch", ticket="01"), [])
+        self.assertEqual(self.fixture.launches(), [])
 
     def test_re_invoking_the_driver_over_an_unfinished_run_adopts_it(self):
         self.interrupted(("01", ()), ("02", ("01",)))

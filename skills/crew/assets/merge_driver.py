@@ -608,9 +608,13 @@ def land_wave(plan, wave, options):
     for ticket in tickets:
         number = ticket.id
         branch = dispatch.branch_name(ticket)
-        receipt = projection.ticket(number).receipt or {}
+        facts = projection.ticket(number)
+        receipt = facts.receipt or {}
         if receipt.get("verdict") != LANDABLE:
             lines.append(f"{number} skipped {receipt.get('verdict') or 'no receipt'}")
+            continue
+        if facts.merge_landed:
+            lines.append(f"{number} skipped already landed")
             continue
         unverified = unverified_reason(run.repo_root, branch, receipt)
         if unverified:

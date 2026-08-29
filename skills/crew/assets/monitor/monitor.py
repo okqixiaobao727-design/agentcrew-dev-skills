@@ -705,6 +705,15 @@ def table_bindings(plan):
     return named
 
 
+def _source_map(run_dir, timeout, bindings, claude_reader):
+    """Return one binding-to-lanes map after reading the run-wide Codex source once."""
+    codex = codex_states(run_dir, timeout)
+    return {
+        binding: {CLAUDE: claude_reader(binding), CODEX: codex}
+        for binding in bindings
+    }
+
+
 def live_sources(claude_bin, run_dir, timeout=None, records=(), bindings=(None,)):
     """What each lane says about the children of each account binding the run touches.
 
@@ -714,16 +723,41 @@ def live_sources(claude_bin, run_dir, timeout=None, records=(), bindings=(None,)
     Codex lane is asked once for the run and shared, because a Codex child's bridge state lives in
     the run directory and no Claude profile has anything to say about it.
     """
-    codex = codex_states(run_dir, timeout)
     # The one line a frame may record about falling back, shared by every account it reads.
     announced = []
-    return {
-        binding: {
-            CLAUDE: claude_states(claude_bin, run_dir, timeout, records, binding, announced),
-            CODEX: codex,
-        }
-        for binding in bindings
-    }
+    return _source_map(
+        run_dir,
+        timeout,
+        bindings,
+        lambda binding: claude_states(
+            claude_bin, run_dir, timeout, records, binding, announced
+        ),
+    )
+
+
+def _fresh_claude_states(claude_bin, timeout, binding):
+    """Read one binding without the fallback cache, or return None when it is unknown."""
+    states = session_states(timeout, binding.directory if binding else None)
+    if states is OUT_OF_TIME:
+        return None
+    if states is not None:
+        return states
+    return agent_states(claude_bin, timeout, binding)
+
+
+def fresh_live_sources(claude_bin, run_dir, timeout=None, bindings=(None,)):
+    """Return uncached live sources for decisions that must not repeat a dispatch.
+
+    Sessions files remain the primary Claude source. An unavailable directory falls straight
+    through to one CLI read per binding, while an exhausted file-read budget and a failed CLI are
+    both unknown. The agents cache and live-source audit record are deliberately untouched.
+    """
+    return _source_map(
+        run_dir,
+        timeout,
+        bindings,
+        lambda binding: _fresh_claude_states(claude_bin, timeout, binding),
+    )
 
 
 def read_plan(run_dir):

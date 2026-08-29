@@ -3,13 +3,11 @@
 
 Every fixture is a real git repository holding a three-wave table, a machine log carrying the
 receipts the monitor would have written, and a stub PATH. What is asserted is external only: the
-git graph the wave left behind, the lines the machine log gained, the toast tmux was asked to
-display, the children the next wave launched, and the exit code.
+git graph the wave left behind, the lines the machine log gained, the next Wave returned to the
+Driver, and the exit code.
 
-The driver lands a wave through the real merge driver and launches the next through the real
-dispatch renderer, so the world these tests stub is those two scripts' world — their own stub
-`claude` and `tmux`, borrowed rather than copied, so a change to what a launch looks like reaches
-this suite too.
+Advance lands a Wave through the real merge driver. Driver activation owns every launch
+(ADR-0024), so this suite proves advance does not cross that boundary.
 """
 
 import json
@@ -289,7 +287,7 @@ class AdvanceTestCase(unittest.TestCase):
 
 
 class GreenWaveTests(AdvanceTestCase):
-    """A wave that ends all green lands and launches the next one, consulting nobody."""
+    """A green Wave lands and returns the following Wave to Driver activation."""
 
     def green_wave_one(self):
         return {
@@ -297,7 +295,7 @@ class GreenWaveTests(AdvanceTestCase):
             for number, slug, _ in WAVES[1]
         }
 
-    def test_a_green_wave_lands_and_launches_the_next_wave(self):
+    def test_a_green_wave_lands_and_returns_the_next_wave(self):
         heads = self.green_wave_one()
 
         result = self.fixture.advance(1)
@@ -305,53 +303,41 @@ class GreenWaveTests(AdvanceTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for number, head in heads.items():
             self.assertTrue(self.fixture.merged(head), f"{number} did not land:\n{result.stdout}")
-        launched = sorted(
-            pathlib.Path(launch["cwd"]).name for launch in self.fixture.launches()
-        )
-        self.assertEqual(launched, ["08-monitor-dashboard", "09-merge-driver"])
+        self.assertIn("wave 2 ready 08, 09", result.stdout)
+        self.assertEqual(self.fixture.launches(), [])
 
-    def test_the_next_wave_is_cut_from_the_state_this_wave_landed(self):
+    def test_the_integration_branch_contains_every_landed_ticket_before_control_returns(self):
         heads = self.green_wave_one()
 
         self.fixture.advance(1)
 
+        for landed in heads.values():
+            self.assertTrue(self.fixture.merged(landed))
         for number, slug, _ in WAVES[2]:
-            worktree = self.fixture.worktree(number, slug)
-            for landed in heads.values():
-                self.assertEqual(
-                    run_git(worktree, "merge-base", "--is-ancestor", landed, "HEAD",
-                            check=False).returncode,
-                    0,
-                    f"{number} was cut from a commit {landed} is not in",
-                )
+            self.assertFalse(self.fixture.worktree(number, slug).exists())
 
-    def test_every_child_the_next_wave_started_is_in_the_log(self):
-        """The launch events are dispatch's, so advancing leaves the launched set readable."""
+    def test_advance_writes_no_launch_fact_for_the_wave_it_only_identified(self):
         self.green_wave_one()
 
         self.fixture.advance(1)
 
         started = [record for record in self.fixture.records("launch")
                    if record["ticket"] in ("08", "09")]
-        self.assertEqual(
-            [record["ticket"] for record in started], ["08", "08", "09", "09"], started
-        )
-        self.assertEqual([record["child"] for record in started[::2]], ["", ""])
-        self.assertTrue(all(record["child"] for record in started[1::2]), started)
+        self.assertEqual(started, [])
 
-    def test_the_milestone_toast_names_the_wave_that_launched(self):
+    def test_advance_does_not_toast_a_wave_the_driver_has_not_activated(self):
         self.green_wave_one()
 
         self.fixture.advance(1)
 
-        self.assertIn("crew wave 2 launched", self.fixture.toasts())
+        self.assertEqual(self.fixture.toasts(), [])
 
-    def test_the_decision_to_launch_is_recorded_against_the_wave_it_launched(self):
+    def test_advance_does_not_commit_the_wave_before_driver_activation(self):
         self.green_wave_one()
 
         self.fixture.advance(1)
 
-        self.assertOneDecision(2, "launched")
+        self.assertEqual(self.advance_events(), [])
 
     def test_advancing_costs_the_coordinator_nothing(self):
         """No model was run, and nothing was sent to or from the coordinator (ADR-0001)."""
@@ -370,13 +356,17 @@ class GreenWaveTests(AdvanceTestCase):
         """A second run would start the next wave in the worktrees the first one is working in."""
         self.green_wave_one()
         self.fixture.advance(1)
+        self.fixture.log_event(
+            "advance", "--wave", "2", "--decision", "launched",
+            "--detail", "Driver activation committed wave 2",
+        )
 
         again = self.fixture.advance(1)
 
         self.assertNotEqual(again.returncode, 0)
         self.assertIn("wave 1", again.stderr)
         self.assertOneDecision(2, "launched")
-        self.assertEqual(len(self.fixture.launches()), 2)
+        self.assertEqual(self.fixture.launches(), [])
 
     def test_a_run_that_escalated_may_be_advanced_again_once_it_is_settled(self):
         """A halt is where the coordinator rules; the run carries on from the same command."""
@@ -388,7 +378,8 @@ class GreenWaveTests(AdvanceTestCase):
         again = self.fixture.advance(1)
 
         self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
-        self.assertEqual(len(self.fixture.launches()), 2)
+        self.assertIn("wave 2 ready 08, 09", again.stdout)
+        self.assertEqual(self.fixture.launches(), [])
 
     def test_a_resumed_wave_advances_after_its_tracker_outcomes_completed(self):
         """The ticket-104 incident: tracker close outcomes must not un-settle landed work."""
@@ -405,17 +396,15 @@ class GreenWaveTests(AdvanceTestCase):
         result = self.fixture.advance(2)
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        decision = self.assertOneDecision(3, "launched")
+        self.assertEqual(self.advance_events(), [])
         for number in ("08", "09"):
             self.assertIn(
                 f"{number} completed passed over as already landed",
-                decision.get("detail", ""),
+                result.stdout,
             )
         self.assertNotIn("settled completed", result.stdout + result.stderr)
-        self.assertEqual(
-            [pathlib.Path(launch["cwd"]).name for launch in self.fixture.launches()],
-            ["11-skill-body"],
-        )
+        self.assertIn("wave 3 ready 11", result.stdout)
+        self.assertEqual(self.fixture.launches(), [])
 
     def test_the_last_wave_ends_the_run_instead_of_launching(self):
         self.fixture.settled_ticket("11", "skill-body")
@@ -437,16 +426,13 @@ class ParkedAdvanceTests(AdvanceTestCase):
         result = self.fixture.advance(2)
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        event = self.assertOneDecision(3, "launched")
-        detail = event.get("detail", "")
-        self.assertIn("09", detail)
-        self.assertIn("parked", detail)
-        self.assertIn("settled", detail)
+        self.assertEqual(self.advance_events(), [])
+        self.assertIn("09", result.stdout)
+        self.assertIn("parked", result.stdout)
+        self.assertIn("settled", result.stdout)
         self.assertIn("passed over as settled", result.stdout)
-        launched = sorted(
-            pathlib.Path(launch["cwd"]).name for launch in self.fixture.launches()
-        )
-        self.assertEqual(launched, ["11-skill-body"])
+        self.assertIn("wave 3 ready 11", result.stdout)
+        self.assertEqual(self.fixture.launches(), [])
 
     def test_a_last_wave_with_only_a_parked_ticket_records_completion(self):
         self.fixture.settled_ticket("11", "skill-body", verdict="parked")

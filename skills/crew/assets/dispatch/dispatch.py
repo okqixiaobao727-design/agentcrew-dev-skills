@@ -2,10 +2,11 @@
 """Render and launch a wave of crew children from the approved wave table.
 
     render    validate the table and write each child's launch artifacts, launching nothing
-    dispatch  render, then prepare and launch every child of one wave and verify it started
-              on the model the table approved — a Claude child from its entry in the live
-              agents list and the model its own transcript records, a Codex child from the
-              model the bridge pinned into its state file
+    dispatch  render, then prepare and launch the children selected by repeated `--ticket-id`
+              arguments from one `--wave`, in their wave-table order, and verify each started on
+              the model the table approved — a Claude child from its entry in the live agents
+              list and the model its own transcript records, a Codex child from the model the
+              bridge pinned into its state file
     roles     print the manual advisor and developer prompts for one spec and ticket, naming
               the coordinator address the developer sends to
 
@@ -73,9 +74,11 @@ Each launched child is confirmed on one line, which is the whole of what the coo
     06 launched claude <model> <effort> window=@3 name=<agent name> pid=<pid> session=<id>
     06 FAILED <what went wrong>
 
-Exit 0 when every child of the wave launched, verified, and — under `--log` — was recorded,
-1 otherwise: a child the log missed is one wave advancement cannot see, so the wave has not
-advanced whatever the child is doing.
+`dispatch` requires at least one `--ticket-id`, rejects the whole request when any selected id is
+outside the named Wave, and never uses argument order as a second routing order. Exit 0 when every
+selected child launched, verified, and — under `--log` — was recorded, 1 otherwise: a child the
+log missed is one wave advancement cannot see, so the Wave has not activated whatever the child
+is doing.
 """
 
 import argparse
@@ -960,6 +963,10 @@ def parse_args(argv):
     parser.add_argument("command", choices=("render", "dispatch", "roles"))
     parser.add_argument("--table", help="the approved wave table, as JSON")
     parser.add_argument("--wave", type=int, help="which wave of it to render")
+    parser.add_argument(
+        "--ticket-id", action="append", dest="ticket_ids",
+        help="a ticket the dispatch command must launch; repeat for each selected ticket",
+    )
     parser.add_argument("--out-dir", help="where launch artifacts are written")
     parser.add_argument("--spec", help="the spec path for manual role prompts")
     parser.add_argument("--ticket", help="the ticket path for the manual developer prompt")
@@ -995,6 +1002,10 @@ def parse_args(argv):
     missing = [f"--{name.replace('_', '-')}" for name in required if getattr(args, name) is None]
     if missing:
         parser.error(f"{args.command} requires {' '.join(missing)}")
+    if args.command == "dispatch" and not args.ticket_ids:
+        parser.error("dispatch requires --ticket-id")
+    if args.command != "dispatch" and args.ticket_ids:
+        parser.error(f"{args.command} does not accept --ticket-id")
     return args
 
 
@@ -1024,6 +1035,17 @@ def main(argv=None):
                 ),
             )
         tickets = plan.wave(args.wave).tickets
+        if args.command == "dispatch":
+            selected = set(args.ticket_ids)
+            unknown = [ticket for ticket in dict.fromkeys(args.ticket_ids)
+                       if ticket not in {item.id for item in tickets}]
+            if unknown:
+                print(
+                    f"wave {args.wave} does not contain ticket ids: {', '.join(unknown)}",
+                    file=sys.stderr,
+                )
+                return 1
+            tickets = tuple(ticket for ticket in tickets if ticket.id in selected)
     except run_plan.RunPlanError as error:
         for problem in error.problems:
             print(problem, file=sys.stderr)

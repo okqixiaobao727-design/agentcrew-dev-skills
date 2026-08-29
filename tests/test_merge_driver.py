@@ -275,6 +275,25 @@ class CleanMergeTests(MergeDriverTestCase):
         self.assertEqual(self.fixture.events("escalation"), [])
         self.assertOnIntegrationBranch()
 
+    def test_a_logged_landing_is_not_repeated_after_a_tracker_close_commit(self):
+        self.fixture.ticket("07", "alpha", {"alpha.txt": "alpha\n"})
+        first = self.fixture.land()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.fixture.events("merge")), 1)
+
+        self.fixture.commit_on_integration(
+            "tracker-close.txt", "closed\n", "close ticket 07 in tracker"
+        )
+        administrative_head = git_out(self.fixture.repo, "rev-parse", "HEAD")
+
+        repeated = self.fixture.land()
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertIn("07 skipped already landed", repeated.stdout)
+        self.assertEqual(len(self.fixture.events("merge")), 1)
+        self.assertEqual(git_out(self.fixture.repo, "rev-parse", "HEAD"), administrative_head)
+        self.assertOnIntegrationBranch()
+
     def test_failed_and_parked_branches_are_never_merged(self):
         landable = self.fixture.ticket("07", "alpha", {"alpha.txt": "alpha\n"})
         failed = self.fixture.ticket("08", "beta", {"beta.txt": "beta\n"}, verdict="failed")

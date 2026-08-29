@@ -4,7 +4,9 @@ The run advances itself. One settled wave goes in, one decision comes out, and t
 not consulted about any of it: the plan the user approved up front is the whole authority the
 chain runs on ([ADR-0001](adr/0001-coordinator-spends-tokens-only-on-judgment.md)).
 
-The driver is [`skills/crew/assets/advance.py`](../skills/crew/assets/advance.py).
+The landing and advancement classifier is
+[`skills/crew/assets/advance.py`](../skills/crew/assets/advance.py). The crew Driver owns Wave
+activation after that script returns the following Wave.
 
 ```sh
 advance.py advance --table <wave table> --wave N --log <machine log> \
@@ -33,22 +35,30 @@ authority (ADR-0003). The repair flags are the merge driver's and are passed str
    `landable` and merged `clean`, `resolved` or `repaired`, or settled `parked` and has no
    descendants in the wave table. Both halves are read from the log rather than from the driver's
    output, so what advances the run is what the run recorded.
-5. **Launch the next wave**, when there is one and the wave was green, through
-   [`dispatch.py dispatch`](../skills/crew/assets/dispatch/dispatch.py) — cut from what the wave
-   just landed, not from where the run began. The driver reads the integration branch's head after
-   the merges and passes it as the renderer's `--base-commit`, which fixes both the commit each new
-   worktree is cut from and the base each child's review runs against.
+5. **Return the next Wave to the Driver**, when there is one and the wave was green. The Driver
+   invokes the one activation path used for both the first and later Waves. Activation adopts
+   children already visible in the existing live sources, rechecks a recorded launch whose
+   verification failed, and dispatches only the missing ticket ids through
+   [`dispatch.py dispatch`](../skills/crew/assets/dispatch/dispatch.py). Dispatch receives the
+   Run projection's latest landed `merge.sha` as `--base-commit`, or the RunPlan integration base
+   before any merge has landed. It never uses a current integration HEAD that may include tracker
+   close commits.
+6. **Commit the Wave transition only after activation succeeds.** The Driver writes the existing
+   `advance: launched` event after every planned child is accounted for. A following-Wave
+   activation Driver error writes `advance: escalated` and returns a recovery error with `resume`;
+   it never advances the projection's current Wave. Tracker closes follow that decision, so their
+   administrative commits never enter the next Wave's base.
 
 ## The four decisions
 
-Each is recorded once, as one `advance` event in the machine log
-([`docs/machine-log.md`](machine-log.md)), and is the last line the driver prints:
+They are recorded as `advance` events in the machine log
+([`docs/machine-log.md`](machine-log.md)):
 
 | Decision | The run | Exit |
 | --- | --- | --- |
-| `launched` | the next wave is running; the operator is toasted `crew wave <N> launched` | 0 |
+| `launched` | next Wave activated; Driver toasts `crew wave <N> launched` | 0 |
 | `complete` | that was the last wave, and there is nothing to advance to | 0 |
-| `escalated` | failed, parked with descendants, or did not land — chain stops | 1 |
+| `escalated` | landing or following-Wave activation stopped | 1 (advance) / 2 (Driver) |
 | `interrupted` | the operator stopped the run | 130 |
 
 A fifth decision, `stopped`, belongs to the log rather than to this script: the wave loop appends
@@ -56,7 +66,14 @@ it against the wave that ended when the escalation it read leaves nothing to lau
 rule on, because `escalated` alone cannot tell a run that ended from a wave awaiting a ruling
 ([`docs/machine-log.md`](machine-log.md)).
 
-`launched` is recorded against the wave that started; the other three against the wave that ended.
+`launched` is recorded against the Wave that started. An activation `escalated` is recorded
+against the Wave that was attempted; the landing forms of `escalated`, `complete`, and
+`interrupted` are recorded against the Wave that ended.
+`RunProjection.current_wave` follows only the last `launched` event. Consequently a partial
+activation leaves it at the preceding successfully launched Wave: resuming advances that Wave
+again, activation adopts already-started children and dispatches only missing ticket ids, and the
+single successful `launched` event then moves the projection forward.
+
 The toast goes to `tmux display-message`, the operator's terminal, in the family the monitor's
 toasts already speak ([`docs/monitor-dashboard.md`](monitor-dashboard.md)); a run watched from
 outside tmux advances without one. The end of the run gets no toast of its own — the monitor
@@ -100,12 +117,12 @@ child.
 
 ## The operator's interrupt
 
-SIGINT or SIGTERM — Ctrl-C in the run's window — is taken at the next step boundary. A merge or
-the launch already in flight is left to finish, and is shielded from the signal that reached the
-driver, because a merge torn down halfway is exactly the corrupted run state an operator
-interrupts to avoid. The run stops with every step it took either finished or never started, and
-one `interrupted` decision saying where it stopped.
+Inside the advance command, SIGINT or SIGTERM — Ctrl-C in its window — is taken at the next step
+boundary. A merge already in flight is left to finish and is shielded from that signal, because a
+merge torn down halfway is exactly the corrupted run state an operator interrupts to avoid. The
+command stops with every landing step either finished or never started, and one `interrupted`
+decision saying where it stopped.
 
-An interrupt that arrives while the next wave is launching finds no advancement left to stop: the
-wave is running, and the decision is `launched`, because that is what happened. Stopping the
-children it started is the operator's, on the windows they run in.
+Once this script has returned the next Wave, activation belongs to the Driver: a successful
+activation is committed as `launched`, while one that returns a Driver error is recorded as
+`escalated` and is recoverable through the Driver's `resume` path.
