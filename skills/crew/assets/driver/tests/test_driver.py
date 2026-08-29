@@ -1325,6 +1325,7 @@ class LoopTests(DriverTestCase):
             git(
                 self.fixture.worktree("02"),
                 "merge-base", "--is-ancestor", tracker_close, wave_head,
+                check=False,
             ).returncode,
             0,
             "wave 2 contains the later tracker-close commit",
