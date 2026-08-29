@@ -211,9 +211,10 @@ manual run's prompt, never in these documents)
 **Judgment turn** — Any coordinator turn that produces a ruling or an approval. The design goal is
 that a run contains no other kind of coordinator turn.
 
-**Reference index** — The static list of file paths (one descriptive line each, no contents) placed
-in the coordinator's opening context so a ruling never starts with a hunt. Contents are read on
-demand, and nothing but the coordinator itself puts them in the live context.
+**Reference index** — The static list of file paths (one descriptive line each, no contents) that
+staging generates per run in `spec.md`, the coordinator's opening context, so a ruling never starts
+with a hunt. Contents are read on demand, and nothing but the coordinator itself puts them in the
+live context.
 
 **Driver** — The scripted state machine that runs everything else, in a tmux window of its own,
 detached from the coordinator's session: preflight, the validated wave table, the branch and run

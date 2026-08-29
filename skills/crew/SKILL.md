@@ -27,11 +27,11 @@ all is your ruling too; its credentials come from the project's own convention, 
 lacks is parked. An action with no credible undo is **parked** for the human. The red-line hook
 blocks known destructive command shapes; this rule stands where the hook misses.
 
-**Judgment material is read whole; facts are delegated** — the coordinator may use `Read` on the
-whole maintainer-authored Markdown that carries decisions: this run's ticket stubs and `spec.md`,
-the repository's ADRs, glossary, `CONTEXT.md` and tracker conventions, and the Crew skill and its
-references. The hook compares their physical locations. Code, tests and git remain facts for the
-witness brief, which checks every pointer the child cites and recommends nothing. Where the child
+**Judgment material is read whole; facts are delegated** — read `<run-dir>/spec.md` whole at run
+start, before the first ruling: staging generated it as this run's **Reference index** to the
+maintainer-authored Markdown the coordinator may read whole. The hook compares physical locations.
+Code, tests and git remain facts for the witness brief, which checks every pointer the child cites
+and recommends nothing. Where the child
 and the brief state a fact differently, one bounded `Read` settles it: that pointer, an explicit
 offset, 80 lines at most. `Grep`, `Glob` and shell file reads are hunts and the hook refuses them;
 `gh issue view` stays open because the tracker is the ticket. A message lacking what a ruling needs

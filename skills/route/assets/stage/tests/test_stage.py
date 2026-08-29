@@ -254,6 +254,21 @@ class Fixture:
     def run_dir(self, number=1):
         return self.repo / RUN_ROOT / str(number)
 
+    def write_judgment_documents(self):
+        documents = {
+            "CONTEXT.md": "# Fixture context\n",
+            "docs/glossary.md": "# Fixture glossary\n",
+            "docs/adr/0002-second.md": "# Second decision\n",
+            "docs/adr/0001-first.md": "---\nstatus: accepted\n---\n\n# First decision\n",
+            "docs/agents/issue-tracker.md": "# Fixture issue tracker\n",
+            "docs/agents/triage-labels.md": "# Fixture triage labels\n",
+        }
+        for relative, text in documents.items():
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        self.commit("judgment documents")
+
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -369,16 +384,78 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(read["problems"], [])
         self.assertEqual(read["waves"], [["61"], ["62"]])
 
-    def test_the_cover_page_names_every_ticket_its_self_containment_and_its_provenance(self):
+    def test_the_cover_page_maps_every_ticket_to_its_derived_wave(self):
         self.stage_two()
         spec = (self.fixture.run_dir() / SPEC_NAME).read_text()
-        for number in ("61", "62"):
-            self.assertIn(number, spec)
-            self.assertIn(TITLES[number], spec)
+        self.assertEqual(
+            [line for line in spec.splitlines() if line.startswith("- #")],
+            [
+                f"- #61 — {TITLES['61']} — Wave 1",
+                f"- #62 — {TITLES['62']} — Wave 2",
+            ],
+        )
         self.assertIn("self-contained", spec)
         self.assertTrue(
             any(line.startswith("Tracker:") for line in spec.splitlines()),
             f"no Tracker: provenance line in {spec!r}",
+        )
+
+    def test_the_reference_index_names_each_existing_judgment_file_by_realpath(self):
+        self.fixture.write_judgment_documents()
+        result = self.stage_two()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir = self.fixture.run_dir().resolve()
+        repo = self.fixture.repo.resolve()
+        spec = (run_dir / SPEC_NAME).read_text()
+        reference_lines = spec.split("## Reference index\n\n", 1)[1].splitlines()
+        self.assertEqual(
+            reference_lines,
+            [
+                f"- {run_dir / '61.md'} — {TITLES['61']}",
+                f"- {run_dir / '62.md'} — {TITLES['62']}",
+                f"- {repo / 'CONTEXT.md'} — Fixture context",
+                f"- {repo / 'docs/glossary.md'} — Fixture glossary",
+                f"- {repo / 'docs/adr/0001-first.md'} — First decision",
+                f"- {repo / 'docs/adr/0002-second.md'} — Second decision",
+                f"- {repo / 'docs/agents/issue-tracker.md'} — Fixture issue tracker",
+                f"- {repo / 'docs/agents/triage-labels.md'} — Fixture triage labels",
+            ],
+        )
+
+    def test_a_repo_without_an_adr_directory_has_an_empty_adr_index_without_error(self):
+        result = self.stage_two()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        spec = (self.fixture.run_dir() / SPEC_NAME).read_text()
+        reference_lines = spec.split("## Reference index\n\n", 1)[1].splitlines()
+        self.assertFalse(any("/docs/adr/" in line for line in reference_lines))
+
+    def test_a_non_adr_reference_without_a_heading_uses_its_file_name(self):
+        context = self.fixture.repo / "CONTEXT.md"
+        context.write_text("Fixture context without a heading.\n", encoding="utf-8")
+        self.fixture.commit("headingless context")
+
+        result = self.stage_two()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        spec = (self.fixture.run_dir() / SPEC_NAME).read_text()
+        self.assertIn(f"- {context.resolve()} — CONTEXT.md", spec)
+
+    def test_re_staging_refreshes_the_wave_map_without_stale_or_duplicate_rows(self):
+        first = self.stage_two()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.fixture.issue(62, blocked_by=())
+
+        second = self.stage_two()
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        spec = (self.fixture.run_dir() / SPEC_NAME).read_text()
+        ticket_lines = spec.split("## Tickets\n\n", 1)[1].split("\n\n## Reference index", 1)[0]
+        self.assertEqual(
+            ticket_lines.splitlines(),
+            [
+                f"- #61 — {TITLES['61']} — Wave 1",
+                f"- #62 — {TITLES['62']} — Wave 1",
+            ],
         )
 
     # --- the self-check -------------------------------------------------------------------
@@ -826,7 +903,13 @@ class ParentExpansionTests(unittest.TestCase):
             f"# {TITLES['60']}\n\n"
             "Ticket: https://github.example.invalid/issues/60 — the issue body and every comment"
             " are this ticket; read all of it.\n\n"
-            "Tracker: github parent #60\n",
+            "Tracker: github parent #60\n\n"
+            "## Tickets\n\n"
+            f"- #61 — {TITLES['61']} — Wave 1\n"
+            f"- #62 — {TITLES['62']} — Wave 2\n\n"
+            "## Reference index\n\n"
+            f"- {self.fixture.run_dir().resolve() / '61.md'} — {TITLES['61']}\n"
+            f"- {self.fixture.run_dir().resolve() / '62.md'} — {TITLES['62']}\n",
         )
 
     def test_a_sub_issue_list_the_tracker_answers_a_page_at_a_time_expands_whole(self):
