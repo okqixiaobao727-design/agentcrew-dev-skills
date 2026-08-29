@@ -658,25 +658,36 @@ def ticket_listing(plan):
     )
 
 
-def reference_description(path):
-    """One indexed Markdown file's own first level-one heading."""
+def reference_description(path, ticket_titles, adr_root):
+    """One indexed file's ticket title, Markdown heading, or non-ADR file name."""
+    if path in ticket_titles:
+        return ticket_titles[path]
+    is_adr = bounded_read.path_is_below(path, adr_root)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
-        raise Blocked([f"reference index: {path} could not be read — {error}"]) from error
+        if not is_adr:
+            return path.name
+        raise Blocked([f"reference index: ADR {path} could not be read — {error}"]) from error
     for line in lines:
         if line.startswith("# ") and line[2:].strip():
             return line[2:].strip()
+    if not is_adr:
+        return path.name
     raise Blocked([
-        f"reference index: {path} has no `# ` heading — add its one-line description as the"
+        f"reference index: ADR {path} has no `# ` heading — add its one-line description as the"
         " document's first level-one heading"
     ])
 
 
-def reference_listing(directory):
+def reference_listing(plan, directory):
     """The files the shared bounded-read definition places in this run's Reference index."""
+    ticket_titles = {
+        pathlib.Path(ticket.path).resolve(): ticket.title for ticket in plan.tickets
+    }
+    adr_root = directory.resolve().parent.parent / "docs" / "adr"
     return "\n".join(
-        f"- {path} — {reference_description(path)}"
+        f"- {path} — {reference_description(path, ticket_titles, adr_root)}"
         for path in bounded_read.reference_index_paths(directory)
     )
 
@@ -690,7 +701,7 @@ def spec_sections(plan, directory):
         "\n"
         "## Reference index\n"
         "\n"
-        f"{reference_listing(directory)}\n"
+        f"{reference_listing(plan, directory)}\n"
     )
 
 

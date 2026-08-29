@@ -123,7 +123,6 @@ def read_is_judgment_markdown(payload, tool_input, run_dir, crew_dir):
         or resolved == crew_root / "SKILL.md"
         or path_is_below(resolved, crew_root / "references")
         or resolved == repo_root / "references" / "trackers.md"
-        or resolved.parent == repo_root / "docs" / "agents"
     )
 
 

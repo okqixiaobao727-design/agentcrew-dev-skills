@@ -429,6 +429,17 @@ class StagingTests(unittest.TestCase):
         reference_lines = spec.split("## Reference index\n\n", 1)[1].splitlines()
         self.assertFalse(any("/docs/adr/" in line for line in reference_lines))
 
+    def test_a_non_adr_reference_without_a_heading_uses_its_file_name(self):
+        context = self.fixture.repo / "CONTEXT.md"
+        context.write_text("Fixture context without a heading.\n", encoding="utf-8")
+        self.fixture.commit("headingless context")
+
+        result = self.stage_two()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        spec = (self.fixture.run_dir() / SPEC_NAME).read_text()
+        self.assertIn(f"- {context.resolve()} — CONTEXT.md", spec)
+
     def test_re_staging_refreshes_the_wave_map_without_stale_or_duplicate_rows(self):
         first = self.stage_two()
         self.assertEqual(first.returncode, 0, first.stderr)
