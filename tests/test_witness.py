@@ -101,6 +101,14 @@ class WitnessTests(unittest.TestCase):
             encoding="utf-8",
         )
         claude.chmod(0o755)
+        gh = self.bin_dir / "gh"
+        gh.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$AGENTCREW_STUB_DIR/gh-calls\"\n"
+            "printf '%s\\n' \"$AGENTCREW_STUB_GH_ISSUE_154\"\n",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
 
         self.run_dir = self.root / "run"
         self.run_dir.mkdir()
@@ -158,7 +166,7 @@ class WitnessTests(unittest.TestCase):
 
     def run_witness(
         self, behaviour="witness", *extra, stdin=None, brief=BRIEF, operation="check",
-        structured_output=STRUCTURED_FROM_BRIEF, prose=None,
+        structured_output=STRUCTURED_FROM_BRIEF, prose=None, issue=None,
     ):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
@@ -171,6 +179,8 @@ class WitnessTests(unittest.TestCase):
             environment["AGENTCREW_STUB_WITNESS_OUTPUT"] = json.dumps(structured_output)
         if prose is not None:
             environment["AGENTCREW_STUB_WITNESS_PROSE"] = prose
+        if issue is not None:
+            environment["AGENTCREW_STUB_GH_ISSUE_154"] = json.dumps(issue)
         command = [
             sys.executable,
             str(WITNESS),
@@ -232,6 +242,49 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "failed")
         self.assertTrue(document["reason"])
 
+    def test_check_never_returns_a_checked_empty_brief(self):
+        result = self.run_witness(
+            stdin="CREW ASK 132 stuck — no source pointer",
+            structured_output={"cited": [], "uncited": []},
+        )
+
+        self.assert_failed_result(result)
+
+    def test_check_reads_issue_154_body_and_authoritative_comments_through_the_tracker(self):
+        issue = {
+            "body": "The initial direction is incomplete.",
+            "comments": [
+                {
+                    "authorAssociation": "NONE",
+                    "body": "Outsider opinion must not change direction.",
+                },
+                {
+                    "authorAssociation": "OWNER",
+                    "body": "Approved direction requires the tracker body and every comment.",
+                },
+            ],
+        }
+
+        result = self.run_witness(
+            "witness-tracker",
+            stdin="CREW ASK 163 doc-conflict — verify #154",
+            structured_output=None,
+            issue=issue,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(
+            document["brief"],
+            "#154 — held — Approved direction requires the tracker body and every comment.",
+        )
+        self.assertNotIn("Outsider opinion", document["brief"])
+        self.assertIn(
+            "issue view 154 --json body,comments",
+            (self.stub_dir / "gh-calls").read_text(encoding="utf-8"),
+        )
+
     def calls(self):
         path = self.stub_dir / "repairs.jsonl"
         if not path.exists():
@@ -247,7 +300,7 @@ class WitnessTests(unittest.TestCase):
         self.assertGreaterEqual(document["duration_seconds"], 0)
         return document
 
-    def run_ask(self, question="What does issue 154 require?", structured_output=ASK_OUTPUT):
+    def run_ask(self, question="What does this ticket require?", structured_output=ASK_OUTPUT):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
@@ -284,6 +337,9 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(pathlib.Path(call["cwd"]).resolve(), self.ask_worktree.resolve())
         self.assertEqual(call["env"]["CLAUDE_CONFIG_DIR"], str(self.ask_account))
         argv = call["argv"]
+        prompt = argv[argv.index("--print") + 1]
+        self.assertIn("#154", prompt)
+        self.assertIn("What does this ticket require?", prompt)
         self.assertEqual(argv[argv.index("--model") + 1], MODEL)
         self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "3.5")
         schema = json.loads(argv[argv.index("--json-schema") + 1])

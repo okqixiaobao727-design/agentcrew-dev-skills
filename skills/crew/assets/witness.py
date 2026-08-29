@@ -37,6 +37,9 @@ PATH_POINTER = re.compile(PATH_POINTER_VALUE)
 TICKET_POINTER = re.compile(r"(?<![\w#])#\d+")
 ADR_POINTER = re.compile(r"\bADR-\d{4}\b")
 SCHEMA_POINTER_PATTERN = rf"^(?:{PATH_POINTER_BODY}|#\d+|ADR-\d{{4}})$"
+POINTER_SCHEMA = {
+    "type": "string", "minLength": 1, "pattern": SCHEMA_POINTER_PATTERN,
+}
 CHECK_SCHEMA = {
     "type": "object",
     "properties": {
@@ -55,9 +58,7 @@ CHECK_SCHEMA = {
         "finding": {
             "type": "object",
             "properties": {
-                "pointer": {
-                    "type": "string", "minLength": 1, "pattern": SCHEMA_POINTER_PATTERN,
-                },
+                "pointer": POINTER_SCHEMA,
                 "status": {"type": "string", "enum": ["held", "contradicted", "missing"]},
                 "reason": {"type": "string", "minLength": 1},
             },
@@ -79,10 +80,7 @@ ASK_SCHEMA = {
                     "pointers": {
                         "type": "array",
                         "minItems": 1,
-                        "items": {
-                            "type": "string", "minLength": 1,
-                            "pattern": SCHEMA_POINTER_PATTERN,
-                        },
+                        "items": POINTER_SCHEMA,
                     },
                 },
                 "required": ["claim", "pointers"],
@@ -285,6 +283,8 @@ def execute(prompt, worktree, model, budget, timeout, session_environment, schem
         brief = render(response.get("structured_output"))
     except (TypeError, ValueError) as error:
         return failed(error, started, usage)
+    if not isinstance(brief, str) or not brief.strip():
+        return failed("witness session returned an empty brief", started, usage)
     document = {
         "brief": brief,
         "outcome": "checked",
@@ -349,7 +349,9 @@ def ask(args):
             args.timeout_seconds,
         )
         return execute(
-            dispatch.render_witness_prompt(args.question, operation="ask"),
+            dispatch.render_witness_prompt(
+                f"Ticket: #{ticket.id}\nQuestion: {args.question.strip()}", operation="ask"
+            ),
             worktree,
             plan.run.witness_model,
             plan.run.witness_budget_usd,

@@ -114,12 +114,32 @@ def main():
         return 0
     if step in (
         "witness", "witness-write", "witness-rewrite", "witness-error",
-        "witness-partial-usage", "witness-no-usage",
+        "witness-partial-usage", "witness-no-usage", "witness-tracker",
     ):
         if step == "witness-write":
             (pathlib.Path(repo) / STRAY_FILE).write_text("work nobody asked for\n")
         if step == "witness-rewrite":
             (pathlib.Path(repo) / "src" / "check.py").write_text("witness changed it\n")
+        tracker_output = None
+        if step == "witness-tracker":
+            issue = json.loads(subprocess.run(
+                ["gh", "issue", "view", "154", "--json", "body,comments"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout)
+            authoritative = next(
+                comment["body"] for comment in issue["comments"]
+                if comment["authorAssociation"] in ("OWNER", "MEMBER", "COLLABORATOR")
+            )
+            tracker_output = {
+                "cited": [{
+                    "pointer": "#154",
+                    "status": "held",
+                    "reason": authoritative,
+                }],
+                "uncited": [],
+            }
         response = {
             "type": "result",
             "subtype": "success",
@@ -141,7 +161,9 @@ def main():
         if step == "witness-no-usage":
             response.pop("usage")
         structured = os.environ.get("AGENTCREW_STUB_WITNESS_OUTPUT")
-        if structured is not None:
+        if tracker_output is not None:
+            response["structured_output"] = tracker_output
+        elif structured is not None:
             response["structured_output"] = json.loads(structured)
         print(json.dumps(response))
         return 0

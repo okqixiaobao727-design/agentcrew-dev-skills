@@ -145,7 +145,7 @@ def block(text):
 
 
 def render_witness_prompt(subject, templates=None, operation="check"):
-    """One operation filled into the library's shared Witness prompt."""
+    """Return the shared Witness role plus one filled operation task."""
     templates = templates or load_templates()
     witness = templates["witness"]
     return fill(
