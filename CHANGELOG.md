@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Witness is now one taskable fact-finding interface with explicit `check` and `ask` operations.
+  Checks consume structured findings and render deterministic pointer-backed briefs, while an ask
+  resolves the ticket's frozen worktree, account, model and budget from the active Run plan. Both
+  operations can read GitHub issue bodies and authoritative comments without gaining write access
+  or making recommendations (#163).
+
 ## [0.9.11] - 2026-08-29
 
 ### Fixed
