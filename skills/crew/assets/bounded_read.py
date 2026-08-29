@@ -19,6 +19,11 @@ SHELL_PREFIXES = frozenset((
 ))
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 MAX_LINES = 80
+SPEC_NAME = "spec.md"
+REFERENCE_FILES_BEFORE_ADRS = (
+    pathlib.Path("CONTEXT.md"),
+    pathlib.Path("docs/glossary.md"),
+)
 DENIAL_REASON = (
     "Blocked: the coordinator may read judgment Markdown whole, but checks a source fact only "
     "at the escalation's pointer against its witness brief. Use Read with an explicit offset "
@@ -48,6 +53,50 @@ def path_is_below(path, root):
     return True
 
 
+def path_is_reference_entry(path, run_root):
+    """Whether resolved target-repository Markdown belongs in this run's Reference index.
+
+    The hook additionally admits the Crew skill's own resident documents; those are already in the
+    coordinator's context, so this shared staging subset deliberately does not index them again.
+    """
+    repo_root = run_root.parent.parent
+    return (
+        (path.parent == run_root and path.name != SPEC_NAME)
+        or any(path == repo_root / relative for relative in REFERENCE_FILES_BEFORE_ADRS)
+        or path_is_below(path, repo_root / "docs" / "adr")
+        or path.parent == repo_root / "docs" / "agents"
+    )
+
+
+def reference_index_paths(run_dir):
+    """Existing physical files in the per-run Reference index's stable category order."""
+    try:
+        run_root = pathlib.Path(run_dir).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return ()
+    repo_root = run_root.parent.parent
+    candidates = [
+        *sorted(run_root.glob("*.md"), key=lambda path: path.name),
+        *(repo_root / relative for relative in REFERENCE_FILES_BEFORE_ADRS),
+        *sorted((repo_root / "docs" / "adr").rglob("*.md"), key=lambda path: str(path)),
+        *sorted((repo_root / "docs" / "agents").glob("*.md"), key=lambda path: path.name),
+    ]
+    found = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if (
+            resolved.suffix == ".md"
+            and resolved.is_file()
+            and path_is_reference_entry(resolved, run_root)
+            and resolved not in found
+        ):
+            found.append(resolved)
+    return tuple(found)
+
+
 def read_is_judgment_markdown(payload, tool_input, run_dir, crew_dir):
     """Whether one Read targets maintainer-authored Markdown used for judgment."""
     value = tool_input.get("file_path")
@@ -69,10 +118,8 @@ def read_is_judgment_markdown(payload, tool_input, run_dir, crew_dir):
         return False
     repo_root = run_root.parent.parent
     return (
-        resolved.parent == run_root
-        or path_is_below(resolved, repo_root / "docs" / "adr")
-        or resolved == repo_root / "docs" / "glossary.md"
-        or resolved == repo_root / "CONTEXT.md"
+        resolved == run_root / SPEC_NAME
+        or path_is_reference_entry(resolved, run_root)
         or resolved == crew_root / "SKILL.md"
         or path_is_below(resolved, crew_root / "references")
         or resolved == repo_root / "references" / "trackers.md"

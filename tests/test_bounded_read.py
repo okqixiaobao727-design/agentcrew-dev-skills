@@ -10,6 +10,11 @@ import unittest
 
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "crew" / "assets"))
+
+import bounded_read  # noqa: E402
+
+
 SCRIPT = PLUGIN_ROOT / "skills" / "crew" / "assets" / "bounded_read.py"
 CREW_DIR = PLUGIN_ROOT / "skills" / "crew"
 RUN_DIR = PLUGIN_ROOT / "docs" / "research"
@@ -65,6 +70,17 @@ class BoundedReadHookTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "")
+
+    def test_a_plugin_document_is_admitted_without_becoming_a_repo_reference_entry(self):
+        plugin_document = (CREW_DIR / "SKILL.md").resolve()
+
+        allowed = self.run_hook(
+            "Read", {"file_path": str(plugin_document), "limit": 1000}, run_dir=RUN_DIR
+        )
+
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(allowed.stdout, "")
+        self.assertNotIn(plugin_document, bounded_read.reference_index_paths(RUN_DIR))
 
     def test_a_read_with_an_explicit_offset_and_eighty_line_limit_is_allowed(self):
         result = self.run_hook(

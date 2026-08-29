@@ -36,6 +36,11 @@ that directory's `spec.md` and overwrites the markdown files in place, leaving a
 run already started there alone. `crewtask/` is gitignored, so none of this touches the tracked
 tree.
 
+**The spec page is a projection.** After the newly written tickets build a valid Run plan, staging
+renders its ticket order and Wave membership into `spec.md`. The Reference index beside it uses the
+same target-repository judgment-file definition as the bounded-read hook, so navigation and read
+permission cannot drift into separate lists.
+
 **The tracker's side.** `--parent <n>` expands to that parent's native sub-issues, so routing a
 triaged piece of work needs nothing but one number; its closed sub-issues are finished work and stay
 out of the set, where the closure resolution below meets them as satisfied edges. `--routing` is the
@@ -71,6 +76,7 @@ DRIVER_DIR = PLUGIN_ROOT / "skills" / "crew" / "assets" / "driver"
 sys.path.insert(0, str(CREW_ASSETS))
 sys.path.insert(0, str(DRIVER_DIR))
 
+import bounded_read  # noqa: E402
 import driver  # noqa: E402  (the path above is what makes this importable)
 import run_plan  # noqa: E402
 
@@ -644,22 +650,68 @@ def provenance(kind, parent, tickets):
     return f"{kind} " + " ".join(f"#{ticket['id']}" for ticket in numbers)
 
 
-def parent_page(line, parent):
-    """The `spec.md` of a parent run: a tracker pointer and run provenance."""
+def ticket_listing(plan):
+    """The Run plan's ticket order and Wave membership, rendered without reinterpreting either."""
+    return "\n".join(
+        f"- #{ticket.id} — {ticket.title} — Wave {wave.number}"
+        for wave in plan.waves for ticket in wave.tickets
+    )
+
+
+def reference_description(path):
+    """One indexed Markdown file's own first level-one heading."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise Blocked([f"reference index: {path} could not be read — {error}"]) from error
+    for line in lines:
+        if line.startswith("# ") and line[2:].strip():
+            return line[2:].strip()
+    raise Blocked([
+        f"reference index: {path} has no `# ` heading — add its one-line description as the"
+        " document's first level-one heading"
+    ])
+
+
+def reference_listing(directory):
+    """The files the shared bounded-read definition places in this run's Reference index."""
+    return "\n".join(
+        f"- {path} — {reference_description(path)}"
+        for path in bounded_read.reference_index_paths(directory)
+    )
+
+
+def spec_sections(plan, directory):
+    """The two generated sections shared by both staging modes."""
+    return (
+        "## Tickets\n"
+        "\n"
+        f"{ticket_listing(plan)}\n"
+        "\n"
+        "## Reference index\n"
+        "\n"
+        f"{reference_listing(directory)}\n"
+    )
+
+
+def parent_page(line, parent, plan, directory):
+    """The `spec.md` of a parent run: tracker provenance and the validated Run plan."""
     return (
         f"# {parent['title']}\n"
         "\n"
         f"{ticket_pointer(parent['url'])}\n"
         "\n"
         f"{PROVENANCE_KEY} {line}\n"
+        "\n"
+        f"{spec_sections(plan, directory)}"
     )
 
 
-def cover_page(line, tickets):
+def cover_page(line, plan, directory):
     """The generated `spec.md` for a ticket set with no parent to take a spec from."""
-    listed = "\n".join(f"- #{ticket['id']} — {ticket['title']}" for ticket in tickets)
     return (
-        f"# Staged run of {len(tickets)} ticket{'s' if len(tickets) != 1 else ''}\n"
+        f"# Staged run of {len(plan.tickets)}"
+        f" ticket{'s' if len(plan.tickets) != 1 else ''}\n"
         "\n"
         f"{PROVENANCE_KEY} {line}\n"
         "\n"
@@ -667,8 +719,13 @@ def cover_page(line, tickets):
         "ticket in this run is self-contained: its own brief is the whole context, and nothing\n"
         "here adds to it.\n"
         "\n"
-        f"{listed}\n"
+        f"{spec_sections(plan, directory)}"
     )
+
+
+def provenance_page(line):
+    """The allocation marker kept while the newly materialised ticket set is validated."""
+    return f"{PROVENANCE_KEY} {line}\n"
 
 
 def numbered_runs(run_root):
@@ -906,12 +963,16 @@ def stage(args):
     )
     line = provenance(kind, args.parent, tickets)
     number, directory = allocate(repo / RUN_ROOT, line)
-    spec = parent_page(line, parent) if parent else cover_page(line, tickets)
-    materialise(directory, spec, tickets, dependencies, stripped)
+    materialise(directory, provenance_page(line), tickets, dependencies, stripped)
 
     plan, problems = self_check(repo, directory, config)
     if problems:
         raise Blocked(problems)
+    spec = (
+        parent_page(line, parent, plan, directory)
+        if parent else cover_page(line, plan, directory)
+    )
+    (directory / SPEC_NAME).write_text(spec, encoding="utf-8")
     print_stubs(kind, [*tickets, *([parent] if parent else [])])
     print_waves(plan)
 
