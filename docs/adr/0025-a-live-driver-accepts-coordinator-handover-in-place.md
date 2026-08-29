@@ -26,5 +26,13 @@ A successful handover is a hard switch. It atomically supersedes the old Coordin
 Coordinator-originated action must belong to the run's current Coordinator address, and a stale
 answer is rejected before it reaches a child or the Machine log. Waiters belonging to the old
 Coordinator stop with a superseded notice rather than carrying later wake snapshots back to it.
-This decision does not choose the handover transport or its authentication; #112 must settle those
-details before it is ready for an agent.
+
+The invoking `/crew` waits synchronously for a handover result and never reports success while the
+Driver is still switching ownership, re-anchoring children or retiring old Waiters. It does not
+enter ordinary Waiter attachment before that result. The existing trust boundaries remain the
+whole protocol: the launcher resolves the invoking Coordinator from the harness session registry,
+the live Driver applies the handover and uses its existing child-delivery path to re-anchor, and a
+Coordinator action is accepted only when its resolved address is the run's current address. No
+token, lease, handover state machine, rollback protocol, retry counter or background recovery loop
+is added. A failure uses the existing Driver-error and re-typed `/crew` recovery path and continues
+forward toward the new Coordinator rather than restoring the old one.
