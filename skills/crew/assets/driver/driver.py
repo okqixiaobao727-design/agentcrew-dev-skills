@@ -978,7 +978,7 @@ def prepare_branches(repo, base_branch, integration_branch, pull, gate):
     return return_branch, git_output(repo, "rev-parse", "HEAD"), None
 
 
-def install_hook(log, settings, role, ticket=None, session_id=None):
+def install_hook(log, settings, role, ticket=None, session_id=None, run_dir=None):
     """Register one side's log hook; session_id scopes the coordinator's bounded-read hook."""
     arguments = [
         sys.executable, MACHINE_LOG, "--log", log, "install",
@@ -988,6 +988,8 @@ def install_hook(log, settings, role, ticket=None, session_id=None):
         arguments += ["--ticket", ticket]
     if session_id is not None:
         arguments += ["--session-id", session_id]
+    if run_dir is not None:
+        arguments += ["--run-dir", run_dir]
     run_command(arguments, f"the {role} hook could not be installed in {settings}")
 
 
@@ -1772,7 +1774,8 @@ def run_start(args):
 
     record_base_gate(log, gate)
     install_hook(
-        log, repo / SETTINGS_PATH, "coordinator", session_id=run["coordinator_session"]
+        log, repo / SETTINGS_PATH, "coordinator", session_id=run["coordinator_session"],
+        run_dir=feature_dir,
     )
     return wave_loop(args, repo, run_dir, table_path, starting=True)
 
@@ -3140,6 +3143,7 @@ class Loop:
         install_hook(
             self.log, self.repo / SETTINGS_PATH, COORDINATOR_ROLE,
             session_id=self.args.coordinator_session,
+            run_dir=self.run_dir.parent,
         )
         for ticket, facts in sorted(projection.tickets.items()):
             launch = facts.launch

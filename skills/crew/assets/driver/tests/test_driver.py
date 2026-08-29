@@ -1110,9 +1110,10 @@ class LaunchTests(DriverTestCase):
         self.start_a_run(extra=("--coordinator-session", session))
 
         log = str(self.fixture.run_dir / "log.jsonl")
-        coordinator = json.dumps(
-            self.fixture.settings(self.fixture.repo / ".claude" / "settings.local.json")
+        coordinator_settings = self.fixture.settings(
+            self.fixture.repo / ".claude" / "settings.local.json"
         )
+        coordinator = json.dumps(coordinator_settings)
         child = json.dumps(self.fixture.settings(
             self.fixture.repo / ".claude" / "worktrees" / "01-01"
             / ".claude" / "settings.local.json"
@@ -1120,6 +1121,17 @@ class LaunchTests(DriverTestCase):
         self.assertIn(log, coordinator)
         self.assertIn("--role coordinator", coordinator)
         self.assertIn("bounded_read.py", coordinator)
+        bounded_command, = [
+            hook["command"]
+            for block in coordinator_settings["hooks"]["PreToolUse"]
+            if block["matcher"] == "Read|Grep|Glob|Bash"
+            for hook in block["hooks"]
+        ]
+        bounded_words = shlex.split(bounded_command)
+        self.assertEqual(
+            bounded_words[bounded_words.index("--run-dir") + 1],
+            str(self.fixture.feature_dir),
+        )
         self.assertIn(f"--session-id {session}", coordinator)
         self.assertIn(log, child)
         self.assertIn("--role child", child)

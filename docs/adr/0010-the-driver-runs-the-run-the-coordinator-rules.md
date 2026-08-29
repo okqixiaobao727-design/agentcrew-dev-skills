@@ -107,6 +107,17 @@ operator. A clean run costs it one turn to launch, one per ASK, and one to point
 > asked. An escalation now carries a question or a wrap-up and nothing else, and the coordinator
 > speaks to the operator only for a decision that is theirs.
 
+> **Amended (#162, 2026-08-30).** The advisor experiment's zero reversals measured whether later
+> evidence changed a ruling, not whether an internally consistent ruling was correct. #154 showed
+> the missing case: three rulings agreed with a stale brief and were wrong against the maintainer's
+> decisions. The read boundary is therefore a kind line, not a quantity line. Maintainer-authored
+> judgment Markdown may be read whole: the current staged run's top-level Markdown; repository
+> ADRs, glossary, `CONTEXT.md` and tracker conventions; and the Crew skill and its Markdown
+> references. Code, tests and git remain behind the witness, with the one-pointer, explicit-offset,
+> at-most-80-line read retained only for settling a disputed source fact. Searches and shell file
+> reads remain hunts. The former whole-Crew-directory exemption is narrowed to its skill document
+> and Markdown references.
+
 ## Consequences
 
 - The crew skill document is the oracle's resident prefix, so it holds the reversibility contract,

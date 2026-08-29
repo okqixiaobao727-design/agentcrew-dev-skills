@@ -735,11 +735,12 @@ def hook_command(script, log, role, ticket, scope):
     return command
 
 
-def bounded_hook_command(script, log, crew_dir, session_id=None):
+def bounded_hook_command(script, log, crew_dir, run_dir, session_id=None):
     """The coordinator's bounded-read command, owned by the same run log as its message hook."""
     command = (
         f"{shlex.quote(PYTHON)} {shlex.quote(absolute(script))} hook"
         f" --crew-dir {shlex.quote(absolute(crew_dir))}"
+        f" --run-dir {shlex.quote(absolute(run_dir))}"
         f" --owner-log {shlex.quote(absolute(log))}"
     )
     if session_id is not None:
@@ -1017,6 +1018,9 @@ def run_install(args):
     log writer is the one a resumed run's hooks go on running. A caller that keeps its own copy
     names it with `--hook-script` and that path is registered as it was given.
     """
+    if args.role == COORDINATOR and args.run_dir is None:
+        print("machine log: coordinator install requires --run-dir", file=sys.stderr)
+        return 1
     path = pathlib.Path(args.settings)
     settings, problem = read_settings(path)
     if problem is not None:
@@ -1054,7 +1058,7 @@ def run_install(args):
         if session_id is None:
             session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
         bounded = bounded_hook_command(
-            bounded_script, args.log, crew_dir, session_id
+            bounded_script, args.log, crew_dir, args.run_dir, session_id
         )
         install_bounded_hook(settings, bounded, args.log)
     return write_settings(path, settings)
@@ -1336,7 +1340,11 @@ def build_parser():
     )
     install.add_argument(
         "--crew-dir",
-        help="the crew skill directory whose own files the coordinator may read without a bound",
+        help="the crew skill directory whose judgment references the coordinator may read whole",
+    )
+    install.add_argument(
+        "--run-dir",
+        help="the staged run directory whose top-level Markdown the coordinator may read whole",
     )
     install.add_argument(
         "--session-id",

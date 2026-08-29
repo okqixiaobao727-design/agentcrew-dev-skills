@@ -158,6 +158,7 @@ class SeededRun:
             [
                 sys.executable, str(MACHINE_LOG), "--log", str(self.log_path), "install",
                 "--settings", str(self.repo / SETTINGS_PATH), "--role", "coordinator",
+                "--run-dir", str(self.feature_dir),
             ],
             capture_output=True, text=True, env=self.fixture.environment(),
             cwd=str(self.repo),

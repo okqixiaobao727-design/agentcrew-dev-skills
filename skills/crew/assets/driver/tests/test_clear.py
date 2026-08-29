@@ -255,7 +255,7 @@ class ClearTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(machine_log), "--log", str(self.log_path), "install",
              "--settings", str(self.fixture.repo / ".claude" / "settings.local.json"),
-             "--role", "coordinator"],
+             "--role", "coordinator", "--run-dir", str(self.fixture.feature_dir)],
             capture_output=True,
             text=True,
             env=self.fixture.environment(),

@@ -20,8 +20,9 @@ SHELL_PREFIXES = frozenset((
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 MAX_LINES = 80
 DENIAL_REASON = (
-    "Blocked: coordinator file reads are limited to one bounded Read for checking the "
-    "escalation against its witness brief. Use an explicit offset and a limit of at most 80 lines."
+    "Blocked: the coordinator may read judgment Markdown whole, but checks a source fact only "
+    "at the escalation's pointer against its witness brief. Use Read with an explicit offset "
+    "and a limit of at most 80 lines; searches and shell reads are hunts."
 )
 
 
@@ -38,8 +39,18 @@ def read_is_bounded(tool_input):
     )
 
 
-def path_is_in_crew_dir(payload, value, crew_dir):
-    """Whether one path names the crew skill directory or a descendant, resolved by location."""
+def path_is_below(path, root):
+    """Whether one resolved path is below another resolved path."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def read_is_judgment_markdown(payload, tool_input, run_dir, crew_dir):
+    """Whether one Read targets maintainer-authored Markdown used for judgment."""
+    value = tool_input.get("file_path")
     if not isinstance(value, str) or not value:
         return False
     path = pathlib.Path(value)
@@ -49,23 +60,24 @@ def path_is_in_crew_dir(payload, value, crew_dir):
             return False
         path = pathlib.Path(cwd) / path
     try:
-        path.resolve().relative_to(crew_dir.resolve())
-    except (OSError, ValueError):
+        resolved = path.resolve(strict=True)
+        run_root = run_dir.resolve(strict=True)
+        crew_root = crew_dir.resolve(strict=True)
+    except (OSError, RuntimeError):
         return False
-    return True
-
-
-def read_is_in_crew_dir(payload, tool_input, crew_dir):
-    """Whether one Read targets the crew skill itself, compared by resolved location."""
-    return path_is_in_crew_dir(payload, tool_input.get("file_path"), crew_dir)
-
-
-def search_is_in_crew_dir(payload, tool_input, crew_dir):
-    """Whether one Grep or Glob confines its search root to the crew skill directory."""
-    root = tool_input.get("path")
-    if root is None:
-        root = payload.get("cwd")
-    return path_is_in_crew_dir(payload, root, crew_dir)
+    if resolved.suffix != ".md":
+        return False
+    repo_root = run_root.parent.parent
+    return (
+        resolved.parent == run_root
+        or path_is_below(resolved, repo_root / "docs" / "adr")
+        or resolved == repo_root / "docs" / "glossary.md"
+        or resolved == repo_root / "CONTEXT.md"
+        or resolved == crew_root / "SKILL.md"
+        or path_is_below(resolved, crew_root / "references")
+        or resolved == repo_root / "references" / "trackers.md"
+        or resolved.parent == repo_root / "docs" / "agents"
+    )
 
 
 def mark_unquoted_newlines(command):
@@ -166,74 +178,6 @@ def bash_reads_file(command):
     )
 
 
-def read_targets(name, arguments, cwd):
-    """Return the file operands read by one named shell command, conservatively."""
-    if name == "cat":
-        return [word for word in arguments if word != "-" and not word.startswith("-")]
-    if name in ("head", "tail"):
-        values = []
-        skip = False
-        for word in arguments:
-            if skip:
-                skip = False
-                continue
-            if word in ("-c", "--bytes", "-n", "--lines"):
-                skip = True
-            elif not word.startswith("-"):
-                values.append(word)
-        return values
-    if name == "sed":
-        values = []
-        expression_seen = False
-        skip_expression = False
-        for word in arguments:
-            if skip_expression:
-                skip_expression = False
-                expression_seen = True
-            elif word in ("-e", "--expression"):
-                skip_expression = True
-            elif word in ("-f", "--file"):
-                skip_expression = True
-            elif word.startswith("-"):
-                continue
-            elif not expression_seen:
-                expression_seen = True
-            else:
-                values.append(word)
-        return values
-    if name in ("grep", "rg"):
-        values = [word for word in arguments if not word.startswith("-")]
-        return values[1:]
-    if name == "find":
-        roots = []
-        for word in arguments:
-            if word.startswith("-"):
-                break
-            roots.append(word)
-        return roots or [cwd]
-    if name == "ls":
-        if "-d" in arguments or "--directory" in arguments:
-            return []
-        values = [word for word in arguments if not word.startswith("-")]
-        return values or [cwd]
-    return []
-
-
-def bash_reads_only_in_crew_dir(payload, command, crew_dir):
-    """Return whether every shell read target is inside the crew skill directory."""
-    invocations = all_shell_invocations(command)
-    if not invocations:
-        return False
-    cwd = payload.get("cwd")
-    targets = []
-    for name, arguments in invocations:
-        if invocation_reads_file(name, arguments):
-            targets.extend(read_targets(name, arguments, cwd))
-    return bool(targets) and all(
-        path_is_in_crew_dir(payload, target, crew_dir) for target in targets
-    )
-
-
 def emit_denial():
     """Print Claude Code's one-line PreToolUse denial and return exit status zero."""
     print(json.dumps({
@@ -258,18 +202,20 @@ def run_hook(args):
         return 0
     tool_input = payload.get("tool_input", {})
     if payload.get("tool_name") in SEARCH_TOOLS:
-        if isinstance(tool_input, dict) and search_is_in_crew_dir(
-            payload, tool_input, args.crew_dir
-        ):
-            return 0
         return emit_denial()
     if payload.get("tool_name") == "Bash" and isinstance(tool_input, dict):
         if bash_reads_file(tool_input.get("command")):
-            if bash_reads_only_in_crew_dir(payload, tool_input.get("command"), args.crew_dir):
-                return 0
             return emit_denial()
     if payload.get("tool_name") == READ_TOOL and isinstance(tool_input, dict):
-        if read_is_bounded(tool_input) or read_is_in_crew_dir(payload, tool_input, args.crew_dir):
+        if (
+            read_is_bounded(tool_input)
+            or (
+                args.run_dir is not None
+                and read_is_judgment_markdown(
+                    payload, tool_input, args.run_dir, args.crew_dir
+                )
+            )
+        ):
             return 0
         return emit_denial()
     return 0
@@ -280,6 +226,7 @@ def parser():
     subcommands = command.add_subparsers(dest="command", required=True)
     hook = subcommands.add_parser("hook", help="apply the PreToolUse read boundary")
     hook.add_argument("--crew-dir", type=pathlib.Path, required=True)
+    hook.add_argument("--run-dir", type=pathlib.Path)
     hook.add_argument("--session-id", help="the one coordinator or advisor session to bound")
     hook.add_argument(
         "--owner-log",

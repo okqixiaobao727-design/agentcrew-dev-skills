@@ -508,10 +508,11 @@ worktree, alongside the guard hooks:
 
 ```sh
 machine_log.py --log <path> install   --settings <settings.json> --role child --ticket NN
-machine_log.py --log <path> install   --settings <settings.json> --role coordinator
+machine_log.py --log <path> install   --settings <settings.json> --role coordinator \
+    --run-dir <staged-run-dir>
 machine_log.py --log <path> uninstall --settings <settings.json>
-# Manual advisor: m=machine-log script, c=crew dir, s=settings, l=log, i=session ID.
-$m --log $l install --settings $s --role coordinator --crew-dir $c --session-id $i
+# Manual advisor: m=machine-log script, c=crew dir, r=staged run, s=settings, l=log, i=session ID.
+$m --log $l install --settings $s --role coordinator --crew-dir $c --run-dir $r --session-id $i
 $m --log $l uninstall --settings $s
 ```
 
@@ -521,8 +522,10 @@ instead of doubling it — the log an entry writes is what identifies it as this
 version of this script it runs — and every other hook already in the file is left where it is. A
 coordinator install atomically adds the bounded-read `PreToolUse` hook in the same settings write;
 a child install does not. `--session-id` confines that hook to one coordinator or advisor session.
-The two manual-advisor lines use that same coordinator path; their explicit `--crew-dir` remains
-correct even if the command is later run from the version-independent copy beside the log.
+`--run-dir` names the staged directory holding the ticket stubs and `spec.md`; its top-level
+Markdown is judgment material the hook permits a whole-file `Read`. The two manual-advisor lines
+use that same coordinator path; their explicit `--crew-dir` and `--run-dir` remain correct even if
+the command is later run from the version-independent copy beside the log.
 
 The commands registered run the run's own copies of this script and the bounded-read script,
 written beside the log the first time a run installs and refreshed on every install after it. The
