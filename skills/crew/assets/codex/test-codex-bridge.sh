@@ -1,8 +1,79 @@
 #!/usr/bin/env bash
 # End-to-end tests for codex_bridge.py against stub_codex.py.
-# Uses a private tmux server (-L codex-bridge-test); needs tmux and python3+aiohttp.
+# Uses one private tmux socket per invocation; needs tmux and python3+aiohttp.
 
 set -uo pipefail
+
+SCENARIO_TABLE='observation|receipt|test_receipt
+observation|escalation_logging|test_escalation_logging
+telemetry|ruling_logging|test_ruling_logging
+resume|resume_keeps_logging_configuration|test_resume_keeps_logging_configuration
+resume|unmarked_turn_is_watched|test_unmarked_turn_is_watched
+telemetry|missed_edge_is_still_logged_once|test_missed_edge_is_still_logged_once
+telemetry|unrecorded_turn_survives_a_later_turn|test_unrecorded_turn_survives_a_later_turn
+inputs|model_effort_overrides|test_model_effort_overrides
+inputs|without_model_effort_overrides|test_without_model_effort_overrides
+resume|resume_keeps_pinned_model_effort|test_resume_keeps_pinned_model_effort
+resume|model_only_pin_and_resume|test_model_only_pin_and_resume
+resume|unusable_resume_state|test_unusable_resume_state
+resume|question_send|test_question_send
+inputs|send_skill_input|test_send_skill_input
+inputs|launch_skill_input|test_launch_skill_input
+inputs|plain_prompt_has_no_skill_input|test_plain_prompt_has_no_skill_input
+inputs|missing_skill_path_is_reported|test_missing_skill_path_is_reported
+inputs|launch_unresolved_skill_is_reported|test_launch_unresolved_skill_is_reported
+inputs|relaunch_late_skill_failure_is_reported|test_relaunch_late_skill_failure_is_reported
+inputs|relaunch_early_skill_failure_is_reported|test_relaunch_early_skill_failure_is_reported
+inputs|skill_source_fallback|test_skill_source_fallback
+inputs|skill_path_alias|test_skill_path_alias
+observation|wave_wakeup|test_wave_wakeup
+observation|vanished|test_vanished
+observation|transient_pane_read_failures|test_transient_pane_read_failures
+observation|pane_read_failure_limit|test_pane_read_failure_limit
+observation|failed_turn|test_failed_turn
+inputs|tui_exit|test_tui_exit
+observation|no_server|test_no_server
+inputs|duplicates|test_duplicates
+telemetry|watch_timeout|test_watch_timeout
+inputs|stop|test_stop'
+
+scenario_groups() {
+  printf '%s\n' "$SCENARIO_TABLE" | awk -F '|' '!seen[$1]++ { print $1 }'
+}
+
+scenario_group_exists() {
+  printf '%s\n' "$SCENARIO_TABLE" \
+    | awk -F '|' -v selected="$1" '$1 == selected { found=1 } END { exit !found }'
+}
+
+scenario_exists() {
+  printf '%s\n' "$SCENARIO_TABLE" \
+    | awk -F '|' -v selected="$1" '$2 == selected { found=1 } END { exit !found }'
+}
+
+if [ "${1:-}" = "--list-scenario-groups" ]; then
+  scenario_groups
+  exit 0
+fi
+if [ "$#" -gt 0 ]; then
+  printf 'unknown argument: %s\n' "$1" >&2
+  exit 2
+fi
+if [ -n "${CODEX_BRIDGE_TEST_GROUP:-}" ] \
+    && [ -n "${CODEX_BRIDGE_TEST_SCENARIO:-}" ]; then
+  echo "scenario group and single scenario are mutually exclusive" >&2
+  exit 2
+fi
+if [ -n "${CODEX_BRIDGE_TEST_GROUP:-}" ] \
+    && ! scenario_group_exists "$CODEX_BRIDGE_TEST_GROUP"; then
+  printf 'unknown scenario group: %s\n' "$CODEX_BRIDGE_TEST_GROUP" >&2
+  exit 2
+fi
+if [ -n "${CODEX_BRIDGE_TEST_SCENARIO:-}" ] \
+    && ! scenario_exists "$CODEX_BRIDGE_TEST_SCENARIO"; then
+  printf 'unknown scenario: %s\n' "$CODEX_BRIDGE_TEST_SCENARIO" >&2
+  exit 2
+fi
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 BRIDGE="$SCRIPT_DIR/codex_bridge.py"
@@ -22,9 +93,88 @@ ts=1755060070"
 TYPED_TURN_MESSAGE="Ruling applied and the work is committed.
 CREW COMPLETE $STUB_SHA"
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/codex-bridge-test.XXXXXX")
-TUI_EXIT_RUNTIME_ROOT=$(mktemp -d /tmp/codex-tui-exit.XXXXXX)
-RELAUNCH_EARLY_RUNTIME_ROOT=$(mktemp -d /tmp/codex-relaunch-early.XXXXXX)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/codex-bridge-test.XXXXXX") || exit 1
+RESOURCE_ROOT=$(mktemp -d "${CODEX_BRIDGE_TEST_RESOURCE_PARENT:-/tmp}/acb.XXXXXX") \
+  || { rm -rf "$WORK"; exit 1; }
+RUNTIME_ROOT="$RESOURCE_ROOT/runtime"
+TUI_EXIT_RUNTIME_ROOT="$RUNTIME_ROOT/tui-exit"
+RELAUNCH_EARLY_RUNTIME_ROOT="$RUNTIME_ROOT/relaunch-early"
+TMUX_SOCKET="$RESOURCE_ROOT/tmux.sock"
+OWNED_STATES="$WORK/owned-states"
+OWNED_PIDS="$WORK/owned-pids"
+LAST_STARTED=none
+LAST_COMPLETED=none
+CLEANED=0
+OWNED_STATE_SEQUENCE=0
+OWNED_PROCESS_WAIT_SECONDS=5
+OWNED_PROCESS_POLL_SECONDS=0.05
+OWNED_PROCESS_TERM_GRACE_SECONDS=0.1
+HUP_EXIT_STATUS=129
+INT_EXIT_STATUS=130
+TERM_EXIT_STATUS=143
+SECONDS=0
+
+record_pane_pids() {
+  "$REAL_TMUX" -S "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' \
+    >> "$OWNED_PIDS" 2>/dev/null || true
+}
+
+owned_processes() {
+  [ -f "$OWNED_PIDS" ] || return 0
+  sort -u "$OWNED_PIDS" | while read -r pid; do
+    [ -n "$pid" ] || continue
+    command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    case "$command" in
+      *"$WORK"*|*"$RESOURCE_ROOT"*) printf '%s\n' "$pid" ;;
+    esac
+  done
+}
+
+wait_for_owned_processes() {
+  local deadline=$((SECONDS + OWNED_PROCESS_WAIT_SECONDS))
+  while [ -n "$(owned_processes)" ] && [ "$SECONDS" -lt "$deadline" ]; do
+    sleep "$OWNED_PROCESS_POLL_SECONDS"
+  done
+  [ -z "$(owned_processes)" ]
+}
+
+terminate_owned_processes() {
+  local pid
+  for pid in $(owned_processes); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep "$OWNED_PROCESS_TERM_GRACE_SECONDS"
+  for pid in $(owned_processes); do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+cleanup_invocation() {
+  [ "$CLEANED" -eq 0 ] || return 0
+  CLEANED=1
+  record_pane_pids
+  "$REAL_TMUX" -S "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  if ! wait_for_owned_processes; then
+    printf 'contract cleanup left owned processes: %s\n' "$(owned_processes)" >&2
+    terminate_owned_processes
+  fi
+  printf 'contract cleanup last_started=%s last_completed=%s elapsed=%ss\n' \
+    "$LAST_STARTED" "$LAST_COMPLETED" "$SECONDS"
+  rm -rf "$WORK" "$RESOURCE_ROOT"
+}
+
+cleanup_on_exit() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  cleanup_invocation
+  exit "$status"
+}
+
+trap cleanup_on_exit EXIT
+trap 'exit "$HUP_EXIT_STATUS"' HUP
+trap 'exit "$INT_EXIT_STATUS"' INT
+trap 'exit "$TERM_EXIT_STATUS"' TERM
+
 BIN="$WORK/bin"
 PLUGIN_ROOT="$WORK/mattpocock-skills"
 SKILL_DIR="$PLUGIN_ROOT/skills/engineering/implement"
@@ -32,13 +182,17 @@ SKILL_PATH="$SKILL_DIR/SKILL.md"
 CACHE_PLUGIN_ROOT="$WORK/codex-home/plugins/cache/mattpocock/mattpocock-skills/1.2.3"
 CACHE_SKILL_DIR="$CACHE_PLUGIN_ROOT/skills/engineering/implement"
 CACHE_SKILL_PATH="$CACHE_SKILL_DIR/SKILL.md"
-mkdir -p "$BIN"
+mkdir -p "$BIN" "$RUNTIME_ROOT" "$TUI_EXIT_RUNTIME_ROOT" "$RELAUNCH_EARLY_RUNTIME_ROOT"
+mkdir -p "$OWNED_STATES"
 mkdir -p "$SKILL_DIR"
 mkdir -p "$CACHE_SKILL_DIR"
 touch "$SKILL_PATH"
 touch "$CACHE_SKILL_PATH"
 export CODEX_STUB_PLUGIN_ROOT="$PLUGIN_ROOT"
 export CODEX_HOME="$WORK/codex-home"
+export CODEX_BRIDGE_TEST_PIDS="$OWNED_PIDS"
+export CODEX_BRIDGE_TEST_TMUX_SOCKET="$TMUX_SOCKET"
+export TMPDIR="$RUNTIME_ROOT"
 
 TMUX_LIST_PANES_FAILURES="$WORK/tmux-list-panes-failures"
 TMUX_LIST_PANES_FAILED="$WORK/tmux-list-panes-failed"
@@ -55,29 +209,30 @@ if [ "$1" = list-panes ] && [ -f "$TMUX_LIST_PANES_FAILURES" ]; then
   fi
 fi
 if [ "$1" = new-window ] && [ "${CODEX_STUB_DELAY_NEW_WINDOW_RETURN:-}" = 1 ]; then
-  output=$("%s" -L codex-bridge-test "$@")
+  output=$("%s" -S "$CODEX_BRIDGE_TEST_TMUX_SOCKET" "$@")
   status=$?
   pane_id=$(printf "%%s\n" "$output" | cut -f 2)
-  while "%s" -L codex-bridge-test list-panes -a -F "#{pane_id}" \
+  while "%s" -S "$CODEX_BRIDGE_TEST_TMUX_SOCKET" list-panes -a -F "#{pane_id}" \
       | grep -Fx "$pane_id" >/dev/null; do
     sleep 0.01
   done
   printf "%%s\n" "$output"
   exit "$status"
 fi
-exec "%s" -L codex-bridge-test "$@"
+exec "%s" -S "$CODEX_BRIDGE_TEST_TMUX_SOCKET" "$@"
 ' "$REAL_TMUX" "$REAL_TMUX" "$REAL_TMUX" > "$BIN/tmux"
-printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$PYTHON" "$STUB" > "$BIN/codex"
+printf '#!/bin/sh
+printf "%%s\\n" "$$" >> "$CODEX_BRIDGE_TEST_PIDS"
+exec "%s" "%s" "$@"
+' "$PYTHON" "$STUB" > "$BIN/codex"
 chmod +x "$BIN/tmux" "$BIN/codex"
 export PATH="$BIN:$PATH"
 
-cleanup() {
-  tmux kill-server 2>/dev/null
-  rm -rf "$WORK" "$TUI_EXIT_RUNTIME_ROOT" "$RELAUNCH_EARLY_RUNTIME_ROOT"
-}
-trap cleanup EXIT
-
 tmux new-session -d -s bt -x 200 -y 50 || { echo "cannot start test tmux server"; exit 1; }
+CONTROL_WINDOW=$(tmux display-message -p -t 'bt:' '#{window_id}') \
+  || { echo "cannot identify test tmux control window"; exit 1; }
+printf 'contract ownership work=%s tmux_socket=%s resource_root=%s\n' \
+  "$WORK" "$TMUX_SOCKET" "$RESOURCE_ROOT"
 
 FAILURES=0
 fail() { echo "FAIL: $*"; FAILURES=$((FAILURES + 1)); }
@@ -221,6 +376,12 @@ launch_with_options() { # <dir> <state-file> <window-name> <out-file> [launch op
     --window-name "$window_name" --state-file "$state_file" \
     --startup-timeout 15 --prompt "run the implement skill on ticket $window_name" \
     "$@" > "$out_file" 2>"$out_file.err"
+  local status=$?
+  if [ "$status" -eq 0 ] && [ -f "$state_file" ]; then
+    OWNED_STATE_SEQUENCE=$((OWNED_STATE_SEQUENCE + 1))
+    cp "$state_file" "$OWNED_STATES/$OWNED_STATE_SEQUENCE.state.json"
+  fi
+  return "$status"
 }
 
 watch() { # <out-file> <state-file...>
@@ -945,38 +1106,70 @@ test_stop() {
     && ok "stop: window and runtime cleared" || fail "stop: state not stopped"
 }
 
-test_receipt
-test_escalation_logging
-test_ruling_logging
-test_resume_keeps_logging_configuration
-test_unmarked_turn_is_watched
-test_missed_edge_is_still_logged_once
-test_unrecorded_turn_survives_a_later_turn
-test_model_effort_overrides
-test_without_model_effort_overrides
-test_resume_keeps_pinned_model_effort
-test_model_only_pin_and_resume
-test_unusable_resume_state
-test_question_send
-test_send_skill_input
-test_launch_skill_input
-test_plain_prompt_has_no_skill_input
-test_missing_skill_path_is_reported
-test_launch_unresolved_skill_is_reported
-test_relaunch_late_skill_failure_is_reported
-test_relaunch_early_skill_failure_is_reported
-test_skill_source_fallback
-test_skill_path_alias
-test_wave_wakeup
-test_vanished
-test_transient_pane_read_failures
-test_pane_read_failure_limit
-test_failed_turn
-test_tui_exit
-test_no_server
-test_duplicates
-test_watch_timeout
-test_stop
+cleanup_scenario() {
+  local cleanup_failed=0 state window
+  record_pane_pids
+  for state in "$OWNED_STATES"/*.state.json; do
+    [ -f "$state" ] || continue
+    "$PYTHON" "$BRIDGE" stop --state-file "$state" >/dev/null 2>&1 \
+      || cleanup_failed=1
+  done
+  for window in $(
+    "$REAL_TMUX" -S "$TMUX_SOCKET" list-windows -a -F '#{window_id}' 2>/dev/null || true
+  ); do
+    [ "$window" = "$CONTROL_WINDOW" ] && continue
+    "$REAL_TMUX" -S "$TMUX_SOCKET" kill-window -t "$window" >/dev/null 2>&1 \
+      || cleanup_failed=1
+  done
+  if ! wait_for_owned_processes; then
+    terminate_owned_processes
+    cleanup_failed=1
+  fi
+  rm -rf "$RUNTIME_ROOT"
+  mkdir -p "$RUNTIME_ROOT" "$TUI_EXIT_RUNTIME_ROOT" "$RELAUNCH_EARLY_RUNTIME_ROOT"
+  rm -f "$OWNED_STATES"/*.state.json
+  : > "$OWNED_PIDS"
+  return "$cleanup_failed"
+}
+
+SCENARIOS_RUN=0
+run_scenario() { # <group> <name> <function>
+  local group="$1" name="$2" function="$3" failures_before="$FAILURES"
+  if [ -n "${CODEX_BRIDGE_TEST_GROUP:-}" ] \
+      && [ "$CODEX_BRIDGE_TEST_GROUP" != "$group" ]; then
+    return
+  fi
+  if [ -n "${CODEX_BRIDGE_TEST_SCENARIO:-}" ] \
+      && [ "$CODEX_BRIDGE_TEST_SCENARIO" != "$name" ]; then
+    return
+  fi
+  SCENARIOS_RUN=$((SCENARIOS_RUN + 1))
+  LAST_STARTED="$name"
+  printf 'scenario started name=%s elapsed=%ss\n' "$name" "$SECONDS"
+  "$function"
+  if [ "${CODEX_BRIDGE_TEST_FAIL_SCENARIO:-}" = "$name" ]; then
+    fail "$name: forced assertion failure"
+  fi
+  if [ "${CODEX_BRIDGE_TEST_HOLD_SCENARIO:-}" = "$name" ]; then
+    printf 'scenario held name=%s elapsed=%ss\n' "$name" "$SECONDS"
+    while :; do
+      sleep 1
+    done
+  fi
+  cleanup_scenario || fail "$name: owned resource cleanup failed"
+  if [ "$FAILURES" -eq "$failures_before" ]; then
+    LAST_COMPLETED="$name"
+    printf 'scenario completed name=%s elapsed=%ss\n' "$name" "$SECONDS"
+  else
+    printf 'scenario failed name=%s elapsed=%ss\n' "$name" "$SECONDS"
+  fi
+}
+
+while IFS='|' read -r group name function; do
+  run_scenario "$group" "$name" "$function"
+done <<EOF
+$SCENARIO_TABLE
+EOF
 
 if [ "$FAILURES" -gt 0 ]; then
   echo "$FAILURES test(s) failed"
