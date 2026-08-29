@@ -220,7 +220,11 @@ directory, dispatch,
 receipt verification, the rule table's settlements, merges, tracker closes, wave advancement,
 monitor re-arming, and the report. It drives the existing scripts at their published command lines
 and holds no state of its own — every count it acts on is read back out of the machine log,
-which is what makes adopting an unfinished run the same code path as carrying one on.
+which is what makes adopting an unfinished run the same code path as carrying one on. Before any
+Wave is polled, the Driver makes it ready through the same activation path for a fresh start,
+adoption, resume or advance: a recorded launch is adopted, while an unrecorded ticket is dispatched
+only after a successful live-source reading confirms that no child exists
+([ADR-0024](adr/0024-driver-activates-every-wave-through-one-path.md)).
 
 **Waiter** — The coordinator's one background task while a run is live: it blocks until the
 driver leaves a wake snapshot in the run directory, prints that snapshot unchanged, and ends. It
