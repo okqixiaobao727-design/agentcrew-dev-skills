@@ -1,7 +1,7 @@
 {
   "name": "agentcrew-dev-skills",
   "description": "The multi-agent orchestration layer for mattpocock-skills: /route classifies and splits a spec's tickets across your Claude and Codex subscriptions, /crew runs them as unattended waves of tmux child agents.",
-  "version": "0.9.10",
+  "version": "0.9.11",
   "author": {
     "name": "okqixiaobao727-design"
   },

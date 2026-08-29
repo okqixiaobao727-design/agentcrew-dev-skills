@@ -7,6 +7,23 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-08-29
+
+### Fixed
+- A ticket routed to a second Claude account launched a child whose CREW ASK channel was dead in
+  both directions: cross-session name resolution reads a session registry under the sender's own
+  configuration home, and two accounts are two configuration homes holding disjoint registries.
+  The coordinator is now addressed by the socket its registry entry records — carried on the run's
+  metadata and rendered wherever the channel is described — so the send side follows the identity
+  the receive side already used, on every run rather than through a code path only the rare case
+  takes. Message logging and ticket correlation now record that address beside the launch name,
+  which also repairs correlation for a coordinator that copied a message's `from` field as the
+  tool's own instructions describe (#160).
+
+### Changed
+- ADR-0019 is marked deferred: #123 closed without a Tracker module being built, so the ADR's
+  decision stands but its status no longer claims code that does not exist.
+
 ## [0.9.10] - 2026-08-28
 
 ### Fixed
