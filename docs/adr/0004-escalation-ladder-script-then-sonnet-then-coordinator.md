@@ -19,6 +19,17 @@ children's designs disagree), escalates to the coordinator.
 > contract tenable without the coordinator's own reads, which the amended
 > [ADR-0010](0010-the-driver-runs-the-run-the-coordinator-rules.md) measured as pure cost.
 
+> **Approved design (#163; implementation pending, 2026-08-30).** The Witness remains one fresh,
+> read-only, budget-capped module behind one CLI seam, with two named operations. `check` replaces
+> the unnamed `--escalation` form and verifies one escalation from explicit resolved run values;
+> `ask --run <run-dir> --ticket <NN> --question <text>` resolves the active Run plan's frozen
+> worktree, account, model and budget before answering a coordinator's factual question. Both
+> operations return the existing `brief`/`checked|failed` envelope, share one execution path and
+> tracker-comment trust rule, and never recommend or rule. Claude returns mode-specific structured
+> output under a JSON schema; Python validates its pointer semantics and renders the brief, so
+> extra model prose cannot become protocol. The old unnamed CLI form receives no compatibility
+> alias, and this change adds neither a resident witness nor a second witness module.
+
 ## Considered Options
 
 - **Resident cheap "executive" session** doing all mechanics: grows its own long-context
