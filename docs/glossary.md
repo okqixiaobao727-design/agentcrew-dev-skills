@@ -226,11 +226,19 @@ adoption, resume or advance: a recorded launch is adopted, while an unrecorded t
 only after a successful live-source reading confirms that no child exists
 ([ADR-0024](adr/0024-driver-activates-every-wave-through-one-path.md)).
 
+**Run adoption** — A new Driver process taking up an unfinished run after its previous Driver
+ended. It restores the run around the work already recorded; it is not a Coordinator handover or
+a Waiter attachment.
+
 **Waiter** — The coordinator's one background task while a run is live: it blocks until the
 driver leaves a wake snapshot in the run directory, prints that snapshot unchanged, and ends. It
 holds no state and composes nothing, so a killed waiter loses no run fact — but until another is
 attached, no wake reaches the coordinator (#127). Re-typing `/crew <feature-dir>` attaches one.
 _Avoid_: wake monitor (the per-child watchers), listener, poller
+
+**Waiter attachment** — A Coordinator session attaching its stateless Waiter to a run whose Driver
+continues unchanged. It restores delivery of future wake snapshots; it is neither Run adoption nor
+Coordinator handover.
 
 **Wake surface** — The exhaustive list of what reaches the coordinator mid-run: a `CREW ASK` of any
 kind, a semantic merge conflict a child has bounced back a second time, and any state the rule table
@@ -315,6 +323,13 @@ Read off the harness at start, carried on the run's metadata, and used verbatim 
 never normalised
 ([ADR-0023](adr/0023-the-coordinator-is-addressed-by-socket-not-by-name.md)). It is what makes a
 child on a second account reach the same coordinator as a child on the first.
+
+**Coordinator handover** — An in-place transfer of a live run from its current Coordinator to a
+new Coordinator while the existing Driver continues. A manual `/crew` invocation from a different
+Coordinator address requests the transfer even if the old process still appears alive; the Driver
+atomically supersedes the old Coordinator, records the new identity and re-anchors live children
+before Wave activation or polling continues
+([ADR-0025](adr/0025-a-live-driver-accepts-coordinator-handover-in-place.md)).
 
 **On-child-launch hook** — An optional config entry — a command plus optional extra environment
 variables for the child — run once per child at launch. Empty by default. It is the extension point
