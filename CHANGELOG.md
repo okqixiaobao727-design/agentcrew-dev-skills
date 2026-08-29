@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-08-30
+
 ### Added
 - Witness is now one taskable fact-finding interface with explicit `check` and `ask` operations.
   Checks consume structured findings and render deterministic pointer-backed briefs, while an ask
