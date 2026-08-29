@@ -166,6 +166,7 @@ class TicketFacts:
     events: tuple = ()
     first_launch: Mapping | None = None
     launch: Mapping | None = None
+    launch_verification_failed: bool = False
     receipt: Mapping | None = None
     latest_settling_event: Mapping | None = None
     progress_event: Mapping | None = None
@@ -192,6 +193,7 @@ class RunProjection:
     """The immutable current facts derived from one physically ordered Machine log."""
 
     tickets: Mapping
+    latest_landed_merge: Mapping | None = None
     current_wave: int = 1
     ended: bool = False
     halted: bool = False
@@ -275,8 +277,14 @@ def project(records):
     current_wave = 1
     ended = False
     latest_advance = None
+    latest_landed_merge = None
     episodes = {}
     for record in frozen_records:
+        if (
+            record.get("event") == "merge"
+            and record.get("result") in LANDED_MERGE_RESULTS
+        ):
+            latest_landed_merge = record
         if record.get("event") == "advance":
             latest_advance = record
             decision = record.get("decision")
@@ -362,6 +370,14 @@ def project(records):
     tickets = {}
     for ticket, events in events_by_ticket.items():
         launches = [record for record in events if record.get("event") == "launch"]
+        launch_verification_failed = False
+        launch_seen = False
+        for record in events:
+            if record.get("event") == "launch":
+                launch_seen = True
+                launch_verification_failed = False
+            elif record.get("event") == "launch-failed" and launch_seen:
+                launch_verification_failed = True
         receipts = [record for record in events if record.get("event") == "receipt"]
         latest_settling_event = None
         progress_event = None
@@ -420,6 +436,7 @@ def project(records):
             events=tuple(events),
             first_launch=launches[0] if launches else None,
             launch=launches[-1] if launches else None,
+            launch_verification_failed=launch_verification_failed,
             receipt=receipts[-1] if receipts else None,
             latest_settling_event=latest_settling_event,
             progress_event=progress_event,
@@ -438,6 +455,7 @@ def project(records):
         )
     return RunProjection(
         tickets=MappingProxyType(tickets),
+        latest_landed_merge=latest_landed_merge,
         current_wave=current_wave,
         ended=ended,
         halted=(

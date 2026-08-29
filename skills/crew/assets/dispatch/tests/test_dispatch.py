@@ -180,7 +180,7 @@ class Fixture:
         return path
 
     def run_dispatch(self, command, table, wave=1, env_overrides=None, extra=(),
-                     out_dir=None, cwd=None):
+                     out_dir=None, cwd=None, ticket_ids=None):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
@@ -189,12 +189,27 @@ class Fixture:
         environment.pop("AGENTCREW_STUB_STATE_MODEL", None)
         environment.pop("AGENTCREW_STUB_STATE_CWD", None)
         environment.update(env_overrides or {})
+        if command == "dispatch" and ticket_ids is None:
+            try:
+                payload = json.loads(pathlib.Path(table).read_text())
+                ticket_ids = [
+                    ticket["id"]
+                    for item in payload["waves"] if item["wave"] == wave
+                    for ticket in item["tickets"]
+                ]
+            except (OSError, UnicodeDecodeError, ValueError, TypeError, KeyError):
+                ticket_ids = []
+            # Invalid-table tests must reach dispatch's table reader rather than fail this fixture's
+            # new required-argument setup first. The placeholder is never used by a valid table.
+            ticket_ids = ticket_ids or ["fixture-ticket"]
         return subprocess.run(
             [
                 sys.executable, str(DISPATCH), command,
                 "--table", str(table),
                 "--wave", str(wave),
                 "--out-dir", str(self.out_dir if out_dir is None else out_dir),
+                *(argument for ticket in (ticket_ids or ())
+                  for argument in ("--ticket-id", ticket)),
                 *extra,
             ],
             capture_output=True, text=True, env=environment,
@@ -1828,6 +1843,68 @@ class MixedWaveTests(DispatchTestCase):
         self.assertEqual(len(lines), 2, result.stdout)
         self.assertTrue(lines[0].startswith("06 launched claude"), lines[0])
         self.assertTrue(lines[1].startswith("07 launched codex"), lines[1])
+
+
+class DispatchTicketSelectionTests(DispatchTestCase):
+    def test_dispatch_requires_at_least_one_ticket_id(self):
+        table = self.fixture.table([self.fixture.ticket("06", "only-child")])
+
+        result = self.fixture.run_dispatch("dispatch", table, ticket_ids=())
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("--ticket-id", result.stderr)
+        self.assertEqual(self.fixture.launches(), [])
+
+    def test_dispatch_filters_by_ticket_id_in_run_plan_order(self):
+        tickets = [
+            self.fixture.ticket("06", "first-child"),
+            self.fixture.ticket("07", "unselected-child"),
+            self.fixture.ticket("08", "last-child"),
+        ]
+        table = self.fixture.table(tickets)
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, ticket_ids=("08", "06"),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual([line.split()[0] for line in lines], ["06", "08"])
+        self.assertEqual(
+            [pathlib.Path(launch["cwd"]).name for launch in self.fixture.launches()],
+            ["06-first-child", "08-last-child"],
+        )
+
+    def test_dispatch_rejects_a_ticket_outside_the_named_wave_before_launching(self):
+        table = self.fixture.table([self.fixture.ticket("06", "only-child")])
+
+        result = self.fixture.run_dispatch(
+            "dispatch", table, ticket_ids=("06", "99"),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("wave 1", result.stderr)
+        self.assertIn("99", result.stderr)
+        self.assertEqual(self.fixture.launches(), [])
+
+    def test_render_and_roles_do_not_accept_ticket_ids(self):
+        ticket = self.fixture.ticket("06", "only-child")
+        table = self.fixture.table([ticket])
+
+        render = self.fixture.run_dispatch("render", table, ticket_ids=("06",))
+        roles = subprocess.run(
+            [
+                sys.executable, str(DISPATCH), *self.fixture.roles_arguments(ticket["path"]),
+                "--ticket-id", "06",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(render.returncode, 0, render.stdout)
+        self.assertIn("render does not accept --ticket-id", render.stderr)
+        self.assertNotEqual(roles.returncode, 0, roles.stdout)
+        self.assertIn("roles does not accept --ticket-id", roles.stderr)
 
 
 class AccountRoutingTests(DispatchTestCase):

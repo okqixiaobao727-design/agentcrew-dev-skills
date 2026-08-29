@@ -81,6 +81,10 @@ def new_window(argv):
     if (state_dir() / "tmux-new-window-fails").exists():
         print("create window failed: index in use", file=sys.stderr)
         return 1
+    selective_failure = state_dir() / "tmux-new-window-fails-for"
+    if selective_failure.exists() and flag(argv, "-n") == selective_failure.read_text().strip():
+        print("create window failed: index in use", file=sys.stderr)
+        return 1
     if unknown_session(flag(argv, "-t")):
         print(f"can't find session: {flag(argv, '-t')}", file=sys.stderr)
         return 1

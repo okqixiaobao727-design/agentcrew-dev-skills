@@ -2,7 +2,7 @@
 """The crew driver: the one command a run is started by, and the state machine it runs on.
 
     start   preflight the run, build and validate its wave table, prepare the branch and the run
-            directory, dispatch wave 1, start the dashboard, and run the wave loop to its end —
+            directory, activate wave 1, start the dashboard, and run the wave loop to its end —
             or, where the feature already carries an unfinished run, adopt that one instead
     clear   inventory one recorded run, ask the operator, and remove its recorded artefacts
     resume  put that loop back where a ruling stopped it
@@ -73,8 +73,8 @@ the second; parked and failed receipts are recorded by the driver rather than by
 child earns one nudge and settles failed on the second silence, unless it is idle because it is
 owed a ruling nothing has answered yet; a vanished child settles failed; a settled wave is
 advanced, which lands its branches, resolves a mechanical conflict in the merge driver itself and
-launches the next wave; a semantic conflict is answered first by a templated instruction to the
-child that has to resolve it; a merged ticket is closed in the run's
+hands the next wave back to the driver for activation; a semantic conflict is answered first by a
+templated instruction to the child that has to resolve it; a merged ticket is closed in the run's
 tracker with its exact undo written into the log; and each wave's monitors are re-armed without a
 coordinator turn.
 
@@ -1760,7 +1760,6 @@ def run_start(args):
         return stop_for_preflight(args, feature_dir, [gate_problem])
     run_dir.mkdir(parents=True, exist_ok=True)
     take_up_run(run_dir)
-    launch_dir = run_dir / LAUNCH_DIR_NAME
     log = run_dir / LOG_NAME
     run = run_section(
         args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit, config
@@ -1775,14 +1774,7 @@ def run_start(args):
     install_hook(
         log, repo / SETTINGS_PATH, "coordinator", session_id=run["coordinator_session"]
     )
-    dispatch_wave(table_path, log, launch_dir, run_dir)
-    children = launched_children(log)
-    for child in children:
-        install_hook(
-            log, pathlib.Path(child["worktree"]) / SETTINGS_PATH, "child", child["ticket"]
-        )
-    print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
-    return wave_loop(args, repo, run_dir, table_path)
+    return wave_loop(args, repo, run_dir, table_path, starting=True)
 
 
 def adopt(args, repo, run_dir, table_path):
@@ -1818,29 +1810,6 @@ def adopt(args, repo, run_dir, table_path):
         return 0
     print(f"crew adopted wave {projection.current_wave}, run directory {run_dir}", flush=True)
     return wave_loop(args, repo, run_dir, table_path, adopting=True)
-
-
-def dispatch_wave(table, log, launch_dir, run_dir):
-    """Dispatch wave 1 through the renderer, which launches, verifies and logs every child."""
-    result = subprocess.run(
-        [
-            sys.executable, str(DISPATCH), "dispatch",
-            "--table", str(table), "--wave", "1",
-            "--out-dir", str(launch_dir), "--log", str(log),
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        return
-    failures = [
-        line for line in result.stdout.splitlines() if " FAILED " in line
-    ] or [(result.stderr or result.stdout).strip()]
-    ticket = failures[0].split(None, 1)[0] if failures[0] else None
-    raise DriverError(
-        "wave 1 did not launch: " + "; ".join(failures),
-        ticket=ticket if ticket and ticket.isdigit() else None,
-        pointer=str(run_dir / LOG_NAME),
-    )
 
 
 def start_dashboard(args, repo, run_dir):
@@ -2219,6 +2188,218 @@ def write_report(run_dir, run, plan, records, cost_output):
     return path
 
 
+# --- making one named Wave ready to poll -------------------------------------------------------
+
+
+class WaveActivation:
+    """Resolve one Wave's planned work against facts and one live-source reading."""
+
+    def __init__(self, loop):
+        self.loop = loop
+
+    def expected_launch(self, ticket):
+        """Return the identity existing live sources use before a launch record exists."""
+        return {
+            "ticket": ticket.id,
+            "executor": ticket.executor,
+            "worktree": str(dispatch.worktree_path(self.loop.run, ticket)),
+        }
+
+    def observations(self, tickets):
+        """Return one shared fresh live-source reading for the supplied tickets."""
+        bindings = []
+        for ticket, _launch in tickets:
+            if ticket.binding not in bindings:
+                bindings.append(ticket.binding)
+        return monitor.fresh_live_sources(
+            monitor.CLAUDE_BIN,
+            self.loop.run_dir,
+            monitor.DEFAULT_TIMEOUT_SECONDS,
+            bindings=tuple(bindings),
+        )
+
+    @staticmethod
+    def observation(ticket, launch, sources):
+        """Return present, absent or unknown from the monitor's existing lane semantics."""
+        _state, anomaly, status = monitor.live_state(launch, sources, ticket.binding)
+        if anomaly is not None:
+            return monitor.UNKNOWN, anomaly[1]
+        if status is None:
+            return "absent", ""
+        return "present", ""
+
+    def child_window(self, ticket, launch):
+        """Return the recorded or uniquely named tmux window of an observed child."""
+        if launch.get("window"):
+            return str(launch["window"])
+        result = subprocess.run(
+            [
+                "tmux", "list-windows", "-t", self.loop.run.tmux_session,
+                "-F", "#{window_id}\t#{window_name}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise DriverError(
+                f"ticket {ticket.id}'s observed child window could not be read:"
+                f" {(result.stderr or result.stdout).strip()}",
+                ticket=ticket.id,
+                pointer=str(self.loop.log),
+            )
+        matches = [
+            line.split("\t", 1)[0]
+            for line in result.stdout.splitlines()
+            if "\t" in line and line.split("\t", 1)[1] == ticket.id
+        ]
+        if len(matches) != 1:
+            raise DriverError(
+                f"ticket {ticket.id}'s observed child has {len(matches)} matching tmux windows",
+                ticket=ticket.id,
+                pointer=str(self.loop.log),
+            )
+        return matches[0]
+
+    def record_adoption(self, ticket, launch):
+        """Append the launch fact that makes one child adoptable; return nothing."""
+        worktree = launch.get("worktree") or dispatch.worktree_path(self.loop.run, ticket)
+        arguments = [
+            sys.executable, MACHINE_LOG, "--log", self.loop.log, "launch",
+            "--ticket", ticket.id,
+            "--child", str(launch.get("child") or ""),
+            "--workflow", ticket.workflow,
+            "--executor", ticket.executor,
+            "--model", ticket.model,
+            "--effort", ticket.effort,
+            "--branch", dispatch.branch_name(ticket),
+            "--worktree", str(worktree),
+            "--window", self.child_window(ticket, launch),
+        ]
+        if ticket.executor == CLAUDE:
+            arguments += ["--account", str(ticket.binding.directory)]
+        run_command(
+            arguments,
+            f"ticket {ticket.id}'s observed child could not be adopted",
+            ticket=ticket.id,
+            pointer=str(self.loop.log),
+        )
+
+    def reverify(self, ticket, launch):
+        """Return an amended launch after checking the executor's original proof surface once."""
+        worktree = pathlib.Path(launch.get("worktree") or dispatch.worktree_path(
+            self.loop.run, ticket
+        ))
+        try:
+            if ticket.executor == CLAUDE:
+                entry = dispatch.verify_child(ticket, worktree, 0)
+                return {**launch, "child": entry.get("name") or launch.get("child")}
+            state_file = pathlib.Path(self.loop.run.codex.state_dir) / f"{ticket.id}.json"
+            state = dispatch.verify_codex_child(ticket, worktree, state_file)
+            return {**launch, "child": state.get("threadId") or launch.get("child")}
+        except (dispatch.LaunchError, KeyError, OSError) as error:
+            raise DriverError(
+                f"ticket {ticket.id}'s recorded launch failed re-verification: {error}",
+                ticket=ticket.id,
+                pointer=str(self.loop.log),
+            ) from error
+
+    def activation_base(self, projection):
+        """Return the last code landing point, or the RunPlan base before any merge landed."""
+        landed = projection.latest_landed_merge
+        if landed is None:
+            return self.loop.run.integration_base_commit
+        sha = landed.get("sha")
+        resolved = (
+            git_output(self.loop.repo, "rev-parse", "--verify", f"{sha}^{{commit}}")
+            if isinstance(sha, str) and sha
+            else None
+        )
+        if resolved is None or resolved.lower() != sha.lower():
+            raise DriverError(
+                "the latest landed merge has no valid full commit sha",
+                ticket=str(landed.get("ticket")) if landed.get("ticket") is not None else None,
+                pointer=str(self.loop.log),
+            )
+        return sha
+
+    def dispatch(self, wave, tickets, base_commit):
+        """Make this activation's one exact dispatch attempt; return nothing on success."""
+        arguments = [
+            sys.executable, str(DISPATCH), "dispatch",
+            "--table", str(self.loop.table_path), "--wave", str(wave),
+            "--out-dir", str(self.loop.run_dir / LAUNCH_DIR_NAME),
+            "--log", str(self.loop.log),
+            "--base-commit", base_commit,
+        ]
+        for ticket in tickets:
+            arguments += ["--ticket-id", ticket]
+        result = subprocess.run(arguments, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        failures = [
+            line for line in result.stdout.splitlines() if " FAILED " in line
+        ] or [(result.stderr or result.stdout).strip()]
+        number = failures[0].split(None, 1)[0] if failures[0] else None
+        raise DriverError(
+            f"wave {wave} did not activate: " + "; ".join(failures),
+            ticket=number if number and number.isdigit() else None,
+            pointer=str(self.loop.log),
+        )
+
+    def restore_hooks(self, wave):
+        """Install every existing child worktree's current run hook; return nothing."""
+        projection = machine_log.project(self.loop.records())
+        for ticket in self.loop.tickets_of(wave):
+            launch = projection.ticket(ticket.id).launch
+            worktree = (launch or {}).get("worktree")
+            if worktree and pathlib.Path(worktree).is_dir():
+                install_hook(
+                    self.loop.log,
+                    pathlib.Path(worktree) / SETTINGS_PATH,
+                    CHILD_ROLE,
+                    ticket.id,
+                )
+
+    def activate(self, wave):
+        """Make named `wave` ready for normal polling and restore its hooks; return nothing."""
+        try:
+            records = self.loop.records()
+            projection = machine_log.project(records)
+            unrecorded = []
+            failed_verification = []
+            for ticket in self.loop.tickets_of(wave):
+                facts = projection.ticket(ticket.id)
+                if facts.settlement_state not in (machine_log.LIVE, machine_log.BLOCKED):
+                    continue
+                if facts.launch is None:
+                    unrecorded.append((ticket, self.expected_launch(ticket)))
+                elif facts.launch_verification_failed:
+                    failed_verification.append((ticket, facts.launch))
+
+            for ticket, launch in failed_verification:
+                self.record_adoption(ticket, self.reverify(ticket, launch))
+
+            sources = self.observations(unrecorded) if unrecorded else {}
+            absent = []
+            for ticket, launch in unrecorded:
+                state, detail = self.observation(ticket, launch, sources)
+                if state == "absent":
+                    absent.append(ticket.id)
+                elif state == monitor.UNKNOWN:
+                    raise DriverError(
+                        f"ticket {ticket.id}'s live source is unknown: {detail}",
+                        ticket=ticket.id,
+                        pointer=str(self.loop.log),
+                    )
+                else:
+                    self.record_adoption(ticket, launch)
+
+            if absent:
+                self.dispatch(wave, absent, self.activation_base(projection))
+        finally:
+            self.restore_hooks(wave)
+
+
 # --- the loop's own context --------------------------------------------------------------------
 
 
@@ -2237,6 +2418,7 @@ class Loop:
             raise DriverError(str(error), pointer=str(table_path)) from error
         self.run = self.plan.run
         self.monitors = []
+        self.activation = WaveActivation(self)
 
     # --- what it reads --------------------------------------------------------------------
 
@@ -2716,12 +2898,11 @@ class Loop:
     # --- the wave boundary ------------------------------------------------------------------
 
     def advance(self, wave):
-        """Land the settled wave and launch the next; returns the wave to work, or None when done.
+        """Land the settled Wave and activate the next; return the Wave to work, or None.
 
-        Every rung below the coordinator lives inside this one call — the merge driver classifies a
-        conflict and resolves a mechanical one itself, and advance launches the next wave and
-        blocks what a stopped ticket stopped. What comes back is a decision, and only two of them
-        are this loop's to act on.
+        Advance classifies and lands the current Wave, then this Driver activates the following
+        Wave. The existing `launched` decision is the commit point: it is written only after
+        activation succeeds.
         """
         result = subprocess.run(
             [
@@ -2744,14 +2925,43 @@ class Loop:
                 f" {(result.stderr or result.stdout).strip()}",
                 pointer=str(self.log),
             )
-        self.close_merged()
-        records = self.records()
-        projection = machine_log.project(records)
-        following = projection.current_wave
-        if following == wave:
+        following_wave = self.plan.following_wave(wave)
+        if following_wave is None:
+            self.close_merged()
             return None
-        self.open_wave(projection)
+        following = following_wave.number
+        try:
+            self.activation.activate(following)
+        except DriverError as error:
+            self.record_advance(following, ESCALATED, str(error))
+            self.close_merged()
+            raise
+        children = ", ".join(ticket.id for ticket in following_wave.tickets)
+        self.record_advance(following, LAUNCHED, f"advanced from wave {wave}: {children}")
+        self.toast(f"crew wave {following} {LAUNCHED}")
+        self.close_merged()
+        self.open_wave()
         return following
+
+    def record_advance(self, wave, decision, detail):
+        """Write one existing advance decision through the Machine-log boundary; return nothing."""
+        run_command(
+            [
+                sys.executable, MACHINE_LOG, "--log", self.log,
+                "advance", "--wave", str(wave), "--decision", decision,
+                "--detail", detail,
+            ],
+            f"wave {wave}'s {decision} decision could not be recorded",
+            pointer=str(self.log),
+        )
+
+    @staticmethod
+    def toast(text):
+        """Show one non-governing milestone on the operator's channel; return nothing."""
+        try:
+            subprocess.run(["tmux", "display-message", text], capture_output=True, text=True)
+        except OSError:
+            pass
 
     def rule_on_halt(self, wave, result):
         """The chain stopped: answer a semantic conflict once, and read what the rest of it means.
@@ -2882,20 +3092,8 @@ class Loop:
         except run_plan.RunPlanError:
             return ticket
 
-    def open_wave(self, projection):
-        """Give the wave advance just launched everything a launched wave has; returns nothing.
-
-        Its children get this run's escalation hook and the dashboard is pointed at the run again,
-        exactly as the first wave's launch did — the command owns the run's one window, so calling
-        it every wave is what brings a window the operator closed back.
-        """
-        for ticket, facts in sorted(projection.tickets.items()):
-            launch = facts.launch
-            if launch is None:
-                continue
-            worktree = launch.get("worktree")
-            if worktree:
-                install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
+    def open_wave(self):
+        """Open or restore this run's dashboard for normal Wave polling; return nothing."""
         start_dashboard(self.args, self.repo, self.run_dir)
 
     def close_merged(self):
@@ -2951,7 +3149,6 @@ class Loop:
             if worktree and pathlib.Path(worktree).is_dir():
                 install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
         self.reanchor(projection)
-        start_dashboard(self.args, self.repo, self.run_dir)
 
     def reanchor(self, projection):
         """Point the run and its live children at the coordinator driving it now; returns nothing.
@@ -3275,7 +3472,7 @@ def gh_or_raise(repo, number, message, *arguments):
 # --- the loop's two entry points ---------------------------------------------------------------
 
 
-def wave_loop(args, repo, run_dir, table_path, adopting=False):
+def wave_loop(args, repo, run_dir, table_path, adopting=False, starting=False):
     """Run the wave loop over a prepared run; returns the exit code its ending earns.
 
     Every way out of the loop carries the command that puts it back: a run stopped by a driver
@@ -3286,12 +3483,16 @@ def wave_loop(args, repo, run_dir, table_path, adopting=False):
     handling: a run that cannot be adopted wakes the coordinator with a snapshot exactly as one
     that cannot be carried on does.
     """
-    start_dashboard(args, repo, run_dir)
     loop = Loop(args, repo, run_dir, table_path)
     resume = resume_command(args)
     try:
         if adopting:
             loop.adopt()
+        projection = machine_log.project(loop.records())
+        loop.activation.activate(projection.current_wave)
+        loop.open_wave()
+        if starting:
+            print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
         return loop.run_until_woken()
     except Wake as wake:
         snapshot(

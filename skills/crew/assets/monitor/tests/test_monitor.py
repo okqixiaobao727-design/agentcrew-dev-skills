@@ -9,6 +9,7 @@ was asked to display, the verdict line, the log lines that follow it, and the ex
 
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
@@ -28,6 +30,10 @@ ACCOUNTS = TESTS_DIR.parents[1] / "accounts.py"
 # The projection module the monitor reads Machine-log facts through; part of every release of it.
 MACHINE_LOG = TESTS_DIR.parents[1] / "machine_log.py"
 RUN_PLAN = TESTS_DIR.parents[1] / "run_plan.py"
+
+MONITOR_SPEC = importlib.util.spec_from_file_location("crew_monitor_test_subject", MONITOR)
+MONITOR_MODULE = importlib.util.module_from_spec(MONITOR_SPEC)
+MONITOR_SPEC.loader.exec_module(MONITOR_MODULE)
 
 # Stamped in the run's one timestamp format, so every elapsed time below is arithmetic a reader
 # can check: 09:00:00 to 09:12:31 is twelve minutes and thirty-one seconds.
@@ -2702,6 +2708,30 @@ class LiveSourceTests(MonitorTestCase):
         self.assertEqual(frame(first.stdout), frame(second.stdout))
         self.assertIn(row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
                       first.stdout)
+
+    def test_fresh_sources_bypass_a_stale_absence_without_changing_the_cache(self):
+        self.live_run()
+        shutil.rmtree(self.fixture.sessions_dir())
+        self.fixture.command_agents({})
+        cached_frame = self.fixture.pin_frame("--no-color")
+        self.assertEqual(cached_frame.returncode, 0, cached_frame.stderr)
+        cache_path = self.fixture.agents_cache_path()
+        cached_absence = cache_path.read_text()
+
+        self.fixture.command_agents({"06": "busy"})
+        plan = MONITOR_MODULE.read_plan(self.fixture.run_dir)
+        binding = plan.ticket("06").binding
+        with mock.patch.dict(os.environ, self.fixture.environment(), clear=True):
+            sources = MONITOR_MODULE.fresh_live_sources(
+                str(self.fixture.bin_dir / "claude"),
+                self.fixture.run_dir,
+                bindings=(binding,),
+            )
+
+        worktree = MONITOR_MODULE.worktree_key(self.fixture.worktrees["06"])
+        self.assertEqual(sources[binding][MONITOR_MODULE.CLAUDE][worktree], "busy")
+        self.assertEqual(cache_path.read_text(), cached_absence)
+        self.assertEqual(self.spawns(), [["agents", "--json"], ["agents", "--json"]])
 
     def test_a_fetch_older_than_the_window_is_made_again(self):
         self.live_run()

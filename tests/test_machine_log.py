@@ -293,6 +293,41 @@ class RunProjectionTests(unittest.TestCase):
         self.assertEqual(missing.events, ())
         self.assertIsNone(missing.launch)
 
+    def test_launch_verification_failure_follows_the_latest_launch_epoch(self):
+        cases = (
+            ("no launch", [], False),
+            ("only launch", [{"event": "launch", "ticket": "7"}], False),
+            ("failed after launch", [
+                {"event": "launch", "ticket": "7"},
+                {"event": "launch-failed", "ticket": "7"},
+            ], True),
+            ("new launch clears failure", [
+                {"event": "launch", "ticket": "7"},
+                {"event": "launch-failed", "ticket": "7"},
+                {"event": "launch", "ticket": "7"},
+            ], False),
+        )
+
+        for name, records, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    machine_log.project(records).ticket("7").launch_verification_failed,
+                    expected,
+                )
+
+    def test_latest_landed_merge_uses_physical_order_across_the_run(self):
+        projection = machine_log.project([
+            {"event": "merge", "ticket": "7", "result": "clean", "sha": "a" * 40},
+            {"event": "merge", "ticket": "8", "result": "conflict"},
+            {"event": "merge", "ticket": "8", "result": "resolved", "sha": "b" * 40},
+            {"event": "merge", "ticket": "9", "result": "escalated"},
+            {"event": "merge", "ticket": "10", "result": "repaired", "sha": "c" * 40},
+        ])
+
+        self.assertEqual(projection.latest_landed_merge["ticket"], "10")
+        self.assertEqual(projection.latest_landed_merge["sha"], "c" * 40)
+        self.assertIsNone(machine_log.project([]).latest_landed_merge)
+
     def test_settlement_facts_keep_event_presence_quality_and_progress_distinct(self):
         projection = machine_log.project([
             {"event": "receipt", "ticket": "7", "verdict": "landable", "ts": "03"},
