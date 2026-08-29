@@ -76,10 +76,11 @@ prompt over the trusted channel, never be sent afterwards as a message.
 
 **One rule: answer everything, keep it moving. Nothing parks except the red line.**
 
-The coordinator rules from the escalation and its witness brief, with at most one bounded read of a
-pointer the two state differently — it is serving the whole wave at once. Children escalate in a
-fixed compact format: ticket number, one of five kinds, the question in one paragraph, two or three
-options with one recommended, every fact as a pointer.
+The coordinator reads maintainer-authored judgment Markdown whole. It rules source facts from the
+escalation and its witness brief, with at most one bounded read of a pointer the two state
+differently — it is serving the whole wave at once. Children escalate in a fixed compact format:
+ticket number, one of five kinds, the question in one paragraph, two or three options with one
+recommended, every fact as a pointer.
 
 Every judgement goes into the decision log, and any action reaching outside a worktree gets its own
 entry stating how to undo it.

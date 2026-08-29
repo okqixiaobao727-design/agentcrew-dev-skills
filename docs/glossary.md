@@ -199,9 +199,10 @@ runs, and which tests the ticket names. Method belongs to the skill the opening 
 
 **Coordinator** — The session in the main tmux window that runs `/crew`, and the run's **oracle**:
 its whole job is judgment. It launches the driver, rules on what children escalate and on what the
-rule table has no row for, and points at the report. It writes no product code and opens no run
-file — it rules from what an escalation and its witness brief show it, with at most one bounded
-read to settle a fact they state differently
+rule table has no row for, and points at the report. It writes no product code. It reads the
+judgment Markdown the Contract names whole; for code, tests and git facts it rules from the
+escalation and its witness brief, with at most one bounded read to settle a fact they state
+differently
 ([ADR-0010](adr/0010-the-driver-runs-the-run-the-coordinator-rules.md)). It speaks to the human
 only for a decision that is theirs; the human asks when they want to know.
 _Avoid_: lead, orchestrator (legacy term from `/orchestrate`), advisor (the role's name in a
@@ -288,10 +289,13 @@ fixed in this ticket, opened as a ticket seeded from that line, or dropped. A co
 leftovers is a receipt, not a wrap-up.
 _Avoid_: tail, follow-up list
 
-**Bounded read** — The one file access open to the coordinator: a single pointer, read with an
-explicit offset and at most 80 lines, to settle a fact the escalation and the witness brief state
-differently, or to see a pointer the brief marks missing. A whole file, a search, or a shell read
-is a **hunt**, and the hook refuses it.
+**Bounded read** — The coordinator's file boundary is a kind line. Maintainer-authored judgment
+Markdown is read whole: top-level Markdown in the current staged run; repository ADRs, the
+glossary, `CONTEXT.md`, `references/trackers.md` and `docs/agents/*.md`; and the Crew `SKILL.md`
+and its Markdown references. Physical locations decide membership (ADR-0007). Code, tests and git
+are facts: one source pointer may be read with an explicit offset and at most 80 lines to settle
+what an escalation and its witness brief state differently, or to see a pointer the brief marks
+missing. `Grep`, `Glob` and shell file reads are a **hunt**, and the hook refuses them.
 
 **Ruling** — A judgment the coordinator issues in reply to an escalation: design direction, a
 conflict verdict, or a scope decision.

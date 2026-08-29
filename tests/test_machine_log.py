@@ -1515,6 +1515,8 @@ class InstallTests(MachineLogTestCase):
             args += ["--session-id", session_id]
         if crew_dir is not None:
             args += ["--crew-dir", str(crew_dir)]
+        if role == "coordinator":
+            args += ["--run-dir", str(self.log.parent)]
         return run_cli(*args, log=self.log)
 
     def test_the_child_side_registers_a_posttooluse_hook_on_sendmessage(self):
@@ -1553,7 +1555,18 @@ class InstallTests(MachineLogTestCase):
         self.assertIn("bounded_read.py", hook["command"])
         self.assertIn(" hook --crew-dir ", hook["command"])
         self.assertIn(f"--crew-dir {CREW_DIR}", hook["command"])
+        self.assertIn(f"--run-dir {self.log.parent}", hook["command"])
         self.assertIn(f"--session-id {COORDINATOR_SESSION}", hook["command"])
+
+    def test_a_coordinator_install_without_a_staged_run_directory_is_refused(self):
+        result = run_cli(
+            "install", "--settings", str(self.settings), "--role", "coordinator",
+            log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--run-dir", result.stderr)
+        self.assertFalse(self.settings.exists())
 
     def test_installing_the_coordinator_twice_leaves_one_bounded_read_hook(self):
         self.install(role="coordinator")
@@ -1574,7 +1587,8 @@ class InstallTests(MachineLogTestCase):
             [
                 sys.executable, str(copied_script), "--log", str(copied_log),
                 "install", "--settings", str(self.settings), "--role", "coordinator",
-                "--crew-dir", str(CREW_DIR), "--session-id", COORDINATOR_SESSION,
+                "--crew-dir", str(CREW_DIR), "--run-dir", str(run_dir),
+                "--session-id", COORDINATOR_SESSION,
             ],
             capture_output=True,
             text=True,
@@ -1583,6 +1597,7 @@ class InstallTests(MachineLogTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         command, = registered_bounded_commands(self.settings)
         self.assertIn(f"--crew-dir {CREW_DIR}", command)
+        self.assertIn(f"--run-dir {run_dir}", command)
 
     def test_the_registered_command_is_the_one_that_writes_the_log(self):
         self.install(role="child", ticket="07")
@@ -1710,7 +1725,8 @@ class InheritedSettingsTests(MachineLogTestCase):
         self.child_settings.parent.mkdir(parents=True)
         self.assertEqual(
             run_cli("install", "--settings", str(self.coordinator_settings),
-                    "--role", "coordinator", log=self.log).returncode,
+                    "--role", "coordinator", "--run-dir", str(self.log.parent.parent),
+                    log=self.log).returncode,
             0,
         )
         self.assertEqual(
@@ -1779,7 +1795,8 @@ class VersionIndependentPathTests(MachineLogTestCase):
         """Install the way a run does: the plugin's own copy, naming no script but itself."""
         return subprocess.run(
             [sys.executable, str(self.plugin), "--log", str(self.log),
-             "install", "--settings", str(self.settings), "--role", "coordinator"],
+             "install", "--settings", str(self.settings), "--role", "coordinator",
+             "--run-dir", str(self.log.parent.parent)],
             capture_output=True, text=True,
         )
 
@@ -1840,10 +1857,12 @@ class UninstallTests(MachineLogTestCase):
         self.log = self.project / "features" / "crew-v3" / ".crew" / "log.jsonl"
 
     def install(self, log=None, role="child"):
+        chosen_log = log if log is not None else self.log
         ticket = ("--ticket", "07") if role == "child" else ()
+        run_dir = ("--run-dir", str(chosen_log.parent.parent)) if role == "coordinator" else ()
         return run_cli(
-            "install", "--settings", str(self.settings), "--role", role, *ticket,
-            log=log if log is not None else self.log,
+            "install", "--settings", str(self.settings), "--role", role, *ticket, *run_dir,
+            log=chosen_log,
         )
 
     def uninstall(self, log=None):
