@@ -5,8 +5,8 @@ The driver's own `gh` stub answers the **close** operation — labels and closur
 of a ticket's text, which is the whole of what staging reads. This one answers the operations
 staging calls, over the issues in `AGENTCREW_STUB_DIR/gh-issues.json`, keyed by number:
 
-- **read** — `issue view <n> --json number,title,body,state`, and `--json labels` / `--json
-  comments` for the two the write operations have to read before they write.
+- **read** — `issue view <n> --json number,title,body,state,url,comments`, and `--json labels` /
+  `--json comments` for the two the write operations have to read before they write.
 - **edit** — `issue edit <n> --body-file -`, replacing the body with what stdin carries.
 - **mark** — `issue edit <n> --add-label/--remove-label`, the pickup labels.
 - **comment** — `issue comment <n> --body <text>`, appended to the issue's comments.
@@ -62,6 +62,7 @@ def known_fields(number, record):
         "title": record.get("title", ""),
         "body": record.get("body", ""),
         "state": record.get("state", "OPEN"),
+        "url": record.get("url", f"https://github.example.invalid/issues/{number}"),
         "labels": [{"name": name} for name in record.get("labels", [])],
         "comments": [{"body": body} for body in record.get("comments", [])],
     }

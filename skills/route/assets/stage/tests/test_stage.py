@@ -165,15 +165,17 @@ class Fixture:
     # --- the tracker's side ---------------------------------------------------------------
 
     def issue(self, number, title=None, body=None, state="OPEN", blocked_by=(),
-              native_blocked_by=(), sub_issues=(), page_size=None):
+              native_blocked_by=(), sub_issues=(), page_size=None, url=None, comments=()):
         """One ticket, written where this fixture's tracker keeps them."""
         title = TITLES.get(str(number), f"Ticket {number}") if title is None else title
         body = ticket_body(blocked_by) if body is None else body
         if self.tracker == "github":
+            url = url or f"https://github.example.invalid/issues/{number}"
             path = self.stub_dir / "gh-issues.json"
             table = json.loads(path.read_text())
             table[str(number)] = {
-                "title": title, "body": body, "state": state,
+                "title": title, "body": body, "state": state, "url": url,
+                "comments": list(comments),
                 "blocked_by": [str(blocker) for blocker in native_blocked_by],
                 "sub_issues": [str(child) for child in sub_issues],
                 "page_size": page_size,
@@ -348,7 +350,10 @@ class StagingTests(unittest.TestCase):
     def test_green_staging_prints_one_stderr_line_per_derived_wave(self):
         result = self.stage_two()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr.splitlines(), ["wave 1: #61", "wave 2: #62"])
+        self.assertEqual(
+            [line for line in result.stderr.splitlines() if line.startswith("wave ")],
+            ["wave 1: #61", "wave 2: #62"],
+        )
 
     def test_green_staging_writes_a_spec_and_one_file_per_ticket_and_nothing_else(self):
         self.stage_two()
@@ -488,7 +493,12 @@ class StagingTests(unittest.TestCase):
             sorted(path.name for path in (self.fixture.repo / RUN_ROOT).iterdir()), ["1"]
         )
         self.assertFalse(stale.exists())
-        self.assertIn("Edited on the tracker.", (self.fixture.run_dir() / "61.md").read_text())
+        staged = (self.fixture.run_dir() / "61.md").read_text()
+        if self.tracker == "github":
+            self.assertIn("Ticket: https://github.example.invalid/issues/61 — ", staged)
+            self.assertNotIn("Edited on the tracker.", staged)
+        else:
+            self.assertIn("Edited on the tracker.", staged)
 
     def test_staging_leaves_the_tracked_tree_untouched(self):
         result = self.stage_two()
@@ -615,11 +625,83 @@ class LocalTrackerTests(StagingTests):
 
     tracker = "local"
 
+    def test_local_ticket_staging_is_byte_identical_and_prints_no_stub_line(self):
+        ticket = self.fixture.issue(61)
+        before = self.fixture.ticket_file("61")
+
+        result = self.fixture.stage(ticket)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.fixture.run_dir() / "61.md").read_text(), before)
+        self.assertNotIn("stubbed", result.stderr)
+
     def test_dependency_staging_makes_no_github_api_call(self):
         result = self.stage_two()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.fixture.stub_dir / "gh-calls.jsonl").exists())
+
+
+class GithubStubTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = Fixture("github")
+        self.addCleanup(self.fixture.cleanup)
+
+    def test_a_github_ticket_is_a_tracker_stub_with_only_its_machine_sections(self):
+        url = "https://github.example.invalid/issues/61"
+        ticket = self.fixture.issue(61, url=url)
+
+        result = self.fixture.stage(ticket)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        staged = (self.fixture.run_dir() / "61.md").read_text()
+        self.assertEqual(
+            staged,
+            f"# {TITLES['61']}\n\n"
+            f"Ticket: {url} — the issue body and every comment are this ticket;"
+            " read all of it.\n\n"
+            f"{ROUTING.rstrip()}\n\n"
+            "## Blocked by\n\n"
+            "None — can start immediately.\n",
+        )
+
+    def test_github_staging_prints_sorted_stub_urls_and_initial_comment_counts_before_waves(self):
+        second = self.fixture.issue(62, comments=("one", "two", "three"))
+        first = self.fixture.issue(61, comments=("design", "maintainer decision"))
+        routing = self.fixture.routing_file({"61": dict(APPROVED), "62": dict(APPROVED)})
+
+        result = self.fixture.stage(second, first, "--routing", routing)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stderr.splitlines()[:2],
+            [
+                "ticket #61: stubbed https://github.example.invalid/issues/61 (2 comments)",
+                "ticket #62: stubbed https://github.example.invalid/issues/62 (3 comments)",
+            ],
+        )
+        self.assertEqual(result.stdout, f"/crew {RUN_ROOT}/1\n")
+        staged = (self.fixture.run_dir() / "61.md").read_text()
+        self.assertNotIn("design", staged)
+        self.assertNotIn("maintainer decision", staged)
+
+    def test_re_staging_after_a_tracker_edit_keeps_the_ticket_url_in_the_stub(self):
+        ticket = self.fixture.issue(61)
+        first = self.fixture.routing_file({"61": dict(APPROVED)})
+        result = self.fixture.stage(ticket, "--routing", first)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        revised = dict(APPROVED)
+        revised["effort"] = "medium"
+
+        second = self.fixture.stage(
+            ticket, "--routing", self.fixture.routing_file({"61": revised})
+        )
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn(
+            "Ticket: https://github.example.invalid/issues/61 — ",
+            (self.fixture.run_dir() / "61.md").read_text(),
+        )
 
 
 class GithubDependencyTests(unittest.TestCase):
@@ -661,7 +743,7 @@ class GithubDependencyTests(unittest.TestCase):
         self.assertEqual(staged.count("#70"), 1)
         self.assertEqual(read["waves"], [["61", "70"], ["62"]])
 
-    def test_a_body_only_edge_is_staged_byte_for_byte_as_before(self):
+    def test_a_body_only_edge_is_preserved_in_the_stub_machine_section(self):
         first = self.fixture.issue(61)
         body = ticket_body(blocked_by=("61",))
         second = self.fixture.issue(62, body=body)
@@ -669,7 +751,14 @@ class GithubDependencyTests(unittest.TestCase):
         result = self.fixture.stage(first, second)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = f"# {TITLES['62']}\n\n{body.rstrip()}\n"
+        expected = (
+            f"# {TITLES['62']}\n\n"
+            "Ticket: https://github.example.invalid/issues/62 — the issue body and every comment"
+            " are this ticket; read all of it.\n\n"
+            f"{ROUTING.rstrip()}\n\n"
+            "## Blocked by\n\n"
+            "- #61 — a fixture edge.\n"
+        )
         self.assertEqual((self.fixture.run_dir() / "62.md").read_text(), expected)
 
     def test_a_closed_native_outside_set_edge_is_spent_in_the_staged_copy(self):
@@ -728,15 +817,16 @@ class ParentExpansionTests(unittest.TestCase):
         held = sorted(path.name for path in self.fixture.run_dir().iterdir())
         self.assertEqual(held, ["61.md", "62.md", SPEC_NAME])
 
-    def test_the_spec_is_the_parent_ticket_body_and_carries_the_provenance(self):
+    def test_the_parent_spec_is_a_tracker_stub_with_provenance(self):
         result = self.fixture.stage("--parent", self.parent())
         self.assertEqual(result.returncode, 0, result.stderr)
         spec = (self.fixture.run_dir() / SPEC_NAME).read_text()
-        self.assertIn(TITLES["60"], spec)
-        self.assertIn("The parent's own brief, which is this run's spec.", spec)
-        self.assertTrue(
-            any(line.startswith("Tracker:") and "60" in line for line in spec.splitlines()),
-            f"no Tracker: provenance line naming the parent in {spec!r}",
+        self.assertEqual(
+            spec,
+            f"# {TITLES['60']}\n\n"
+            "Ticket: https://github.example.invalid/issues/60 — the issue body and every comment"
+            " are this ticket; read all of it.\n\n"
+            "Tracker: github parent #60\n",
         )
 
     def test_a_sub_issue_list_the_tracker_answers_a_page_at_a_time_expands_whole(self):

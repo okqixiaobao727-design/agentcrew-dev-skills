@@ -4,9 +4,11 @@
 `/route` ends on the tracker, and `/crew` begins at a directory; this script is the bridge between
 them. It takes the ticket set the user approved, writes `crewtask/<n>/` — a `spec.md` plus one
 `<ticket-number>.md` per ticket, at the directory's root, which is the layout the driver reads —
-and then asks the driver's own code whether that directory would start. Only a fully green answer
-prints `/crew crewtask/<n>`. Anything else names each blocking item beside its fix and withholds
-the command, because a printed command that fails is the defect this script exists to remove.
+and then asks the driver's own code whether that directory would start. A github file is a stub
+pointing at the live issue and carrying only the two machine sections; a local file remains the
+ticket itself. Only a fully green answer prints `/crew crewtask/<n>`. Anything else names each
+blocking item beside its fix and withholds the command, because a printed command that fails is the
+defect this script exists to remove.
 
 **The self-check uses the Run plan, not a copy of it.** Ticket parsing, `## Routing` validation,
 concrete account binding, the dependency graph and the wave-table build are the Run plan builder's
@@ -39,8 +41,8 @@ triaged piece of work needs nothing but one number; its closed sub-issues are fi
 out of the set, where the closure resolution below meets them as satisfied edges. `--routing` is the
 table the user approved: each entry is written back as that ticket's `## Routing` section and its
 role label, through the **edit** and **mark** operations `references/trackers.md` names, and the
-same text is what gets staged — the tracker and the run directory cannot disagree because they are
-written from one value. Without `--routing` nothing is written to the tracker at all. Finally, a
+same routing is projected into the staged stub. Without `--routing` nothing is written to the
+tracker at all. Finally, a
 green self-check **comments** the staged `/crew crewtask/<n>` on the parent, or on every ticket of a
 parentless set, so the pickup point lives where work state lives; a failed one comments nothing.
 Every write is skipped when the tracker already holds that exact value, so re-staging refreshes
@@ -84,7 +86,7 @@ LATER = "resolved-at-launch"
 BLOCKED_EXIT = 1
 
 GH = "gh"
-GH_FIELDS = "number,title,body,state"
+GH_FIELDS = "number,title,body,state,url,comments"
 GH_STATE_CLOSED = "CLOSED"
 GH_SUB_ISSUES = "repos/{owner}/{repo}/issues/%s/sub_issues"
 GH_BLOCKED_BY = "repos/{owner}/{repo}/issues/%s/dependencies/blocked_by"
@@ -181,20 +183,38 @@ def local_status(text):
     return None
 
 
-def staged_text(kind, title, body):
-    """That ticket as the run directory holds it, from the body the tracker holds.
+def section(text, wanted):
+    """One Markdown section, including its heading, exactly as the source carries it."""
+    lines = text.splitlines(keepends=True)
+    start = None
+    for index, line in enumerate(lines):
+        heading = run_plan.SECTION.match(line.rstrip("\n"))
+        if heading and start is not None:
+            return "".join(lines[start:index]).rstrip("\n")
+        if heading and heading.group(1).lower() == wanted:
+            start = index
+    return "" if start is None else "".join(lines[start:]).rstrip("\n")
 
-    The github tracker keeps the title out of the body, and the staged file is what the driver reads
-    a title from, so the two are put back together as the run-directory layout wants them. The local
-    tracker's body is the whole file, title and all.
-    """
+
+def ticket_pointer(url):
+    """The tracker-authority line shared by ticket and parent stubs."""
+    return f"Ticket: {url} — the issue body and every comment are this ticket; read all of it."
+
+
+def staged_text(kind, title, body, url=None):
+    """That ticket as the run directory holds it, pointing at its tracker authority."""
     if kind == driver.TRACKER_GITHUB:
-        return f"# {title}\n\n{body.rstrip()}\n"
+        machine_sections = [
+            held for name in (run_plan.ROUTING_SECTION, run_plan.BLOCKED_BY_SECTION)
+            if (held := section(body, name))
+        ]
+        suffix = "".join(f"\n\n{held}" for held in machine_sections)
+        return f"# {title}\n\n{ticket_pointer(url)}{suffix}\n"
     return body
 
 
 def read_ticket(kind, repo, reference):
-    """One ticket: its number, title, the body the tracker holds, and whether it is closed."""
+    """One ticket and the tracker facts staging projects into its run-directory file."""
     if kind == driver.TRACKER_GITHUB:
         issue = gh_read(repo, reference)
         body = issue.get("body") or ""
@@ -203,7 +223,9 @@ def read_ticket(kind, repo, reference):
             "id": str(issue.get("number")),
             "title": title,
             "body": body,
-            "text": staged_text(kind, title, body),
+            "text": staged_text(kind, title, body, issue.get("url")),
+            "url": issue.get("url"),
+            "comment_count": len(issue.get("comments") or []),
             "path": None,
             "closed": (issue.get("state") or "").upper() == GH_STATE_CLOSED,
         }
@@ -431,7 +453,7 @@ def edit_body(kind, repo, ticket, body):
     else:
         ticket["path"].write_text(body, encoding="utf-8")
     ticket["body"] = body
-    ticket["text"] = staged_text(kind, ticket["title"], body)
+    ticket["text"] = staged_text(kind, ticket["title"], body, ticket.get("url"))
 
 
 def local_marked(text, role):
@@ -623,13 +645,13 @@ def provenance(kind, parent, tickets):
 
 
 def parent_page(line, parent):
-    """The `spec.md` of a run with a parent: that ticket's own body, and where it came from."""
+    """The `spec.md` of a parent run: a tracker pointer and run provenance."""
     return (
         f"# {parent['title']}\n"
         "\n"
-        f"{PROVENANCE_KEY} {line}\n"
+        f"{ticket_pointer(parent['url'])}\n"
         "\n"
-        f"{parent['body'].strip()}\n"
+        f"{PROVENANCE_KEY} {line}\n"
     )
 
 
@@ -735,6 +757,18 @@ def print_waves(plan):
         print(f"wave {wave.number}: {tickets}", file=sys.stderr)
 
 
+def print_stubs(kind, tickets):
+    """One informational stderr line per GitHub stub, in ticket-number order."""
+    if kind != driver.TRACKER_GITHUB:
+        return
+    for ticket in sorted(tickets, key=lambda held: int(held["id"])):
+        print(
+            f"ticket #{ticket['id']}: stubbed {ticket['url']}"
+            f" ({ticket['comment_count']} comments)",
+            file=sys.stderr,
+        )
+
+
 # --- the command line ------------------------------------------------------------------------
 
 
@@ -807,7 +841,7 @@ def build_parser():
         "--parent", metavar="N",
         help=(
             "the parent ticket to stage, expanded into its open native sub-issues; the run's"
-            " `spec.md` is then the parent's own body, and the staged command is commented there"
+            " `spec.md` then points at the live parent, and the staged command is commented there"
         ),
     )
     parser.add_argument(
@@ -878,6 +912,7 @@ def stage(args):
     plan, problems = self_check(repo, directory, config)
     if problems:
         raise Blocked(problems)
+    print_stubs(kind, [*tickets, *([parent] if parent else [])])
     print_waves(plan)
 
     # Only now, with the self-check green, does the pickup point go on the tracker: a command that

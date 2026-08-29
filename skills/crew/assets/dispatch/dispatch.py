@@ -144,8 +144,10 @@ def block(text):
 def render_witness_prompt(escalation, templates=None):
     """One escalation filled into the library's public `[witness].prompt` template."""
     templates = templates or load_templates()
-    return block(templates["witness"]["prompt"]).replace(
-        "<escalation>", str(escalation).strip()
+    return (
+        block(templates["witness"]["prompt"])
+        .replace("<ticket comment rule>", block(templates["ticket"]["comment_rule"]))
+        .replace("<escalation>", str(escalation).strip())
     )
 
 
@@ -393,6 +395,7 @@ def render_turn(run, ticket, templates, review_script, log=None):
         "<machine log path>": log or "",
         "<machine log script>": run_log_script(log),
         "<design bridge>": shape.get("design_bridge", ""),
+        "<ticket comment rule>": block(templates["ticket"]["comment_rule"]),
         "<review caller budget>": f"\n  {caller_budget}" if has_review else "",
         "<writing skill>": writing_skill,
         "<commit step>": f"{4 if has_review else 3}. Commit.",

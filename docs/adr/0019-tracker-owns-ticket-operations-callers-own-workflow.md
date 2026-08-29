@@ -19,10 +19,10 @@ live-synchronisation requirement.
 ## Decision
 
 One **Tracker module** owns the complete implementation of the tracker operations `read`, `edit`,
-`mark`, `comment` and `close`. Reading includes tracker-native child discovery and resolving the
-status of a referenced ticket. Stage decides which reads and writes its staging workflow requires;
-the Driver decides when a merged ticket is closed. Neither caller knows how a tracker performs an
-operation.
+`mark`, `comment` and `close`. Reading includes read-with-comments, author-association filtering,
+tracker-native child discovery and resolving the status of a referenced ticket. Stage decides
+which reads and writes its staging workflow requires; the Driver decides when a merged ticket is
+closed. Neither caller knows how a tracker performs an operation.
 
 The Tracker interface returns one normalised ticket value containing the common facts callers
 need and an opaque, persistable locator. Callers may carry that locator but never parse or construct

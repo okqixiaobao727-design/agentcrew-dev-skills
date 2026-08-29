@@ -17,11 +17,19 @@ user with the rest of what that step reports.
 
 | Operation | github | local |
 | --- | --- | --- |
-| **read** — a ticket's body, its `Blocked by:` edges, and its current `## Routing` | `gh issue view <n> --json number,title,body,labels,comments`, and the convention document's list command for the whole feature | read the ticket file at the path the convention document gives that feature |
+| **read** | Read the tracker content below. | Read the tracker file below. |
 | **edit** — replace a ticket's body with new text | `gh issue edit <n> --body-file -` with the complete new text, so the edit is one atomic replacement | rewrite the whole file |
 | **mark** — declare who may pick the ticket up | the triage labels `ready-for-agent` and `ready-for-human` | the same two role strings on the ticket's `Status:` line |
 | **comment** — leave a note on a ticket, its body untouched | `gh issue comment <n> --body <text>` | one `Crew: <text>` line in the ticket file, rewritten rather than repeated |
 | **close** — record a finished ticket and take it out of the pickup queue | `gh issue close <n>` with its pickup label removed; the undo is reopening it and restoring the label | set `Status:` to the finished value the convention document names, `done` where it names none; the undo is restoring the value it held |
+
+**Read** — load a ticket's content at the tracker, including its `Blocked by:` edges and current
+`## Routing`:
+
+- **github** — run `gh issue view <n> --json number,title,body,labels,comments`. Read the body and
+  every comment there. `OWNER`, `MEMBER` and `COLLABORATOR` comments are part of the ticket; every
+  other comment is opinion.
+- **local** — read the ticket file at the path the convention document gives that feature.
 
 **A local run stays in the working tree.** Every operation above is a file read or a file write
 inside the repo, so a local-mode run reaches no remote and calls no tracker CLI at all — a step that

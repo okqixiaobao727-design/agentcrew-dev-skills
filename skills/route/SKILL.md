@@ -40,14 +40,15 @@ yet is **to-tickets+route**: hand over to
 [`references/to-tickets+route.md`](references/to-tickets+route.md) — `/mattpocock-skills:to-tickets` cuts,
 confirms, publishes and stages there with the routing rules riding along, and steps 2–4 below never
 run. The other two entrances are **route-only**: assemble the ticket set — a parent's open
-sub-issues, or the tickets named — and **read** every ticket of it: body, `Blocked by:` edges
-resolved into dependents as well as blockers, and its existing `## Routing` section. Read the
-parent ticket's body too where the set came from one; a set given as a list may have no parent and
-no spec, and then each ticket's own body is the whole context.
+sub-issues, or the tickets named — and **read** every ticket at the tracker: on github, its body
+and every comment; on local, its ticket file. Include `Blocked by:` edges resolved into dependents
+as well as blockers, and the existing `## Routing` section. Read the parent at the tracker too
+where the set came from one; a set given as a list may have no parent and no spec, and then each
+ticket's tracker content is the whole context.
 
 **Done when** the tracker and the entrance are both settled and stated to the user, and in
-route-only mode every ticket of the set is loaded with its body, blockers, dependents, and current
-routing.
+route-only mode every ticket of the set is loaded with its tracker content, blockers, dependents,
+and current routing.
 
 ## 2. Classify each ticket
 
@@ -87,9 +88,9 @@ python3 <route-skill-dir>/assets/stage/stage.py --routing <approved-table.json> 
 `<route-skill-dir>` is the absolute directory this `SKILL.md` loaded from, and a `<ticket>` is what
 the settled tracker calls one — an issue number on github, a path to the ticket's file on local.
 The script owns every write from here: each approved `## Routing` section and role label onto the
-tracker, the `crewtask/<n>/` run directory, the self-check of that directory against the driver's
-own preflight, and — on a green self-check only — the `/crew crewtask/<n>` command, commented on
-the tracker and printed.
+tracker, the `crewtask/<n>/` run directory whose github files point back to their live issues, the
+self-check of that directory against the driver's own preflight, and — on a green self-check
+only — the `/crew crewtask/<n>` command, commented on the tracker and printed.
 
 Exit 0: hand the user the printed command, which is the whole of what a later session needs.
 Anything else: hand them the blocking items the script named, each beside its fix, and nothing more

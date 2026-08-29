@@ -48,6 +48,20 @@ lives in the ticket and in the staging-time validation that reads it; it does no
 table. The single-routing-authority promise above is what forces this: a key left absent would
 oblige each consumer to re-derive its meaning, which is a second authority reassembled downstream.
 
+## Amendment (#154)
+
+For github, the tracker is the ticket's only content authority. Staging writes a stub carrying the
+title, live issue URL, `## Routing` and `## Blocked by`; the issue body and every comment remain at
+the URL for each child, coordinator, witness and reviewer to read. Comments whose
+`authorAssociation` is `OWNER`, `MEMBER` or `COLLABORATOR` are ticket direction; all others are
+opinion. Local tickets remain files and are staged unchanged.
+
+Two costs are accepted. In this public repository an authorised comment posted mid-run can change
+direction without a separate human gate, with the author-association rule as the trust boundary.
+There is also no per-run content snapshot, so two readers at different times can see different
+ticket versions. A stale local copy was rejected because it silently discards later tracker
+decisions, the failure #154 records.
+
 ## Consequences
 
 - **Model names are always full IDs, never aliases.** Measured: `--model haiku` under

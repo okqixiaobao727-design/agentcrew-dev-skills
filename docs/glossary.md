@@ -31,8 +31,10 @@ agent judges *did I build the right thing*. Its **Testing Decisions** section ma
 settles the test seam in advance, so a child never has to stop and ask a human mid-run.
 
 **ticket** — The vertical slice `/to-tickets` produces: one narrow path through every layer that
-can be demonstrated or verified on its own and fits in a fresh context window. Carries
-`Blocked by:` and `Status:` fields, plus AgentCrew's `## Routing` section.
+can be demonstrated or verified on its own and fits in a fresh context window. Its content lives
+at the Tracker: a github ticket is its issue body and comments, while a local ticket is its file.
+A staged github file is only a live `Ticket:` link plus the `## Routing` and `## Blocked by` machine
+sections; it is not a content copy. A local staged file remains the ticket itself.
 
 **Tracker** — Where tickets live and where their status is written back, named by the repo's
 `docs/agents/issue-tracker.md`. Two are exercised: **github**, where a ticket is an issue reached
