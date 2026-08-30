@@ -7,6 +7,15 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-08-31
+
+### Added
+- Every Run now owns a dedicated Crew worktree under the repository's ignored worktree root: the
+  Driver performs the base gate, Integration-branch checkout, Wave merges, adoption, resume and
+  clear there, so the invoking checkout stays on its own branch and remains free for unrelated
+  work while Crew runs. Run metadata records the worktree as `crew_worktree`, the completion
+  snapshot and report name it, and the dead `return_branch` field is gone (#169).
+
 ### Changed
 - Review lanes may now use the same vendor as their Implementer while remaining fresh independent
   Review-Switch sessions. All four vendor combinations pass route staging, Run-plan validation,
