@@ -48,6 +48,7 @@ class RunPlanTests(unittest.TestCase):
         self.account.mkdir()
         self.run = {
             "repo_root": str(self.root),
+            "crew_worktree": str(self.root / ".claude" / "worktrees" / "crew-demo"),
             "spec_path": str(self.feature / "spec.md"),
             "integration_branch": "crew/demo",
             "integration_base_commit": "a" * 40,
@@ -60,7 +61,6 @@ class RunPlanTests(unittest.TestCase):
             "permission_mode": "acceptEdits",
             "coordinator_config_home": str(self.account),
             "base_branch": "main",
-            "return_branch": "main",
             "feature_dir": str(self.feature),
             "repair_model": "claude-sonnet-5",
             "witness_model": WITNESS_MODEL,
@@ -97,6 +97,10 @@ class RunPlanTests(unittest.TestCase):
         plan = run_plan.build(self.feature, self.run)
 
         self.assertEqual(plan.run.repo_root, str(self.root))
+        self.assertEqual(
+            plan.run.crew_worktree,
+            str(self.root / ".claude" / "worktrees" / "crew-demo"),
+        )
         self.assertEqual([wave.number for wave in plan.waves], [1, 2])
         self.assertEqual([ticket.id for ticket in plan.tickets], ["01", "02"])
         self.assertEqual(plan.ticket("02").blocked_by, ("01",))
@@ -426,9 +430,17 @@ class RunPlanTests(unittest.TestCase):
         run_plan.build(self.feature, self.run).write(path)
         valid = json.loads(path.read_text(encoding="utf-8"))
         cases = {
+            "missing Crew worktree": (
+                lambda value: value["run"].pop("crew_worktree"),
+                "lacks crew_worktree",
+            ),
             "relative repository": (
                 lambda value: value["run"].update(repo_root="relative"),
                 "repo_root.*absolute path",
+            ),
+            "relative Crew worktree": (
+                lambda value: value["run"].update(crew_worktree=".claude/worktrees/crew-demo"),
+                "crew_worktree.*absolute path",
             ),
             "relative spec": (
                 lambda value: value["run"].update(spec_path="spec.md"),

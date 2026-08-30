@@ -59,8 +59,12 @@ class SeededRun:
         self.run_dir.mkdir()
         self.log_path = self.run_dir / "log.jsonl"
         self.integration_branch = f"crew/{name}"
+        self.crew_worktree = self.repo / ".claude" / "worktrees" / f"crew-{name}"
 
-        git(self.repo, "branch", self.integration_branch, BASE_BRANCH)
+        git(
+            self.repo, "worktree", "add", "-b", self.integration_branch,
+            str(self.crew_worktree), BASE_BRANCH,
+        )
         self.landed_worktree = self.worktree(f"{name}-landed", f"{name}/landed", "landed\n")
         self.merge_into_integration(f"{name}/landed")
         self.parked_worktree = self.worktree(f"{name}-parked", f"{name}/parked", "parked\n")
@@ -68,6 +72,7 @@ class SeededRun:
         (self.run_dir / "wave-table.json").write_text(json.dumps({
             "run": {
                 "repo_root": str(self.repo),
+                "crew_worktree": str(self.crew_worktree),
                 "spec_path": str(self.feature_dir / "spec.md"),
                 "integration_branch": self.integration_branch,
                 "integration_base_commit": git(
@@ -80,7 +85,6 @@ class SeededRun:
                 "permission_mode": "acceptEdits",
                 "coordinator_config_home": str(fixture.config_dir),
                 "base_branch": BASE_BRANCH,
-                "return_branch": BASE_BRANCH,
                 "feature_dir": str(self.feature_dir),
                 "repair_model": REPAIR_MODEL,
                 "tracker": TRACKER,
@@ -147,10 +151,7 @@ class SeededRun:
 
     def merge_into_integration(self, branch):
         """Land that branch on this run's integration branch, as a merged ticket's is."""
-        current = self.fixture.current_branch()
-        git(self.repo, "switch", self.integration_branch)
-        git(self.repo, "merge", "--no-ff", branch, "-m", f"merge {branch}")
-        git(self.repo, "switch", current)
+        git(self.crew_worktree, "merge", "--no-ff", branch, "-m", f"merge {branch}")
 
     def install_hook(self):
         """Register this run's coordinator hook in the repo's settings, as its start did."""
@@ -316,6 +317,7 @@ class WorktreeSweepTests(SweepTestCase):
         )
         self.assertFalse(dead.landed_worktree.exists())
         self.assertTrue(dead.parked_worktree.exists())
+        self.assertTrue(dead.crew_worktree.exists())
         self.assertIn("dead/parked", self.fixture.branches())
         self.assertIn(dead.integration_branch, self.fixture.branches())
 

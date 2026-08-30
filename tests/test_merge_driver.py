@@ -87,6 +87,8 @@ class Fixture:
         run_git(self.repo, "commit", "-m", "base")
         self.base_commit = git_out(self.repo, "rev-parse", "HEAD")
         run_git(self.repo, "checkout", "-b", INTEGRATION_BRANCH)
+        self.source = self.root / "source"
+        run_git(self.repo, "worktree", "add", str(self.source), "main")
 
         # The coordinator's own Claude configuration home, which is what a ticket that named no
         # account was resolved to as the wave table was built (ADR-0014).
@@ -161,7 +163,8 @@ class Fixture:
     def table_path(self, tickets=None, waves=None):
         table = {
             "run": {
-                "repo_root": str(self.repo),
+                "repo_root": str(self.source),
+                "crew_worktree": str(self.repo),
                 "spec_path": str(self.repo / FEATURE / "spec.md"),
                 "integration_branch": INTEGRATION_BRANCH,
                 "integration_base_commit": self.base_commit,
@@ -234,6 +237,26 @@ class MergeDriverTestCase(unittest.TestCase):
 
 
 class CleanMergeTests(MergeDriverTestCase):
+    def test_a_dirty_source_checkout_does_not_participate_in_landing(self):
+        branch = self.fixture.ticket("07", "alpha", {"alpha.txt": "alpha\n"})
+        run_git(self.fixture.source, "switch", "-c", "operator-work")
+        (self.fixture.source / SHARED).write_text("operator edit\n")
+
+        result = self.fixture.land()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.fixture.merged(branch))
+        self.assertEqual(
+            git_out(self.fixture.source, "rev-parse", "--abbrev-ref", "HEAD"),
+            "operator-work",
+        )
+        self.assertEqual((self.fixture.source / SHARED).read_text(), "operator edit\n")
+        self.assertEqual(
+            git_out(self.fixture.source, "status", "--porcelain"),
+            f"M {SHARED}",
+        )
+        self.assertOnIntegrationBranch()
+
     def test_landable_branches_merge_in_ticket_order_with_no_ff_and_no_model(self):
         first = self.fixture.ticket("07", "alpha", {"alpha.txt": "alpha\n"})
         second = self.fixture.ticket("08", "beta", {"beta.txt": "beta\n"})

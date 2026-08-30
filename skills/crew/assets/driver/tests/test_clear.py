@@ -109,7 +109,11 @@ class ClearTests(unittest.TestCase):
         self.fixture.ticket("02", "unmerged ticket")
         self.fixture.commit_feature()
 
-        git(self.fixture.repo, "switch", "-c", INTEGRATION_BRANCH)
+        self.crew_worktree = self.fixture.crew_worktree
+        git(
+            self.fixture.repo, "worktree", "add", "-b", INTEGRATION_BRANCH,
+            str(self.crew_worktree), BASE_BRANCH,
+        )
 
         self.merged_worktree = self.fixture.repo / ".recorded" / "merged-worktree"
         git(self.fixture.repo, "worktree", "add", "-b", MERGED_BRANCH,
@@ -117,7 +121,10 @@ class ClearTests(unittest.TestCase):
         (self.merged_worktree / "merged.txt").write_text("merged\n")
         git(self.merged_worktree, "add", "merged.txt")
         git(self.merged_worktree, "commit", "-m", "merged commit")
-        git(self.fixture.repo, "merge", "--no-ff", MERGED_BRANCH, "-m", "merge recorded branch")
+        git(
+            self.crew_worktree, "merge", "--no-ff", MERGED_BRANCH,
+            "-m", "merge recorded branch",
+        )
 
         self.unmerged_worktree = self.fixture.repo / ".recorded" / "unmerged-worktree"
         git(self.fixture.repo, "branch", UNMERGED_BRANCH, BASE_BRANCH)
@@ -143,6 +150,7 @@ class ClearTests(unittest.TestCase):
         repo_root = str(self.fixture.repo)
         run = {
             "repo_root": repo_root,
+            "crew_worktree": str(self.crew_worktree),
             "spec_path": str(self.fixture.spec_path),
             "integration_branch": INTEGRATION_BRANCH,
             "integration_base_commit": git(
@@ -155,7 +163,6 @@ class ClearTests(unittest.TestCase):
             "permission_mode": "acceptEdits",
             "coordinator_config_home": str(self.fixture.config_dir),
             "base_branch": BASE_BRANCH,
-            "return_branch": BASE_BRANCH,
             "feature_dir": str(self.fixture.feature_dir),
             "repair_model": REPAIR_MODEL,
             "tracker": TRACKER,
@@ -276,6 +283,7 @@ class ClearTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("01", result.stdout)
         self.assertIn("02", result.stdout)
+        self.assertIn(str(self.crew_worktree), result.stdout)
         ask_offset = result.stdout.index("Clear this run?")
         self.assertLess(result.stdout.index(UNCOMMITTED_FILE), ask_offset)
         self.assertLess(result.stdout.index(UNMERGED_COMMIT_MESSAGE), ask_offset)
@@ -321,6 +329,23 @@ class ClearTests(unittest.TestCase):
             self.fixture.repo, "branch", "--format=%(refname:short)"
         ).stdout)
 
+    def test_a_foreign_directory_at_the_recorded_crew_path_is_refused_and_preserved(self):
+        git(
+            self.fixture.repo, "worktree", "remove", "--force", "--",
+            str(self.crew_worktree),
+        )
+        self.crew_worktree.mkdir(parents=True)
+        marker = self.crew_worktree / "foreign.txt"
+        marker.write_text("not this Run\n")
+
+        result = self.run_clear("yes")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("Clear this run?", result.stdout)
+        self.assertIn(str(self.crew_worktree), result.stderr)
+        self.assertIn("not a readable Git worktree", result.stderr)
+        self.assertTrue(marker.exists())
+
     def test_confirmation_tolerates_a_tmux_server_already_gone(self):
         (self.fixture.stub_dir / "tmux-server-gone").write_text("yes\n")
 
@@ -343,6 +368,7 @@ class ClearTests(unittest.TestCase):
             DASHBOARD_WINDOW,
             str(self.merged_worktree),
             str(self.unmerged_worktree),
+            str(self.crew_worktree),
             MERGED_BRANCH,
             UNMERGED_BRANCH,
             UNCOMMITTED_FILE,
@@ -356,6 +382,8 @@ class ClearTests(unittest.TestCase):
         worktree_list = git(self.fixture.repo, "worktree", "list", "--porcelain").stdout
         self.assertNotIn(str(self.merged_worktree), worktree_list)
         self.assertNotIn(str(self.unmerged_worktree), worktree_list)
+        self.assertNotIn(str(self.crew_worktree), worktree_list)
+        self.assertFalse(self.crew_worktree.exists())
         branches = git(self.fixture.repo, "branch", "--format=%(refname:short)").stdout
         self.assertNotIn(MERGED_BRANCH, branches)
         self.assertNotIn(UNMERGED_BRANCH, branches)

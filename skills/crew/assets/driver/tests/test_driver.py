@@ -40,6 +40,7 @@ from harness import (
     DRIVER_RECORD,
     DriverTestCase,
     EXPLICIT,
+    FEATURE_NAME,
     INHERITED,
     INTEGRATION_BRANCH,
     LAUNCH,
@@ -214,6 +215,47 @@ class ReportSelectionTests(unittest.TestCase):
 
 
 class PreflightTests(DriverTestCase):
+    def test_a_foreign_worktree_at_the_crew_path_is_named_and_preserved(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        foreign_branch = "operator/foreign-worktree"
+        git(self.fixture.repo, "branch", foreign_branch, BASE_BRANCH)
+        git(
+            self.fixture.repo, "worktree", "add", str(self.fixture.crew_worktree),
+            foreign_branch,
+        )
+        marker = self.fixture.crew_worktree / "foreign.txt"
+        marker.write_text("not this Run\n")
+
+        result = self.fixture.start()
+        snapshot = self.snapshot(result)
+
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(str(self.fixture.crew_worktree), snapshot["detail"])
+        self.assertIn(f"branch {foreign_branch}", snapshot["detail"])
+        self.assertTrue(marker.exists(), "fresh start removed the foreign worktree")
+        self.assertIn(foreign_branch, self.fixture.branches())
+        self.assertNotIn(INTEGRATION_BRANCH, self.fixture.branches())
+        self.assertFalse(self.fixture.run_dir.exists())
+
+    def test_a_stale_integration_branch_is_named_and_preserved(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        base = git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip()
+        git(self.fixture.repo, "branch", INTEGRATION_BRANCH, base)
+
+        result = self.fixture.start()
+        snapshot = self.snapshot(result)
+
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(INTEGRATION_BRANCH, snapshot["detail"])
+        self.assertIn("no registered worktree", snapshot["detail"])
+        self.assertEqual(
+            git(self.fixture.repo, "rev-parse", INTEGRATION_BRANCH).stdout.strip(), base
+        )
+        self.assertFalse(self.fixture.crew_worktree.exists())
+        self.assertFalse(self.fixture.run_dir.exists())
+
     def test_a_failing_configured_base_gate_stops_the_run_with_its_diagnosis(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
@@ -232,12 +274,20 @@ class PreflightTests(DriverTestCase):
             self.fixture.gate_calls(),
             [
                 {
-                    "cwd": str(self.fixture.repo),
+                    "cwd": str(self.fixture.crew_worktree),
                     "argv": ["--full"],
                     "head": git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip(),
                 }
             ],
         )
+        (self.fixture.stub_dir / "base-gate-exit").write_text("0")
+
+        retry = self.started()
+
+        self.assertIsNone(retry.poll())
+        self.assertEqual(len(self.fixture.gate_calls()), 2)
+        self.assertTrue(self.fixture.crew_worktree.is_dir())
+        self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
 
     def test_a_passing_configured_base_gate_is_recorded_before_the_run_starts(self):
         self.fixture.ticket("01", "first thing")
@@ -268,10 +318,11 @@ class PreflightTests(DriverTestCase):
         self.assertIn("README.md", notice)
         self.assertEqual(self.fixture.gate_calls(), [])
 
-    def test_a_diverged_base_is_reported_without_running_the_base_gate(self):
+    def test_a_remote_base_newer_than_local_does_not_move_the_run_snapshot(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
         self.fixture.configure_gate()
+        local_tip = git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip()
         other = self.fixture.root / "other-gated"
         subprocess.run(
             ["git", "clone", str(self.fixture.origin), str(other)],
@@ -284,16 +335,16 @@ class PreflightTests(DriverTestCase):
         git(other, "commit", "-m", "theirs")
         git(other, "push", "origin", BASE_BRANCH)
 
-        result = self.fixture.start()
+        self.started()
 
-        notice = self.assert_preflight_failed(result, 1)
-        self.assertIn("fast-forward", notice)
-        self.assertEqual(self.fixture.gate_calls(), [])
+        self.assertEqual(self.fixture.table()["run"]["integration_base_commit"], local_tip)
+        self.assertEqual(git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip(), local_tip)
+        self.assertEqual(self.fixture.gate_calls()[0]["head"], local_tip)
 
-    def test_a_cross_branch_start_gates_the_pulled_base_and_returns_on_failure(self):
+    def test_a_cross_branch_start_gates_the_local_base_and_leaves_source_untouched_on_failure(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
-        self.fixture.configure_gate(exit_code=9, output="pulled base is red\n")
+        self.fixture.configure_gate(exit_code=9, output="local base is red\n")
         git(self.fixture.repo, "push", "origin", BASE_BRANCH)
         git(self.fixture.repo, "switch", "-c", "starting-branch")
         (self.fixture.repo / "starting.md").write_text("starting branch\n")
@@ -312,7 +363,7 @@ class PreflightTests(DriverTestCase):
         git(other, "add", "pulled.md")
         git(other, "commit", "-m", "advance base")
         git(other, "push", "origin", BASE_BRANCH)
-        pulled_head = git(other, "rev-parse", "HEAD").stdout.strip()
+        local_base_head = git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip()
 
         result = self.fixture.start()
 
@@ -323,9 +374,9 @@ class PreflightTests(DriverTestCase):
             "starting-branch",
         )
         self.assertEqual(git(self.fixture.repo, "rev-parse", "HEAD").stdout.strip(), starting_head)
-        self.assertEqual(self.fixture.gate_calls()[0]["head"], pulled_head)
+        self.assertEqual(self.fixture.gate_calls()[0]["head"], local_base_head)
 
-    def test_a_failing_base_gate_restores_a_detached_starting_commit(self):
+    def test_a_failing_base_gate_leaves_a_detached_starting_commit_unchanged(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
         self.fixture.configure_gate(exit_code=6, output="detached base is red\n")
@@ -354,12 +405,17 @@ class PreflightTests(DriverTestCase):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
         (self.fixture.repo / "README.md").write_text("edited\n")
+        branch = self.fixture.current_branch()
+        head = git(self.fixture.repo, "rev-parse", "HEAD").stdout.strip()
 
         result = self.fixture.start()
 
         notice = self.assert_preflight_failed(result, 1)
         self.assertIn("README.md", notice)
         self.assertIn("committed", notice)
+        self.assertEqual(self.fixture.current_branch(), branch)
+        self.assertEqual(git(self.fixture.repo, "rev-parse", "HEAD").stdout.strip(), head)
+        self.assertEqual((self.fixture.repo / "README.md").read_text(), "edited\n")
 
     def test_an_untracked_file_is_not_a_preflight_failure(self):
         self.fixture.ticket("01", "first thing")
@@ -389,8 +445,7 @@ class PreflightTests(DriverTestCase):
 
         self.started()
 
-    def test_a_base_branch_that_cannot_fast_forward_stops_the_run(self):
-        """The check reads what origin holds now: this checkout has never fetched the divergence."""
+    def test_a_remote_divergence_does_not_replace_the_local_base_tip(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
         other = self.fixture.root / "other"
@@ -407,23 +462,22 @@ class PreflightTests(DriverTestCase):
         (self.fixture.repo / "mine.md").write_text("mine\n")
         git(self.fixture.repo, "add", "mine.md")
         git(self.fixture.repo, "commit", "-m", "mine")
+        local_tip = git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip()
 
-        result = self.fixture.start()
+        self.started()
 
-        notice = self.assert_preflight_failed(result, 1)
-        self.assertIn(BASE_BRANCH, notice)
-        self.assertIn("fast-forward", notice)
+        self.assertEqual(self.fixture.table()["run"]["integration_base_commit"], local_tip)
+        self.assertEqual(git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip(), local_tip)
 
-    def test_an_origin_that_cannot_be_reached_stops_the_run(self):
+    def test_an_origin_that_cannot_be_reached_is_not_consulted(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
         git(self.fixture.repo, "remote", "set-url", "origin", str(self.fixture.root / "gone.git"))
 
-        result = self.fixture.start()
+        local_tip = git(self.fixture.repo, "rev-parse", BASE_BRANCH).stdout.strip()
+        self.started()
 
-        notice = self.assert_preflight_failed(result, 1)
-        self.assertIn("origin", notice)
-        self.assertIn(BASE_BRANCH, notice)
+        self.assertEqual(self.fixture.table()["run"]["integration_base_commit"], local_tip)
 
     def test_a_missing_default_base_branch_names_the_repository_fix(self):
         self.fixture.ticket("01", "first thing")
@@ -1046,11 +1100,11 @@ class LaunchTests(DriverTestCase):
         run = self.fixture.table()["run"]
         head = git(self.fixture.repo, "rev-parse", INTEGRATION_BRANCH).stdout.strip()
         self.assertEqual(run["repo_root"], str(self.fixture.repo))
+        self.assertEqual(run["crew_worktree"], str(self.fixture.crew_worktree))
         self.assertEqual(run["spec_path"], str(self.fixture.spec_path))
         self.assertEqual(run["integration_branch"], INTEGRATION_BRANCH)
         self.assertEqual(run["integration_base_commit"], head)
         self.assertEqual(run["base_branch"], BASE_BRANCH)
-        self.assertEqual(run["return_branch"], BASE_BRANCH)
         self.assertEqual(run["coordinator_name"], COORDINATOR_NAME)
         self.assertEqual(run["coordinator_pid"], COORDINATOR_PID)
         self.assertEqual(run["coordinator_session"], COORDINATOR_SESSION)
@@ -1061,6 +1115,10 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(run["witness_model"], WITNESS_MODEL)
         self.assertEqual(run["witness_budget_usd"], WITNESS_BUDGET_USD)
         self.assertEqual(run["tracker"], TRACKER)
+        self.assertEqual(
+            len({run["repo_root"], run["feature_dir"], run["crew_worktree"]}),
+            3,
+        )
 
     def test_a_relative_path_is_recorded_absolute(self):
         """Every path the table carries is read in a child's worktree, never in this cwd."""
@@ -1071,11 +1129,21 @@ class LaunchTests(DriverTestCase):
 
         self.assertEqual(self.fixture.table()["run"]["spec_path"], str(self.fixture.spec_path))
 
-    def test_the_integration_branch_is_cut_and_checked_out(self):
+    def test_the_source_checkout_stays_on_its_branch_and_the_crew_worktree_holds_integration(self):
         self.start_a_run()
 
         self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
-        self.assertEqual(self.fixture.current_branch(), INTEGRATION_BRANCH)
+        self.assertEqual(self.fixture.current_branch(), BASE_BRANCH)
+        self.assertTrue(self.fixture.crew_worktree.is_dir())
+        self.assertEqual(
+            git(
+                self.fixture.crew_worktree, "rev-parse", "--abbrev-ref", "HEAD"
+            ).stdout.strip(),
+            INTEGRATION_BRANCH,
+        )
+        ticket_worktree = self.fixture.worktree("01")
+        self.assertEqual(ticket_worktree.parent, self.fixture.crew_worktree.parent)
+        self.assertNotIn(self.fixture.crew_worktree, ticket_worktree.parents)
 
     def test_only_wave_one_is_dispatched_and_its_launch_amendment_is_logged(self):
         self.start_a_run()
@@ -1295,6 +1363,34 @@ class LoopTests(DriverTestCase):
         self.assertEqual(self.events("ruling"), [], "a clean run instructed a child")
         settings = self.fixture.settings(self.fixture.repo / ".claude" / "settings.local.json")
         self.assertNotIn("bounded_read.py", json.dumps(settings))
+        self.assertTrue(self.fixture.crew_worktree.is_dir())
+        self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
+
+    def test_source_edits_and_a_branch_switch_after_launch_do_not_affect_later_waves(self):
+        process = self.start(("01", ()), ("02", ("01",)))
+        (self.fixture.repo / "README.md").write_text("operator edit\n")
+        git(self.fixture.repo, "switch", "-c", "operator-work")
+
+        first_head = self.fixture.commit_work("01")
+        self.fixture.says("01", f"CREW COMPLETE {first_head}")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the dirty source checkout interrupted wave 2",
+        )
+
+        self.assertEqual(self.fixture.current_branch(), "operator-work")
+        self.assertEqual((self.fixture.repo / "README.md").read_text(), "operator edit\n")
+        self.assertEqual(
+            (self.fixture.crew_worktree / "README.md").read_text(), "fixture\n"
+        )
+        self.assertEqual(
+            git(
+                self.fixture.worktree("02"), "merge-base", "--is-ancestor", first_head, "HEAD"
+            ).returncode,
+            0,
+        )
+        self.fixture.completes("02")
+        self.woken(process, "run-complete")
 
     def test_next_wave_precedes_the_tracker_close_commit_and_outcome(self):
         process = self.start(("01", ()), ("02", ("01",)))
@@ -1377,6 +1473,7 @@ class LoopTests(DriverTestCase):
             r" completed \|",
         )
         self.assertIn(INTEGRATION_BRANCH, report)
+        self.assertIn(str(self.fixture.crew_worktree), report)
         self.assertIn("human", report.lower())
         self.assertIn("## Base gate", report)
         self.assertIn("- Base gate: none configured", report)
@@ -1393,6 +1490,8 @@ class LoopTests(DriverTestCase):
             [record["ticket"] for record in self.events("session-cost")], ["01"]
         )
         self.assertEqual(snapshot["reason"], "run-complete")
+        self.assertEqual(snapshot["integration_branch"], INTEGRATION_BRANCH)
+        self.assertEqual(snapshot["crew_worktree"], str(self.fixture.crew_worktree))
 
     def test_a_pin_surface_removes_its_pin_and_a_window_surface_has_none_to_remove(self):
         self.fixture.configure(surface="pin")
@@ -1425,6 +1524,8 @@ class LoopTests(DriverTestCase):
         self.fixture.completes("01")
 
         self.woken(process, "driver-error")
+        self.assertTrue(self.fixture.crew_worktree.is_dir())
+        self.assertIn(INTEGRATION_BRANCH, self.fixture.branches())
         self.assertEqual(list(pin_dir.glob("*.json")), [])
         log = str(self.fixture.run_dir / "log.jsonl")
         coordinator_settings = self.fixture.settings(
@@ -1884,8 +1985,6 @@ class LoopTests(DriverTestCase):
         table_path.write_text(json.dumps(table))
 
         resumed = self.fixture.resume()
-        self.assertIn("resumed", resumed.stdout.readline())
-        self.fixture.says("01", "CREW FAILED the approach does not work")
         snapshot = self.woken(resumed, "driver-error")
 
         self.assertIn("do not follow the dependency frontier", snapshot["detail"])
@@ -2583,7 +2682,47 @@ class LoopTests(DriverTestCase):
         self.assertEqual(len(closed), 1, self.fixture.log_records())
         self.assertIn(TRACKER, closed[0]["detail"])
         self.assertIn("undo:", closed[0]["detail"])
+        close_sha = git(self.fixture.crew_worktree, "rev-parse", "HEAD").stdout.strip()
+        self.assertIn(f"(1) take the `Status: done` line off", closed[0]["detail"])
+        self.assertIn(f"(2) run `git revert {close_sha}`", closed[0]["detail"])
+        self.assertIn(str(self.fixture.crew_worktree), closed[0]["detail"])
+        self.assertEqual(len(close_sha), 40)
+        report = (self.fixture.feature_dir / REPORT_NAME).read_text()
+        self.assertIn(f"(1) take the `Status: done` line off", report)
+        self.assertIn(f"(2) run `git revert {close_sha}`", report)
+        self.assertIn(str(self.fixture.crew_worktree), report)
+        crew_ticket = self.fixture.crew_worktree / "features" / FEATURE_NAME / "01.md"
+        self.assertIn("Status: done", crew_ticket.read_text())
         self.assertIn("Status: done", (self.fixture.feature_dir / "01.md").read_text())
+
+    def test_a_gitignored_durable_ticket_is_closed_without_a_crew_copy(self):
+        (self.fixture.repo / ".gitignore").write_text("features/\n")
+        git(self.fixture.repo, "add", ".gitignore")
+        git(self.fixture.repo, "commit", "-m", "ignore durable run records")
+        self.fixture.ticket("01", "first thing")
+
+        process = self.started()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "the ignored durable ticket's child never launched",
+        )
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        durable_ticket = self.fixture.feature_dir / "01.md"
+        crew_ticket = self.fixture.crew_worktree / "features" / FEATURE_NAME / "01.md"
+        self.assertIn("Status: done", durable_ticket.read_text())
+        self.assertFalse(crew_ticket.exists())
+        undo = self.events("outcome", ticket="01", outcome="completed")[0]["detail"]
+        self.assertIn("undo: take the `Status: done` line off", undo)
+        self.assertNotIn("git revert", undo)
+        self.assertEqual(
+            git(
+                self.fixture.crew_worktree, "status", "--porcelain",
+                "--untracked-files=no",
+            ).stdout.strip(),
+            "",
+        )
 
     def test_a_local_close_leaves_the_working_tree_clean_for_the_next_wave(self):
         """A close is a write inside the repo, and an uncommitted one stops the merge after it."""
@@ -2599,7 +2738,9 @@ class LoopTests(DriverTestCase):
 
         # Untracked paths are the run's own directory and the guard assets, which the run's own
         # clean-tree rule allows; what a merge refuses is a tracked file left uncommitted.
-        left = git(self.fixture.repo, "status", "--porcelain", "--untracked-files=no").stdout
+        left = git(
+            self.fixture.crew_worktree, "status", "--porcelain", "--untracked-files=no"
+        ).stdout
         self.assertEqual(left.strip(), "")
 
     def test_a_github_run_closes_the_issue_and_records_reopening_it_as_the_undo(self):
@@ -2630,7 +2771,9 @@ class LoopTests(DriverTestCase):
         self.assertTrue(calls, "the tracker was never reached")
         for call in calls:
             self.assertNotIn("--repo", call["argv"], f"gh was handed a repository: {call['argv']}")
-            self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.repo))
+            self.assertEqual(
+                os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.crew_worktree)
+            )
 
 
 class DriverLifecycleTests(DriverTestCase):
@@ -3502,8 +3645,44 @@ class AdoptionTests(DriverTestCase):
         # A start that began again would have cut its integration branch afresh and recorded the
         # commit it cut it from; the run the adoption carried on is the one already on the ground.
         self.assertEqual(self.fixture.table()["run"], run, "the adopted run was started afresh")
+        worktrees = git(self.fixture.repo, "worktree", "list", "--porcelain").stdout
+        self.assertEqual(worktrees.count(f"worktree {self.fixture.crew_worktree}\n"), 1)
         self.assertEqual(len(self.events("launch", ticket="01")), 2, "01 was dispatched twice")
         self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+
+    def test_explicit_resume_reuses_the_recorded_crew_worktree(self):
+        self.interrupted(("01", ()))
+        recorded = self.fixture.table()["run"]["crew_worktree"]
+
+        resumed = self.fixture.resume()
+        self.assertIn("resumed", resumed.stdout.readline())
+        self.fixture.completes("01")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(self.fixture.table()["run"]["crew_worktree"], recorded)
+        worktrees = git(self.fixture.repo, "worktree", "list", "--porcelain").stdout
+        self.assertEqual(worktrees.count(f"worktree {recorded}\n"), 1)
+        self.assertEqual(
+            git(recorded, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+            INTEGRATION_BRANCH,
+        )
+
+    def test_adoption_refuses_a_foreign_directory_at_the_recorded_crew_worktree(self):
+        self.interrupted(("01", ()))
+        worktree = self.fixture.crew_worktree
+        git(self.fixture.repo, "worktree", "remove", "--force", "--", str(worktree))
+        worktree.mkdir(parents=True)
+        marker = worktree / "foreign.txt"
+        marker.write_text("not this Run\n")
+
+        adopted = self.fixture.launch()
+        result = self.fixture.ended(adopted)
+        snapshot = self.snapshot(result)
+
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(str(worktree), snapshot["detail"])
+        self.assertIn("not a readable Git worktree", snapshot["detail"])
+        self.assertTrue(marker.exists(), "adoption removed the foreign directory")
 
     def test_adopting_an_existing_run_does_not_run_its_configured_base_gate_again(self):
         self.fixture.configure_gate()

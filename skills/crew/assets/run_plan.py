@@ -53,6 +53,7 @@ class LaunchHook:
 @dataclass(frozen=True)
 class RunMetadata:
     repo_root: str
+    crew_worktree: str
     spec_path: str
     integration_branch: str
     integration_base_commit: str
@@ -65,7 +66,6 @@ class RunMetadata:
     coordinator_session: str = ""
     coordinator_address: str = ""
     base_branch: str | None = None
-    return_branch: str | None = None
     feature_dir: str | None = None
     repair_model: str | None = None
     witness_model: str | None = None
@@ -512,7 +512,8 @@ def _metadata(values):
     if not isinstance(values, dict):
         raise RunPlanError(["run: metadata is not an object"])
     required = (
-        "repo_root", "spec_path", "integration_branch", "integration_base_commit",
+        "repo_root", "crew_worktree", "spec_path", "integration_branch",
+        "integration_base_commit",
         "coordinator_name", "coordinator_pid", "crew_skill_dir", "tmux_session",
         "permission_mode", "coordinator_config_home",
     )
@@ -520,6 +521,7 @@ def _metadata(values):
     if missing:
         raise RunPlanError(["run: lacks " + ", ".join(missing)])
     repo_root = _absolute(values, "repo_root")
+    crew_worktree = _absolute(values, "crew_worktree")
     spec_path = _absolute(values, "spec_path")
     integration_branch = _string(values, "integration_branch")
     integration_base_commit = _string(values, "integration_base_commit")
@@ -547,7 +549,7 @@ def _metadata(values):
         raise RunPlanError(["run: coordinator_address is not a string"])
     optional = {
         key: _string(values, key, optional=True)
-        for key in ("base_branch", "return_branch", "repair_model", "tracker")
+        for key in ("base_branch", "repair_model", "tracker")
     }
     _, witness_model, witness_budget_usd = witness_routing(
         values.get("witness_model"), values.get("witness_budget_usd")
@@ -590,6 +592,7 @@ def _metadata(values):
         hook_value = LaunchHook(command, tuple(environment.items()))
     return RunMetadata(
         repo_root=repo_root,
+        crew_worktree=crew_worktree,
         spec_path=spec_path,
         integration_branch=integration_branch,
         integration_base_commit=integration_base_commit,
@@ -602,7 +605,6 @@ def _metadata(values):
         coordinator_session=coordinator_session,
         coordinator_address=coordinator_address,
         base_branch=optional["base_branch"],
-        return_branch=optional["return_branch"],
         feature_dir=feature_dir,
         repair_model=optional["repair_model"],
         witness_model=witness_model,
@@ -617,6 +619,7 @@ def _metadata(values):
 def _metadata_object(run):
     document = {
         "repo_root": run.repo_root,
+        "crew_worktree": run.crew_worktree,
         "spec_path": run.spec_path,
         "integration_branch": run.integration_branch,
         "integration_base_commit": run.integration_base_commit,
@@ -631,7 +634,7 @@ def _metadata_object(run):
         "declared_accounts": list(run.declared_accounts),
     }
     for key in (
-        "base_branch", "return_branch", "feature_dir", "repair_model", "witness_model",
+        "base_branch", "feature_dir", "repair_model", "witness_model",
         "witness_budget_usd", "tracker",
     ):
         value = getattr(run, key)

@@ -164,6 +164,7 @@ class Fixture:
     def table(self, tickets, **run_overrides):
         run = {
             "repo_root": str(self.repo),
+            "crew_worktree": str(self.repo),
             "spec_path": str(self.spec_path),
             "integration_branch": "crew/demo",
             "integration_base_commit": self.base_commit,

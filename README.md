@@ -66,9 +66,10 @@ Every repo you use AgentCrew in also needs `docs/agents/issue-tracker.md`: both 
 learn where tickets live and where status is written back, and neither has a fallback.
 
 A project may also configure a base gate as an argv list: for example,
-`[preflight] gate = ["python3", "scripts/test.py"]`. AgentCrew runs it without a shell from the
-repository root, after checking out and fast-forwarding the base and before cutting the integration
-branch. With no gate, the run proceeds and both the machine log and final report say
+`[preflight] gate = ["python3", "scripts/test.py"]`. AgentCrew snapshots the selected local base
+tip into a dedicated Crew worktree, then runs the gate there without a shell before any child is
+launched. It never fetches or moves the local base branch. With no gate, the run proceeds and both
+the machine log and final report say
 `base gate: none configured`; a skipped gate is never reported as a pass.
 
 ## Install
@@ -207,17 +208,23 @@ What the pinned dashboard is and how it is wired into Claude Code is in
 
 ### `[preflight]` — the optional integration-base gate
 
-`gate` is a non-empty argv list, not a shell command string. The Driver runs it from the repository
-root after the cheap read-only preflight checks, after checking out and fast-forwarding the base,
-and immediately before cutting the integration branch. Exit 0 passes. Any other exit status stops
-the fresh run as `preflight-failed`, restores the branch or detached commit the operator started
-from, creates no integration branch or child worktree, and shows the command, exit status, and
-output tail in the preflight notice. AgentCrew sets no timeout and does not parse test-runner
-output; the configured command owns both concerns.
+`gate` is a non-empty argv list, not a shell command string. After the cheap read-only preflight
+checks, the Driver creates `<repo>/.claude/worktrees/crew-<run-slug>` at the selected local base
+branch's current committed tip, checks out the Integration branch there, and runs the gate in that
+Crew worktree. Exit 0 passes. Any other exit status stops the fresh run as `preflight-failed`,
+removes that not-yet-active Crew worktree and its fresh Integration branch, leaves the invoking
+checkout unchanged, and shows the command, exit status, and output tail in the preflight notice.
+AgentCrew sets no timeout and does not parse test-runner output; the configured command owns both
+concerns.
+
+Once active, all Wave merges use the recorded Crew worktree. The invoking checkout may switch
+branches or gain edits without affecting the Run. Completion, failure, and interruption retain the
+Crew worktree and Integration branch for inspection; only the explicit confirmed `clear` command
+removes them. Ticket worktrees remain siblings under the same ignored worktree root.
 
 Like every other value in the run section, the gate argv is read once from the project's config at
-start; a fast-forward does not re-read any run configuration. The machine log records the captured
-argv that was actually executed.
+start; fixing the local base snapshot does not re-read any run configuration. The machine log
+records the captured argv that was actually executed.
 
 ```toml
 [preflight]
