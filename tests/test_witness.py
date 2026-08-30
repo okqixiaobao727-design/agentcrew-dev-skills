@@ -130,6 +130,7 @@ class WitnessTests(unittest.TestCase):
             json.dumps({
                 "run": {
                     "repo_root": str(self.root),
+                    "crew_worktree": str(self.worktree),
                     "spec_path": str(spec),
                     "integration_branch": "crew/witness",
                     "integration_base_commit": "a" * 40,

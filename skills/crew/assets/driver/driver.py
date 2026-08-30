@@ -39,16 +39,16 @@ of emitting a wake snapshot.
 The `answer` subcommand is also an operator terminal command, but its failures emit a `driver-error`
 wake snapshot so the coordinator can see why the child could not be answered.
 
-**A preflight failure never reaches the coordinator as diagnosis.** Its first phase is five
-read-only checks — a clean working tree, a base branch that resolves and fast-forwards, a valid
-routing on every ticket (the renderer's own validation, which is the authority on the case list),
-a complete acyclic dependency graph, and, for a run that reviews at all, the installed
-Review-Switch command this repository's review lane is (ADR-0020) — plus the run's two configured
-decisions, the repair rung's model and the tracker its merged tickets are closed in, neither of
-which has a default. Once those pass, branch preparation checks out and fast-forwards the base and
-runs the project's optional `[preflight] gate` from the repository root, immediately before it cuts
-the integration branch. A red gate restores the starting ref and creates neither integration
-branch nor child worktree. On any failure the driver launches nothing, prints the
+**A preflight failure never reaches the coordinator as diagnosis.** Its read-only phase checks the
+invoking checkout is clean, the selected local base branch resolves, every ticket has valid routing
+(the renderer's own validation, which is the authority on the case list), the dependency graph is
+complete and acyclic, and a run that reviews has the installed Review-Switch command its lane uses
+(ADR-0020). It also checks the run's configured repair model and tracker, neither of which has a
+default. Once those pass, the driver snapshots the local base tip into a new Crew worktree on the
+Integration branch and runs the project's optional `[preflight] gate` there. It never fetches or
+moves the local base ref. A red gate removes only that fresh worktree and Integration branch; the
+invoking checkout stays on the same ref with the same files, and no wave table exists. On any
+failure the driver launches nothing, prints the
 `preflight-failed` snapshot naming the problem count and the display surface, and shows the full
 problem list to the operator in a detached tmux window named `crew-preflight` in the run's own
 session, ending with the reminder that fixes must be committed. That notice is the run's only
@@ -82,8 +82,9 @@ coordinator turn.
 epilogue over the tickets the log says landed: their worktrees removed, their branches deleted,
 their windows and the dashboard's killed, their Codex sessions stopped. Parked and failed tickets
 keep worktree, branch and window, and the report lists those paths. The coordinator's window, the
-integration branch the run hands over and the durable run directory are never touched. An artefact
-that would not go does not withhold the run's ending: the `run-complete` snapshot carries a
+Crew worktree, the Integration branch the run hands over and the durable run directory are never
+touched. An artefact that would not go does not withhold the run's ending: the `run-complete`
+snapshot names the Integration branch and Crew worktree and carries a
 `cleanup` field, null where the site was cleared and the failure where it was not. The `clear`
 subcommand keeps its confirmation, because it is aimed at a run in any state rather than at one
 whose log says what landed.
@@ -168,6 +169,7 @@ LAUNCH_DIR_NAME = "launch"
 CODEX_DIR_NAME = "codex"
 PARKED_PATHS_NAME = "parked-paths"
 REPORT_NAME = "report.md"
+WORKTREE_ROOT = pathlib.Path(".claude") / "worktrees"
 
 # The operator's preflight surface: one detached window, found and cleared by this name.
 NOTICE_WINDOW_NAME = "crew-preflight"
@@ -226,11 +228,6 @@ PREFLIGHT_FAILED = "preflight-failed"
 JUDGMENT_NEEDED = "judgment-needed"
 DRIVER_ERROR = "driver-error"
 RUN_COMPLETE = "run-complete"
-
-# What origin holds for the base branch: the one fact preflight and the preparation share.
-UPSTREAM_PRESENT = "present"
-UPSTREAM_ABSENT = "absent"
-UPSTREAM_UNREACHABLE = "unreachable"
 
 PREFLIGHT_EXIT = 1
 DRIVER_ERROR_EXIT = 2
@@ -548,7 +545,7 @@ def run_command(arguments, message, ticket=None, pointer=None):
     return result.stdout
 
 
-# --- the five preflight checks ----------------------------------------------------------------
+# --- start-time preflight ----------------------------------------------------------------------
 
 
 def dirty_tree_problems(repo):
@@ -580,35 +577,12 @@ def default_base_branch(repo):
     return None
 
 
-def upstream_state(repo, branch):
-    """Whether origin carries that branch now; returns one of the three states and its detail.
+def base_branch_problems(repo, branch):
+    """Whether the selected local base branch resolves to a committed tip.
 
-    Asked of origin itself rather than of this checkout's remote-tracking refs, which go stale in
-    both directions: a ref that has moved on, and a ref for a branch upstream has since deleted.
-    One answer serves the whole run — preflight compares against it, and the preparation pulls
-    only where it says there is something to pull, so the two never disagree about upstream.
-    """
-    if not git_output(repo, "remote"):
-        return UPSTREAM_ABSENT, ""
-    listed = git(repo, "ls-remote", "--heads", "origin", branch)
-    if listed.returncode != 0:
-        return UPSTREAM_UNREACHABLE, listed.stderr.strip()
-    return (UPSTREAM_PRESENT if listed.stdout.strip() else UPSTREAM_ABSENT), ""
-
-
-def base_branch_problems(repo, branch, upstream):
-    """Whether the base branch resolves and whether `git pull --ff-only` would carry it forward.
-
-    Upstream is asked what it holds now, not what this checkout last heard: the comparison is
-    against a freshly fetched remote-tracking ref, because a stale one turns a diverged branch into
-    a preflight the run passes and a pull it then fails on, which is the failure this check exists
-    to spare the coordinator. Fetching moves no local branch and touches no working tree, so the
-    check stays read-only about the run.
-
-    A base branch upstream does not carry has nothing to fast-forward onto, and passes: the check
-    is that the branch this run cuts from is not diverged from upstream, not that a remote exists.
-    A branch ahead of its counterpart is not diverged either — `git pull --ff-only` carries it as
-    it stands — so only two histories that have parted ways fail here.
+    A Run snapshots the local ref exactly as it stands. Remote discovery, fetch and pull are not
+    preflight checks: allowing any of them here would let a remote change retarget the snapshot
+    between the operator's invocation and Crew worktree creation.
     """
     if not branch:
         return [
@@ -618,28 +592,6 @@ def base_branch_problems(repo, branch, upstream):
         ]
     if git_output(repo, "rev-parse", "--verify", f"refs/heads/{branch}") is None:
         return [f"base branch: `{branch}` does not resolve to a branch in this repository"]
-    state, detail = upstream
-    if state == UPSTREAM_UNREACHABLE:
-        return [
-            f"base branch: origin could not be reached, so whether `{branch}` fast-forwards is"
-            f" unknown — {detail}"
-        ]
-    if state == UPSTREAM_ABSENT:
-        return []
-    fetched = git(repo, "fetch", "origin", branch)
-    if fetched.returncode != 0:
-        return [
-            f"base branch: origin/{branch} could not be fetched, so whether `{branch}`"
-            f" fast-forwards is unknown — {fetched.stderr.strip()}"
-        ]
-    upstream = "FETCH_HEAD"
-    behind = git(repo, "merge-base", "--is-ancestor", branch, upstream).returncode == 0
-    ahead = git(repo, "merge-base", "--is-ancestor", upstream, branch).returncode == 0
-    if not behind and not ahead:
-        return [
-            f"base branch: `{branch}` cannot fast-forward onto origin/{branch} — the two have"
-            " diverged, so reconcile them before the run cuts from it"
-        ]
     return []
 
 
@@ -881,11 +833,11 @@ def coordinator_config_home():
                else pathlib.Path.home() / accounts.CONFIG_HOME)
 
 
-def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit,
-                config):
+def run_section(args, repo, feature_dir, run_dir, base_branch, base_commit, config):
     """The table's `run` section: everything about this run that is not a ticket."""
     run = {
         "repo_root": str(repo),
+        "crew_worktree": str(crew_worktree_path(repo, feature_dir)),
         "spec_path": str(args.spec or feature_dir / "spec.md"),
         "integration_branch": f"crew/{feature_dir.name}",
         "integration_base_commit": base_commit,
@@ -899,9 +851,8 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
         "crew_skill_dir": str(CREW_SKILL_DIR),
         "tmux_session": args.tmux_session,
         "permission_mode": args.permission_mode,
-        # Recorded for the run's own wind-down: where the run came from, and where it goes back to.
+        # The local branch whose committed tip the Run snapshots once at start.
         "base_branch": base_branch,
-        "return_branch": return_branch,
         "feature_dir": str(feature_dir),
         # The two configured decisions, recorded as this start resolved them. The loop and every
         # resume of it read the run's own record rather than the config file, so editing
@@ -929,53 +880,125 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, return_branch, ba
     return run
 
 
-def restore_return_branch(repo, return_branch):
-    """Put a failed preparation back on the branch or detached commit it started from."""
-    if git(repo, "show-ref", "--verify", f"refs/heads/{return_branch}").returncode == 0:
-        result = git(repo, "switch", "--", return_branch)
-    else:
-        result = git(repo, "switch", "--detach", "--", return_branch)
+def crew_worktree_path(repo, feature_dir):
+    """The deterministic sibling checkout owned by this Run."""
+    return pathlib.Path(repo) / WORKTREE_ROOT / f"crew-{pathlib.Path(feature_dir).name}"
+
+
+def exact_worktree_branch(worktree):
+    """The branch checked out at this exact Git root, or None for a nested/foreign path."""
+    worktree = pathlib.Path(worktree)
+    top = git_output(worktree, "rev-parse", "--show-toplevel")
+    if top is None or pathlib.Path(top).resolve() != worktree.resolve():
+        return None
+    return git_output(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def branch_worktrees(repo, branch):
+    """Every registered worktree currently checking out `branch`."""
+    result = git(repo, "worktree", "list", "--porcelain")
     if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
         raise DriverError(
-            f"the base gate failed and the starting ref {return_branch} could not be restored:"
-            f" {result.stderr.strip()}"
+            f"the repository's worktrees could not be read: {detail}"
+        )
+    paths = []
+    worktree = None
+    wanted = f"refs/heads/{branch}"
+    for line in result.stdout.splitlines() + [""]:
+        if line.startswith("worktree "):
+            worktree = line.removeprefix("worktree ")
+        elif line == f"branch {wanted}" and worktree:
+            paths.append(worktree)
+        elif not line:
+            worktree = None
+    return paths
+
+
+def fresh_artefact_problems(repo, worktree, integration_branch):
+    """Standing identities a fresh Run must never adopt or overwrite."""
+    problems = []
+    if worktree.exists():
+        branch = exact_worktree_branch(worktree)
+        identity = f"branch {branch}" if branch else "a path that is not a readable Git worktree"
+        problems.append(f"Crew worktree: {worktree} already exists as {identity}")
+    if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
+        checkouts = branch_worktrees(repo, integration_branch)
+        location = f" in {', '.join(checkouts)}" if checkouts else " with no registered worktree"
+        problems.append(
+            f"integration branch: {integration_branch} already exists{location}"
+        )
+    return problems
+
+
+def remove_failed_preparation(repo, worktree, integration_branch):
+    """Roll back only the fresh ref and checkout made for a red base gate."""
+    removed = git(repo, "worktree", "remove", "--force", "--", str(worktree))
+    if removed.returncode != 0:
+        raise DriverError(
+            f"the red base gate left Crew worktree {worktree}:"
+            f" {(removed.stderr or removed.stdout).strip()}"
+        )
+    deleted = git(repo, "branch", "-D", "--", integration_branch)
+    if deleted.returncode != 0:
+        raise DriverError(
+            f"the red base gate removed Crew worktree {worktree} but left integration branch"
+            f" {integration_branch}: {(deleted.stderr or deleted.stdout).strip()}"
         )
 
 
-def prepare_branches(repo, base_branch, integration_branch, pull, gate):
-    """Fast-forward the base branch and cut this run's integration branch from it; returns the
-    branch the run returns to, the commit it is based on, and any base-gate problem."""
-    current = git_output(repo, "rev-parse", "--abbrev-ref", "HEAD")
-    return_branch = current if current and current != "HEAD" else git_output(
-        repo, "rev-parse", "HEAD"
+def prepare_crew_worktree(repo, worktree, base_commit, integration_branch, gate):
+    """Create and gate the Integration checkout; return its gate problem, or None."""
+    problems = fresh_artefact_problems(repo, worktree, integration_branch)
+    if problems:
+        raise DriverError("; ".join(problems))
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    created = git(
+        repo, "worktree", "add", "-b", integration_branch, str(worktree), base_commit
     )
-    if current != base_branch:
-        result = git(repo, "switch", base_branch)
-        if result.returncode != 0:
-            raise DriverError(f"the base branch {base_branch} could not be checked out")
-    if pull:
-        result = git(repo, "pull", "--ff-only")
-        if result.returncode != 0:
-            raise DriverError(
-                f"{base_branch} could not be fast-forwarded: {result.stderr.strip()}"
-            )
-    gate_problem = base_gate_problem(repo, gate)
+    if created.returncode != 0:
+        raise DriverError(
+            f"Crew worktree {worktree} on integration branch {integration_branch} could not be"
+            f" created: {(created.stderr or created.stdout).strip()}"
+        )
+    gate_problem = base_gate_problem(worktree, gate)
     if gate_problem is not None:
-        restore_return_branch(repo, return_branch)
-        return return_branch, None, gate_problem
-    if git_output(repo, "rev-parse", "--verify", f"refs/heads/{integration_branch}"):
-        raise DriverError(
-            f"the integration branch {integration_branch} already exists, and this feature holds no"
-            " wave table to adopt the run that cut it from: a run was started here and its record"
-            " is gone, which no fresh start may cut a branch over"
+        remove_failed_preparation(repo, worktree, integration_branch)
+    return gate_problem
+
+
+def registered_worktrees(repo, branch, error_type):
+    """Return the branch's registered worktrees, translating lookup failure to `error_type`."""
+    try:
+        return branch_worktrees(repo, branch)
+    except DriverError as error:
+        raise error_type(str(error)) from error
+
+
+def validate_recorded_crew_worktree(run, error_type=DriverError):
+    """Return the Run's exact Integration checkout, or raise `error_type` for its identity."""
+    repo = pathlib.Path(run.repo_root)
+    worktree = pathlib.Path(run.crew_worktree)
+    branch = exact_worktree_branch(worktree)
+    if not worktree.is_dir() or branch is None:
+        raise error_type(
+            f"the recorded Crew worktree {worktree} is not a readable Git worktree"
         )
-    result = git(repo, "switch", "-c", integration_branch)
-    if result.returncode != 0:
-        raise DriverError(
-            f"the integration branch {integration_branch} could not be cut:"
-            f" {result.stderr.strip()}"
+    if branch != run.integration_branch:
+        raise error_type(
+            f"the recorded Crew worktree {worktree} is on branch {branch}, not"
+            f" {run.integration_branch}"
         )
-    return return_branch, git_output(repo, "rev-parse", "HEAD"), None
+    registered = {
+        str(pathlib.Path(path).resolve())
+        for path in registered_worktrees(repo, run.integration_branch, error_type)
+    }
+    if str(worktree.resolve()) not in registered:
+        raise error_type(
+            f"the recorded Crew worktree {worktree} is not the registered checkout of"
+            f" {run.integration_branch}; registered: {', '.join(sorted(registered)) or 'none'}"
+        )
+    return worktree
 
 
 def install_hook(log, settings, role, ticket=None, session_id=None, run_dir=None):
@@ -1133,8 +1156,6 @@ def clear_run_data(run_dir):
         plan = run_plan.load(table_path)
     except run_plan.RunPlanError as error:
         raise ClearError(str(error)) from error
-    if not plan.run.return_branch:
-        raise ClearError(f"the wave table {table_path} carries no run.return_branch")
     return plan, plan.run, clear_records(log_path), log_path
 
 
@@ -1238,6 +1259,18 @@ def clear_dashboard_window(path):
 def clear_inventory(run_dir, plan, run, records, log_path):
     """Render every recorded ticket artefact and the exact uncommitted/unmerged work."""
     repo = pathlib.Path(run.repo_root)
+    crew_worktree = pathlib.Path(run.crew_worktree)
+    if crew_worktree.exists():
+        validate_recorded_crew_worktree(run, ClearError)
+        crew_status = clear_status(crew_worktree)
+    else:
+        crew_status = None
+        registered = registered_worktrees(repo, run.integration_branch, ClearError)
+        if registered:
+            raise ClearError(
+                f"the recorded Crew worktree {crew_worktree} is gone, but integration branch"
+                f" {run.integration_branch} is checked out at {', '.join(registered)}"
+            )
     launches = clear_launches(records)
     by_ticket = {}
     ticket_paths = {}
@@ -1249,9 +1282,17 @@ def clear_inventory(run_dir, plan, run, records, log_path):
     lines = [
         f"run: {run_dir}",
         f"integration branch: {run.integration_branch}",
-        f"return branch: {run.return_branch}",
+        f"Crew worktree: {crew_worktree}"
+        + (" (already gone)" if crew_status is None else ""),
         f"machine log: {log_path}",
     ]
+    if crew_status is None:
+        lines.append("Crew worktree uncommitted files: already gone")
+    elif crew_status:
+        lines.append("Crew worktree uncommitted files:")
+        lines.extend(f"  {item}" for item in crew_status)
+    else:
+        lines.append("Crew worktree uncommitted files: none")
     for ticket in clear_tickets(plan, records):
         path = ticket_paths.get(ticket)
         lines.append(f"ticket {ticket}" + (f" ({path})" if path else "") + ":")
@@ -1384,15 +1425,12 @@ def clear_kill_windows(plan):
         clear_kill_window(window)
 
 
-def clear_worktrees_and_branches(repo, rows, trust_inventory=False):
+def clear_worktrees_and_branches(repo, rows):
     """Remove each planned worktree and delete its branch, once per recorded artefact.
 
-    `git branch -d` asks whether the branch is merged into HEAD, and every caller here has already
-    asked the better question: the inventory compared it against the run's own integration branch.
-    The two agree while HEAD is that branch, which is where a run's clear and its epilogue both
-    stand. A caller standing anywhere else — the start that sweeps a dead run, whose HEAD is its
-    own repo's — sets `trust_inventory`, and a row the inventory found merged is deleted on that
-    answer instead of on HEAD's, which is about somebody else's run entirely.
+    The inventory already compared each branch against the Run's Integration branch in its Crew
+    worktree. Deletion therefore uses that recorded answer rather than asking about the invoking
+    checkout's unrelated HEAD.
     """
     unique_rows = []
     seen_rows = set()
@@ -1408,27 +1446,22 @@ def clear_worktrees_and_branches(repo, rows, trust_inventory=False):
     for row in unique_rows:
         if row["unmerged"] is None:
             continue
-        flag = "-D" if row["unmerged"] or trust_inventory else "-d"
-        clear_git(repo, "branch", flag, "--", row["branch"])
+        clear_git(repo, "branch", "-D", "--", row["branch"])
 
 
 def clear_actions(run_dir, run, log_path, plan):
     """Apply the clearing steps using only the paths and ids in the inventory."""
     repo = pathlib.Path(run.repo_root)
     integration_branch = run.integration_branch
-    if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
-        clear_git(repo, "switch", "--", integration_branch)
+    crew_worktree = pathlib.Path(run.crew_worktree)
 
     state_dir = pathlib.Path(run.codex.state_dir) if run.codex else None
     clear_stop_codex_sessions(run, plan.launches)
     clear_kill_windows(plan)
     clear_worktrees_and_branches(repo, plan.rows)
 
-    return_branch = run.return_branch
-    if git(repo, "show-ref", "--verify", f"refs/heads/{return_branch}").returncode == 0:
-        clear_git(repo, "switch", "--", return_branch)
-    else:
-        clear_git(repo, "switch", "--detach", "--", return_branch)
+    clear_unlock_worktree(repo, crew_worktree)
+    clear_remove_worktree(repo, crew_worktree)
     if git(repo, "show-ref", "--verify", f"refs/heads/{integration_branch}").returncode == 0:
         clear_git(repo, "branch", "-D", "--", integration_branch)
 
@@ -1604,7 +1637,7 @@ def sweep_landed(run_dir):
     projection = machine_log.project(records)
     landed = {ticket for ticket, facts in projection.tickets.items() if facts.merge_landed}
     plan = epilogue_plan(plan, landed)
-    clear_worktrees_and_branches(pathlib.Path(run.repo_root), plan.rows, trust_inventory=True)
+    clear_worktrees_and_branches(pathlib.Path(run.repo_root), plan.rows)
 
 
 def sweep_dead_runs(repo, keep_run_dir):
@@ -1675,10 +1708,10 @@ def sweep_dead_runs(repo, keep_run_dir):
 # --- start ------------------------------------------------------------------------------------
 
 
-def preflight(repo, feature_dir, base_branch, upstream, run):
-    """The five read-only checks and the run's two configured values, every problem of every one."""
+def preflight(repo, feature_dir, base_branch, run):
+    """Run every read-only start check and return every problem they establish."""
     problems = dirty_tree_problems(repo)
-    problems += base_branch_problems(repo, base_branch, upstream)
+    problems += base_branch_problems(repo, base_branch)
     try:
         plan = run_plan.build(feature_dir, run)
     except run_plan.RunPlanError as error:
@@ -1735,16 +1768,20 @@ def run_start(args):
         print(f"crew sweep: {warning}", file=sys.stderr, flush=True)
     table_path = run_dir / TABLE_NAME
     if table_path.exists():
-        return adopt(args, repo, run_dir, table_path)
+        return adopt(args, run_dir, table_path)
 
     base_branch = args.base_branch or default_base_branch(repo)
     # The table preflight validates: everything the run section carries but the commit the run has
     # not cut yet, which no routing rule reads.
     head = git_output(repo, "rev-parse", "HEAD")
     config = project_config(repo)
-    candidate = run_section(args, repo, feature_dir, run_dir, base_branch, head, head, config)
-    upstream = upstream_state(repo, base_branch) if base_branch else (UPSTREAM_ABSENT, "")
-    problems = preflight(repo, feature_dir, base_branch, upstream, candidate)
+    base_commit = git_output(
+        repo, "rev-parse", "--verify", f"refs/heads/{base_branch}^{{commit}}"
+    ) if base_branch else None
+    candidate = run_section(
+        args, repo, feature_dir, run_dir, base_branch, base_commit or head, config
+    )
+    problems = preflight(repo, feature_dir, base_branch, candidate)
     gate = None
     if not problems:
         gate, problems = configured_base_gate(config)
@@ -1753,10 +1790,9 @@ def run_start(args):
         return stop_for_preflight(args, feature_dir, problems)
 
     integration_branch = candidate["integration_branch"]
-    return_branch, base_commit, gate_problem = prepare_branches(
-        repo, base_branch, integration_branch,
-        pull=upstream[0] == UPSTREAM_PRESENT,
-        gate=gate,
+    worktree = pathlib.Path(candidate["crew_worktree"])
+    gate_problem = prepare_crew_worktree(
+        repo, worktree, base_commit, integration_branch, gate
     )
     if gate_problem is not None:
         return stop_for_preflight(args, feature_dir, [gate_problem])
@@ -1764,7 +1800,7 @@ def run_start(args):
     take_up_run(run_dir)
     log = run_dir / LOG_NAME
     run = run_section(
-        args, repo, feature_dir, run_dir, base_branch, return_branch, base_commit, config
+        args, repo, feature_dir, run_dir, base_branch, base_commit, config
     )
     try:
         plan = run_plan.build(feature_dir, run)
@@ -1777,10 +1813,10 @@ def run_start(args):
         log, repo / SETTINGS_PATH, "coordinator", session_id=run["coordinator_session"],
         run_dir=feature_dir,
     )
-    return wave_loop(args, repo, run_dir, table_path, starting=True)
+    return wave_loop(args, run_dir, table_path, starting=True)
 
 
-def adopt(args, repo, run_dir, table_path):
+def adopt(args, run_dir, table_path):
     """Take over the unfinished run this feature already carries; returns the exit code it earns.
 
     Starting and resuming are the same action, so this is what `start` does whenever the feature
@@ -1798,21 +1834,26 @@ def adopt(args, repo, run_dir, table_path):
     it starts polling is `Loop.adopt`, and what it reads from the log is what it would have read
     had it never stopped.
     """
+    try:
+        plan = run_plan.load(table_path)
+    except run_plan.RunPlanError as error:
+        raise DriverError(str(error), pointer=str(table_path)) from error
+    validate_recorded_crew_worktree(plan.run)
     log = run_dir / LOG_NAME
     records = machine_log.read_records(log)
     projection = machine_log.project(records)
     if projection.ended:
-        try:
-            plan = run_plan.load(table_path)
-        except run_plan.RunPlanError as error:
-            raise DriverError(str(error), pointer=str(table_path)) from error
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
         report = report_path(run_dir, plan.run)
-        snapshot(RUN_COMPLETE, pointer=str(report), report=str(report))
+        snapshot(
+            RUN_COMPLETE, pointer=str(report), report=str(report),
+            integration_branch=plan.run.integration_branch,
+            crew_worktree=plan.run.crew_worktree,
+        )
         return 0
     print(f"crew adopted wave {projection.current_wave}, run directory {run_dir}", flush=True)
-    return wave_loop(args, repo, run_dir, table_path, adopting=True)
+    return wave_loop(args, run_dir, table_path, adopting=True)
 
 
 def start_dashboard(args, repo, run_dir):
@@ -2099,6 +2140,7 @@ def render_report(run, tickets, records, cost_output):
     lines += [
         "", "## Integration branch", "",
         f"- Integration branch: `{integration}`",
+        f"- Crew worktree: `{run.crew_worktree}`",
         f"- Base branch: `{base}`",
         f"- Merging `{integration}` into `{base}` is the human's decision.",
     ]
@@ -2313,7 +2355,9 @@ class WaveActivation:
             return self.loop.run.integration_base_commit
         sha = landed.get("sha")
         resolved = (
-            git_output(self.loop.repo, "rev-parse", "--verify", f"{sha}^{{commit}}")
+            git_output(
+                self.loop.crew_worktree, "rev-parse", "--verify", f"{sha}^{{commit}}"
+            )
             if isinstance(sha, str) and sha
             else None
         )
@@ -2409,9 +2453,8 @@ class WaveActivation:
 class Loop:
     """One run's wave loop: the rule table, the run it applies to, and the monitors it waits on."""
 
-    def __init__(self, args, repo, run_dir, table_path):
+    def __init__(self, args, run_dir, table_path):
         self.args = args
-        self.repo = repo
         self.run_dir = run_dir
         self.log = run_dir / LOG_NAME
         self.table_path = table_path
@@ -2420,6 +2463,8 @@ class Loop:
         except run_plan.RunPlanError as error:
             raise DriverError(str(error), pointer=str(table_path)) from error
         self.run = self.plan.run
+        self.repo_root = pathlib.Path(self.run.repo_root)
+        self.crew_worktree = validate_recorded_crew_worktree(self.run)
         self.monitors = []
         self.activation = WaveActivation(self)
 
@@ -3097,7 +3142,7 @@ class Loop:
 
     def open_wave(self):
         """Open or restore this run's dashboard for normal Wave polling; return nothing."""
-        start_dashboard(self.args, self.repo, self.run_dir)
+        start_dashboard(self.args, self.crew_worktree, self.run_dir)
 
     def close_merged(self):
         """Close every merged ticket in the run's tracker, recording each undo; returns nothing."""
@@ -3141,7 +3186,7 @@ class Loop:
         records = self.records()
         projection = machine_log.project(records)
         install_hook(
-            self.log, self.repo / SETTINGS_PATH, COORDINATOR_ROLE,
+            self.log, self.repo_root / SETTINGS_PATH, COORDINATOR_ROLE,
             session_id=self.args.coordinator_session,
             run_dir=self.run_dir.parent,
         )
@@ -3329,7 +3374,11 @@ class Loop:
             epilogue(self.run_dir, self.run, self.plan, records, self.log)
         except ClearError as error:
             cleanup = str(error)
-        snapshot(RUN_COMPLETE, pointer=str(report), report=str(report), cleanup=cleanup)
+        snapshot(
+            RUN_COMPLETE, pointer=str(report), report=str(report), cleanup=cleanup,
+            integration_branch=self.run.integration_branch,
+            crew_worktree=self.run.crew_worktree,
+        )
         return 0
 
 
@@ -3391,12 +3440,43 @@ def close_ticket(run, ticket, number):
 def close_local_ticket(run, ticket, number):
     """Set a local ticket's `Status:` to the finished value; returns how to put it back.
 
-    A local tracker's close is a write inside the repository, so the edit is committed on the
-    integration branch as it is made: the merge driver refuses to land a wave into a working tree
-    that carries uncommitted changes, and a close left loose would stop the run's next wave on
-    bookkeeping the run itself wrote.
+    The durable ticket remains authoritative and is always updated at its recorded path. Where the
+    base snapshot also tracks that path, the same status is committed in the Crew worktree so the
+    Integration branch stays clean for its next Wave. A gitignored durable ticket has no Crew copy
+    and needs no Git operation.
     """
-    path = pathlib.Path(ticket.path)
+    source = pathlib.Path(run.repo_root).resolve()
+    durable_path = pathlib.Path(ticket.path).resolve()
+    try:
+        relative = durable_path.relative_to(source)
+    except ValueError as error:
+        raise DriverError(
+            f"{number} could not be closed: {ticket.path} is outside repository {source}",
+            ticket=number,
+        ) from error
+    undo = write_local_ticket_status(durable_path, number)
+    crew_worktree = pathlib.Path(run.crew_worktree)
+    tracked = git(crew_worktree, "ls-files", "--error-unmatch", "--", str(relative))
+    if tracked.returncode == 0:
+        crew_path = crew_worktree / relative
+        write_local_ticket_status(crew_path, number)
+        close_sha = commit_close(crew_worktree, crew_path, number)
+        if close_sha is not None:
+            undo = (
+                f"(1) {undo}; (2) run `git revert {close_sha}` in the recorded Crew worktree "
+                f"{crew_worktree}"
+            )
+    elif tracked.returncode != 1:
+        detail = (tracked.stderr or tracked.stdout).strip()
+        raise DriverError(
+            f"whether the Crew snapshot tracks {relative} could not be read: {detail}",
+            ticket=number,
+        )
+    return undo
+
+
+def write_local_ticket_status(path, number):
+    """Write the finished status to `path`; return the exact text operation that undoes it."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     except OSError as error:
@@ -3416,20 +3496,27 @@ def close_local_ticket(run, ticket, number):
         with path.open("a", encoding="utf-8") as handle:
             handle.write(f"\nStatus: {STATUS_FINISHED}\n")
         undo = f"take the `Status: {STATUS_FINISHED}` line off the end of {path}"
-    commit_close(run.repo_root, path, number)
     return undo
 
 
 def commit_close(repo, path, number):
-    """Commit that close on the integration branch, and nothing else with it."""
+    """Commit that close on the integration branch; return its SHA, or None if unchanged."""
     result = git(
         repo, "commit", "-m", f"chore: close {number} in the local tracker", "--", str(path)
     )
-    if result.returncode != 0 and git_output(repo, "status", "--porcelain", "--", str(path)):
+    if result.returncode == 0:
+        close_sha = git_output(repo, "rev-parse", "HEAD")
+        if close_sha is None:
+            raise DriverError(
+                f"the commit closing {number} has no readable SHA", ticket=number
+            )
+        return close_sha
+    if git_output(repo, "status", "--porcelain", "--", str(path)):
         detail = (result.stderr or result.stdout).strip()
         raise DriverError(
             f"the close of {number} could not be committed: {detail}", ticket=number
         )
+    return None
 
 
 def close_github_issue(run, number):
@@ -3439,7 +3526,7 @@ def close_github_issue(run, number):
     `OWNER/REPO` slug there, not a path, and the checkout it is run in is what it resolves the
     slug from — which is also the one repository this run is allowed to touch.
     """
-    repo = run.repo_root
+    repo = run.crew_worktree
     listed = gh(repo, "issue", "view", number, "--json", "labels")
     labels = []
     if listed.returncode == 0:
@@ -3476,7 +3563,7 @@ def gh_or_raise(repo, number, message, *arguments):
 # --- the loop's two entry points ---------------------------------------------------------------
 
 
-def wave_loop(args, repo, run_dir, table_path, adopting=False, starting=False):
+def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
     """Run the wave loop over a prepared run; returns the exit code its ending earns.
 
     Every way out of the loop carries the command that puts it back: a run stopped by a driver
@@ -3487,7 +3574,7 @@ def wave_loop(args, repo, run_dir, table_path, adopting=False, starting=False):
     handling: a run that cannot be adopted wakes the coordinator with a snapshot exactly as one
     that cannot be carried on does.
     """
-    loop = Loop(args, repo, run_dir, table_path)
+    loop = Loop(args, run_dir, table_path)
     resume = resume_command(args)
     try:
         if adopting:
@@ -3537,12 +3624,17 @@ def run_resume(args):
         raise DriverError(
             f"{feature_dir} holds no run to resume: {table} is not there", pointer=str(feature_dir)
         )
-    repo = repository_root(feature_dir, args.repo_root)
+    repository_root(feature_dir, args.repo_root)
+    try:
+        plan = run_plan.load(table)
+    except run_plan.RunPlanError as error:
+        raise DriverError(str(error), pointer=str(table)) from error
+    validate_recorded_crew_worktree(plan.run)
     args.tmux_session = tmux_session(args.tmux_session)
     attend_coordinator(args.coordinator_pane)
     take_up_run(run_dir)
     print(f"crew resumed, run directory {run_dir}", flush=True)
-    return wave_loop(args, repo, run_dir, table)
+    return wave_loop(args, run_dir, table)
 
 
 def run_answer(args):
@@ -3554,7 +3646,7 @@ def run_answer(args):
             f"{run_dir} holds no run to answer: {table_path} is not there",
             pointer=str(run_dir),
         )
-    loop = Loop(args, run_dir.parent, run_dir, table_path)
+    loop = Loop(args, run_dir, table_path)
     ticket = str(args.ticket)
     launch = machine_log.project(loop.records()).ticket(ticket).launch
     if launch is None:

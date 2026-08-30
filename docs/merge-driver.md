@@ -14,8 +14,9 @@ merge_driver.py land --table <wave table> --wave N --log <machine log> \
 ```
 
 The wave table is the dispatch renderer's — the same file, the same authority (ADR-0003) — and
-the driver reads two things from its `run` section, `repo_root` and `integration_branch`, plus
-the tickets of the named wave. A ticket's branch is not table data: it is the name the renderer gave
+the driver reads the recorded `crew_worktree` and `integration_branch` from its `run` section,
+plus the tickets of the named wave. `repo_root` remains the repository identity; it is not the
+checkout the merge mutates. A ticket's branch is not table data: it is the name the renderer gave
 it, derived by the same code, so the driver merges exactly what dispatch created.
 
 `--repair-model` has no default on purpose. The repair rung's model is a routing decision, and a

@@ -75,6 +75,7 @@ WAKE_NAME = "wake.json"
 FEATURE_NAME = "demo"
 INTEGRATION_BRANCH = "crew/demo"
 BASE_BRANCH = "main"
+CREW_WORKTREE_NAME = f"crew-{FEATURE_NAME}"
 # The configured decisions the driver records into the run.
 REPAIR_MODEL = "claude-sonnet-5"
 WITNESS_MODEL = "claude-sonnet-5"
@@ -552,6 +553,10 @@ class Fixture:
     def run_dir(self):
         return self.feature_dir / RUN_DIR_NAME
 
+    @property
+    def crew_worktree(self):
+        return self.repo / ".claude" / "worktrees" / CREW_WORKTREE_NAME
+
     def table(self):
         return json.loads((self.run_dir / "wave-table.json").read_text())
 
@@ -700,6 +705,10 @@ class DriverTestCase(unittest.TestCase):
     def assert_nothing_launched(self):
         self.assertEqual(self.fixture.launches(), [])
         self.assertNotIn(INTEGRATION_BRANCH, self.fixture.branches())
+        self.assertFalse(
+            self.fixture.crew_worktree.exists(),
+            "a failed start left its not-yet-active Crew worktree",
+        )
         self.assertFalse(self.fixture.run_dir.exists(), "a failed start left a run directory")
 
     def started(self, extra=()):

@@ -36,6 +36,7 @@ The wave table is one JSON object:
     {
       "run": {
         "repo_root":               absolute path to the repository the worktrees are cut in
+        "crew_worktree":           absolute path to the Run's Integration checkout
         "spec_path":               absolute path to the spec every child is pointed at
         "integration_branch":      the branch completed tickets land on
         "integration_base_commit": the commit ticket worktrees and reviews are based on

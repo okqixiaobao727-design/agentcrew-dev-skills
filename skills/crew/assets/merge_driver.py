@@ -542,7 +542,7 @@ def land_ticket(run, ticket, branch, options):
     the next ticket starts from a repository in one piece, and one `escalated` event carries the
     reason to the coordinator.
     """
-    repo = run.repo_root
+    repo = run.crew_worktree
     into = run.integration_branch
     number = ticket.id
     record = merge_recorder(run, ticket, branch, options)
@@ -589,7 +589,7 @@ def check_repair_model(model):
 
 def open_integration_branch(run):
     """Check the integration branch out, refusing a repository with work of its own in the way."""
-    repo = run.repo_root
+    repo = run.crew_worktree
     if git_or_raise(repo, "status", "--porcelain", "--untracked-files=no"):
         raise WaveError(f"{repo} has uncommitted changes; nothing was merged")
     git_or_raise(repo, "checkout", run.integration_branch)
@@ -616,7 +616,7 @@ def land_wave(plan, wave, options):
         if facts.merge_landed:
             lines.append(f"{number} skipped already landed")
             continue
-        unverified = unverified_reason(run.repo_root, branch, receipt)
+        unverified = unverified_reason(run.crew_worktree, branch, receipt)
         if unverified:
             line, _ = escalate(run, ticket, branch, options, unverified, [])
             lines.append(line)

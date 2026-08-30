@@ -798,7 +798,7 @@ def candidate_run(repo, directory, config):
     head = driver.git_output(repo, "rev-parse", "HEAD") or LATER
     return driver.run_section(
         args, repo, directory, directory / driver.RUN_DIR_NAME,
-        base_branch=None, return_branch=head, base_commit=head, config=config,
+        base_branch=None, base_commit=head, config=config,
     )
 
 
@@ -809,8 +809,8 @@ def self_check(repo, directory, config):
     plan = None
     base_branch = driver.default_base_branch(repo)
     if base_branch is None:
-        # Fetch and fast-forward checks belong to run start; staging only checks default naming.
-        problems += driver.base_branch_problems(repo, base_branch, (driver.UPSTREAM_ABSENT, ""))
+        # Resolving the selected local ref belongs to run start; staging only checks default naming.
+        problems += driver.base_branch_problems(repo, base_branch)
     try:
         plan = run_plan.build(directory, run)
     except run_plan.RunPlanError as error:

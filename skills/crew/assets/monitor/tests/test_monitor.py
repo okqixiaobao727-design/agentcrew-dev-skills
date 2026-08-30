@@ -321,6 +321,7 @@ class Fixture:
         self.table_path.write_text(json.dumps({
             "run": {
                 "repo_root": str(self.repo),
+                "crew_worktree": str(self.repo),
                 "spec_path": str(self.root / "spec.md"),
                 "integration_branch": "crew/feature",
                 "integration_base_commit": self.base_commit,
