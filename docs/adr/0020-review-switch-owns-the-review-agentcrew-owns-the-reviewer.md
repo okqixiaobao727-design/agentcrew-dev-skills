@@ -29,5 +29,6 @@ knows: the ticket's base commit, the ticket's path, and where in the ticket a re
   Codex child. What stays is the caller's budget, stated once in `[review]`: A `run again` axis is
   run again at most once during this ticket's only review; past that the child sends `CREW ASK
   <NN> stuck` with its reason. `CREW ASK` stays this repo's word for the escalating act.
-- Cross review is unchanged. Choosing a reviewer from the other vendor is a routing decision,
-  and routing did not move.
+- Choosing a reviewer is a routing decision, and routing did not move. This ADR originally required
+  the reviewer to come from the other vendor; [ADR-0027](0027-a-review-lane-is-independent-not-necessarily-cross-vendor.md)
+  later removed that constraint while preserving Reviewer independence.

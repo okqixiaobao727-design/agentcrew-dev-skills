@@ -158,9 +158,14 @@ acceptance criteria can be written as a fact table waiting to be filled in: the 
 enumerated up front, the verification method is specified, and the deliverable recommends no
 approach. Missing any one of the three makes it open exploration.
 
-**Cross review** — Only tdd and refactor tickets get code review, and the reviewer always comes from
-a different vendor than the implementer (Claude implements, Codex reviews, and vice versa). Review
-intensity rises with the quadrant's stakes.
+**Review lane** — The independent Reviewer session assigned to a tdd or refactor ticket, identified
+by its vendor, model and effort. It never reuses the Implementer's session.
+
+**Cross-vendor review** — A Review lane whose vendor differs from the Implementer's vendor.
+
+**Same-vendor review** — A Review lane whose vendor matches the Implementer's vendor. The Reviewer
+is still a fresh independent session; same vendor never means self-review.
+_Avoid_: cross review (ambiguous)
 
 **Standards axis / Spec axis** — The two axes a review runs and reports separately. Standards =
 style, naming, convention — anything that leaves behaviour intact. Spec = correctness, safety,
@@ -358,9 +363,13 @@ frame is drawn is different. The window is unchanged and stays the default
 
 ## Artefacts
 
-**Worktree** — A child's isolated working directory. It isolates *files*, not the world: inside a
-worktree a child still reaches the network, remote hosts and production databases. That is why the
-red line exists.
+**Crew worktree** — A Run's dedicated checkout. The Driver performs the run's Git operations there
+while the checkout from which the Coordinator invoked `/crew` remains untouched.
+
+**Ticket worktree** — A child's isolated working directory. It isolates *files*, not the world:
+inside a ticket worktree a child still reaches the network, remote hosts and production databases.
+That is why the red line exists.
+_Avoid_: worktree (ambiguous)
 
 **Integration branch** — `crew/<feature-slug>`, cut from the base branch when the run starts. Every
 finished ticket merges into it; the base branch is untouched for the whole unattended run and the
