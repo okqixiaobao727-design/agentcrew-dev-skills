@@ -64,6 +64,10 @@ One table, one checkpoint — the shape `classify.md` gives it. Ask the user to 
 revision they give — re-cutting a ticket means re-classifying it — redisplay the full table, and ask
 again.
 
+For a `tdd` or `refactor` ticket, the user may revise the suggested Review lane to either vendor,
+with its own full model ID and effort. A same-vendor choice is legal and still means a fresh
+Reviewer session through Review-Switch; never infer a substitute or reuse the Implementer session.
+
 The user may also name an **account** for any ticket at this checkpoint — the Claude login whose
 subscription that ticket's children spend. It is theirs to say and never yours to conclude: no
 classification proposes one, and a ticket the user names none for runs on the coordinator's own

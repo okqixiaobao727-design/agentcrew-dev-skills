@@ -7,6 +7,11 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Review lanes may now use the same vendor as their Implementer while remaining fresh independent
+  Review-Switch sessions. All four vendor combinations pass route staging, Run-plan validation,
+  dispatch rendering and independent cost attribution; shipped defaults remain cross-vendor (#170).
+
 ## [0.9.12] - 2026-08-30
 
 ### Added

@@ -361,8 +361,6 @@ def _validation_problems(plan, check_wave_layout=True):
                 faults.append(
                     f"Review vendor `{review.vendor}` is outside {', '.join(REVIEW_VENDORS)}"
                 )
-            elif review.vendor == ticket.executor:
-                faults.append(f"Review vendor `{review.vendor}` is its own Executor, not a lane")
             if not review.model:
                 faults.append("Review lacks model")
             else:

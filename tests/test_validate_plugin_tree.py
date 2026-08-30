@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 
@@ -16,6 +17,11 @@ PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "scripts" / "validate_plugin_tree.py"
 CONFIG = "config/agentcrew.default.toml"
 DISPATCH = "skills/crew/assets/dispatch/dispatch.py"
+
+VALIDATOR_SPEC = importlib.util.spec_from_file_location("validate_plugin_tree", SCRIPT)
+VALIDATOR = importlib.util.module_from_spec(VALIDATOR_SPEC)
+VALIDATOR_SPEC.loader.exec_module(VALIDATOR)
+REVIEWER_CASES = VALIDATOR.REVIEWER_CASES
 
 
 IDENTIFIERS_FILE = ".agentcrew-local-identifiers"
@@ -617,6 +623,17 @@ class ProjectConfigTests(unittest.TestCase):
 
     def test_the_shipped_defaults_are_accepted_verbatim(self):
         self.assert_accepts((PLUGIN_ROOT / CONFIG).read_text())
+
+    def test_the_shipped_review_lanes_remain_the_existing_cross_vendor_defaults(self):
+        with (PLUGIN_ROOT / CONFIG).open("rb") as handle:
+            config = tomllib.load(handle)
+
+        self.assertEqual(set(config["reviewer"]), set(REVIEWER_CASES))
+        for case in REVIEWER_CASES:
+            with self.subTest(case=case):
+                implementer = config["implementer"]["tdd-refactor"][case]
+                reviewer = config["reviewer"][case]
+                self.assertNotEqual(implementer["executor"], reviewer["executor"])
 
     def test_a_single_overridden_cell_is_accepted(self):
         self.assert_accepts_with_required(

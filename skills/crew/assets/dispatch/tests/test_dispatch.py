@@ -32,6 +32,16 @@ CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
 CODEX_MODEL = "gpt-5.6-luna"
 CODEX_EFFORT = "max"
+VENDOR_ROUTING = {
+    "claude": {"model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+    "codex": {"model": CODEX_MODEL, "effort": CODEX_EFFORT},
+}
+REVIEW_LANE_MATRIX = (
+    ("claude", "claude"),
+    ("claude", "codex"),
+    ("codex", "claude"),
+    ("codex", "codex"),
+)
 WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_BUDGET_USD = 2.5
 COORDINATOR_NAME = "crew-coordinator-1f"
@@ -477,8 +487,8 @@ class TableValidationTests(DispatchTestCase):
         tickets = [
             self.fixture.ticket("01", "missing-model", model=None),
             self.fixture.ticket("02", "bad-workflow", workflow="yolo"),
-            self.fixture.ticket("03", "same-vendor-review", review={
-                "vendor": "claude", "model": CODEX_MODEL, "effort": CODEX_EFFORT,
+            self.fixture.ticket("03", "unknown-review-vendor", review={
+                "vendor": "gemini", "model": CODEX_MODEL, "effort": CODEX_EFFORT,
             }),
             self.fixture.ticket("04", "review-without-lane", workflow="direct"),
             self.fixture.ticket("05", "no-review", workflow="tdd", review=None),
@@ -954,32 +964,28 @@ class ReviewEventRenderTests(DispatchTestCase):
         ):
             self.assertNotIn(key, event)
 
-    def claude_lane(self, account=None, **overrides):
-        """A ticket whose reviewer is the Claude lane, on the account the caller names.
-
-        An account named here is a ticket that named one, so its binding is explicit; naming none
-        is the ordinary row, inherited on the coordinator's own home.
-        """
+    def review_lane(self, executor, reviewer, account=None, **overrides):
+        """A ticket routed to the two vendors and optional explicit account the caller names."""
+        implementer = VENDOR_ROUTING[executor]
+        review = VENDOR_ROUTING[reviewer]
         return dict(
-            workflow="refactor", executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
-            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+            workflow="refactor",
+            executor=executor,
+            model=implementer["model"],
+            effort=implementer["effort"],
+            review={"vendor": reviewer, "model": review["model"], "effort": review["effort"]},
             account=str(account or self.fixture.config_dir),
             account_mode=EXPLICIT if account else INHERITED,
             **overrides,
         )
 
-    def test_both_reviewing_vendors_use_the_same_installed_command_and_hook_shape(self):
-        prompt = self.prompt_for("--log", str(self.machine_log), **self.claude_lane())
-        argv = review_command_argv(prompt)
+    def claude_lane(self, account=None, **overrides):
+        """A Claude Reviewer lane, on the account the caller names.
 
-        self.assertEqual(argv[0], "review-bridge")
-        self.assertEqual(argv[argv.index("--reviewer") + 1], "claude")
-        self.assertEqual(argv[argv.index("--model") + 1], CLAUDE_MODEL)
-        self.assertEqual(argv[argv.index("--effort") + 1], CLAUDE_EFFORT)
-        self.assertEqual(
-            shlex.split(self.hook_command(prompt, "--on-review-start")),
-            self.expected_review_hook("running", "claude", CLAUDE_MODEL),
-        )
+        An account named here is a ticket that named one, so its binding is explicit; naming none
+        is the ordinary row, inherited on the coordinator's own home.
+        """
+        return self.review_lane("codex", "claude", account, **overrides)
 
     def test_a_relative_log_reaches_the_child_as_an_absolute_path(self):
         """The review runs in the child's worktree, where a relative path names nothing."""
@@ -1006,10 +1012,57 @@ class ReviewEventRenderTests(DispatchTestCase):
 class ReviewAccountTests(ReviewEventRenderTests):
     """The reviewer of a ticket runs on that ticket's account, whichever account that is.
 
-    The renderer hands the bridge the profile directory the wave table resolved for the row, so
-    the review lane spends where the ticket spends. The Codex lane is a different vendor with its
-    own credentials and takes none of this.
+    The renderer hands a Claude Reviewer the profile directory the wave table resolved for the row,
+    so the Review lane spends where the ticket spends. A Codex Reviewer uses its own credentials and
+    takes none of this.
     """
+
+    def test_all_vendor_combinations_render_complete_independent_review_lanes(self):
+        for executor, reviewer in REVIEW_LANE_MATRIX:
+            with self.subTest(executor=executor, reviewer=reviewer):
+                prompt = self.prompt_for(
+                    "--log", str(self.machine_log),
+                    **self.review_lane(executor, reviewer, self.fixture.other_account),
+                )
+                argv = review_command_argv(prompt)
+                pairs = list(zip(argv[1::2], argv[2::2], strict=True))
+                arguments = dict(pairs)
+                expected_flags = [
+                    "--reviewer", "--cwd", "--model", "--effort",
+                ]
+                if reviewer == "claude":
+                    expected_flags.append("--account")
+                expected_flags += [
+                    "--base", "--spec", "--axis",
+                    "--on-review-start", "--on-axis-end", "--on-review-end",
+                ]
+
+                review = VENDOR_ROUTING[reviewer]
+                self.assertEqual(argv[0], "review-bridge")
+                self.assertEqual([flag for flag, _ in pairs], expected_flags)
+                self.assertEqual(arguments["--reviewer"], reviewer)
+                self.assertEqual(arguments["--cwd"], self.worktree)
+                self.assertEqual(arguments["--model"], review["model"])
+                self.assertEqual(arguments["--effort"], review["effort"])
+                self.assertEqual(arguments["--base"], self.fixture.base_commit)
+                self.assertEqual(
+                    arguments["--spec"], str(self.fixture.feature_dir / "06-reviewed.md")
+                )
+                self.assertEqual(arguments["--axis"], "both")
+                if reviewer == "claude":
+                    self.assertEqual(arguments["--account"], str(self.fixture.other_account))
+                self.assertEqual(
+                    shlex.split(arguments["--on-review-start"]),
+                    self.expected_review_hook("running", reviewer, review["model"]),
+                )
+                self.assertEqual(
+                    shlex.split(arguments["--on-review-end"]),
+                    self.expected_review_hook("returned", reviewer, review["model"]),
+                )
+                axis_hook = arguments["--on-axis-end"]
+                self.assertIn(f"--ticket 06 --executor {reviewer}", axis_hook)
+                self.assertIn(f"--lane '{reviewer} {review['model']}'", axis_hook)
+                self.assertIn(RENDERED_RUN_AGAIN_BUDGET, " ".join(prompt.split()))
 
     def test_the_claude_reviewer_is_launched_on_the_tickets_own_account(self):
         second = self.fixture.root / "claude-config-b"

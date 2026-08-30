@@ -183,6 +183,7 @@ REVIEW_SESSION = "9d1f4c2a-0000-4000-8000-000000000003"
 # The session driving the run, which works in the repository rather than in any child's worktree.
 COORDINATOR_SESSION = "9d1f4c2a-0000-4000-8000-000000000002"
 CODEX_SESSION = "019ffe0e-e154-7a93-88c2-3be07fd543cd"
+CODEX_REVIEW_SESSION = "019ffe0e-e154-7a93-88c2-3be07fd543ce"
 
 # The guard assets the dispatch renderer installs into every Claude worktree before its child
 # starts; the child never commits them, so they are not what makes a tree dirty.
@@ -3397,6 +3398,41 @@ class CostTests(MonitorTestCase):
         """The session-cost events in the log, in the order they were appended."""
         return [line for line in self.fixture.log_lines() if line["event"] == "session-cost"]
 
+    def assert_same_vendor_review_is_independent(
+        self, *, ticket, executor, model, child_session, review_session, totals, write_transcript
+    ):
+        """A lane-tagged review session is billed once and never folded into its child.
+
+        Same-vendor review leaves both transcripts in one worktree. The review's existing
+        lane-tagged row owns its session; the cost CLI must append a separate child-only row.
+        """
+        self.fixture.worktree(ticket)
+        self.fixture.launch(ticket, executor=executor, model=model)
+        write_transcript(ticket)
+        write_transcript(ticket, session=review_session)
+        self.fixture.append(
+            LAUNCH_TS, "session-cost", ticket=ticket, executor=executor, model=model,
+            lane=f"{executor} {model}", session=review_session,
+            input_tokens=totals["input"], output_tokens=totals["output"],
+            cache_read_tokens=totals["cache_read"],
+            cache_creation_tokens=totals["cache_creation"], total_tokens=totals["total"],
+        )
+
+        result = self.cost()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = self.costs()
+        review = [entry for entry in entries if "lane" in entry]
+        child = [entry for entry in entries if "lane" not in entry]
+        self.assertEqual(len(review), 1, review)
+        self.assertEqual(review[0]["executor"], executor)
+        self.assertEqual(review[0]["lane"], f"{executor} {model}")
+        self.assertEqual(review[0]["session"], review_session)
+        self.assertEqual(review[0]["total_tokens"], totals["total"])
+        self.assertEqual(len(child), 1, child)
+        self.assertEqual(child[0]["session"], child_session)
+        self.assertEqual(child[0]["total_tokens"], totals["total"])
+
     def test_a_claude_child_costs_what_its_transcripts_usage_adds_up_to(self):
         self.fixture.worktree("06")
         self.fixture.launch("06")
@@ -3424,33 +3460,16 @@ class CostTests(MonitorTestCase):
             }],
         )
 
-    def test_a_same_vendor_review_transcript_is_not_folded_into_the_childs_row(self):
-        """A review is its own session, already costed under its own lane-tagged row.
-
-        Reviewing a Claude child on the Claude lane leaves a second transcript in the child's
-        worktree; billing the child for it would charge the ticket twice for tokens the review
-        lane already accounts for.
-        """
-        self.fixture.worktree("06")
-        self.fixture.launch("06")
-        self.fixture.claude_transcript("06")
-        self.fixture.claude_transcript("06", session=REVIEW_SESSION)
-        self.fixture.append(
-            LAUNCH_TS, "session-cost", ticket="06", executor="claude", model=MODEL,
-            lane=f"claude {MODEL}", session=REVIEW_SESSION,
-            input_tokens=CLAUDE_TOTALS["input"], output_tokens=CLAUDE_TOTALS["output"],
-            cache_read_tokens=CLAUDE_TOTALS["cache_read"],
-            cache_creation_tokens=CLAUDE_TOTALS["cache_creation"],
-            total_tokens=CLAUDE_TOTALS["total"],
+    def test_a_claude_same_vendor_review_is_billed_as_an_independent_lane(self):
+        self.assert_same_vendor_review_is_independent(
+            ticket="06",
+            executor="claude",
+            model=MODEL,
+            child_session=CLAUDE_SESSION,
+            review_session=REVIEW_SESSION,
+            totals=CLAUDE_TOTALS,
+            write_transcript=self.fixture.claude_transcript,
         )
-
-        result = self.cost()
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        child = [entry for entry in self.costs() if "lane" not in entry]
-        self.assertEqual(len(child), 1, child)
-        self.assertEqual(child[0]["session"], CLAUDE_SESSION)
-        self.assertEqual(child[0]["total_tokens"], CLAUDE_TOTALS["total"])
 
     def test_a_claude_transcript_with_a_subdirectory_after_the_worktree_is_measured(self):
         worktree = self.fixture.worktree("06")
@@ -3562,6 +3581,17 @@ class CostTests(MonitorTestCase):
         self.assertEqual(entry["cache_read_tokens"], CODEX_TOTALS["cache_read"])
         self.assertEqual(entry["cache_creation_tokens"], CODEX_TOTALS["cache_creation"])
         self.assertEqual(entry["total_tokens"], CODEX_TOTALS["total"])
+
+    def test_a_codex_same_vendor_review_is_billed_as_an_independent_lane(self):
+        self.assert_same_vendor_review_is_independent(
+            ticket="07",
+            executor="codex",
+            model=CODEX_MODEL,
+            child_session=CODEX_SESSION,
+            review_session=CODEX_REVIEW_SESSION,
+            totals=CODEX_TOTALS,
+            write_transcript=self.fixture.codex_rollout,
+        )
 
     def test_a_codex_rollout_with_a_subdirectory_of_the_worktree_is_measured(self):
         worktree = self.fixture.worktree("07")

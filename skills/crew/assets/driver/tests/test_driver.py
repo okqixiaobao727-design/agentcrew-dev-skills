@@ -481,7 +481,7 @@ class PreflightTests(DriverTestCase):
         self.assertIn("02", notice)
         self.assertIn("full model ID", notice)
 
-    def test_a_review_lane_on_its_own_executor_is_rejected(self):
+    def test_a_hand_written_ticket_with_a_same_vendor_review_passes_preflight(self):
         self.fixture.ticket(
             "01", "same vendor", routing=ROUTING.replace(
                 f"Review: codex {CODEX_MODEL} {CODEX_EFFORT}",
@@ -490,10 +490,13 @@ class PreflightTests(DriverTestCase):
         )
         self.fixture.commit_feature()
 
-        result = self.fixture.start()
+        self.started()
 
-        notice = self.assert_preflight_failed(result, 1)
-        self.assertIn("Review", notice)
+        ticket = self.fixture.table()["waves"][0]["tickets"][0]
+        self.assertEqual(
+            ticket["review"],
+            {"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
 
     def test_a_feature_carrying_no_tickets_names_the_path_the_pattern_and_the_archive_trap(self):
         """The layout mistake is diagnosable from the error alone.
