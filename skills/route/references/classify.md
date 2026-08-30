@@ -49,7 +49,9 @@ ticket's.
 
 `tdd` and `refactor` are the only workflows whose diff a review can catch anything in, so they are
 the only ones that carry a `Review` line. The quadrant that chose the implementer chooses
-`reviewer.<quadrant>`.
+`reviewer.<quadrant>` as the suggestion. That cell's vendor, model and effort are independent of the
+Implementer cell: both same-vendor and cross-vendor Review lanes are legal. At the confirmation
+checkpoint, apply a user's revised concrete lane verbatim and redisplay the complete table.
 
 An `ops` ticket that touches production keeps its cell's effort and carries the note *consider
 raising the effort* in its reason, so the user decides the effort at confirmation.

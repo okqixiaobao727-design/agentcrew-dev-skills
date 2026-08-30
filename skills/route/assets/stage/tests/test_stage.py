@@ -27,6 +27,17 @@ REPAIR_MODEL = "claude-sonnet-5"
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CODEX_MODEL = "gpt-5.6-luna"
 
+VENDOR_ROUTING = {
+    "claude": {"model": CLAUDE_MODEL, "effort": "medium"},
+    "codex": {"model": CODEX_MODEL, "effort": "max"},
+}
+REVIEW_LANE_MATRIX = (
+    ("claude", "claude"),
+    ("claude", "codex"),
+    ("codex", "claude"),
+    ("codex", "codex"),
+)
+
 RUN_ROOT = "crewtask"
 SPEC_NAME = "spec.md"
 
@@ -289,7 +300,10 @@ def parsed(directory, environment):
         "directory, __import__('stage').candidate_run(repo, directory, config));"
         "tickets = [{"
         "'id': t.id, 'title': t.title, 'blocked_by': list(t.blocked_by),"
-        "'effort': t.effort, 'account': t.binding.directory,"
+        "'executor': t.executor, 'model': t.model, 'effort': t.effort,"
+        "'review': ({'vendor': t.review.vendor, 'model': t.review.model,"
+        "'effort': t.review.effort} if t.review is not None else None),"
+        "'account': t.binding.directory,"
         "'account_mode': t.binding.mode"
         "} for t in plan.tickets];"
         "print(json.dumps({"
@@ -592,6 +606,57 @@ class StagingTests(unittest.TestCase):
             self.assertIn(APPROVED_SECTION, body)
             self.assertEqual(body.count("## Routing"), 1)
             self.assertIn("## What to build", body)
+
+    def test_all_implementer_to_reviewer_vendor_combinations_stage_verbatim(self):
+        refs = []
+        approved = {}
+        expected = {}
+        for issue_number, (executor, reviewer) in enumerate(REVIEW_LANE_MATRIX, start=61):
+            number = str(issue_number)
+            refs.append(self.fixture.issue(number))
+            implementer = VENDOR_ROUTING[executor]
+            review = VENDOR_ROUTING[reviewer]
+            approved[number] = {
+                "workflow": "tdd",
+                "executor": executor,
+                "model": implementer["model"],
+                "effort": implementer["effort"],
+                "review": f"{reviewer} {review['model']} {review['effort']}",
+                "reasons": "the approved routing.",
+            }
+            expected[number] = {
+                "executor": executor,
+                "model": implementer["model"],
+                "effort": implementer["effort"],
+                "review": {
+                    "vendor": reviewer,
+                    "model": review["model"],
+                    "effort": review["effort"],
+                },
+            }
+
+        routing_file = self.fixture.routing_file(approved)
+        result = self.stage_approved(*refs, "--routing", routing_file)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"/crew {RUN_ROOT}/1\n")
+        tickets = {
+            ticket["id"]: ticket
+            for ticket in parsed(self.fixture.run_dir(), self.fixture.environment())["tickets"]
+        }
+        for number, expected_routing in expected.items():
+            with self.subTest(
+                executor=expected_routing["executor"],
+                reviewer=expected_routing["review"]["vendor"],
+            ):
+                self.assertEqual(
+                    {key: tickets[number][key] for key in expected_routing},
+                    expected_routing,
+                )
+                self.assertIn(
+                    f"Review: {approved[number]['review']}",
+                    self.fixture.tracker_body(number),
+                )
 
     def test_a_ticket_carrying_no_routing_yet_is_given_the_approved_one(self):
         first = self.fixture.issue(61, body="## What to build\n\nA fixture with no routing.\n")

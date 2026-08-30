@@ -89,8 +89,9 @@ effort = "medium"
 # --- Reviewer table ---------------------------------------------------------
 # `tdd` and `refactor` are the only workflows whose diff a review can catch anything in, so they
 # are the only ones that carry a reviewer, and the four cells are the same quadrant that chose the
-# implementer — no second classification. Keep the reviewer on the vendor that did not implement,
-# at the strength the stakes justify.
+# implementer — no second classification. Each cell independently selects the Review lane's
+# vendor, model and effort. The shipped cells stay cross-vendor; a project may retarget any cell to
+# a fresh same-vendor Reviewer session.
 
 [reviewer.core-complex]
 executor = "codex"

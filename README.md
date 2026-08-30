@@ -150,7 +150,9 @@ retargeted on its own.
 
 `tdd` and `refactor` are the only workflows whose diff a review can catch anything in, so they are
 the only ones that carry a reviewer. The quadrant that chose the implementer chooses the reviewer,
-and the reviewing vendor is always the one that did not implement.
+whose vendor, model and effort are configured independently. The shipped lanes remain cross-vendor,
+but a project may retarget any cell to a same-vendor lane; either relationship always launches a
+fresh Reviewer session through Review-Switch rather than reusing the Implementer's session.
 
 | Cell | Shipped default |
 | --- | --- |

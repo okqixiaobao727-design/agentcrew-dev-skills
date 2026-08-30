@@ -20,6 +20,20 @@ import run_plan  # noqa: E402
 
 WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_BUDGET_USD = 2.0
+IMPLEMENTER_ROUTING = {
+    "claude": {"model": "claude-opus-5", "effort": "max"},
+    "codex": {"model": "gpt-5.6-luna", "effort": "max"},
+}
+REVIEWER_ROUTING = {
+    "claude": {"model": "claude-opus-5", "effort": "medium"},
+    "codex": {"model": "gpt-5.6-sol", "effort": "high"},
+}
+REVIEW_LANE_MATRIX = (
+    ("claude", "claude"),
+    ("claude", "codex"),
+    ("codex", "claude"),
+    ("codex", "codex"),
+)
 
 
 class RunPlanTests(unittest.TestCase):
@@ -188,6 +202,44 @@ class RunPlanTests(unittest.TestCase):
         table_path.write_text(json.dumps(replacement), encoding="utf-8")
         self.assertEqual(run_plan.load(table_path).ticket("01").title, "Replaced")
 
+    def test_all_review_lane_vendor_combinations_survive_write_load_round_trip(self):
+        expected = []
+        for number, (executor, reviewer) in enumerate(REVIEW_LANE_MATRIX, start=1):
+            implementer = IMPLEMENTER_ROUTING[executor]
+            review = REVIEWER_ROUTING[reviewer]
+            self.ticket(f"{number:02}", f"Lane {number}", routing=(
+                "Workflow: tdd\n"
+                f"Executor: {executor}\n"
+                f"Model: {implementer['model']}\n"
+                f"Effort: {implementer['effort']}\n"
+                f"Review: {reviewer} {review['model']} {review['effort']}\n"
+            ))
+            expected.append((
+                executor,
+                implementer["model"],
+                reviewer,
+                review["model"],
+                review["effort"],
+            ))
+        table_path = self.root / "wave-table.json"
+
+        run_plan.build(self.feature, self.run).write(table_path)
+        loaded = run_plan.load(table_path)
+
+        self.assertEqual(
+            [
+                (
+                    ticket.executor,
+                    ticket.model,
+                    ticket.review.vendor,
+                    ticket.review.model,
+                    ticket.review.effort,
+                )
+                for ticket in loaded.tickets
+            ],
+            expected,
+        )
+
     def test_a_table_written_without_the_coordinator_address_still_loads(self):
         """A run already under way when the address shipped resumes; it is not a required key."""
         self.ticket("01", "Foundation")
@@ -276,13 +328,38 @@ class RunPlanTests(unittest.TestCase):
                 lambda value: value["waves"][0]["tickets"][0].update(executor="gemini"),
                 "Executor `gemini`",
             ),
+            "unknown review vendor": (
+                lambda value: value["waves"][0]["tickets"][0].update(
+                    workflow="tdd",
+                    review={
+                        "vendor": "gemini", "model": "gemini-3-pro", "effort": "medium",
+                    },
+                ),
+                "Review vendor `gemini`",
+            ),
             "unknown effort": (
                 lambda value: value["waves"][0]["tickets"][0].update(effort="heroic"),
                 "Effort `heroic`",
             ),
+            "unknown review effort": (
+                lambda value: value["waves"][0]["tickets"][0].update(
+                    workflow="tdd",
+                    review={
+                        "vendor": "codex", "model": "gpt-5.6-sol", "effort": "heroic",
+                    },
+                ),
+                "Review effort `heroic`",
+            ),
             "model alias": (
                 lambda value: value["waves"][0]["tickets"][0].update(model="opus"),
                 "full model ID",
+            ),
+            "review model alias": (
+                lambda value: value["waves"][0]["tickets"][0].update(
+                    workflow="tdd",
+                    review={"vendor": "codex", "model": "gpt-5.6", "effort": "medium"},
+                ),
+                "Review model.*full model ID",
             ),
             "review on no-lane workflow": (
                 lambda value: value["waves"][0]["tickets"][0].update(review={
@@ -293,15 +370,6 @@ class RunPlanTests(unittest.TestCase):
             "missing review lane": (
                 lambda value: value["waves"][0]["tickets"][0].update(workflow="tdd"),
                 "lacks Review",
-            ),
-            "reviewer equals executor": (
-                lambda value: value["waves"][0]["tickets"][0].update(
-                    workflow="tdd",
-                    review={
-                        "vendor": "claude", "model": "claude-opus-5", "effort": "medium",
-                    },
-                ),
-                "own Executor",
             ),
             "relative account": (
                 lambda value: value["waves"][0]["tickets"][0].update(account="relative"),
