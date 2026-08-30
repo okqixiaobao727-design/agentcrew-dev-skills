@@ -226,6 +226,7 @@ class Fixture:
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["CLAUDE_CONFIG_DIR"] = str(self.config_dir)
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
+        environment["CREW_LAUNCH_PERMISSION_MODE_SECONDS"] = "0"
         for name in list(environment):
             if name.startswith("AGENTCREW_STUB_DRIVER_"):
                 del environment[name]
@@ -340,6 +341,26 @@ class LaunchTests(unittest.TestCase):
 
         call = self.one_call(self.fixture.launch())
 
+        self.assertEqual(flag(call["argv"], "--permission-mode"), SWITCHED_MODE)
+
+    def test_a_fresh_session_waits_for_its_first_permission_mode(self):
+        """A slash-command turn records its mode only after the launcher has started."""
+        self.fixture.registry(os.getpid())
+        transcript = self.fixture.transcript([])
+        os.utime(transcript, ns=(0, transcript.stat().st_mtime_ns))
+
+        launch = self.fixture.start_launch(
+            env_overrides={"CREW_LAUNCH_PERMISSION_MODE_SECONDS": "1"}
+        )
+        self.assertTrue(
+            self.fixture.wait_for(lambda: transcript.stat().st_atime_ns > 0),
+            "the launcher did not read the transcript before its permission-mode deadline",
+        )
+        self.fixture.transcript([SWITCHED_MODE])
+        stdout, stderr = launch.communicate(timeout=LAUNCH_TIMEOUT)
+
+        result = subprocess.CompletedProcess(launch.args, launch.returncode, stdout, stderr)
+        call = self.one_call(result)
         self.assertEqual(flag(call["argv"], "--permission-mode"), SWITCHED_MODE)
 
     def test_the_driver_is_launched_in_the_directory_the_command_was_typed_in(self):

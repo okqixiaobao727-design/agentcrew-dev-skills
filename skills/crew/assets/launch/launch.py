@@ -100,8 +100,14 @@ TMUX_PANE_VARIABLE = "TMUX_PANE"
 # called failed. It is the first thing its loop does, so this is generous rather than tuned; the
 # environment moves it in the shape the loop's own poll interval is already moved by one.
 HANDSHAKE_SECONDS = float(os.environ.get("CREW_LAUNCH_HANDSHAKE_SECONDS") or 30.0)
-# How often this waiter looks for the wake it is waiting on. Nothing here is on a hot path: the
-# thing being waited for takes minutes to hours.
+# How long a fresh coordinator session is given to record its permission mode. A slash-command
+# turn can start this launcher before its first mode-bearing transcript entry is written, so the
+# transcript remains authoritative while the launcher gives that entry a bounded time to arrive.
+PERMISSION_MODE_SECONDS = float(
+    os.environ.get("CREW_LAUNCH_PERMISSION_MODE_SECONDS") or 10.0
+)
+# How often the launcher rereads state it is waiting on. Neither the first permission-mode record
+# nor a run's wake is a hot path, so polling keeps both waits simple and bounded.
 POLL_SECONDS = 0.5
 # How long a released run is watched before its silence is called a deliberate stop. A driver
 # releases the run an instant before it writes its wake, so this only has to outlast one file
@@ -253,12 +259,18 @@ def recorded_mode(path):
 
 
 def permission_mode(entry, pid):
-    """The mode that session is in now, out of the newest transcript entry that records one."""
+    """The current mode from the transcript, after a bounded wait for its first such entry."""
     session = entry.get(REGISTRY_SESSION)
-    for path in transcripts(session):
-        mode = recorded_mode(path)
-        if mode is not None:
-            return mode
+    deadline = time.monotonic() + PERMISSION_MODE_SECONDS
+    while True:
+        for path in transcripts(session):
+            mode = recorded_mode(path)
+            if mode is not None:
+                return mode
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(POLL_SECONDS, remaining))
     raise LaunchError(
         f"no transcript entry under {harness_directory(TRANSCRIPTS)} records the permission mode"
         f" of session {session or 'unnamed'} (pid {pid}):"
