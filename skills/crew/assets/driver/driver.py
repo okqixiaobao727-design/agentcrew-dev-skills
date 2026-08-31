@@ -142,6 +142,7 @@ sys.path.insert(0, str(ASSETS))
 import machine_log  # noqa: E402
 # Account bindings become process environments only through the account module.
 import accounts  # noqa: E402
+import coordinator_control  # noqa: E402
 import run_plan  # noqa: E402
 import witness as witness_runner  # noqa: E402
 # The monitor still owns process liveness, the driver pid record and every operator-facing surface;
@@ -1959,7 +1960,7 @@ def adopt(args, run_dir, table_path):
     return wave_loop(args, run_dir, table_path, adopting=True)
 
 
-def start_dashboard(args, repo, run_dir):
+def start_dashboard(context, repo, run_dir):
     """Point the operator's dashboard at the run, on whichever surface the repo chose.
 
     Idempotent, and run by every driver that takes the run up rather than only by the one that
@@ -1968,8 +1969,8 @@ def start_dashboard(args, repo, run_dir):
     """
     arguments = [
         sys.executable, MONITOR, "window",
-        "--run-dir", run_dir, "--session", args.tmux_session,
-        "--coordinator-pid", args.coordinator_pid,
+        "--run-dir", run_dir, "--session", context.display_session,
+        "--coordinator-pid", context.pid,
     ]
     config = repo / CONFIG_NAME
     if config.exists():
@@ -2512,6 +2513,7 @@ class WaveActivation:
 
     def activate(self, wave):
         """Make named `wave` ready for normal polling and restore its hooks; return nothing."""
+        self.loop.service_coordinator()
         try:
             records = self.loop.records()
             projection = machine_log.project(records)
@@ -2566,10 +2568,62 @@ class Loop:
         except run_plan.RunPlanError as error:
             raise DriverError(str(error), pointer=str(table_path)) from error
         self.run = self.plan.run
+        self.coordinator = coordinator_control.CoordinatorContext(
+            name=getattr(args, "coordinator_name", None) or self.run.coordinator_name,
+            pid=getattr(args, "coordinator_pid", None) or self.run.coordinator_pid,
+            harness_session=(
+                getattr(args, "coordinator_session", None) or self.run.coordinator_session
+            ),
+            address=getattr(args, "coordinator_address", None) or self.run.coordinator_address,
+            pane=getattr(args, "coordinator_pane", None),
+            permission_mode=(
+                getattr(args, "permission_mode", None) or self.run.permission_mode
+            ),
+            display_session=getattr(args, "tmux_session", None) or self.run.tmux_session,
+        )
+        self.coordinator_control = coordinator_control.CoordinatorControl(run_dir)
         self.repo_root = pathlib.Path(self.run.repo_root)
         self.crew_worktree = validate_recorded_crew_worktree(self.run)
         self.monitors = []
         self.activation = WaveActivation(self)
+
+    def service_coordinator(self):
+        """Service Coordinator control before Driver activation or polling."""
+        self.coordinator = self.coordinator_control.service(
+            self.coordinator, self.apply_coordinator
+        )
+
+    def apply_coordinator(self, context):
+        """Apply one Coordinator context while Coordinator control holds the handover boundary."""
+        previous_address = self.run.coordinator_address
+        self.coordinator = context
+        attend_coordinator(context.pane)
+
+        run = replace(
+            self.run,
+            coordinator_name=context.name,
+            coordinator_pid=context.pid,
+            coordinator_session=context.harness_session,
+            coordinator_address=context.address,
+            permission_mode=context.permission_mode,
+        )
+        plan = replace(self.plan, run=run)
+        try:
+            plan.write(self.table_path)
+        except run_plan.RunPlanError as error:
+            raise DriverError(str(error), pointer=str(self.table_path)) from error
+        self.run = run
+        self.plan = plan
+
+        install_hook(
+            self.log,
+            self.repo_root / SETTINGS_PATH,
+            COORDINATOR_ROLE,
+            session_id=context.harness_session,
+            run_dir=self.run_dir.parent,
+        )
+        self.reanchor(machine_log.project(self.records()), previous_address)
+        start_dashboard(context, self.crew_worktree, self.run_dir)
 
     # --- what it reads --------------------------------------------------------------------
 
@@ -3245,7 +3299,7 @@ class Loop:
 
     def open_wave(self):
         """Open or restore this run's dashboard for normal Wave polling; return nothing."""
-        start_dashboard(self.args, self.crew_worktree, self.run_dir)
+        start_dashboard(self.coordinator, self.crew_worktree, self.run_dir)
 
     def close_merged(self):
         """Close every merged ticket in the run's tracker, recording each undo; returns nothing."""
@@ -3290,7 +3344,7 @@ class Loop:
         projection = machine_log.project(records)
         install_hook(
             self.log, self.repo_root / SETTINGS_PATH, COORDINATOR_ROLE,
-            session_id=self.args.coordinator_session,
+            session_id=self.coordinator.harness_session,
             run_dir=self.run_dir.parent,
         )
         for ticket, facts in sorted(projection.tickets.items()):
@@ -3300,9 +3354,9 @@ class Loop:
             worktree = launch.get("worktree")
             if worktree and pathlib.Path(worktree).is_dir():
                 install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
-        self.reanchor(projection)
+        self.service_coordinator()
 
-    def reanchor(self, projection):
+    def reanchor(self, projection, previous_address):
         """Point the run and its live children at the coordinator driving it now; returns nothing.
 
         A coordinator that restarted binds a new socket, so every Claude child of the run is
@@ -3320,26 +3374,8 @@ class Loop:
         instruction that landed and could not be recorded is a driver error, and it wakes the
         coordinator here as it does everywhere else.
         """
-        name = self.args.coordinator_name
-        pid = self.args.coordinator_pid
-        session = self.args.coordinator_session
-        address = self.args.coordinator_address
-        if (
-            self.run.coordinator_name,
-            self.run.coordinator_pid,
-            self.run.coordinator_session,
-            self.run.coordinator_address,
-        ) == (name, pid, session, address):
-            return
-        channel_changed = self.run.coordinator_address != address
-        self.run = replace(
-            self.run, coordinator_name=name, coordinator_pid=pid,
-            coordinator_session=session, coordinator_address=address,
-        )
-        self.plan = replace(self.plan, run=self.run)
-        self.plan.write(self.table_path)
         # A restart that moves only the hook scope leaves the address a child sends to standing.
-        if not channel_changed:
+        if previous_address == self.coordinator.address:
             return
         for ticket, facts in sorted(projection.tickets.items()):
             launch = facts.launch
@@ -3349,7 +3385,10 @@ class Loop:
                 continue
             with contextlib.suppress(Unreachable):
                 self.deliver(ticket, launch, ANCHOR_TEMPLATE.format(
-                    marker=ANCHOR_MARKER, ticket=ticket, name=name, address=address,
+                    marker=ANCHOR_MARKER,
+                    ticket=ticket,
+                    name=self.coordinator.name,
+                    address=self.coordinator.address,
                 ))
 
     # --- the loop itself ----------------------------------------------------------------------
@@ -3418,6 +3457,7 @@ class Loop:
 
     def poll(self, wave):
         """One turn of the loop over one wave; returns the wave to work next, or None when done."""
+        self.service_coordinator()
         records = self.records()
         projection = machine_log.project(records)
         if self.rule_on_messages(projection):
@@ -3678,7 +3718,6 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
     that cannot be carried on does.
     """
     loop = Loop(args, run_dir, table_path)
-    resume = resume_command(args)
     try:
         if adopting:
             loop.adopt()
@@ -3690,20 +3729,24 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
         return loop.run_until_woken()
     except Wake as wake:
         snapshot(
-            wake.reason, ticket=wake.ticket, pointer=wake.pointer, resume=resume, **wake.fields
+            wake.reason,
+            ticket=wake.ticket,
+            pointer=wake.pointer,
+            resume=resume_command(loop.args, loop.coordinator),
+            **wake.fields,
         )
         return 0
     except DriverError as error:
         snapshot(
             DRIVER_ERROR, ticket=error.ticket, pointer=error.pointer,
-            detail=str(error), resume=resume,
+            detail=str(error), resume=resume_command(loop.args, loop.coordinator),
         )
         return DRIVER_ERROR_EXIT
     finally:
         disarm(loop.monitors)
 
 
-def resume_command(args):
+def resume_command(args, coordinator):
     """The one command that puts the loop back where it left off, for the snapshot to carry.
 
     The launcher rather than this driver's own `resume`, because every driver of a run belongs in
@@ -3714,7 +3757,7 @@ def resume_command(args):
     """
     return shlex.join([
         sys.executable, str(LAUNCH), str(args.feature_dir),
-        "--coordinator-pid", str(args.coordinator_pid),
+        "--coordinator-pid", str(coordinator.pid),
     ])
 
 
@@ -3775,8 +3818,14 @@ def run_answer(args):
             f"unsupported answer key(s): {', '.join(unsupported)}",
             ticket=ticket, pointer=str(loop.log),
         )
-    loop.deliver(ticket, launch, args.text, args.keys)
-    return 0
+    control = coordinator_control.CoordinatorControl(run_dir)
+    try:
+        return control.authorized_action(
+            lambda: loop.deliver(ticket, launch, args.text, args.keys) or 0
+        )
+    except coordinator_control.CoordinatorControlError as error:
+        print(str(error), flush=True)
+        return DRIVER_ERROR_EXIT
 
 
 # --- entry point ------------------------------------------------------------------------------

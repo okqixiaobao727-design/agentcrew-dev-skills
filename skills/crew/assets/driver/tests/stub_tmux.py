@@ -103,6 +103,15 @@ def new_window(argv):
         "composer": "",
     }
     save_windows(table)
+    if flag(argv, "-n") == "crew-driver":
+        subprocess.Popen(
+            ["sh", "-c", argv[-1]],
+            cwd=flag(argv, "-c") or os.getcwd(),
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     print(window_id)
     return 0
 
