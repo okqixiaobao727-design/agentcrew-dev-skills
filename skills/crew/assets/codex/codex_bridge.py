@@ -8,7 +8,8 @@ orchestrator talks to the session through this CLI:
     launch  start app-server + TUI window with the first turn, write a state file
     send    submit a follow-up turn (answer, fix-up request) to a session
     watch   block while every watched session is busy; exit with a JSON snapshot
-            as soon as any session is idle (turn finished) or vanished
+            as soon as any session is idle (turn finished) or vanished; --once
+            evaluates every supplied session once and returns even when all are busy
     stop    kill a session's window and runtime
 
 Each command prints one JSON object on stdout. Exit 0 on success, 1 on error.
@@ -19,7 +20,8 @@ of ours is still the session speaking. The launch marker lets the outer process 
 thread the TUI created; the bridge never reads Codex's rollout persistence state during launch.
 What is copied to the machine log is keyed on the message rather than on the busy-to-idle edge
 that carried it, because an edge is seen only by the watch that happens to be polling either side
-of it, and one missed edge used to drop a child's last word for good.
+of it, and one missed edge used to drop a child's last word for good. The copy must succeed before
+`finalMessage` advances, so a failed append leaves the same message visible to the next watch.
 """
 
 import argparse
@@ -494,12 +496,12 @@ async def check_opening_skill(socket_path, cwd, skill_path):
         await client.__aexit__(None, None, None)
 
 
-def log_message(state, role, message, log=None, ticket=None):
-    """Copy a bridge message through the machine-log writer's existing schema."""
+def log_message(state, role, message, log=None, ticket=None, require_append=False):
+    """Return whether the bridge message was copied, raising when a required append fails."""
     log = log if log is not None else state.get("machineLog")
     ticket = ticket if ticket is not None else state.get("ticket")
     if not log:
-        return
+        return False
     command = [
         sys.executable,
         str(MACHINE_LOG),
@@ -514,14 +516,25 @@ def log_message(state, role, message, log=None, ticket=None):
     if ticket is not None:
         command.extend(["--ticket", str(ticket)])
     try:
-        subprocess.run(
+        result = subprocess.run(
             command,
             capture_output=True,
             text=True,
             check=False,
         )
-    except OSError:
-        pass
+    except OSError as error:
+        if require_append:
+            raise BridgeError(f"Cannot record the {role} message in {log}: {error}") from error
+        return False
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        if require_append:
+            raise BridgeError(
+                f"Cannot record the {role} message in {log}:"
+                f" writer exited {result.returncode}{f': {detail}' if detail else ''}"
+            )
+        return False
+    return True
 
 
 def model_config_overrides(args):
@@ -913,7 +926,7 @@ async def cmd_watch(args):
             # observation read a second time.
             recorded = state.get("finalMessage")
             if message and message != recorded:
-                log_message(state, "child", message)
+                log_message(state, "child", message, require_append=True)
             # A recorded message stands until another replaces it. `busy` carries none, and a
             # busy that is really a transport failure retried carries none either; forgetting the
             # last message there would log it again when the same turn is read next poll.
@@ -939,7 +952,7 @@ async def cmd_watch(args):
             snapshot.append(row)
             if status != "busy":
                 actionable = True
-        if actionable:
+        if actionable or args.once:
             print(json.dumps({"sessions": snapshot}, ensure_ascii=False))
             return 0
         if time.monotonic() >= deadline:
@@ -1011,6 +1024,10 @@ def build_parser():
                        default=DEFAULT_WATCH_INTERVAL_SECONDS)
     watch.add_argument("--timeout", type=float,
                        default=DEFAULT_WATCH_TIMEOUT_SECONDS)
+    watch.add_argument(
+        "--once", action="store_true",
+        help="Evaluate every supplied session once and return its current snapshot",
+    )
 
     stop = commands.add_parser("stop", help="Kill a session's window and runtime")
     stop.add_argument("--state-file", required=True)

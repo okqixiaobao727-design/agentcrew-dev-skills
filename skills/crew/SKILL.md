@@ -96,4 +96,6 @@ ended without asking you for anything: report that line as it stands and stop.
 An interrupted run — a crash, a killed driver, a restarted session — resumes by re-typing `/crew
 <run-dir>`: start adopts a run already under way rather than beginning a second one. The operator
 sees the same thing on their dashboard, which carries `✖ driver dead — /crew <run-dir> to resume`
-whenever the run's driver was killed rather than exiting.
+whenever the run's driver was killed rather than exiting. Re-typing it over a final Run also checks
+each recorded, unlanded Codex child once before returning the old report, so a protocol message sent
+after settlement enters the original Driver rule table instead of being dropped.

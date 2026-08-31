@@ -61,10 +61,11 @@ a second time, the children keep the worktrees and windows they have, their hook
 where their worktrees still stand, a coordinator that restarted re-anchors the run and the live
 children it answers, the dashboard is drawn again, and the loop picks the run up from its log —
 which is where every count it acts on lives, so an adopted run and an uninterrupted one are the
-same code path. What ends adoption is the log's own final advance decision, which is the monitor's
-predicate asked rather than restated: a run that has completed is not adopted, and the driver says
-so and points at the run's report. So re-typing the crew command is the whole of what an
-interruption, a driver crash or a coordinator restart costs.
+same code path. Before returning an old report for a final advance decision, the Driver observes
+each strictly correlated, unlanded Codex child once. No new protocol message preserves the final
+decision; a new one is appended before its Codex cursor advances and returns to the same rule
+table. So re-typing the crew command is the whole of what an interruption, a driver crash or a
+coordinator restart costs, including one resumed child that spoke after settlement.
 
 **The wave loop is a rule table, and the rule table is exhaustive.** Between the launch and the
 report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
@@ -1186,16 +1187,20 @@ def clear_launches(records):
     return list(launches.values())
 
 
+def codex_state_path(codex, ticket):
+    """Return one ticket's state-file path under a Run's configured Codex state directory."""
+    return pathlib.Path(codex.state_dir) / f"{ticket}.json"
+
+
 def clear_codex_state_files(run, launches):
     """The state files named by recorded Codex ticket ids, never a directory glob."""
-    state_dir = pathlib.Path(run.codex.state_dir) if run.codex else None
-    if state_dir is None:
+    if run.codex is None:
         return []
     state_files = []
     for launch in launches:
         if launch.get("executor") != CODEX:
             continue
-        state_file = state_dir / f"{launch['ticket']}.json"
+        state_file = codex_state_path(run.codex, launch["ticket"])
         if state_file not in state_files:
             state_files.append(state_file)
     return state_files
@@ -1816,6 +1821,105 @@ def run_start(args):
     return wave_loop(args, run_dir, table_path, starting=True)
 
 
+def terminal_identity_error(ticket, log, detail):
+    """Return the Driver error for a recorded terminal-child identity mismatch."""
+    return DriverError(
+        f"ticket {ticket}'s recorded launch failed re-verification: {detail}",
+        ticket=ticket,
+        pointer=str(log),
+    )
+
+
+def verified_terminal_codex_state_files(plan, projection, log):
+    """Return strictly correlated state files for observable, unlanded terminal children."""
+    state_files = []
+    for ticket in plan.tickets:
+        facts = projection.ticket(ticket.id)
+        launch = facts.launch
+        if launch is None or facts.merge_landed:
+            continue
+        planned_codex = ticket.executor == CODEX
+        recorded_codex = lane_of(launch) == CODEX
+        if not planned_codex and not recorded_codex:
+            continue
+
+        if not planned_codex or not recorded_codex:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"executor mismatch: the table approved {ticket.executor},"
+                f" the latest launch records {launch.get('executor')}",
+            )
+        if str(launch.get("ticket")) != ticket.id:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"ticket mismatch: the latest launch records {launch.get('ticket')},"
+                f" the table approved {ticket.id}",
+            )
+        if plan.run.codex is None:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                "the Run plan carries no Codex bridge configuration",
+            )
+        state_file = codex_state_path(plan.run.codex, ticket.id)
+        try:
+            identity = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(identity, dict) or not {"machineLog", "ticket"} <= identity.keys():
+            continue
+        worktree = launch.get("worktree")
+        try:
+            state = dispatch.verify_codex_child(ticket, worktree, state_file)
+        except (dispatch.LaunchError, KeyError, OSError) as error:
+            raise terminal_identity_error(ticket.id, log, error) from error
+        thread = launch.get("child")
+        if not isinstance(thread, str) or not thread or state.get("threadId") != thread:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"thread mismatch: the state file names {state.get('threadId')},"
+                f" the latest launch records {thread}",
+            )
+        if str(state.get("ticket")) != ticket.id:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"ticket mismatch: the state file names {state.get('ticket')},"
+                f" the latest launch records {ticket.id}",
+            )
+        recorded_log = state.get("machineLog")
+        if (
+            not isinstance(recorded_log, str)
+            or os.path.realpath(recorded_log) != os.path.realpath(log)
+        ):
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"Machine log mismatch: the state file names {recorded_log},"
+                f" this Run records {log}",
+            )
+        state_files.append(state_file)
+    return state_files
+
+
+def reconcile_terminal_codex_messages(plan, projection, log):
+    """Observe each correlated unlanded Codex child once, then return the refreshed facts."""
+    state_files = verified_terminal_codex_state_files(plan, projection, log)
+    if not state_files:
+        return projection
+    run_command(
+        [
+            sys.executable, str(plan.run.codex.bridge), "watch", "--once", *state_files,
+        ],
+        "the terminal Run's Codex messages could not be observed",
+        pointer=str(log),
+    )
+    return machine_log.project(machine_log.read_records(log))
+
+
 def adopt(args, run_dir, table_path):
     """Take over the unfinished run this feature already carries; returns the exit code it earns.
 
@@ -1824,15 +1928,12 @@ def adopt(args, run_dir, table_path):
     worktrees, branches and windows the interrupted run left them, and what they lost — the process
     watching them — is what this puts back.
 
-    One thing stands between the log and the loop: a run the monitor's `over` calls finished has
-    nothing to adopt — an `advance` decision of `complete`, or the `stopped` this loop appends
-    when a chain halted for good. A wave that escalated or was interrupted is neither: it is
-    re-run by the run that adopts it, which is how such a run carries on at all. The question is
-    asked of the monitor so the loop and the operator's surfaces can never disagree about it. A
-    finished run earns saying so and pointing at its report, and nothing else a re-typed command
-    may do to it. Everything an unfinished one needs is the loop's own — what it puts back before
-    it starts polling is `Loop.adopt`, and what it reads from the log is what it would have read
-    had it never stopped.
+    One thing stands between the log and the loop: before a terminal Run returns its old report,
+    each unlanded recorded Codex child is observed once through the bridge that owns its thread.
+    No new protocol message leaves the terminal facts unchanged. A message appended by that
+    observation is ordered after the old ending, so the refreshed projection hands it to the
+    loop's existing rule table. A wave that escalated or was interrupted is already unfinished and
+    takes the same loop without this terminal observation.
     """
     try:
         plan = run_plan.load(table_path)
@@ -1842,6 +1943,8 @@ def adopt(args, run_dir, table_path):
     log = run_dir / LOG_NAME
     records = machine_log.read_records(log)
     projection = machine_log.project(records)
+    if projection.ended:
+        projection = reconcile_terminal_codex_messages(plan, projection, log)
     if projection.ended:
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
@@ -2338,7 +2441,7 @@ class WaveActivation:
             if ticket.executor == CLAUDE:
                 entry = dispatch.verify_child(ticket, worktree, 0)
                 return {**launch, "child": entry.get("name") or launch.get("child")}
-            state_file = pathlib.Path(self.loop.run.codex.state_dir) / f"{ticket.id}.json"
+            state_file = codex_state_path(self.loop.run.codex, ticket.id)
             state = dispatch.verify_codex_child(ticket, worktree, state_file)
             return {**launch, "child": state.get("threadId") or launch.get("child")}
         except (dispatch.LaunchError, KeyError, OSError) as error:

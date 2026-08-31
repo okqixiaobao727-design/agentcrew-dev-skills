@@ -227,15 +227,19 @@ directory, dispatch,
 receipt verification, the rule table's settlements, merges, tracker closes, wave advancement,
 monitor re-arming, and the report. It drives the existing scripts at their published command lines
 and holds no state of its own — every count it acts on is read back out of the machine log,
-which is what makes adopting an unfinished run the same code path as carrying one on. Before any
+which is what makes adopting an unfinished run the same code path as carrying one on. A final Run
+first performs one bounded observation of each strictly correlated, unlanded Codex child; a late
+protocol message makes the prior ending non-current and enters that same rule table. Before any
 Wave is polled, the Driver makes it ready through the same activation path for a fresh start,
 adoption, resume or advance: a recorded launch is adopted, while an unrecorded ticket is dispatched
 only after a successful live-source reading confirms that no child exists
 ([ADR-0024](adr/0024-driver-activates-every-wave-through-one-path.md)).
 
-**Run adoption** — A new Driver process taking up an unfinished run after its previous Driver
-ended. It restores the run around the work already recorded; it is not a Coordinator handover or
-a Waiter attachment.
+**Run adoption** — A new Driver process taking up a run after its previous Driver ended. An
+unfinished Run resumes immediately. A Run with a final advance first observes its strictly
+correlated, unlanded Codex children once; it returns the old report when that adds no protocol fact,
+or resumes when one makes the old ending non-current. Adoption restores the run around the work
+already recorded; it is not a Coordinator handover or a Waiter attachment.
 
 **Waiter** — The coordinator's one background task while a run is live: it blocks until the
 driver leaves a wake snapshot in the run directory, prints that snapshot unchanged, and ends. It
