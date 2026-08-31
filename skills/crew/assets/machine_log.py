@@ -316,6 +316,13 @@ def project(records):
         child_message = event in ("message", "escalation") and record.get("role") == CHILD
         if child_message:
             episode["unanswered_child_message"] = record
+            verb, _line = final_verb(message)
+            if ended and (
+                event == "escalation"
+                or verb in (COMPLETE_VERB, PARKED_VERB, FAILED_VERB)
+                or malformed_receipt(message) is not None
+            ):
+                ended = False
             if event == "escalation":
                 episode["escalation"] = record
                 episode["witness"] = None

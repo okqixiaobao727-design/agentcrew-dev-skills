@@ -534,6 +534,52 @@ class RunProjectionTests(unittest.TestCase):
         self.assertFalse(resumed.ended)
         self.assertFalse(resumed.halted)
 
+    def test_a_late_actionable_message_reopens_a_stopped_run_until_it_ends_again(self):
+        stopped = {"event": "advance", "decision": "stopped", "wave": 1}
+        completion = {
+            "event": "message", "ticket": "7", "role": "child",
+            "message": f"CREW COMPLETE {'a' * 40}",
+        }
+
+        self.assertTrue(machine_log.project([stopped]).ended)
+        self.assertFalse(machine_log.project([stopped, completion]).ended)
+        self.assertTrue(machine_log.project([
+            stopped,
+            completion,
+            {"event": "advance", "decision": "complete", "wave": 1},
+        ]).ended)
+
+    def test_a_late_actionable_message_reopens_a_run_completed_with_a_parked_leaf(self):
+        parked = {
+            "event": "message", "ticket": "7", "role": "child",
+            "message": "CREW PARKED /tmp/parked-7.md",
+        }
+        completion = {
+            "event": "message", "ticket": "7", "role": "child",
+            "message": f"CREW COMPLETE {'b' * 40}",
+        }
+        projection = machine_log.project([
+            {"event": "launch", "ticket": "7", "child": "seven"},
+            parked,
+            {"event": "receipt", "ticket": "7", "verdict": "parked"},
+            {"event": "advance", "decision": "complete", "wave": 1},
+            completion,
+        ])
+
+        self.assertFalse(projection.ended)
+        self.assertEqual(projection.ticket("7").unanswered_child_message, completion)
+
+    def test_a_late_non_protocol_message_does_not_reopen_a_finished_run(self):
+        projection = machine_log.project([
+            {"event": "advance", "decision": "complete", "wave": 1},
+            {
+                "event": "message", "ticket": "7", "role": "child",
+                "message": "I am still thinking about the ticket",
+            },
+        ])
+
+        self.assertTrue(projection.ended)
+
 
 class SettlementStateTests(unittest.TestCase):
     """The one public predicate every settlement-quality reader shares."""

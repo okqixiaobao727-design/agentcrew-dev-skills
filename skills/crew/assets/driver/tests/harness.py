@@ -535,6 +535,13 @@ class Fixture:
         statuses[ticket] = status
         path.write_text(json.dumps(statuses))
 
+    def codex_says_in_thread(self, ticket, message):
+        """Leave one finished turn in the recorded Codex thread, outside the Machine log."""
+        path = self.stub_dir / "codex-thread-messages.json"
+        messages = json.loads(path.read_text()) if path.exists() else {}
+        messages[ticket] = message
+        path.write_text(json.dumps(messages))
+
     def vanishes(self, ticket):
         """Take that child's session off its account's list, as a session that died leaves it.
 

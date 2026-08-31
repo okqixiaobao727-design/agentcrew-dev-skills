@@ -24,9 +24,11 @@ does not start while that halt stands. A later launch after the root is repaired
 derived block without deleting its history. The edges are the table's, like everything else about
 routing (ADR-0003).
 
-A wave the log says has already been advanced past is refused before anything is merged: a second
-run would start the same next wave again, in the worktrees the first one is working in. A wave
-that escalated or was interrupted is not refused — re-running it is how the run carries on.
+A wave the log currently says has already been advanced past is refused before anything is merged:
+a second run would start the same next wave again, in the worktrees the first one is working in. A
+wave that escalated or was interrupted is not refused — re-running it is how the run carries on.
+Neither is a historical final Wave followed by an actionable child message: that later fact makes
+the old `complete` non-current until the rule table processes the message and ends the Run again.
 
 An interrupt — SIGINT or SIGTERM, the operator's Ctrl-C in the run's window — is taken at the
 next step boundary. The merge already in flight is left to finish, and is shielded from
@@ -117,15 +119,18 @@ def already_advanced(records, wave, following):
     """The decision that already carried the run past `wave`, or None.
 
     Re-running a wave that escalated or was interrupted is how a run resumes once the coordinator
-    has ruled. Re-running one that launched or completed would start the next wave a second time,
-    in the worktrees the first one is working in — the duplicate the monitor calls an error.
+    has ruled. A completed final Wave is likewise current only while no later actionable child
+    message has reopened the Run. Re-running a Wave whose next Wave launched would start that Wave
+    a second time, in the worktrees the first one is working in — the duplicate the monitor calls
+    an error.
     """
+    projection = machine_log.project(records)
     for record in records:
         if record.get("event") != "advance":
             continue
         decision = record.get("decision")
         against = str(record.get("wave"))
-        if decision == COMPLETE and against == str(wave):
+        if decision == COMPLETE and against == str(wave) and projection.ended:
             return record
         if decision == LAUNCHED and following is not None and against == str(following):
             return record

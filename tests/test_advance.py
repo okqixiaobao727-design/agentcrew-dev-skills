@@ -416,6 +416,24 @@ class GreenWaveTests(AdvanceTestCase):
         self.assertOneDecision(3, "complete")
         self.assertEqual(self.fixture.launches(), [])
 
+    def test_a_late_actionable_message_supersedes_the_old_final_wave_decision(self):
+        self.fixture.settled_ticket("11", "skill-body", verdict="parked")
+        first = self.fixture.advance(3)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        head = self.fixture.work("11", "skill-body")
+        self.fixture.log_event(
+            "message", "--role", "child", "--ticket", "11",
+            "--message", f"CREW COMPLETE {head}",
+        )
+        self.fixture.receipt("11", "landable", head)
+
+        resumed = self.fixture.advance(3)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+        self.assertTrue(self.fixture.merged(head))
+        decisions = self.advance_events()
+        self.assertEqual([event.get("decision") for event in decisions], ["complete", "complete"])
+
 
 class ParkedAdvanceTests(AdvanceTestCase):
     """A parked ticket only stops the chain when the table has descendants to block."""

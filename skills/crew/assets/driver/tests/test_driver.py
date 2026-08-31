@@ -3436,6 +3436,353 @@ class AdoptionTests(DriverTestCase):
         with (self.fixture.run_dir / "log.jsonl").open("a") as handle:
             handle.write(json.dumps(record) + "\n")
 
+    def parked_run(self, *tickets):
+        """A terminal Codex run whose first ticket parked with descendants still blocked."""
+        process = self.running(*tickets, routing=CODEX_ROUTING)
+        root = tickets[0][0]
+        self.fixture.says(root, f"CREW PARKED /tmp/parked-{root}.md")
+        self.woken(process, "run-complete")
+        projection = driver_module.machine_log.project(self.fixture.log_records())
+        self.assertTrue(projection.ended)
+        self.assertEqual(projection.ticket(root).settlement_state, "parked")
+        return root
+
+    def stage_verified_completion(self, ticket):
+        """Return the SHA after staging its completion and verification in the log."""
+        sha = self.fixture.commit_work(ticket)
+        self.fixture.says(ticket, f"CREW COMPLETE {sha}")
+        result = subprocess.run(
+            [
+                sys.executable, str(driver_module.MONITOR), "verify",
+                "--ticket", ticket,
+                "--worktree", str(self.fixture.worktree(ticket)),
+                "--sha", sha,
+                "--base", self.fixture.table()["run"]["integration_base_commit"],
+                "--log", str(self.fixture.run_dir / "log.jsonl"),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.fixture.environment(),
+            cwd=str(self.fixture.repo),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(len(self.events("receipt", ticket=ticket, verdict="landable")), 1)
+        return sha
+
+    def stage_merged_wave(self, wave="1"):
+        """Land one verified Wave without running the Driver steps that follow the merge."""
+        result = subprocess.run(
+            [
+                sys.executable, str(driver_module.ADVANCE), "advance",
+                "--table", str(self.fixture.run_dir / "wave-table.json"),
+                "--wave", wave,
+                "--log", str(self.fixture.run_dir / "log.jsonl"),
+                "--out-dir", str(self.fixture.run_dir / driver_module.LAUNCH_DIR_NAME),
+                "--repair-model", str(self.fixture.table()["run"]["repair_model"]),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.fixture.environment(),
+            cwd=str(self.fixture.repo),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_a_stopped_run_with_no_new_message_returns_its_unchanged_report(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        records = self.fixture.log_records()
+        report = (self.fixture.feature_dir / REPORT_NAME).read_bytes()
+        calls = len(self.fixture.codex_calls())
+
+        result = self.fixture.start()
+
+        self.assertEqual(self.snapshot(result)["reason"], "run-complete")
+        self.assertEqual(self.fixture.log_records(), records)
+        self.assertEqual((self.fixture.feature_dir / REPORT_NAME).read_bytes(), report)
+        observations = [
+            call["argv"] for call in self.fixture.codex_calls()[calls:]
+            if call["argv"][:2] == ["watch", "--once"]
+        ]
+        self.assertEqual(observations, [[
+            "watch", "--once", str(self.fixture.run_dir / "codex" / f"{root}.json"),
+        ]])
+
+    def test_a_late_completion_already_in_the_log_uses_the_normal_next_wave_path(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.says(root, completion)
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the late completion did not activate the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_a_late_completion_only_in_the_thread_is_appended_once_then_uses_the_same_path(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.verified_launch("02") is not None, timeout=10.0
+            ),
+            "the thread-only completion did not activate the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        matching = [
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_thread_append_resumes_without_duplicate_work(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+        failure = self.fixture.stub_dir / "codex-once-fails-after-append"
+        failure.write_text("yes\n")
+
+        interrupted = self.fixture.start()
+
+        interrupted_snapshot = json.loads([
+            line for line in interrupted.stdout.splitlines() if line.strip()
+        ][-1])
+        self.assertEqual(interrupted_snapshot["reason"], "driver-error")
+        self.assertEqual(len([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]), 1)
+        self.assertEqual(self.events("receipt", ticket=root, verdict="landable"), [])
+        failure.unlink()
+
+        resumed = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the append checkpoint did not resume into the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]), 1)
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_verification_resumes_without_duplicate_work(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        self.stage_verified_completion(root)
+
+        resumed = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the verified checkpoint did not resume into the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_merge_resumes_without_duplicate_work(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        self.stage_verified_completion(root)
+        self.stage_merged_wave()
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+
+        resumed = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the merged checkpoint did not resume into the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_activation_resumes_without_duplicate_work(self):
+        self.fixture.configure(tracker="github")
+        self.fixture.issues({
+            "01": {"labels": ["ready-for-agent"], "closed": False},
+            "02": {"labels": ["ready-for-agent"], "closed": False},
+        })
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        self.stage_verified_completion(root)
+        failure = self.fixture.stub_dir / "gh-close-fails"
+        failure.write_text("yes\n")
+
+        interrupted = self.fixture.start()
+
+        interrupted_snapshot = json.loads([
+            line for line in interrupted.stdout.splitlines() if line.strip()
+        ][-1])
+        self.assertEqual(interrupted_snapshot["reason"], "driver-error")
+        self.assertIsNotNone(self.fixture.verified_launch("02"))
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(
+            len(self.events("advance", wave="2", decision="launched")), 1
+        )
+        self.assertEqual(self.events("outcome", ticket=root, outcome="completed"), [])
+        failure.unlink()
+
+        resumed = self.fixture.launch()
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+        self.assertTrue(self.fixture.issues()[root]["closed"])
+        self.assertTrue(self.fixture.issues()["02"]["closed"])
+
+    def test_a_late_thread_completion_reopens_a_run_completed_with_a_parked_leaf(self):
+        root = self.parked_run(("01", ()))
+        self.assertEqual(self.events("advance")[-1]["decision"], "complete")
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+
+        result = self.fixture.start()
+
+        snapshot = json.loads([line for line in result.stdout.splitlines() if line.strip()][-1])
+        self.assertEqual(snapshot["reason"], "run-complete", snapshot)
+        self.assertEqual(len([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]), 1)
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(self.events("advance")[-1]["decision"], "complete")
+
+    def test_a_late_thread_escalation_reaches_the_existing_rule_table(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        escalation = (
+            f"CREW ASK {root} design — choose the existing interface or a new one"
+            " ts=1788139000"
+        )
+        self.fixture.codex_says_in_thread(root, escalation)
+
+        result = self.fixture.start()
+
+        snapshot = json.loads([line for line in result.stdout.splitlines() if line.strip()][-1])
+        self.assertEqual(snapshot["reason"], "judgment-needed")
+        self.assertEqual(snapshot["ticket"], root)
+        matching = [
+            record for record in self.events("escalation", ticket=root)
+            if record.get("message") == escalation
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(self.events("merge", ticket=root), [])
+
+    def test_an_invalid_late_thread_completion_uses_the_existing_recheck_contract(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        invalid = "CREW COMPLETE " + "0" * 40
+        self.fixture.codex_says_in_thread(root, invalid)
+
+        adopted = self.fixture.launch()
+        rechecks = lambda: [
+            record for record in self.events("ruling", ticket=root)
+            if str(record.get("message", "")).startswith("CREW RECHECK")
+        ]
+        self.assertTrue(
+            self.fixture.wait_for(rechecks),
+            f"{root} was never sent a CREW RECHECK",
+        )
+        instruction = rechecks()[-1]["message"]
+
+        self.assertIn("0" * 40, instruction)
+        self.assertEqual(self.events("merge", ticket=root), [])
+        self.fixture.completes(root)
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the corrected completion did not activate the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+        self.assertEqual(len(rechecks()), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+
+    def test_terminal_observation_skips_states_that_cannot_name_an_observable_child(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        state_file = self.fixture.run_dir / "codex" / f"{root}.json"
+        original = json.loads(state_file.read_text())
+        records = self.fixture.log_records()
+        report = (self.fixture.feature_dir / REPORT_NAME).read_bytes()
+        cases = (
+            ("missing", None),
+            ("unreadable", "{not-json"),
+            ("legacy", json.dumps({
+                key: value for key, value in original.items()
+                if key not in ("machineLog", "ticket")
+            })),
+        )
+
+        for name, content in cases:
+            with self.subTest(state=name):
+                if content is None:
+                    state_file.unlink(missing_ok=True)
+                else:
+                    state_file.write_text(content)
+                calls = len(self.fixture.codex_calls())
+
+                result = self.fixture.start()
+
+                self.assertEqual(self.snapshot(result)["reason"], "run-complete")
+                self.assertEqual(self.fixture.log_records(), records)
+                self.assertEqual((self.fixture.feature_dir / REPORT_NAME).read_bytes(), report)
+                self.assertEqual(self.fixture.codex_calls()[calls:], [])
+
+    def test_terminal_observation_refuses_recorded_identity_mismatches(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+        state_file = self.fixture.run_dir / "codex" / f"{root}.json"
+        state = json.loads(state_file.read_text())
+        cases = (
+            ("threadId", "foreign-thread", "thread mismatch"),
+            ("ticket", "99", "ticket mismatch"),
+            ("machineLog", "/tmp/foreign-log.jsonl", "Machine log mismatch"),
+        )
+
+        for field, value, detail in cases:
+            with self.subTest(field=field):
+                changed = dict(state)
+                changed[field] = value
+                state_file.write_text(json.dumps(changed))
+
+                result = self.fixture.start()
+
+                snapshot = self.snapshot(result)
+                self.assertEqual(snapshot["reason"], "driver-error")
+                self.assertIn(detail, snapshot["detail"])
+        self.assertEqual([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ], [])
+        self.assertEqual(self.events("merge", ticket=root), [])
+
     def test_a_true_pre_launch_failure_is_dispatched_by_the_next_start(self):
         self.feature(("01", ()))
         failure = self.fixture.stub_dir / "tmux-new-window-fails"
