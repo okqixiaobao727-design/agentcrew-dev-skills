@@ -28,16 +28,18 @@ DEFAULT_WAKE = {"reason": "run-complete", "ticket": None, "pointer": "report.md"
 
 
 def flag(argv, name):
+    """Return the value following `name`, or None when that flag is absent."""
     return argv[argv.index(name) + 1] if name in argv else None
 
 
 def run_dir(argv):
+    """Return the Run directory named by this Driver command, or None when it names none."""
     feature = flag(argv, "--feature-dir")
     return pathlib.Path(feature).resolve() / ".crew" if feature else None
 
 
 def waiter(directory):
-    """What the run directory said about its waiter when this driver started, or None.
+    """Return what the Run directory said about its Waiter when this Driver started, or None.
 
     A real driver asks the same question of the same file before every wake it writes, so what a
     driver could have read is recorded here rather than inferred from timing afterwards.
@@ -50,7 +52,38 @@ def waiter(directory):
         return None
 
 
+def coordinator_context(argv):
+    """Return the exact immutable context the launcher handed this Driver stand-in."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+    import coordinator_control
+
+    return coordinator_control, coordinator_control.CoordinatorContext(
+        name=flag(argv, "--coordinator-name"),
+        pid=int(flag(argv, "--coordinator-pid")),
+        harness_session=flag(argv, "--coordinator-session"),
+        address=flag(argv, "--coordinator-address"),
+        pane=flag(argv, "--coordinator-pane"),
+        permission_mode=flag(argv, "--permission-mode"),
+        display_session=flag(argv, "--tmux-session"),
+    )
+
+
+def record_handover(state_dir, context):
+    """Record one changed context applied by the Driver stand-in; return nothing."""
+    with (state_dir / "driver-handover-calls.jsonl").open("a") as handle:
+        handle.write(json.dumps({
+            "name": context.name,
+            "pid": context.pid,
+            "harness_session": context.harness_session,
+            "address": context.address,
+            "pane": context.pane,
+            "permission_mode": context.permission_mode,
+            "display_session": context.display_session,
+        }) + "\n")
+
+
 def main():
+    """Run the Driver stand-in and return the configured process exit status."""
     argv = sys.argv[1:]
     state_dir = pathlib.Path(os.environ["AGENTCREW_STUB_DIR"])
     directory = run_dir(argv)
@@ -64,7 +97,37 @@ def main():
     if directory is None or not directory.is_dir():
         return int(os.environ.get("AGENTCREW_STUB_DRIVER_EXIT") or 0)
     (directory / "driver.pid").write_text(f"{os.getpid()}\n")
-    time.sleep(float(os.environ.get("AGENTCREW_STUB_DRIVER_HOLD") or 0))
+    hold = float(os.environ.get("AGENTCREW_STUB_DRIVER_HOLD") or 0)
+    if os.environ.get("AGENTCREW_STUB_DRIVER_SERVICE"):
+        coordinator_control, context = coordinator_context(argv)
+        control = coordinator_control.CoordinatorControl(directory)
+        deadline = time.monotonic() + hold
+        handed_over = False
+        while True:
+            if (
+                os.environ.get("AGENTCREW_STUB_DRIVER_SERVICE_GATE")
+                and not (state_dir / "service-enabled").exists()
+            ):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+                continue
+            previous = context
+            context = control.service(
+                context,
+                lambda next_context: (
+                    record_handover(state_dir, next_context)
+                    if next_context.address != previous.address else None
+                ),
+            )
+            handed_over = handed_over or context.address != previous.address
+            if handed_over and (state_dir / "wake-after-handover").exists():
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+    else:
+        time.sleep(hold)
     (directory / "driver.pid").unlink(missing_ok=True)
     if not os.environ.get("AGENTCREW_STUB_DRIVER_STOPPED"):
         wake = os.environ.get("AGENTCREW_STUB_DRIVER_WAKE") or json.dumps(DEFAULT_WAKE)

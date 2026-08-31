@@ -487,12 +487,15 @@ class Fixture:
 
     def answers(self, ticket, text):
         """Deliver the coordinator's ruling the way the coordinator delivers one."""
+        environment = self.environment({
+            "CLAUDE_CODE_MESSAGING_SOCKET": COORDINATOR_ADDRESS.removeprefix("uds:")
+        })
         subprocess.run(
             [
                 sys.executable, str(DRIVER), "answer", "--run-dir", str(self.run_dir),
                 "--ticket", ticket, "--text", text,
             ],
-            check=True, capture_output=True, env=self.environment(), cwd=str(self.repo),
+            check=True, capture_output=True, env=environment, cwd=str(self.repo),
         )
 
     def agents_path(self, home=None):

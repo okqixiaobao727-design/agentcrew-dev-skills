@@ -23,11 +23,14 @@ import unittest
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "skills" / "crew" / "assets" / "machine_log.py"
 BOUNDED_SCRIPT = SCRIPT.with_name("bounded_read.py")
+CONTROL_SCRIPT = SCRIPT.with_name("coordinator_control.py")
 CREW_DIR = SCRIPT.parent.parent
 GLOSSARY = PLUGIN_ROOT / "docs" / "glossary.md"
 SHAPES = PLUGIN_ROOT / "skills" / "crew" / "assets" / "dispatch" / "templates" / "shapes.toml"
 COORDINATOR_SESSION = "9d1f4c2a-0000-4000-8000-000000000133"
+COORDINATOR_SOCKET = "/private/tmp/cc-socks-501/1504.sock"
 sys.path.insert(0, str(SCRIPT.parent))
+import coordinator_control  # noqa: E402
 import machine_log  # noqa: E402
 
 # The run's one timestamp format: `date -u +%Y-%m-%dT%H:%M:%SZ`, as the crew skill reads it.
@@ -87,6 +90,31 @@ def run_hook(payload, log=None, role="child", ticket=None, sender=None):
         command += ["--log", str(log)]
     return subprocess.run(
         [*command, *args],
+        input=payload if isinstance(payload, str) else json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=hook_environment(sender),
+    )
+
+
+def seed_coordinator(log, socket=COORDINATOR_SOCKET):
+    context = coordinator_control.CoordinatorContext(
+        name="crew-coordinator",
+        pid=1504,
+        harness_session=COORDINATOR_SESSION,
+        address=f"uds:{socket}",
+        pane="%1",
+        permission_mode="acceptEdits",
+        display_session="$1:",
+    )
+    return coordinator_control.CoordinatorControl(pathlib.Path(log).parent).service(
+        context, lambda _context: None
+    )
+
+
+def run_guard(payload, log, sender=None):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--log", str(log), "guard"],
         input=payload if isinstance(payload, str) else json.dumps(payload),
         capture_output=True,
         text=True,
@@ -1345,10 +1373,58 @@ class AppendOnlyTests(MachineLogTestCase):
 class HookTests(MachineLogTestCase):
     """The PostToolUse hook on SendMessage, on both sides of the channel."""
 
+    def test_the_current_coordinator_passes_the_send_guard(self):
+        seed_coordinator(self.log)
+
+        result = run_guard(send_message_event(RULING), self.log, sender=COORDINATOR_SOCKET)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_stale_coordinator_is_denied_before_send_and_post_hook_mutation(self):
+        seed_coordinator(self.log)
+        stale = "/private/tmp/cc-socks-501/2601.sock"
+
+        guarded = run_guard(send_message_event(RULING), self.log, sender=stale)
+        posted = run_hook(
+            send_message_event(RULING), self.log, role="coordinator", sender=stale
+        )
+
+        decision = json.loads(guarded.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["hookEventName"], "PreToolUse")
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertEqual(
+            decision["permissionDecisionReason"],
+            "crew: this Coordinator no longer owns the run",
+        )
+        self.assertEqual(
+            json.loads(posted.stdout)["systemMessage"],
+            "crew: this Coordinator no longer owns the run",
+        )
+        self.assertFalse(self.log.exists())
+
+    def test_a_coordinator_hook_without_a_socket_refuses_instead_of_guessing(self):
+        seed_coordinator(self.log)
+
+        guarded = run_guard(send_message_event(RULING), self.log)
+        posted = run_hook(send_message_event(RULING), self.log, role="coordinator")
+
+        reason = (
+            "crew: no coordinator address in this environment"
+            " (CLAUDE_CODE_MESSAGING_SOCKET unset)"
+        )
+        self.assertEqual(
+            json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecisionReason"],
+            reason,
+        )
+        self.assertEqual(json.loads(posted.stdout)["systemMessage"], reason)
+        self.assertFalse(self.log.exists())
+
     def test_a_coordinators_outgoing_ruling_is_appended_verbatim(self):
+        seed_coordinator(self.log)
         result = run_hook(
             send_message_event(RULING, to="agentcrew-dev-skills-07"),
-            log=self.log, role="coordinator",
+            log=self.log, role="coordinator", sender=COORDINATOR_SOCKET,
         )
 
         self.assertEqual(result.returncode, 0)
@@ -1487,7 +1563,11 @@ class HookTests(MachineLogTestCase):
 
     def test_everything_the_coordinator_sends_is_a_ruling_whatever_it_opens_with(self):
         """The coordinator is the top of the ladder: it answers escalations, it never sends one."""
-        run_hook(send_message_event(ESCALATION), log=self.log, role="coordinator")
+        seed_coordinator(self.log)
+        run_hook(
+            send_message_event(ESCALATION), log=self.log, role="coordinator",
+            sender=COORDINATOR_SOCKET,
+        )
 
         self.assertEqual(self.only_line()["event"], "ruling")
 
@@ -1513,7 +1593,11 @@ class HookTests(MachineLogTestCase):
         self.assertEqual(self.only_line()["message"], structured)
 
     def test_the_ticket_is_left_out_when_the_installing_side_knew_none(self):
-        run_hook(send_message_event(RULING), log=self.log, role="coordinator")
+        seed_coordinator(self.log)
+        run_hook(
+            send_message_event(RULING), log=self.log, role="coordinator",
+            sender=COORDINATOR_SOCKET,
+        )
 
         self.assertNotIn("ticket", self.only_line())
 
@@ -1586,6 +1670,15 @@ class InstallTests(MachineLogTestCase):
         self.assertEqual(len(blocks), 1, "one block claims the bounded-read matchers")
         return blocks[0]["hooks"]
 
+    def installed_send_guard_hooks(self):
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        blocks = [
+            block for block in settings["hooks"]["PreToolUse"]
+            if block["matcher"] == "SendMessage"
+        ]
+        self.assertEqual(len(blocks), 1, "one pre-tool block claims SendMessage")
+        return blocks[0]["hooks"]
+
     def install(self, role="child", ticket=None, script=None, session_id=None, crew_dir=None):
         args = ["install", "--settings", str(self.settings), "--role", role]
         if ticket is not None:
@@ -1624,6 +1717,14 @@ class InstallTests(MachineLogTestCase):
 
         self.assertIn("--role coordinator", command)
         self.assertNotIn("--ticket", command)
+
+    def test_the_coordinator_registers_one_pretool_send_guard(self):
+        result = self.install(role="coordinator")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hooks = self.installed_send_guard_hooks()
+        self.assertEqual(len(hooks), 1)
+        self.assertIn(" guard", hooks[0]["command"])
 
     def test_the_coordinator_install_also_registers_the_bounded_read_hook(self):
         result = self.install(
@@ -1843,7 +1944,9 @@ class InheritedSettingsTests(MachineLogTestCase):
         self.assertEqual([entry["role"] for entry in self.lines()], ["child"])
 
     def test_the_coordinators_own_message_is_logged_once_as_a_ruling(self):
-        self.send_from(self.repo, RULING)
+        seed_coordinator(self.log)
+
+        self.send_from(self.repo, RULING, sender=COORDINATOR_SOCKET)
 
         entry = self.only_line()
 
@@ -1871,6 +1974,9 @@ class VersionIndependentPathTests(MachineLogTestCase):
         self.plugin.parent.mkdir(parents=True)
         self.plugin.write_bytes(SCRIPT.read_bytes())
         self.plugin.with_name("bounded_read.py").write_bytes(BOUNDED_SCRIPT.read_bytes())
+        self.plugin.with_name("coordinator_control.py").write_bytes(
+            CONTROL_SCRIPT.read_bytes()
+        )
 
     def install_from_the_plugin(self):
         """Install the way a run does: the plugin's own copy, naming no script but itself."""
@@ -1891,12 +1997,14 @@ class VersionIndependentPathTests(MachineLogTestCase):
     def test_the_hook_still_writes_the_log_after_the_installing_version_is_gone(self):
         self.install_from_the_plugin()
         command, = registered_commands(self.settings)
+        seed_coordinator(self.log)
         # The upgrade: the version that installed the hook is no longer on this machine.
         shutil.rmtree(pathlib.Path(self.work.name) / "plugins" / self.VERSION)
 
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
             input=json.dumps(send_message_event(RULING, cwd=str(self.project))),
+            env=hook_environment(COORDINATOR_SOCKET),
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2099,6 +2207,20 @@ class UninstallTests(MachineLogTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(registered_commands(self.settings), [neighbour])
 
+    def test_a_foreign_command_using_the_word_guard_is_not_claimed_by_this_run(self):
+        foreign = f"python3 /elsewhere/policy.py --log {self.log} guard"
+        self.settings.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "SendMessage", "hooks": [
+                {"type": "command", "command": foreign},
+            ]},
+        ]}}), encoding="utf-8")
+
+        result = self.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], foreign)
+
     def test_a_missing_settings_file_is_nothing_to_uninstall(self):
         result = self.uninstall()
 
@@ -2118,11 +2240,15 @@ class MachineParseabilityTests(MachineLogTestCase):
     """A later agent reconstructs the run from the file alone."""
 
     def test_a_run_reads_back_as_one_object_per_line_with_arithmetic_stamps(self):
+        seed_coordinator(self.log)
         run_cli("launch", "--ticket", "07", "--child", "c", "--workflow", "tdd",
                 "--executor", "claude", "--model", "claude-opus-4-6-20260401",
                 "--effort", "medium", log=self.log)
         run_hook(send_message_event(ESCALATION), log=self.log, role="child", ticket="07")
-        run_hook(send_message_event(RULING), log=self.log, role="coordinator")
+        run_hook(
+            send_message_event(RULING), log=self.log, role="coordinator",
+            sender=COORDINATOR_SOCKET,
+        )
         run_cli("receipt", "--ticket", "07", "--verdict", "landable", log=self.log)
         run_cli("outcome", "--ticket", "07", "--outcome", "completed", log=self.log)
 

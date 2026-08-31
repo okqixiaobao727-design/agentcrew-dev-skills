@@ -1181,13 +1181,19 @@ class LaunchTests(DriverTestCase):
         driver's log before this driver runs at all."""
         self.start_a_run()
 
+        public_layout = {
+            "wave-table.json", "log.jsonl", "launch", "parked-paths",
+            "bounded_read.py", "dashboard-window", "dashboard-window.lock", "machine_log.py",
+            DRIVER_RECORD,
+        }
+        private_control_layout = {
+            driver_module.coordinator_control._STATE_NAME,
+            driver_module.coordinator_control._LOCK_NAME,
+            pathlib.Path(driver_module.coordinator_control.__file__).name,
+        }
         self.assertEqual(
-            sorted(path.name for path in self.fixture.run_dir.iterdir()),
-            sorted([
-                "wave-table.json", "log.jsonl", "launch", "parked-paths",
-                "bounded_read.py", "dashboard-window", "dashboard-window.lock", "machine_log.py",
-                DRIVER_RECORD,
-            ]),
+            {path.name for path in self.fixture.run_dir.iterdir()},
+            public_layout | private_control_layout,
         )
 
     def test_the_coordinator_and_the_child_carry_this_run_s_hooks(self):
@@ -3103,14 +3109,19 @@ class AnswerTests(DriverTestCase):
         )
         return process
 
-    def answer(self, *arguments):
+    def answer(self, *arguments, sender=COORDINATOR_ADDRESS.removeprefix("uds:")):
+        environment = self.fixture.environment()
+        if sender is None:
+            environment.pop("CLAUDE_CODE_MESSAGING_SOCKET", None)
+        else:
+            environment["CLAUDE_CODE_MESSAGING_SOCKET"] = sender
         return subprocess.run(
             [
                 sys.executable, str(DRIVER), "answer",
                 "--run-dir", str(self.fixture.run_dir), "--ticket", "01", *arguments,
             ],
             capture_output=True, text=True,
-            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+            env=environment, cwd=str(self.fixture.repo),
         )
 
     def kill_window(self, window):
@@ -3139,6 +3150,37 @@ class AnswerTests(DriverTestCase):
         self.assertEqual(ruling["role"], "coordinator")
         self.assertEqual(ruling["to"], "stub-child-1")
         self.assertEqual(ruling["message"], text)
+
+    def test_a_stale_coordinator_is_rejected_before_delivery_or_ruling(self):
+        self.start()
+        text = "Use the stale coordinator's answer"
+        sent_before = len([
+            call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]
+        ])
+
+        result = self.answer("--text", text, sender="/tmp/stale-coordinator.sock")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("crew: this Coordinator no longer owns the run", result.stdout)
+        self.assertEqual(
+            len([call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]]),
+            sent_before,
+        )
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_an_answer_without_a_caller_socket_is_rejected_without_guessing(self):
+        self.start()
+        text = "Use an address guessed from another identity"
+
+        result = self.answer("--text", text, sender=None)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "crew: no coordinator address in this environment"
+            " (CLAUDE_CODE_MESSAGING_SOCKET unset)",
+            result.stdout,
+        )
+        self.assertEqual(self.events("ruling", ticket="01"), [])
 
     def test_text_left_in_the_composer_is_not_recorded_as_delivered(self):
         self.start()
@@ -4241,6 +4283,183 @@ class AdoptionTests(DriverTestCase):
         ]
         self.assertEqual(len(launched), 1, "02 was not launched once")
         self.assertIn(RESTARTED_ADDRESS, json.dumps(launched[0]))
+
+    def test_crew_adopts_a_dead_drivers_run_under_the_new_coordinator_context(self):
+        """The public launcher starts one replacement Driver that applies its full context."""
+        self.interrupted(("01", ()))
+        second_session = "6dc60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        adopted = subprocess.Popen(
+            [
+                sys.executable, str(LAUNCH), str(self.fixture.feature_dir),
+                "--coordinator-name", "crew-coordinator-2a",
+                "--coordinator-pid", "2601",
+                "--coordinator-session", second_session,
+                "--coordinator-address", RESTARTED_ADDRESS,
+                "--permission-mode", "bypassPermissions",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.fixture.environment({"TMUX_PANE": "%8"}), cwd=str(self.fixture.repo),
+        )
+        self.fixture.running.append(adopted)
+
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.table()["run"]["coordinator_address"]
+                == RESTARTED_ADDRESS,
+                timeout=5,
+            ),
+            "the /crew adoption kept the Coordinator recorded by the dead Driver",
+        )
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.events("ruling", ticket="01")) == 1),
+            "the /crew adoption never re-anchored the live child",
+        )
+        self.fixture.completes("01")
+        stdout, stderr = adopted.communicate(timeout=30)
+
+        self.assertEqual(adopted.returncode, 0, stderr)
+        self.assertEqual(json.loads(stdout)["reason"], "run-complete")
+        run = self.fixture.table()["run"]
+        self.assertEqual(run["coordinator_pid"], 2601)
+        self.assertEqual(run["coordinator_session"], second_session)
+        self.assertEqual(run["permission_mode"], "bypassPermissions")
+
+    def test_a_live_driver_hands_over_in_place_before_its_next_poll_and_activation(self):
+        """The launcher waits while this same Driver switches every Coordinator-owned fact."""
+        self.fixture.configure(surface="pin")
+        self.fixture.ticket("01", "first thing")
+        self.fixture.ticket("02", "second thing", blocked_by=("01",))
+        self.fixture.commit_feature()
+        driver = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "wave 1 never launched",
+        )
+        driver_pid = int((self.fixture.run_dir / DRIVER_RECORD).read_text().strip())
+        before = self.fixture.table()["run"]
+        second_name = "crew-coordinator-2a"
+        second_pid = 2601
+        second_session = "7dc60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        second_mode = "bypassPermissions"
+        environment = self.fixture.environment({"TMUX_PANE": "%8"})
+        handover = subprocess.Popen(
+            [
+                sys.executable, str(LAUNCH), str(self.fixture.feature_dir),
+                "--coordinator-name", second_name,
+                "--coordinator-pid", str(second_pid),
+                "--coordinator-session", second_session,
+                "--coordinator-address", RESTARTED_ADDRESS,
+                "--permission-mode", second_mode,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=environment, cwd=str(self.fixture.repo),
+        )
+        self.fixture.running.append(handover)
+
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.table()["run"]["coordinator_address"]
+                == RESTARTED_ADDRESS
+            ),
+            "the live Driver never serviced the Coordinator handover",
+        )
+        after = self.fixture.table()["run"]
+        self.assertIsNone(driver.poll(), "handover replaced the live Driver")
+        self.assertIsNone(handover.poll(), "the new waiter returned before the Run woke")
+        self.assertEqual(
+            int((self.fixture.run_dir / DRIVER_RECORD).read_text().strip()), driver_pid
+        )
+        self.assertEqual(
+            {
+                key: after[key]
+                for key in (
+                    "coordinator_name", "coordinator_pid", "coordinator_session",
+                    "coordinator_address", "permission_mode",
+                )
+            },
+            {
+                "coordinator_name": second_name,
+                "coordinator_pid": second_pid,
+                "coordinator_session": second_session,
+                "coordinator_address": RESTARTED_ADDRESS,
+                "permission_mode": second_mode,
+            },
+        )
+        unchanged = set(before) - {
+            "coordinator_name", "coordinator_pid", "coordinator_session",
+            "coordinator_address", "permission_mode",
+        }
+        self.assertEqual({key: after[key] for key in unchanged},
+                         {key: before[key] for key in unchanged})
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.events("ruling", ticket="01")) == 1),
+            "the live child was never re-anchored",
+        )
+        settings = json.dumps(self.fixture.settings(
+            self.fixture.repo / ".claude" / "settings.local.json"
+        ))
+        self.assertIn(f"--session-id {second_session}", settings)
+        pin, = (self.fixture.config_dir / "agentcrew" / "pins").glob("*.json")
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: json.loads(pin.read_text())["coordinator_pid"] == second_pid
+            ),
+            "the dashboard pin kept the old Coordinator pid",
+        )
+
+        self.fixture.completes("01")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "wave 2 never activated under the handed-over Coordinator",
+        )
+        second_launch = [
+            call for call in self.fixture.launches()
+            if str(self.fixture.worktree("02")) in json.dumps(call)
+        ]
+        self.assertEqual(len(second_launch), 1)
+        self.assertIn(RESTARTED_ADDRESS, json.dumps(second_launch[0]))
+        self.assertIn(second_mode, json.dumps(second_launch[0]))
+        second_window = self.fixture.windows()[self.fixture.launch_record("02")["window"]]
+        self.assertEqual(second_window["target"], before["tmux_session"])
+
+        self.fixture.completes("02")
+        self.woken(driver, "run-complete")
+        handover_out, handover_err = handover.communicate(timeout=30)
+        self.assertEqual(handover.returncode, 0, handover_err)
+        self.assertEqual(json.loads(handover_out)["reason"], "run-complete")
+
+    def test_a_failed_live_handover_wakes_forward_under_the_new_coordinator(self):
+        """A failed apply emits the existing Driver error and never restores old ownership."""
+        driver = self.running(("01", ()))
+        second_pid = 2601
+        second_session = "8dc60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        settings = self.fixture.repo / ".claude" / "settings.local.json"
+        settings.write_text('{"hooks": ')
+        handover = subprocess.Popen(
+            [
+                sys.executable, str(LAUNCH), str(self.fixture.feature_dir),
+                "--coordinator-name", "crew-coordinator-2a",
+                "--coordinator-pid", str(second_pid),
+                "--coordinator-session", second_session,
+                "--coordinator-address", RESTARTED_ADDRESS,
+                "--permission-mode", "bypassPermissions",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.fixture.environment({"TMUX_PANE": "%8"}), cwd=str(self.fixture.repo),
+        )
+        self.fixture.running.append(handover)
+
+        snapshot = self.woken(driver, "driver-error")
+        handover_out, handover_err = handover.communicate(timeout=30)
+        handed_over = self.fixture.table()["run"]
+
+        self.assertEqual(handover.returncode, 0, handover_err)
+        self.assertEqual(json.loads(handover_out)["reason"], "driver-error")
+        self.assertIn(f"--coordinator-pid {second_pid}", snapshot["resume"])
+        self.assertIn("could not be installed", snapshot["detail"])
+        self.assertEqual(handed_over["coordinator_pid"], second_pid)
+        self.assertEqual(handed_over["coordinator_session"], second_session)
+        self.assertEqual(handed_over["coordinator_address"], RESTARTED_ADDRESS)
 
     def test_a_same_address_new_session_adoption_updates_the_hook_without_reanchoring(self):
         """The condition is the address: what a child was told to trust has not moved."""
