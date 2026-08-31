@@ -215,6 +215,20 @@ class ReportSelectionTests(unittest.TestCase):
 
 
 class PreflightTests(DriverTestCase):
+    def test_the_shipped_default_config_passes_preflight_without_a_launch_hook(self):
+        shipped = DRIVER.parents[4] / "config" / "agentcrew.default.toml"
+        (self.fixture.repo / "agentcrew.toml").write_text(
+            shipped.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        git(self.fixture.repo, "add", "agentcrew.toml")
+        git(self.fixture.repo, "commit", "-m", "use the shipped config")
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+
+        self.started()
+
+        self.assertNotIn("launch_hook", self.fixture.table()["run"])
+
     def test_a_foreign_worktree_at_the_crew_path_is_named_and_preserved(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()

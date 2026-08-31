@@ -533,6 +533,23 @@ class StagingTests(unittest.TestCase):
         self.assertNotIn("/crew ", result.stdout)
         self.assertIn("agentcrew.toml", result.stderr)
 
+    def test_the_shipped_default_config_passes_the_real_self_check(self):
+        shipped = PLUGIN_ROOT / "config" / "agentcrew.default.toml"
+        (self.fixture.repo / "agentcrew.toml").write_text(
+            shipped.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        ticket = self.fixture.tickets_dir / "61.md"
+        ticket.write_text(
+            f"# {TITLES['61']}\n\n{ticket_body()}\nStatus: {AGENT_ROLE}\n",
+            encoding="utf-8",
+        )
+        self.fixture.commit("use the shipped config")
+
+        result = self.fixture.stage(str(ticket))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"/crew {RUN_ROOT}/1\n")
+
     def test_a_missing_default_base_branch_withholds_the_command_and_names_the_fix(self):
         self.two_tickets()
         git(self.fixture.repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
