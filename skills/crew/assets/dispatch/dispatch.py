@@ -51,7 +51,7 @@ The wave table is one JSON object:
                                    account a ticket naming none runs on
         "declared_accounts":       the account names the project config declares, [] where it
                                    declares none — diagnosis only, never a path
-        "launch_hook":             optional {"command": str, "env": {name: value}}
+        "launch_hook":             optional {"command": optional str, "env": {name: value}}
         "codex":                   {"bridge": path, "state_dir": path} — required by a codex ticket
       },
       "waves": [{"wave": 1, "tickets": [{
@@ -556,9 +556,9 @@ def run_launch_hook(run, worktree, window_id, timeout):
     hangs must not hold up a wave that is otherwise ready to work.
     """
     hook = run.launch_hook
-    command = hook.command if hook else None
-    if not command:
+    if hook is None or hook.command is None:
         return None
+    command = hook.command
     environment = dict(os.environ)
     environment.update(hook_environment(run))
     environment["AGENTCREW_CHILD_CWD"] = str(worktree)

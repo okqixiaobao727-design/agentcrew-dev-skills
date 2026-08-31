@@ -68,6 +68,10 @@ def main():
         handle.write(json.dumps({
             "argv": argv, "cwd": cwd, "sessionId": session_id,
             "configHome": str(config_home()),
+            "env": {
+                key: value for key, value in os.environ.items()
+                if key.startswith("AGENTCREW_HOOK_")
+            },
         }) + "\n")
 
     agents = read_agents()

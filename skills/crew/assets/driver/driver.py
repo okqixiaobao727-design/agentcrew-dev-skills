@@ -811,7 +811,7 @@ def config_value(config, keys):
 def launch_hook(config):
     """The project's `[hooks.on-child-launch]`, or nothing where it declares none."""
     section = config_value(config, LAUNCH_HOOK_SECTION)
-    return section if isinstance(section, dict) and section else None
+    return section if isinstance(section, dict) else None
 
 
 def declared_accounts(config):
@@ -875,7 +875,7 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, base_commit, conf
         },
     }
     hook = launch_hook(config)
-    if hook:
+    if hook is not None:
         run["launch_hook"] = hook
     return run
 
