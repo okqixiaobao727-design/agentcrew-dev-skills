@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-08-31
+
 ### Fixed
 - A `/crew` slash-command turn that launched before its first mode-bearing transcript record was
   written no longer fails the coordinator permission-mode read. The transcript stays authoritative,
