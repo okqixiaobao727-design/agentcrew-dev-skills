@@ -7,6 +7,11 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- The machine-log tests no longer inherit the ambient `CLAUDE_CODE_SESSION_ID`. An install scopes
+  its hook to the session it ran in, so a suite run from inside a Claude Code session pinned a
+  session the tests never send and the bounded-read hook silently passed the tool through.
+
 ## [0.9.14] - 2026-08-31
 
 ### Fixed

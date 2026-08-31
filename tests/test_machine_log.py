@@ -27,6 +27,7 @@ CREW_DIR = SCRIPT.parent.parent
 GLOSSARY = PLUGIN_ROOT / "docs" / "glossary.md"
 SHAPES = PLUGIN_ROOT / "skills" / "crew" / "assets" / "dispatch" / "templates" / "shapes.toml"
 COORDINATOR_SESSION = "9d1f4c2a-0000-4000-8000-000000000133"
+SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
 sys.path.insert(0, str(SCRIPT.parent))
 import machine_log  # noqa: E402
 
@@ -210,6 +211,12 @@ class MachineLogTestCase(unittest.TestCase):
         self.work = tempfile.TemporaryDirectory()
         self.addCleanup(self.work.cleanup)
         self.log = pathlib.Path(self.work.name) / "machine.log"
+        # An install scopes its hook to the session it ran in, read from the ambient environment.
+        # A test runner started inside a Claude Code session carries one, which would silently
+        # pin a session these tests never send, so a test that wants a session sets it itself.
+        ambient = os.environ.pop(SESSION_ENV, None)
+        if ambient is not None:
+            self.addCleanup(os.environ.__setitem__, SESSION_ENV, ambient)
 
     def lines(self):
         """Every event recorded so far, parsed."""
