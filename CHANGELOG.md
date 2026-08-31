@@ -11,6 +11,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 - A `/crew` slash-command turn that launched before its first mode-bearing transcript record was
   written no longer fails the coordinator permission-mode read. The transcript stays authoritative,
   but it is reread for a bounded interval before the read fails closed (#172).
+- The plugin-tree validator no longer reports every file inside a Run's Crew worktree as shipped
+  residue. Git will not descend into a nested checkout to list the files it ignores, so an ignored
+  path is now read as a prefix, and the validator's own tree fixture stops copying ignored paths
+  into a fresh repository that would ignore nothing.
 
 ## [0.9.13] - 2026-08-31
 

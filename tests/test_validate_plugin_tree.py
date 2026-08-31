@@ -38,6 +38,23 @@ def run_validator(root, env=None):
     )
 
 
+def ignored_source_paths():
+    """Absolute paths under `PLUGIN_ROOT` that this repository ignores.
+
+    Wholly ignored directories are collapsed to the directory itself. A crew run's worktree sits
+    under the repo it is building and is ignored there, so copying it into the fixture would smuggle
+    another checkout's local paths into a tree whose fresh repository ignores nothing.
+    """
+    listed = subprocess.run(
+        ["git", "-C", str(PLUGIN_ROOT), "ls-files", "--others", "--ignored",
+         "--exclude-standard", "--directory", "-z"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return {PLUGIN_ROOT / entry for entry in listed.split("\0") if entry}
+
+
 class TreeFixture:
     """A writable copy of the shipped plugin tree, seeded with one defect."""
 
@@ -49,7 +66,13 @@ class TreeFixture:
         # instead of owning one. The fixture gets its own repository below, so that the residue
         # lint's ignore lookup, the `.git/` internals these tests seed, and the unpacked-release
         # case that deletes it all behave the same in a clone and in a worktree.
-        shutil.copytree(PLUGIN_ROOT, self.root, ignore=shutil.ignore_patterns(GIT_DIR))
+        ignored = ignored_source_paths()
+
+        def unshipped(directory, names):
+            source = pathlib.Path(directory)
+            return {GIT_DIR} | {name for name in names if source / name in ignored}
+
+        shutil.copytree(PLUGIN_ROOT, self.root, ignore=unshipped)
         subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
         # A maintainer's own identifier list must not decide what these tests reject.
         self.path(IDENTIFIERS_FILE).unlink(missing_ok=True)
@@ -362,6 +385,19 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.write(".gitignore", self.tree.read(".gitignore") + "run-dir/\n")
         self.tree.path("run-dir").mkdir()
         self.tree.write("run-dir/decisions.md", "Landed from example-host for $46.\n")
+        result = run_validator(self.tree.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_file_inside_an_ignored_nested_worktree_is_accepted(self):
+        # A crew run's worktree is a nested checkout carrying its own `.git`, and git will not
+        # descend into one to list the files it ignores. The ignored *directory* is what names it,
+        # so an ignored path has to be read as a prefix or every crew worktree fails this lint.
+        self.tree.set_local_identifiers("example-host")
+        self.tree.write(".gitignore", self.tree.read(".gitignore") + "run-dir/\n")
+        worktree = self.tree.path("run-dir/crew-70")
+        worktree.mkdir(parents=True)
+        subprocess.run(["git", "init", "--quiet", str(worktree)], check=True)
+        self.tree.write("run-dir/crew-70/decisions.md", "Landed from example-host for $46.\n")
         result = run_validator(self.tree.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

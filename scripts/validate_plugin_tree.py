@@ -581,11 +581,15 @@ def ignored_paths(root):
     nothing to leak: a crew run's own working directory, sitting under the repo it is building,
     must not fail this lint. An untracked file that is *not* ignored still ships, so it is still
     scanned. Outside a git repo there is nothing to ask, and the tree as it stands is what ships.
+
+    Wholly ignored directories are collapsed to the directory itself, so a caller must treat an
+    entry as a prefix. A crew worktree is a nested checkout carrying its own `.git`, and git will
+    not descend into one to list its files; only the collapsed directory entry names it.
     """
     try:
         listed = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--others", "--ignored",
-             "--exclude-standard", "-z"],
+             "--exclude-standard", "--directory", "-z"],
             capture_output=True,
             text=True,
             check=True,
@@ -610,7 +614,7 @@ def shipped_paths(root):
         relative = path.relative_to(root)
         if GIT_DIR in relative.parts:
             continue
-        if relative in ignored:
+        if relative in ignored or any(parent in ignored for parent in relative.parents):
             continue
         yield relative
 
