@@ -283,10 +283,15 @@ public interface that the child cannot make alone, most often before its first e
 phase's decision points travel as one `design` escalation, the child's own pick marked on each.
 
 **Witness brief** — A pointer-backed, fact-only result from one fresh, read-only, budget-capped
-Witness session. An escalation `check` marks each cited pointer held, contradicted or missing and is
-launched automatically by the driver, or by the child before sending in a run without a driver. An
-`ask` is coordinator-initiated and returns independently stated factual claims, each with at least
-one pointer. Both carry no recommendation or ruling.
+Witness session. An escalation `check` receives the normalised cited-pointer list as an exact,
+numbered input and marks each covered pointer held, contradicted or missing. `checked` carries all
+findings and no reason; `partial` carries the usable covered findings plus a reason naming each
+omitted or structurally rejected expected pointer. Repeated and out-of-order expected pointers stay
+out of the brief, while extra cited pointers become uncited findings. `failed` carries no brief. The
+Driver launches `check` automatically, or a child launches
+it before sending in a run without a driver. An `ask` is coordinator-initiated and returns
+independently stated factual claims, each with at least one pointer. Both operations carry no
+recommendation or ruling.
 _Avoid_: research, verification
 
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers

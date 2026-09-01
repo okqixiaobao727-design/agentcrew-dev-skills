@@ -145,15 +145,19 @@ def block(text):
     return text.strip("\n")
 
 
-def render_witness_prompt(subject, templates=None, operation="check"):
+def render_witness_prompt(subject, templates=None, operation="check", check_pointers=()):
     """Return the shared Witness role plus one filled operation task."""
     templates = templates or load_templates()
     witness = templates["witness"]
+    numbered_pointers = "\n".join(
+        f"{number}. {pointer}" for number, pointer in enumerate(check_pointers, 1)
+    )
     return fill(
         f"{block(witness['prompt'])}\n\n{block(witness[operation])}",
         {
             "<ticket comment rule>": block(templates["ticket"]["comment_rule"]),
             f"<{operation} subject>": str(subject).strip(),
+            "<check pointers>": numbered_pointers,
         },
     )
 

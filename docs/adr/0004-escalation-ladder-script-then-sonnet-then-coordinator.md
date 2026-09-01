@@ -24,11 +24,20 @@ children's designs disagree), escalates to the coordinator.
 > the unnamed `--escalation` form and verifies one escalation from explicit resolved run values;
 > `ask --run <run-dir> --ticket <NN> --question <text>` resolves the active Run plan's frozen
 > worktree, account, model and budget before answering a coordinator's factual question. Both
-> operations return the existing `brief`/`checked|failed` envelope, share one execution path and
+> operations return the `brief`/`checked|partial|failed` envelope, share one execution path and
 > tracker-comment trust rule, and never recommend or rule. Claude returns mode-specific structured
 > output under a JSON schema; Python validates its pointer semantics and renders the brief, so
 > extra model prose cannot become protocol. The old unnamed CLI form receives no compatibility
 > alias, and this change adds neither a resident witness nor a second witness module.
+
+> **Amended (#175, 2026-09-01).** An escalation `check` receives Python's normalised expected
+> pointer list as numbered prompt input. `checked` carries every finding in a non-empty brief and
+> no reason; `partial` carries the usable covered findings in a non-empty brief and a reason naming
+> every omitted or structurally rejected pointer. Repeated and out-of-order expected pointers stay
+> out of the brief, while extra cited pointers become uncited findings. Only a zero-coverage result
+> is `failed` with an empty brief. The Witness result
+> and Machine-log event carry required `covered_count` and `uncovered_count` integers, so neither
+> the Driver nor the coordinator derives protocol facts from model prose.
 
 ## Considered Options
 

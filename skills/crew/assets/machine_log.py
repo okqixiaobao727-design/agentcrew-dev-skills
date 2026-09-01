@@ -143,7 +143,7 @@ HALTED_DECISIONS = ("escalated", "interrupted")
 # The two lanes a child runs in. A usage figure is only readable against the executor that wrote
 # it, so an executor this log does not know is an executor whose figures nobody can check.
 EXECUTORS = ("claude", "codex")
-WITNESS_OUTCOMES = ("checked", "failed")
+WITNESS_OUTCOMES = ("checked", "partial", "failed")
 BASE_GATE_STATUSES = ("passed", "not-configured")
 # Where a lane's live children were read from, when a dashboard had to read them from anywhere but
 # its first choice (ADR-0012). The set is closed on the sources a lane actually has, so a line
@@ -1156,10 +1156,18 @@ def witness_problem(args):
     """Why a witness event contradicts itself, or None when its shape is complete."""
     if args.duration_seconds < 0:
         return "duration_seconds is never negative"
+    if args.covered_count < 0 or args.uncovered_count < 0:
+        return "witness coverage counts are never negative"
     if args.outcome == "checked" and args.reason:
         return "a checked witness carries an empty reason"
-    if args.outcome == "failed" and not args.reason.strip():
-        return "a failed witness carries its reason"
+    if args.outcome in ("partial", "failed") and not args.reason.strip():
+        return f"a {args.outcome} witness carries its reason"
+    if args.outcome == "checked" and args.uncovered_count:
+        return "a checked witness leaves no pointers uncovered"
+    if args.outcome == "partial" and not args.covered_count:
+        return "a partial witness has one or more covered pointers"
+    if args.outcome == "failed" and args.covered_count:
+        return "a failed witness covers no pointers"
     counters = [getattr(args, name) for name in COST_COUNTERS]
     total = getattr(args, COST_TOTAL)
     figures = [value for value in counters + [total] if value is not None]
@@ -1256,6 +1264,8 @@ def build_parser():
     witness.add_argument("--outcome", required=True, choices=WITNESS_OUTCOMES)
     witness.add_argument("--reason", required=True)
     witness.add_argument("--duration-seconds", required=True, type=float)
+    witness.add_argument("--covered-count", required=True, type=int)
+    witness.add_argument("--uncovered-count", required=True, type=int)
     for tokens in ("input", "output", "cache-read", "cache-creation", "total"):
         witness.add_argument(f"--{tokens}-tokens", type=int, help=f"{tokens} tokens, as counted")
 

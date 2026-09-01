@@ -3646,7 +3646,8 @@ class CostTests(MonitorTestCase):
         )
         self.fixture.append(
             LAUNCH_TS, "witness", ticket="06", executor="codex",
-            model="gpt-5.6-luna", outcome="checked", reason="",
+            model="gpt-5.6-luna", outcome="partial", reason="uncovered pointer",
+            covered_count=10, uncovered_count=2,
             duration_seconds=2.5, input_tokens=1, output_tokens=2,
             cache_read_tokens=3, cache_creation_tokens=4, total_tokens=10,
         )
