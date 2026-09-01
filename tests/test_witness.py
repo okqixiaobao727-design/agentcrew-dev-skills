@@ -15,6 +15,9 @@ PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 ASSETS = PLUGIN_ROOT / "skills" / "crew" / "assets"
 WITNESS = ASSETS / "witness.py"
+sys.path.insert(0, str(ASSETS))
+import witness as witness_module  # noqa: E402
+
 MODEL = "claude-sonnet-5"
 BUDGET_USD = "2"
 BRIEF = (
@@ -167,6 +170,55 @@ class WitnessTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_pointer_list_normalises_real_ticket_spellings_without_guessing(self):
+        run_plan_path = self.worktree / "skills" / "crew" / "assets" / "run_plan.py"
+        driver_path = self.worktree / "skills" / "crew" / "assets" / "driver" / "driver.py"
+        outside_path = pathlib.Path.home() / ".claude" / "state" / "review.md"
+        escalation = (
+            f"ticket {self.root / '175.md'}，branch worktree-175-175，事实 #138，"
+            f"{run_plan_path}:48，skills/crew/assets/run_plan.py:48，"
+            "…run_plan.py:578，…:645，:646；"
+            "中文skills/crew/assets/driver/driver.py:811，ADR-0018，"
+            f"~/.claude/state/review.md:40，{outside_path}:40，"
+            "skills/crew/assets/run_plan.py"
+        )
+
+        result = witness_module.pointers(escalation, self.worktree)
+
+        self.assertTrue(all(isinstance(pointer, witness_module.Pointer) for pointer in result))
+        self.assertEqual(
+            [str(pointer) for pointer in result],
+            [
+                "#138",
+                "skills/crew/assets/run_plan.py:48",
+                "skills/crew/assets/run_plan.py:578",
+                "skills/crew/assets/run_plan.py:645",
+                "skills/crew/assets/run_plan.py:646",
+                "skills/crew/assets/driver/driver.py:811",
+                "ADR-0018",
+                f"{outside_path}:40",
+            ],
+        )
+
+    def test_an_ambiguous_or_unknown_elided_path_stays_unresolved(self):
+        escalation = (
+            "a/run_plan.py:1，b/run_plan.py:2，…run_plan.py:3，"
+            "…unknown.py:4，…:5"
+        )
+
+        result = witness_module.pointers(escalation, self.worktree)
+
+        self.assertEqual(
+            [str(pointer) for pointer in result],
+            [
+                "a/run_plan.py:1",
+                "b/run_plan.py:2",
+                "run_plan.py:3",
+                "unknown.py:4",
+                "unknown.py:5",
+            ],
+        )
+
     def run_witness(
         self, behaviour="witness", *extra, stdin=None, brief=BRIEF, operation="check",
         structured_output=STRUCTURED_FROM_BRIEF, prose=None, issue=None,
@@ -252,6 +304,15 @@ class WitnessTests(unittest.TestCase):
         )
 
         self.assert_failed_result(result)
+
+    def test_matching_no_expected_pointer_returns_failed_with_zero_coverage(self):
+        result = self.run_witness(structured_output={"cited": [], "uncited": []})
+
+        document = self.assert_failed_result(result)
+        self.assertEqual(document["covered_count"], 0)
+        self.assertEqual(document["uncovered_count"], 3)
+        for pointer in ("src/check.py:12", "#130", "ADR-0004"):
+            self.assertIn(pointer, document["reason"])
 
     def test_check_reads_issue_154_body_and_authoritative_comments_through_the_tracker(self):
         issue = {
@@ -409,6 +470,8 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["brief"], BRIEF)
         self.assertEqual(document["outcome"], "checked")
         self.assertEqual(document["reason"], "")
+        self.assertEqual(document["covered_count"], 3)
+        self.assertEqual(document["uncovered_count"], 0)
         self.assertGreaterEqual(document["duration_seconds"], 0)
         self.assertEqual(
             document["usage"],
@@ -419,6 +482,42 @@ class WitnessTests(unittest.TestCase):
                 "cache_creation_input_tokens": 44,
             },
         )
+
+    def test_check_renders_the_numbered_normalised_pointer_list_into_the_prompt(self):
+        result = self.run_witness()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = self.calls()[0]["argv"][1]
+        self.assertIn(
+            "1. src/check.py:12\n2. #130\n3. ADR-0004",
+            prompt,
+        )
+        self.assertNotIn("<check pointers>", prompt)
+
+    def test_omitting_two_expected_pointers_returns_a_partial_brief_and_coverage(self):
+        expected = [f"src/check.py:{line}" for line in range(1, 13)]
+        escalation = "CREW ASK 132 design — " + "，".join(expected)
+        cited = [
+            {"pointer": pointer, "status": "held", "reason": f"fact {number}"}
+            for number, pointer in enumerate(expected[:10], 1)
+        ]
+
+        result = self.run_witness(
+            stdin=escalation,
+            structured_output={"cited": cited, "uncited": []},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["covered_count"], 10)
+        self.assertEqual(document["uncovered_count"], 2)
+        self.assertEqual(document["brief"].splitlines(), [
+            f"{pointer} — held — fact {number}"
+            for number, pointer in enumerate(expected[:10], 1)
+        ])
+        self.assertIn("src/check.py:11", document["reason"])
+        self.assertIn("src/check.py:12", document["reason"])
 
     def test_the_session_is_headless_budget_capped_read_only_and_in_the_worktree(self):
         result = self.run_witness()
@@ -522,21 +621,105 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["brief"], brief)
 
-    def test_check_rejects_missing_duplicate_out_of_order_and_repeated_uncited_pointers(self):
-        missing = json.loads(json.dumps(CHECK_OUTPUT))
-        missing["cited"].pop()
-        duplicate = json.loads(json.dumps(CHECK_OUTPUT))
-        duplicate["cited"].append(dict(duplicate["cited"][-1]))
+    def test_check_degrades_out_of_order_findings_to_the_largest_ordered_partial(self):
         out_of_order = json.loads(json.dumps(CHECK_OUTPUT))
         out_of_order["cited"].reverse()
+
+        result = self.run_witness(structured_output=out_of_order)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(
+            document["brief"],
+            "src/check.py:12 — held — the cited guard is present",
+        )
+        self.assertEqual(document["covered_count"], 1)
+        self.assertEqual(document["uncovered_count"], 2)
+        self.assertIn("structural rejection (out of order): #130", document["reason"])
+        self.assertIn("structural rejection (out of order): ADR-0004", document["reason"])
+        self.assertNotIn("uncovered pointers", document["reason"])
+
+    def test_a_duplicate_expected_finding_is_structurally_rejected_from_a_partial(self):
+        duplicate = json.loads(json.dumps(CHECK_OUTPUT))
+        duplicate["cited"].append(dict(duplicate["cited"][-1]))
+
+        result = self.run_witness(structured_output=duplicate)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["covered_count"], 2)
+        self.assertEqual(document["uncovered_count"], 1)
+        self.assertNotIn("ADR-0004 —", document["brief"])
+        self.assertIn("structural rejection (repeated): ADR-0004", document["reason"])
+        self.assertNotIn("uncovered pointers", document["reason"])
+
+    def test_an_expected_pointer_repeated_as_uncited_is_rejected_from_a_partial(self):
         repeated_uncited = json.loads(json.dumps(CHECK_OUTPUT))
         repeated_uncited["uncited"] = [dict(repeated_uncited["cited"][0])]
 
-        for structured_output in (missing, duplicate, out_of_order, repeated_uncited):
-            with self.subTest(structured_output=structured_output):
-                self.assert_failed_result(
-                    self.run_witness(structured_output=structured_output)
-                )
+        result = self.run_witness(structured_output=repeated_uncited)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["covered_count"], 2)
+        self.assertEqual(document["uncovered_count"], 1)
+        self.assertNotIn("src/check.py:12 —", document["brief"])
+        self.assertIn(
+            "structural rejection (repeated): src/check.py:12",
+            document["reason"],
+        )
+
+    def test_an_extra_cited_pointer_becomes_uncited_in_a_structural_partial(self):
+        extra = json.loads(json.dumps(CHECK_OUTPUT))
+        extra["cited"].append({
+            "pointer": "docs/context.md:7",
+            "status": "held",
+            "reason": "the extra context exists",
+        })
+
+        result = self.run_witness(structured_output=extra)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["covered_count"], 3)
+        self.assertEqual(document["uncovered_count"], 0)
+        self.assertEqual(
+            document["brief"],
+            BRIEF + "\nuncited docs/context.md:7 — held — the extra context exists",
+        )
+        self.assertIn(
+            "structural rejection (extra cited): docs/context.md:7",
+            document["reason"],
+        )
+
+    def test_pointer_free_escalation_keeps_an_uncited_finding_as_checked(self):
+        structured_output = {
+            "cited": [],
+            "uncited": [{
+                "pointer": "#200",
+                "status": "held",
+                "reason": "the follow-up ticket exists",
+            }],
+        }
+
+        result = self.run_witness(
+            stdin="CREW ASK 132 wrap-up — place the remaining follow-up ts=1",
+            structured_output=structured_output,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked")
+        self.assertEqual(
+            document["brief"],
+            "uncited #200 — held — the follow-up ticket exists",
+        )
+        self.assertEqual(document["covered_count"], 0)
+        self.assertEqual(document["uncovered_count"], 0)
 
     def test_a_nonpointer_line_cannot_pose_as_an_uncited_pointer(self):
         brief = BRIEF + "\ntotal garbage — held — anything"

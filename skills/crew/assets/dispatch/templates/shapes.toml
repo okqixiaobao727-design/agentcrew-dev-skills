@@ -139,6 +139,12 @@ omitted:
 
 <check subject>
 
+The expected pointers are an input, not something to re-derive. Return one `cited` finding for each
+numbered entry, using its exact pointer string once and in this order (the number is not part of the
+pointer):
+
+<check pointers>
+
 Return structured `cited` findings in citation order, followed by unique `uncited` findings. Each
 finding carries its pointer, `held|contradicted|missing` status, and one non-empty factual reason.
 '''

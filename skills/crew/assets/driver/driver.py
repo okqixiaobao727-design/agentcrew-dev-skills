@@ -28,9 +28,9 @@ run file, which is what keeps the oracle boundary intact; `monitor-wave.sh` and 
 launch line and goes on working, and only one of the four reasons ends it.
 
 A `judgment-needed` snapshot for a child escalation carries the child's message in `detail` and
-the checked text in `brief`. When the witness failed, `brief` is empty and the plain-string
-`witness_reason` sits beside it; `witness_reason` is absent on success and the snapshot's existing
-`reason` remains the wake reason.
+the checked text in `brief`. A partial Witness keeps that non-empty brief and adds its plain-string
+`witness_reason`; a failed Witness carries an empty brief and its reason. `witness_reason` is absent
+only on a fully checked result, and the snapshot's existing `reason` remains the wake reason.
 
 The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle
 event: it prints a multi-line inventory, asks for confirmation, and reports errors directly instead
@@ -2613,7 +2613,10 @@ class Loop:
     # --- the rule table, row by row ---------------------------------------------------------
 
     def run_witness(self, ticket, launch, message):
-        """Run and record one escalation witness; returns its checked or failed document."""
+        """Run and record one escalation witness.
+
+        Returns its checked, partial or failed document.
+        """
         started = time.monotonic()
         witness_executor, witness_model, witness_budget_usd = run_plan.witness_routing(
             self.run.witness_model, self.run.witness_budget_usd
@@ -2624,6 +2627,8 @@ class Loop:
                 "brief": "",
                 "outcome": "failed",
                 "reason": str(reason).strip() or "witness process failed",
+                "covered_count": 0,
+                "uncovered_count": 0,
                 "duration_seconds": round(time.monotonic() - started, 3),
             }
 
@@ -2665,17 +2670,34 @@ class Loop:
         outcome = document.get("outcome")
         brief = document.get("brief")
         reason = document.get("reason")
+        covered_count = document.get("covered_count")
+        uncovered_count = document.get("uncovered_count")
         duration = document.get("duration_seconds")
+        coverage_is_sound = all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (covered_count, uncovered_count)
+        )
         sound = (
             outcome in machine_log.WITNESS_OUTCOMES
             and isinstance(brief, str)
             and isinstance(reason, str)
+            and coverage_is_sound
             and isinstance(duration, (int, float))
             and not isinstance(duration, bool)
             and duration >= 0
             and (
-                (outcome == "checked" and bool(brief) and not reason)
-                or (outcome == "failed" and not brief and bool(reason.strip()))
+                (
+                    outcome == "checked" and bool(brief) and not reason
+                    and not uncovered_count
+                )
+                or (
+                    outcome == "partial" and bool(brief) and bool(reason.strip())
+                    and bool(covered_count)
+                )
+                or (
+                    outcome == "failed" and not brief and bool(reason.strip())
+                    and not covered_count
+                )
             )
         )
         if not sound:
@@ -2692,6 +2714,8 @@ class Loop:
             "--outcome", document["outcome"],
             "--reason", document["reason"],
             "--duration-seconds", str(document["duration_seconds"]),
+            "--covered-count", str(document["covered_count"]),
+            "--uncovered-count", str(document["uncovered_count"]),
         ]
         counters = {
             "input": usage.get("input_tokens"),
@@ -2737,7 +2761,7 @@ class Loop:
             child=launch.get("child"), window=launch.get("window"),
             **(
                 {"witness_reason": witness_result["reason"]}
-                if witness_result["outcome"] == "failed" else {}
+                if witness_result["outcome"] in ("partial", "failed") else {}
             ),
         )
 

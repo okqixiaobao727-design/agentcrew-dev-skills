@@ -844,6 +844,7 @@ class EventTests(MachineLogTestCase):
             "--model", "claude-sonnet-5",
             "--outcome", "failed", "--reason", "witness session timed out",
             "--duration-seconds", "900.125",
+            "--covered-count", "0", "--uncovered-count", "3",
             "--input-tokens", "11", "--output-tokens", "22",
             "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
             "--total-tokens", "110", log=self.log,
@@ -859,11 +860,58 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["outcome"], "failed")
         self.assertEqual(entry["reason"], "witness session timed out")
         self.assertEqual(entry["duration_seconds"], 900.125)
+        self.assertEqual(entry["covered_count"], 0)
+        self.assertEqual(entry["uncovered_count"], 3)
         self.assertEqual(entry["input_tokens"], 11)
         self.assertEqual(entry["output_tokens"], 22)
         self.assertEqual(entry["cache_read_tokens"], 33)
         self.assertEqual(entry["cache_creation_tokens"], 44)
         self.assertEqual(entry["total_tokens"], 110)
+
+    def test_a_partial_witness_records_its_required_coverage_counts(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "partial", "--reason", "uncovered pointers: c.py:11, c.py:12",
+            "--duration-seconds", "12.5",
+            "--covered-count", "10", "--uncovered-count", "2", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["outcome"], "partial")
+        self.assertEqual(entry["covered_count"], 10)
+        self.assertEqual(entry["uncovered_count"], 2)
+
+    def test_a_structural_partial_can_cover_every_expected_pointer(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "partial",
+            "--reason", "structural rejection (extra cited): docs/context.md:7",
+            "--duration-seconds", "12.5",
+            "--covered-count", "3", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["outcome"], "partial")
+        self.assertEqual(entry["covered_count"], 3)
+        self.assertEqual(entry["uncovered_count"], 0)
+
+    def test_a_pointer_free_checked_witness_records_zero_coverage(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--covered-count", "0", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["outcome"], "checked")
+        self.assertEqual(entry["covered_count"], 0)
+        self.assertEqual(entry["uncovered_count"], 0)
 
     def test_a_passing_base_gate_records_its_argv_without_a_ticket(self):
         result = run_cli(
@@ -909,6 +957,7 @@ class EventTests(MachineLogTestCase):
             "witness", "--ticket", "07", "--executor", "claude",
             "--model", "claude-sonnet-5",
             "--outcome", "unknown", "--reason", "why", "--duration-seconds", "1",
+            "--covered-count", "0", "--uncovered-count", "0",
             log=self.log,
         )
 
@@ -919,7 +968,19 @@ class EventTests(MachineLogTestCase):
         result = run_cli(
             "witness", "--ticket", "07", "--model", "claude-sonnet-5",
             "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--covered-count", "1", "--uncovered-count", "0",
             log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_witness_without_both_coverage_counts_is_refused(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--covered-count", "1", log=self.log,
         )
 
         self.assertEqual(result.returncode, 2)
@@ -929,19 +990,40 @@ class EventTests(MachineLogTestCase):
         cases = (
             ("checked with a failure reason", [
                 "--outcome", "checked", "--reason", "failed", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
             ]),
             ("failed without a reason", [
                 "--outcome", "failed", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "0", "--uncovered-count", "1",
+            ]),
+            ("partial without a reason", [
+                "--outcome", "partial", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "10", "--uncovered-count", "2",
+            ]),
+            ("partial without covered pointers", [
+                "--outcome", "partial", "--reason", "uncovered", "--duration-seconds", "1",
+                "--covered-count", "0", "--uncovered-count", "2",
+            ]),
+            ("failed with a covered pointer", [
+                "--outcome", "failed", "--reason", "failed", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
             ]),
             ("negative duration", [
                 "--outcome", "checked", "--reason", "", "--duration-seconds", "-1",
+                "--covered-count", "1", "--uncovered-count", "0",
+            ]),
+            ("negative coverage", [
+                "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "-1", "--uncovered-count", "0",
             ]),
             ("partial cost", [
                 "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
                 "--input-tokens", "11",
             ]),
             ("wrong total", [
                 "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
                 "--input-tokens", "11", "--output-tokens", "22",
                 "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
                 "--total-tokens", "111",

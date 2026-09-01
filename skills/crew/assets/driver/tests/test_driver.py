@@ -2276,6 +2276,111 @@ class LoopTests(DriverTestCase):
         self.assertEqual(len(witness), 1, witness)
         self.assertEqual(witness[0]["outcome"], "failed")
         self.assertEqual(witness[0]["reason"], WITNESS_FAILURE)
+        self.assertEqual(witness[0]["covered_count"], 0)
+        self.assertEqual(witness[0]["uncovered_count"], 1)
+
+    def test_a_partial_witness_wakes_with_its_brief_reason_and_coverage(self):
+        brief = "README.md:1 — held — the fixture file exists"
+        structured_output = {
+            "cited": [{
+                "pointer": "README.md:1",
+                "status": "held",
+                "reason": "the fixture file exists",
+            }],
+            "uncited": [],
+        }
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
+            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
+        })
+
+        message = "CREW ASK 01 scope — check README.md:1, #130 and ADR-0004 ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["brief"], brief)
+        self.assertIn("#130", snapshot["witness_reason"])
+        self.assertIn("ADR-0004", snapshot["witness_reason"])
+        witness = self.events("witness", ticket="01")[0]
+        self.assertEqual(witness["outcome"], "partial")
+        self.assertEqual(witness["covered_count"], 1)
+        self.assertEqual(witness["uncovered_count"], 2)
+        self.assertEqual(snapshot["witness_reason"], witness["reason"])
+
+    def test_a_structural_partial_forwards_zero_uncovered_without_rederiving_it(self):
+        brief = "\n".join((
+            "README.md:1 — held — the fixture file exists",
+            "#130 — held — the ticket exists",
+            "ADR-0004 — held — the decision exists",
+            "uncited docs/context.md:7 — held — the extra context exists",
+        ))
+        structured_output = {
+            "cited": [
+                {
+                    "pointer": "README.md:1",
+                    "status": "held",
+                    "reason": "the fixture file exists",
+                },
+                {
+                    "pointer": "#130",
+                    "status": "held",
+                    "reason": "the ticket exists",
+                },
+                {
+                    "pointer": "ADR-0004",
+                    "status": "held",
+                    "reason": "the decision exists",
+                },
+                {
+                    "pointer": "docs/context.md:7",
+                    "status": "held",
+                    "reason": "the extra context exists",
+                },
+            ],
+            "uncited": [],
+        }
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
+            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
+        })
+
+        message = "CREW ASK 01 scope — check README.md:1, #130 and ADR-0004 ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        witness = self.events("witness", ticket="01")[0]
+        self.assertEqual(snapshot["brief"], brief)
+        self.assertIn("extra cited", snapshot["witness_reason"])
+        self.assertEqual(witness["outcome"], "partial")
+        self.assertEqual(witness["covered_count"], 3)
+        self.assertEqual(witness["uncovered_count"], 0)
+        self.assertEqual(snapshot["witness_reason"], witness["reason"])
+
+    def test_a_pointer_free_escalation_keeps_the_witness_uncited_brief(self):
+        brief = "uncited #200 — held — the follow-up ticket exists"
+        structured_output = {
+            "cited": [],
+            "uncited": [{
+                "pointer": "#200",
+                "status": "held",
+                "reason": "the follow-up ticket exists",
+            }],
+        }
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
+            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
+        })
+
+        message = "CREW ASK 01 wrap-up — place the remaining follow-up ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["brief"], brief)
+        self.assertNotIn("witness_reason", snapshot)
+        witness = self.events("witness", ticket="01")[0]
+        self.assertEqual(witness["outcome"], "checked")
+        self.assertEqual(witness["covered_count"], 0)
+        self.assertEqual(witness["uncovered_count"], 0)
 
     def test_an_overrun_witness_still_wakes_with_the_timeout_reason(self):
         process = self.start(("01", ()), env_overrides={
@@ -2346,6 +2451,8 @@ class LoopTests(DriverTestCase):
         self.assertEqual(witness[0]["model"], model)
         self.assertEqual(witness[0]["outcome"], "checked")
         self.assertEqual(witness[0]["reason"], "")
+        self.assertEqual(witness[0]["covered_count"], 1)
+        self.assertEqual(witness[0]["uncovered_count"], 0)
         self.assertGreaterEqual(witness[0]["duration_seconds"], 0)
         self.assertEqual(witness[0]["input_tokens"], 11)
         self.assertEqual(witness[0]["output_tokens"], 22)
