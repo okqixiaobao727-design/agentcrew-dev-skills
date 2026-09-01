@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.17] - 2026-09-01
+
 ### Added
 - A live driver accepts a coordinator handover in place (ADR-0025). A run whose coordinator session
   has gone is no longer undirectable: `/crew <run-dir>` typed in a new session resolves one
