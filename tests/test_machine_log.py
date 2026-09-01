@@ -473,6 +473,62 @@ class RunProjectionTests(unittest.TestCase):
         self.assertEqual(checked_second.ticket("7").escalation, second)
         self.assertEqual(checked_second.ticket("7").witness, second_witness)
 
+    def test_fact_check_runs_from_each_escalation_until_its_hand_over_ruling(self):
+        escalation = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — choose the projection fact",
+        }
+        hand_over = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": (
+                "CREW RULED 7 — this escalation was handed to the coordinator, which is where "
+                "it is answered."
+            ),
+        }
+
+        self.assertTrue(machine_log.project([escalation]).ticket("7").fact_check_running)
+        for outcome in ("checked", "partial", "failed"):
+            with self.subTest(outcome=outcome):
+                witness = {"event": "witness", "ticket": "7", "outcome": outcome}
+                before_hand_over = machine_log.project([escalation, witness]).ticket("7")
+                self.assertTrue(before_hand_over.fact_check_running)
+                self.assertFalse(before_hand_over.awaiting_ruling)
+
+                after_hand_over = machine_log.project([
+                    escalation, witness, hand_over,
+                ]).ticket("7")
+                self.assertFalse(after_hand_over.fact_check_running)
+                self.assertTrue(after_hand_over.awaiting_ruling)
+
+    def test_the_newest_escalation_governs_the_fact_check_episode(self):
+        first = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — first",
+        }
+        hand_over = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": "CREW RULED 7 — this escalation was handed to the coordinator",
+        }
+        coordinator_ruling = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": "Choose option A.",
+        }
+        second = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 scope — second",
+        }
+
+        ruled = machine_log.project([first, hand_over, coordinator_ruling]).ticket("7")
+        self.assertFalse(ruled.fact_check_running)
+        self.assertFalse(ruled.awaiting_ruling)
+
+        newest = machine_log.project([
+            first, hand_over, coordinator_ruling, second,
+        ]).ticket("7")
+        self.assertEqual(newest.escalation, second)
+        self.assertTrue(newest.fact_check_running)
+        self.assertFalse(newest.awaiting_ruling)
+
     def test_only_receipt_evidence_consumes_a_valid_completion_claim(self):
         claim = {
             "event": "message", "ticket": "7", "role": "child",
