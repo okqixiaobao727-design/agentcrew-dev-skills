@@ -149,7 +149,6 @@ sys.path.insert(0, str(MONITOR.parent))
 import monitor  # noqa: E402
 
 # The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
-RUN_DIR_NAME = ".crew"
 LOG_NAME = "log.jsonl"
 # The channel a woken coordinator reads. The driver runs detached in its own tmux window now, so
 # its stdout belongs to that pane and to the log beside it — the one JSON object the coordinator
@@ -1148,6 +1147,15 @@ def clear_records(log):
     return records
 
 
+def resolved_run_dir(path):
+    """Resolve an operator's Run-directory form or raise the Driver's public error."""
+    path = pathlib.Path(path).resolve()
+    try:
+        return run_plan.resolve_run_dir(path)
+    except run_plan.RunPlanError as error:
+        raise DriverError(str(error), pointer=str(path)) from error
+
+
 def clear_run_data(run_dir):
     """Load the run table and log, keeping all paths at the recorded boundary."""
     table_path = run_dir / TABLE_NAME
@@ -1485,7 +1493,7 @@ def clear_actions(run_dir, run, log_path, plan):
 
 def run_clear(args):
     """Inventory a run, ask in the terminal, and clear only after an affirmative answer."""
-    run_dir = pathlib.Path(args.run_dir).resolve()
+    run_dir = resolved_run_dir(args.run_dir)
     run_plan_value, run, records, log_path = clear_run_data(run_dir)
     lines, plan = clear_inventory(run_dir, run_plan_value, run, records, log_path)
     print("\n".join(lines))
@@ -1748,7 +1756,7 @@ def run_start(args):
     feature_dir = pathlib.Path(args.feature_dir).resolve()
     if not feature_dir.is_dir():
         raise DriverError(f"{feature_dir} is not a feature directory", pointer=str(feature_dir))
-    run_dir = feature_dir / RUN_DIR_NAME
+    run_dir = run_plan.crew_state_dir(feature_dir)
     # Taken up before the first step that can fail, so that every way this start can end reaches
     # the coordinator's waiter: a wake is only written into a run this process has in hand, and a
     # repository root or a tmux session that cannot be resolved is as much a wake as any other.
@@ -3618,7 +3626,7 @@ def resume_command(args):
 def run_resume(args):
     """Carry on the loop of a run already under way, once the coordinator has ruled."""
     feature_dir = pathlib.Path(args.feature_dir).resolve()
-    run_dir = feature_dir / RUN_DIR_NAME
+    run_dir = run_plan.crew_state_dir(feature_dir)
     table = run_dir / TABLE_NAME
     if not table.exists():
         raise DriverError(
@@ -3639,13 +3647,8 @@ def run_resume(args):
 
 def run_answer(args):
     """Deliver one coordinator answer on the recorded child's own channel; returns 0."""
-    run_dir = pathlib.Path(args.run_dir).resolve()
+    run_dir = resolved_run_dir(args.run_dir)
     table_path = run_dir / TABLE_NAME
-    if not table_path.exists():
-        raise DriverError(
-            f"{run_dir} holds no run to answer: {table_path} is not there",
-            pointer=str(run_dir),
-        )
     loop = Loop(args, run_dir, table_path)
     ticket = str(args.ticket)
     launch = machine_log.project(loop.records()).ticket(ticket).launch

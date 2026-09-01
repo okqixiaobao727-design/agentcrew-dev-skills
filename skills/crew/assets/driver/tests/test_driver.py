@@ -59,12 +59,14 @@ from harness import (
     UNREWRITABLE,
     WAITER_RECORD,
     WAKE_NAME,
+    WITNESS,
     WITNESS_BRIEF,
     WITNESS_BUDGET_USD,
     WITNESS_FAILURE,
     WITNESS_MODEL,
     WITNESS_OVERRUN,
     git,
+    run_plan,
     routing_naming,
 )
 
@@ -3125,6 +3127,74 @@ class AnswerTests(DriverTestCase):
         self.assertEqual(ruling["role"], "coordinator")
         self.assertEqual(ruling["to"], "stub-child-1")
         self.assertEqual(ruling["message"], text)
+
+    def test_answer_accepts_the_run_directory_from_the_wake_resume_command(self):
+        process = self.start()
+        self.fixture.says("01", "CREW ASK 01 design — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+        resume = shlex.split(snapshot["resume"])
+        run_dir = resume[resume.index(str(LAUNCH)) + 1]
+        text = "Use the existing retention_audit table"
+
+        result = subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer", "--run-dir", run_dir,
+                "--ticket", "01", "--text", text,
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        ruling = self.events("ruling", ticket="01")[-1]
+        self.assertEqual(ruling["message"], text)
+
+    def test_witness_ask_accepts_the_run_directory_from_the_wake_resume_command(self):
+        process = self.start()
+        self.fixture.says("01", "CREW ASK 01 design — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+        resume = shlex.split(snapshot["resume"])
+        run_dir = resume[resume.index(str(LAUNCH)) + 1]
+        environment = self.fixture.environment()
+        environment["AGENTCREW_STUB_WITNESS_BRIEF"] = WITNESS_BRIEF
+        environment["AGENTCREW_STUB_WITNESS_OUTPUT"] = json.dumps({
+            "claims": [{"claim": "Use the existing table", "pointers": ["#01"]}],
+        })
+
+        result = subprocess.run(
+            [
+                sys.executable, str(WITNESS), "ask", "--run", run_dir,
+                "--ticket", "01", "--question", "Which table should the ticket use?",
+            ],
+            capture_output=True, text=True,
+            env=environment, cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], "Use the existing table — #01")
+
+    def test_answer_reports_the_checked_path_and_accepted_forms_for_a_wrong_directory(self):
+        run_dir = self.fixture.feature_dir / "missing-run"
+
+        result = subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer", "--run-dir", str(run_dir),
+                "--ticket", "01", "--text", "Use the existing table",
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(
+            str(run_dir / run_plan.CREW_STATE_DIR_NAME / "wave-table.json"),
+            snapshot["detail"],
+        )
+        self.assertIn("<feature-dir>/.crew", snapshot["detail"])
 
     def test_text_left_in_the_composer_is_not_recorded_as_delivered(self):
         self.start()

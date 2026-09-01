@@ -797,7 +797,7 @@ def candidate_run(repo, directory, config):
     )
     head = driver.git_output(repo, "rev-parse", "HEAD") or LATER
     return driver.run_section(
-        args, repo, directory, directory / driver.RUN_DIR_NAME,
+        args, repo, directory, run_plan.crew_state_dir(directory),
         base_branch=None, base_commit=head, config=config,
     )
 

@@ -76,13 +76,13 @@ START_COMMAND = "start"
 MONITOR = SCRIPT_DIR.parent / "monitor" / "monitor.py"
 sys.path.insert(0, str(MONITOR.parent))
 import monitor  # noqa: E402
+import run_plan  # noqa: E402
 
 # The run's own directory inside the feature, and the three files this end of the run uses: the
 # wake snapshot the driver leaves for this waiter, the driver's own output now that no task output
 # file collects it, and the lock that makes "is a driver alive, and start one if not" one decision.
 # The fourth — the pid record the whole judgment rests on — belongs to the driver, so the renderer
 # that owns it is asked rather than read here.
-RUN_DIR_NAME = ".crew"
 WAKE_NAME = "wake.json"
 DRIVER_LOG_NAME = "driver.log"
 DRIVER_LOCK_NAME = "driver.lock"
@@ -336,12 +336,12 @@ def coordinator_pane():
     return os.environ.get(TMUX_PANE_VARIABLE) or None
 
 
-def driver_command(args, session, resolved):
+def driver_command(args, session, resolved, run_dir):
     """The driver command line this run starts on, `start` because start is what adopts."""
     pid, name, coordinator_session, address, mode = resolved
     command = [
         sys.executable, str(pathlib.Path(args.driver).resolve()), START_COMMAND,
-        "--feature-dir", str(pathlib.Path(args.run_dir).resolve()),
+        "--feature-dir", str(run_dir.parent),
         "--coordinator-name", name,
         "--coordinator-pid", str(pid),
         "--coordinator-session", coordinator_session,
@@ -436,10 +436,10 @@ def run_directory(args):
     Made here rather than by the driver, because the driver's window writes its log into it before
     the driver has decided whether this run starts at all.
     """
-    feature_dir = pathlib.Path(args.run_dir).resolve()
+    run_dir = run_plan.crew_state_dir(args.run_dir)
+    feature_dir = run_dir.parent
     if not feature_dir.is_dir():
         raise LaunchError(f"{feature_dir} is not a directory of tickets to run")
-    run_dir = feature_dir / RUN_DIR_NAME
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -488,7 +488,7 @@ def start_driver(args, run_dir):
         # started without are still what a failed launch reports, whatever else is wrong.
         resolved = resolve(args)
         session = tmux_session()
-        command = driver_command(args, session, resolved)
+        command = driver_command(args, session, resolved, run_dir)
         # The wake of the cycle just ended, taken away before the driver that would write the next
         # one starts: a waiter that found the old one would answer its coordinator with a snapshot
         # that has already been ruled on.

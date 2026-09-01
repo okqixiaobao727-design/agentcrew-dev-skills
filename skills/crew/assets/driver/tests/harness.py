@@ -25,9 +25,11 @@ import unittest
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS_DIR))
+sys.path.insert(0, str(TESTS_DIR.parents[1]))
 # The stub CLI itself, for the one rule the fixture and the stub have to agree on: which file an
 # account's agents list lives in. Imported rather than restated, so they cannot drift apart.
 import stub_claude  # noqa: E402
+import run_plan  # noqa: E402
 DRIVER = TESTS_DIR.parent / "driver.py"
 MACHINE_LOG = DRIVER.parent.parent / "machine_log.py"
 TRIAGE = DRIVER.parent.parent.parent / "references" / "triage.md"
@@ -35,6 +37,7 @@ MONITOR = DRIVER.parent.parent / "monitor" / "monitor.py"
 # The script every snapshot's `resume` names, because a driver put back belongs in a window of its
 # own exactly as the first one did. Its own suite drives it; here it is only what is named.
 LAUNCH = DRIVER.parent.parent / "launch" / "launch.py"
+WITNESS = DRIVER.parent.parent / "witness.py"
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -55,7 +58,6 @@ COORDINATOR_PANE = "%3"
 PREFLIGHT_WINDOW = "crew-preflight"
 DASHBOARD_WINDOW = "crew-dashboard"
 REPORT_NAME = "report.md"
-RUN_DIR_NAME = ".crew"
 # The two files the run directory gains: the driver's own pid while its loop runs, and the wake
 # snapshot the coordinator's waiter reads instead of the driver's stdout.
 DRIVER_RECORD = "driver.pid"
@@ -551,7 +553,7 @@ class Fixture:
 
     @property
     def run_dir(self):
-        return self.feature_dir / RUN_DIR_NAME
+        return self.feature_dir / run_plan.CREW_STATE_DIR_NAME
 
     @property
     def crew_worktree(self):

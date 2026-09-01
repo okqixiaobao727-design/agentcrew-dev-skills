@@ -112,6 +112,8 @@ class WitnessTests(unittest.TestCase):
 
         self.run_dir = self.root / "run"
         self.run_dir.mkdir()
+        self.state_dir = self.run_dir / ".crew"
+        self.state_dir.mkdir()
         self.ask_account = self.root / "ask-account"
         self.ask_account.mkdir()
         self.ask_worktree = self.root / ".claude" / "worktrees" / "154-witness"
@@ -126,7 +128,7 @@ class WitnessTests(unittest.TestCase):
         ticket = self.root / "154-witness.md"
         spec.write_text("# Witness\n", encoding="utf-8")
         ticket.write_text("# Ticket 154\n", encoding="utf-8")
-        (self.run_dir / "wave-table.json").write_text(
+        (self.state_dir / "wave-table.json").write_text(
             json.dumps({
                 "run": {
                     "repo_root": str(self.root),
@@ -301,7 +303,10 @@ class WitnessTests(unittest.TestCase):
         self.assertGreaterEqual(document["duration_seconds"], 0)
         return document
 
-    def run_ask(self, question="What does this ticket require?", structured_output=ASK_OUTPUT):
+    def run_ask(
+        self, question="What does this ticket require?", structured_output=ASK_OUTPUT,
+        run_dir=None,
+    ):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
@@ -315,7 +320,7 @@ class WitnessTests(unittest.TestCase):
                 str(WITNESS),
                 "ask",
                 "--run",
-                str(self.run_dir),
+                str(run_dir or self.run_dir),
                 "--ticket",
                 "154",
                 "--question",
@@ -345,6 +350,27 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "3.5")
         schema = json.loads(argv[argv.index("--json-schema") + 1])
         self.assertEqual(schema["required"], ["claims"])
+
+    def test_ask_keeps_accepting_the_state_directory_form(self):
+        result = self.run_ask(run_dir=self.state_dir)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], ASK_BRIEF)
+
+    def test_ask_returns_a_failed_envelope_for_a_wrong_run_directory(self):
+        run_dir = self.root / "missing-run"
+
+        result = self.run_ask(run_dir=run_dir)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "failed", document)
+        self.assertIn(
+            str(run_dir / ".crew" / "wave-table.json"), document["reason"]
+        )
+        self.assertIn("<feature-dir>/.crew", document["reason"])
 
     def test_ask_rejects_a_pointer_repeated_across_claims(self):
         result = self.run_ask(structured_output={
