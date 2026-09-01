@@ -59,6 +59,7 @@ class TicketFacts:
     unanswered_child_message: Mapping[str, object] | None
     escalation: Mapping[str, object] | None
     witness: Mapping[str, object] | None
+    fact_check_running: bool
     awaiting_receipt: bool
     awaiting_ruling: bool
     outstanding_nudge: bool
@@ -92,6 +93,10 @@ re-derive a named projection fact from them.
   and clears the second until its own witness event arrives, so an older fact-check cannot be
   paired with a newer escalation. The handed-over ruling consumes the pending message but retains
   this factual pair for audit and report readers.
+- `fact_check_running` is true from the newest escalation until its later
+  `CREW RULED <NN> — handed to the coordinator` line. A `witness` event of any outcome does not
+  clear it: that event says the check process ended, not that the wake snapshot reached disk. A
+  later escalation starts a new occurrence and governs the fact.
 - `latest_settling_event` means the last receipt or outcome with a non-empty value. It answers
   whether the ticket has received a settling event.
 - `settlement_state` retains the closed Machine-log vocabulary and its category precedence: a valid
@@ -328,16 +333,20 @@ written; the event shape and the rule that the last line holds are unchanged.
 
 ### `witness` — one fact-check of a child escalation
 
-`ticket`, `executor`, `model`, `outcome` (`checked` or `failed`), `reason`, `duration_seconds`,
-`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`.
+`ticket`, `executor`, `model`, `outcome` (`checked`, `partial`, or `failed`), `reason`,
+`duration_seconds`, `covered_count`, `uncovered_count`, `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_creation_tokens`, `total_tokens`.
 The Driver writes one line after the child escalation and before its handed-over ruling. `model`
 and the budget that bounded the run come from the run's `[witness]` configuration; `executor` and
 `model` are the resolved witness route, while the hard budget remains in the Wave table. `reason`
-is empty for `checked` and is the witness failure reason for `failed`.
+is empty for `checked` and non-empty for `partial` and `failed`. Both coverage counts are required
+non-negative integers: `checked` leaves none uncovered (and can have no expected pointers when its
+brief consists of uncited findings), `partial` has covered pointers and may have zero uncovered
+pointers when its only structural rejection is an extra cited pointer, and `failed` covers none.
 
 The four token counters and `total_tokens` use the same meanings as `session-cost`, and total is
-their sum. They are absent together when the failed witness returned no usage; the outcome,
-reason, and duration still record the attempted fact-check. The Driver writes this event for both
+their sum. They are absent together when the Witness returned no usage; the outcome, reason,
+coverage, and duration still record the attempted fact-check. The Driver writes this event for both
 Claude and Codex children: the witness itself is driver-side, runs in the escalating child's
 worktree, and uses that ticket's named Claude account where it has one.
 
@@ -464,9 +473,10 @@ machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parke
                                     [--detail TEXT]
 machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state running|returned \
                                     [--detail TEXT]
-machine_log.py --log <path> witness --ticket NN --model ID --outcome checked|failed \
+machine_log.py --log <path> witness --ticket NN --model ID --outcome checked|partial|failed \
                                     --executor claude|codex \
                                     --reason TEXT --duration-seconds N \
+                                    --covered-count N --uncovered-count N \
                                     [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \
                                     [--total-tokens N]

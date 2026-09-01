@@ -186,6 +186,10 @@ REVIEW_RUNNING = "running"
 # What the summary line says while the run is waiting on the operator, so a halted wave is never
 # mistaken for a frozen frame.
 AWAITING_RULING = "⚠ awaiting your ruling"
+# What the same slot says while the Driver is still checking an escalation and no coordinator
+# action is possible yet. The Machine-log projection owns that condition; this renderer only names
+# it.
+FACT_CHECK_RUNNING = "⏳ fact-check running"
 # The run directory's record of the driver driving it: the pid its loop wrote on the way in, which
 # every deliberate exit takes away again and a kill cannot. A record naming a process that is not
 # running is therefore a killed driver by construction — the one thing the operator could not see
@@ -895,12 +899,16 @@ def review_note(events, moment):
     return None
 
 
-def annotations(events, state, anomaly, moment):
+def annotations(events, state, anomaly, moment, fact_check_since=None):
     """The lines drawn under one row: its review, its anomaly, and what last happened to it."""
     lines = []
     review = review_note(events, moment)
     if review:
         lines.append(review)
+    if fact_check_since is not None:
+        started = parse_timestamp(fact_check_since)
+        seconds = max(int((moment - started).total_seconds()), 0) if started is not None else 0
+        lines.append(f"fact-check running · {seconds}s")
     if anomaly is not None:
         lines.append(f"anomaly: {anomaly[0]} · {anomaly[1]}")
     if state in ABNORMAL_STATES and events:
@@ -972,7 +980,12 @@ def build_rows(plan, projection, moment, sources):
                 "launched": launch is not None,
                 "settled": settling is not None,
                 "escalation_count": escalation_count,
-                "annotations": annotations(events, state, anomaly, moment),
+                "fact_check_running": facts.fact_check_running,
+                "awaiting_ruling": facts.awaiting_ruling,
+                "annotations": annotations(
+                    events, state, anomaly, moment,
+                    (facts.escalation or {}).get("ts") if facts.fact_check_running else None,
+                ),
             })
     return rows
 
@@ -1011,10 +1024,17 @@ def summary(rows, run_id, waves, moment, awaiting_ruling=False, banner=None):
     for row in rows:
         counts[row["state"]] += 1
     started = [row["started"] for row in rows if row["started"] is not None]
+    ticket_awaiting_ruling = any(row["awaiting_ruling"] for row in rows)
+    fact_check_running = any(row["fact_check_running"] for row in rows)
+    activity = (
+        AWAITING_RULING if awaiting_ruling or ticket_awaiting_ruling
+        else FACT_CHECK_RUNNING if fact_check_running
+        else ""
+    )
     parts = [
         f"wave {len({row['wave'] for row in rows if row['launched']})}/{waves}",
         " ".join(f"{state}={counts[state]}" for state in STATE_ORDER if counts[state]),
-        banner or (AWAITING_RULING if awaiting_ruling else ""),
+        banner or activity,
         f"elapsed {elapsed(min(started) if started else None, moment)}",
     ]
     return f"crew {run_id} — " + " · ".join(part for part in parts if part)

@@ -20,7 +20,7 @@ user with the rest of what that step reports.
 | **read** | Read the tracker content below. | Read the tracker file below. |
 | **edit** — replace a ticket's body with new text | `gh issue edit <n> --body-file -` with the complete new text, so the edit is one atomic replacement | rewrite the whole file |
 | **mark** — declare who may pick the ticket up | the triage labels `ready-for-agent` and `ready-for-human` | the same two role strings on the ticket's `Status:` line |
-| **comment** — leave a note on a ticket, its body untouched | `gh issue comment <n> --body <text>` | one `Crew: <text>` line in the ticket file, rewritten rather than repeated |
+| **comment** | `gh issue comment` URL | `Crew:` block's `path:line` |
 | **close** — record a finished ticket and take it out of the pickup queue | `gh issue close <n>` with its pickup label removed; the undo is reopening it and restoring the label | set `Status:` to the finished value the convention document names, `done` where it names none; the undo is restoring the value it held |
 
 **Read** — load a ticket's content at the tracker, including its `Blocked by:` edges and current
@@ -34,6 +34,14 @@ user with the rest of what that step reports.
 **A local run stays in the working tree.** Every operation above is a file read or a file write
 inside the repo, so a local-mode run reaches no remote and calls no tracker CLI at all — a step that
 finds itself reaching for `gh` on this tracker has misread which tracker it is on.
+
+**Comment returns an opaque locator.** It is the comment URL on github and the ticket fact's
+`path:line` on local; a Driver deferral passes the staged ticket fact, so that locator names the
+staged copy. A caller carries the string but never parses it. Repeating an identical body returns
+the existing locator and writes nothing; a different body on the same local ticket is a further
+`Crew:` comment block, never an overwrite of the earlier note. A workflow can instead pass a
+`supersedes` body prefix: Tracker replaces the one matching comment and appends when none matches.
+Stage uses that option for its pickup command, preserving every other `Crew:` note.
 
 ## Every other tracker
 

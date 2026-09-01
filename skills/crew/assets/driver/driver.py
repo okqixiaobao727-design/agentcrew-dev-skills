@@ -28,9 +28,9 @@ run file, which is what keeps the oracle boundary intact; `monitor-wave.sh` and 
 launch line and goes on working, and only one of the four reasons ends it.
 
 A `judgment-needed` snapshot for a child escalation carries the child's message in `detail` and
-the checked text in `brief`. When the witness failed, `brief` is empty and the plain-string
-`witness_reason` sits beside it; `witness_reason` is absent on success and the snapshot's existing
-`reason` remains the wake reason.
+the checked text in `brief`. A partial Witness keeps that non-empty brief and adds its plain-string
+`witness_reason`; a failed Witness carries an empty brief and its reason. `witness_reason` is absent
+only on a fully checked result, and the snapshot's existing `reason` remains the wake reason.
 
 The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle
 event: it prints a multi-line inventory, asks for confirmation, and reports errors directly instead
@@ -142,6 +142,7 @@ import machine_log  # noqa: E402
 # Account bindings become process environments only through the account module.
 import accounts  # noqa: E402
 import run_plan  # noqa: E402
+import tracker  # noqa: E402
 import witness as witness_runner  # noqa: E402
 # The monitor still owns process liveness, the driver pid record and every operator-facing surface;
 # Machine-log interpretation itself comes from the projection above.
@@ -149,7 +150,6 @@ sys.path.insert(0, str(MONITOR.parent))
 import monitor  # noqa: E402
 
 # The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
-RUN_DIR_NAME = ".crew"
 LOG_NAME = "log.jsonl"
 # The channel a woken coordinator reads. The driver runs detached in its own tmux window now, so
 # its stdout belongs to that pane and to the log beside it — the one JSON object the coordinator
@@ -263,6 +263,12 @@ NUDGE_MARKER = machine_log.NUDGE_MARKER
 MERGE_MARKER = machine_log.MERGE_MARKER
 ANCHOR_MARKER = machine_log.ANCHOR_MARKER
 HANDED_OVER_MARKER = machine_log.HANDED_OVER_MARKER
+PLACEMENT_MARKERS = (
+    " — this ticket",
+    " — dropped",
+    " — opened ",
+    " — deferred ",
+)
 
 # The tmux key names the permission-prompt command accepts, kept narrow so an answer cannot
 # accidentally become an unsupported tmux key sequence.
@@ -371,6 +377,15 @@ class ClearPlan:
     dashboard_window: str | None
 
 
+@dataclass(frozen=True)
+class HandOverIntent:
+    """The one Machine-log acknowledgement to append after its wake snapshot lands."""
+
+    ticket: str
+    launch: object
+    message: str
+
+
 class Wake(Exception):
     """A state the rule table settles by handing it to judgment; the loop exits on it.
 
@@ -378,11 +393,14 @@ class Wake(Exception):
     second time, and a state the table has no row for. Everything else the loop settles itself.
     """
 
-    def __init__(self, reason, ticket=None, pointer=None, **fields):
+    def __init__(self, reason, ticket=None, pointer=None, hand_over=None, **fields):
         super().__init__(reason)
         self.reason = reason
         self.ticket = ticket
         self.pointer = pointer
+        # Internal workflow intent, deliberately kept out of the JSON snapshot fields. The loop
+        # records it only after that snapshot has reached disk.
+        self.hand_over = hand_over
         self.fields = fields
 
 
@@ -459,6 +477,9 @@ def snapshot(reason, ticket=None, pointer=None, **fields):
     second: a coordinator that pastes the resume command the instant it is woken must not find a
     pid that was about to stop and attach to a driver already on its way out. The file is put in
     place by rename, because a waiter reading it half-written would read no wake at all.
+
+    Returns whether that atomic write landed. A caller whose next log fact promises the snapshot
+    exists can therefore append that fact only on success.
     """
     record = {"reason": reason, "ticket": ticket, "pointer": pointer}
     record.update(fields)
@@ -467,7 +488,7 @@ def snapshot(reason, ticket=None, pointer=None, **fields):
     run_dir = _run_in_hand
     put_down_run()
     if run_dir is None:
-        return
+        return False
     path = run_dir / WAKE_NAME
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
@@ -481,8 +502,9 @@ def snapshot(reason, ticket=None, pointer=None, **fields):
         temporary.unlink(missing_ok=True)
         print(f"crew: the wake snapshot could not be left in {path}: {error}",
               file=sys.stderr, flush=True)
-        return
+        return False
     re_type_resume(run_dir)
+    return True
 
 
 def re_type_resume(run_dir):
@@ -1148,6 +1170,15 @@ def clear_records(log):
     return records
 
 
+def resolved_run_dir(path):
+    """Resolve an operator's Run-directory form or raise the Driver's public error."""
+    path = pathlib.Path(path).resolve()
+    try:
+        return run_plan.resolve_run_dir(path)
+    except run_plan.RunPlanError as error:
+        raise DriverError(str(error), pointer=str(path)) from error
+
+
 def clear_run_data(run_dir):
     """Load the run table and log, keeping all paths at the recorded boundary."""
     table_path = run_dir / TABLE_NAME
@@ -1485,7 +1516,7 @@ def clear_actions(run_dir, run, log_path, plan):
 
 def run_clear(args):
     """Inventory a run, ask in the terminal, and clear only after an affirmative answer."""
-    run_dir = pathlib.Path(args.run_dir).resolve()
+    run_dir = resolved_run_dir(args.run_dir)
     run_plan_value, run, records, log_path = clear_run_data(run_dir)
     lines, plan = clear_inventory(run_dir, run_plan_value, run, records, log_path)
     print("\n".join(lines))
@@ -1748,7 +1779,7 @@ def run_start(args):
     feature_dir = pathlib.Path(args.feature_dir).resolve()
     if not feature_dir.is_dir():
         raise DriverError(f"{feature_dir} is not a feature directory", pointer=str(feature_dir))
-    run_dir = feature_dir / RUN_DIR_NAME
+    run_dir = run_plan.crew_state_dir(feature_dir)
     # Taken up before the first step that can fail, so that every way this start can end reaches
     # the coordinator's waiter: a wake is only written into a run this process has in hand, and a
     # repository root or a tmux session that cannot be resolved is as much a wake as any other.
@@ -1962,74 +1993,102 @@ def report_terminal_details(records, ticket, outcome):
 
 
 def report_rulings(records):
-    """Every ruling for display, with wrap-up leftovers paired to their placements."""
-    wrap_ups = {}
+    """Every ruling for display, with escalation items paired to listed placements."""
+    escalations = {}
     rendered = []
     for position, record in enumerate(records):
         ticket = str(record.get("ticket") or "run")
         if record.get("event") == "escalation":
-            previous = wrap_ups.pop(ticket, None)
+            previous = escalations.pop(ticket, None)
             if previous and previous["handed_over"] is not None:
                 rendered.append(previous["handed_over"])
             message = str(record.get("message") or "")
             verb, verb_line = machine_log.final_verb(message)
             words = verb_line.split() if verb == machine_log.ESCALATION_VERB else []
-            if len(words) >= 4 and words[3] == "wrap-up":
+            if len(words) >= 4:
+                kind = words[3]
                 leftovers = [
                     line for line in message.splitlines()
                     if line.strip() and line != verb_line
                 ]
-                if not leftovers and " — " in verb_line:
+                if kind == "wrap-up" and not leftovers and " — " in verb_line:
                     body = re.sub(r" ts=\d+$", "", verb_line.split(" — ", 1)[1]).strip()
                     if body:
                         leftovers.append(body)
-                wrap_ups[ticket] = {"leftovers": leftovers, "handed_over": None}
+                escalations[ticket] = {
+                    "kind": kind,
+                    "leftovers": leftovers,
+                    "handed_over": None,
+                }
             continue
         if record.get("event") != "ruling":
             continue
         message = str(record.get("message") or "")
-        wrap_up = wrap_ups.get(ticket)
-        if wrap_up:
-            leftovers = wrap_up["leftovers"]
+        escalation = escalations.get(ticket)
+        if escalation:
             lines = message.splitlines()
-            placements = []
-            for leftover in leftovers:
-                closed = {
-                    f"{leftover} — this ticket",
-                    f"{leftover} — dropped",
-                }
-                placement = next(
-                    (
-                        line for line in lines
-                        if line in closed or line.startswith(f"{leftover} — opened ")
-                    ),
-                    None,
-                )
-                if placement is not None:
-                    placements.append(placement)
-            if len(placements) == len(leftovers):
-                rendered.extend(
-                    (position, order, ticket, placement)
-                    for order, placement in enumerate(placements)
-                )
-                wrap_ups.pop(ticket, None)
-                continue
             if message.startswith(f"{HANDED_OVER_MARKER} "):
-                wrap_up["handed_over"] = (position, 0, ticket, message)
+                escalation["handed_over"] = (position, 0, ticket, message)
                 continue
-            if wrap_up["handed_over"] is not None:
-                rendered.append(wrap_up["handed_over"])
-            wrap_ups.pop(ticket, None)
+            placements = [line for line in lines if placement_line(line)]
+            if escalation["kind"] == "wrap-up":
+                paired = []
+                for leftover in escalation["leftovers"]:
+                    placement = next(
+                        (
+                            line for line in placements
+                            if placement_belongs_to(line, leftover)
+                        ),
+                        None,
+                    )
+                    if placement is not None:
+                        paired.append(placement)
+                placements = paired if len(paired) == len(escalation["leftovers"]) else []
+            if placements:
+                other_lines = [
+                    line for line in lines
+                    if line.strip() and not placement_line(line)
+                ]
+                if other_lines:
+                    rendered.append((position, 0, ticket, message))
+                else:
+                    rendered.extend(
+                        (position, order, ticket, placement)
+                        for order, placement in enumerate(placements)
+                    )
+                escalations.pop(ticket, None)
+                continue
+            if escalation["handed_over"] is not None:
+                rendered.append(escalation["handed_over"])
+            escalations.pop(ticket, None)
         rendered.append((position, 0, ticket, message))
     rendered.extend(
-        wrap_up["handed_over"]
-        for wrap_up in wrap_ups.values()
-        if wrap_up["handed_over"] is not None
+        escalation["handed_over"]
+        for escalation in escalations.values()
+        if escalation["handed_over"] is not None
     )
     return [
         (ticket, message)
         for _position, _order, ticket, message in sorted(rendered)
     ]
+
+
+def placement_line(line):
+    """Whether one ruling line names one of the placement grammar's four outcomes."""
+    return any(
+        line.endswith(marker) if marker in PLACEMENT_MARKERS[:2] else marker in line
+        for marker in PLACEMENT_MARKERS
+    )
+
+
+def placement_belongs_to(line, leftover):
+    """Whether one placement line rules the named wrap-up leftover."""
+    return any(
+        line == f"{leftover}{marker}"
+        if marker in PLACEMENT_MARKERS[:2]
+        else line.startswith(f"{leftover}{marker}")
+        for marker in PLACEMENT_MARKERS
+    )
 
 
 def report_undo_effects(records):
@@ -2605,7 +2664,10 @@ class Loop:
     # --- the rule table, row by row ---------------------------------------------------------
 
     def run_witness(self, ticket, launch, message):
-        """Run and record one escalation witness; returns its checked or failed document."""
+        """Run and record one escalation witness.
+
+        Returns its checked, partial or failed document.
+        """
         started = time.monotonic()
         witness_executor, witness_model, witness_budget_usd = run_plan.witness_routing(
             self.run.witness_model, self.run.witness_budget_usd
@@ -2616,6 +2678,8 @@ class Loop:
                 "brief": "",
                 "outcome": "failed",
                 "reason": str(reason).strip() or "witness process failed",
+                "covered_count": 0,
+                "uncovered_count": 0,
                 "duration_seconds": round(time.monotonic() - started, 3),
             }
 
@@ -2657,17 +2721,34 @@ class Loop:
         outcome = document.get("outcome")
         brief = document.get("brief")
         reason = document.get("reason")
+        covered_count = document.get("covered_count")
+        uncovered_count = document.get("uncovered_count")
         duration = document.get("duration_seconds")
+        coverage_is_sound = all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (covered_count, uncovered_count)
+        )
         sound = (
             outcome in machine_log.WITNESS_OUTCOMES
             and isinstance(brief, str)
             and isinstance(reason, str)
+            and coverage_is_sound
             and isinstance(duration, (int, float))
             and not isinstance(duration, bool)
             and duration >= 0
             and (
-                (outcome == "checked" and bool(brief) and not reason)
-                or (outcome == "failed" and not brief and bool(reason.strip()))
+                (
+                    outcome == "checked" and bool(brief) and not reason
+                    and not uncovered_count
+                )
+                or (
+                    outcome == "partial" and bool(brief) and bool(reason.strip())
+                    and bool(covered_count)
+                )
+                or (
+                    outcome == "failed" and not brief and bool(reason.strip())
+                    and not covered_count
+                )
             )
         )
         if not sound:
@@ -2684,6 +2765,8 @@ class Loop:
             "--outcome", document["outcome"],
             "--reason", document["reason"],
             "--duration-seconds", str(document["duration_seconds"]),
+            "--covered-count", str(document["covered_count"]),
+            "--uncovered-count", str(document["uncovered_count"]),
         ]
         counters = {
             "input": usage.get("input_tokens"),
@@ -2706,13 +2789,16 @@ class Loop:
         return document
 
     def hand_over(self, ticket, launch, message):
-        """Record that this escalation is the coordinator's now, and wake it; never returns.
+        """Check this escalation and raise the wake that hands it to the coordinator; never returns.
 
-        Written as the escalation is handed over rather than when the run comes back, because the
-        one thing the driver knows for certain is which escalation it is exiting on. Acknowledging
-        at resume instead would take in every escalation standing at that moment: two children
-        asking at once means one snapshot and two acknowledgements, and the ASK nobody was shown
-        would be settled unread.
+        The loop writes the wake snapshot atomically before it records the hand-over line. Written
+        there rather than when the run comes back, because the one thing the driver knows for
+        certain is which escalation it is exiting on. Acknowledging at resume instead would take in
+        every escalation standing at that moment: two children asking at once means one snapshot
+        and two acknowledgements, and the ASK nobody was shown would be settled unread. If the
+        snapshot write fails, no hand-over line is recorded and this escalation remains standing
+        for the next Driver. If the later log append fails, the complete wake remains authoritative,
+        the failure is printed in the Driver pane, and the escalation likewise remains open.
 
         The line is what the log has of the answer, too. A ruling sent through a child's tmux pane
         — the channel a permission prompt answers on — passes no hook and reaches no log, so
@@ -2720,16 +2806,19 @@ class Loop:
         never go on.
         """
         witness_result = self.run_witness(ticket, launch, message)
-        self.record_ruling(ticket, launch, HANDED_OVER.format(
-            marker=HANDED_OVER_MARKER, ticket=ticket
-        ))
+        handed_over = HandOverIntent(
+            ticket=ticket,
+            launch=launch,
+            message=HANDED_OVER.format(marker=HANDED_OVER_MARKER, ticket=ticket),
+        )
         raise Wake(
             JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
+            hand_over=handed_over,
             detail=message, brief=witness_result["brief"],
             child=launch.get("child"), window=launch.get("window"),
             **(
                 {"witness_reason": witness_result["reason"]}
-                if witness_result["outcome"] == "failed" else {}
+                if witness_result["outcome"] in ("partial", "failed") else {}
             ),
         )
 
@@ -3586,9 +3675,19 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
             print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
         return loop.run_until_woken()
     except Wake as wake:
-        snapshot(
+        landed = snapshot(
             wake.reason, ticket=wake.ticket, pointer=wake.pointer, resume=resume, **wake.fields
         )
+        if landed and wake.hand_over is not None:
+            try:
+                loop.record_ruling(
+                    wake.hand_over.ticket, wake.hand_over.launch, wake.hand_over.message
+                )
+            except DriverError as error:
+                # The coordinator already has the complete escalation snapshot. Keep that one
+                # coherent wake, leave the escalation open in the log, and make the append failure
+                # visible in the driver's own pane instead of emitting a conflicting second wake.
+                print(f"crew: {error}", file=sys.stderr, flush=True)
         return 0
     except DriverError as error:
         snapshot(
@@ -3618,7 +3717,7 @@ def resume_command(args):
 def run_resume(args):
     """Carry on the loop of a run already under way, once the coordinator has ruled."""
     feature_dir = pathlib.Path(args.feature_dir).resolve()
-    run_dir = feature_dir / RUN_DIR_NAME
+    run_dir = run_plan.crew_state_dir(feature_dir)
     table = run_dir / TABLE_NAME
     if not table.exists():
         raise DriverError(
@@ -3639,13 +3738,8 @@ def run_resume(args):
 
 def run_answer(args):
     """Deliver one coordinator answer on the recorded child's own channel; returns 0."""
-    run_dir = pathlib.Path(args.run_dir).resolve()
+    run_dir = resolved_run_dir(args.run_dir)
     table_path = run_dir / TABLE_NAME
-    if not table_path.exists():
-        raise DriverError(
-            f"{run_dir} holds no run to answer: {table_path} is not there",
-            pointer=str(run_dir),
-        )
     loop = Loop(args, run_dir, table_path)
     ticket = str(args.ticket)
     launch = machine_log.project(loop.records()).ticket(ticket).launch
@@ -3673,6 +3767,60 @@ def run_answer(args):
             ticket=ticket, pointer=str(loop.log),
         )
     loop.deliver(ticket, launch, args.text, args.keys)
+    return 0
+
+
+def plan_ticket(loop, reference):
+    """Resolve one reference through this Run plan or name its outside-plan state."""
+    reference = str(reference)
+    try:
+        return loop.plan.ticket(reference)
+    except run_plan.RunPlanError as error:
+        raise DriverError(
+            f"ticket {reference} has state outside-run-plan: {error}",
+            ticket=reference,
+            pointer=str(loop.table_path),
+        ) from error
+
+
+def run_defer(args):
+    """Put one finding on a pending target, then deliver and record that placement."""
+    run_dir = resolved_run_dir(args.run_dir)
+    loop = Loop(args, run_dir, run_dir / TABLE_NAME)
+    source_ticket = plan_ticket(loop, args.ticket)
+    target_ticket = plan_ticket(loop, args.to)
+    source = source_ticket.id
+    target = target_ticket.id
+    if source == target:
+        raise DriverError(
+            f"ticket {target} has state source, not pending", ticket=target, pointer=str(loop.log)
+        )
+    projection = machine_log.project(loop.records())
+    launch = projection.ticket(source).launch
+    if launch is None:
+        raise DriverError(
+            f"{source} has no recorded child in {loop.log}", ticket=source, pointer=str(loop.log)
+        )
+    if projection.ticket(target).launch is not None:
+        raise DriverError(
+            f"ticket {target} has state launched, not pending",
+            ticket=target,
+            pointer=str(loop.log),
+        )
+    finding = args.text
+    if not isinstance(finding, str) or not finding.strip():
+        raise DriverError(
+            "a deferral needs --text naming the finding and its pointers",
+            ticket=source,
+            pointer=str(loop.log),
+        )
+    body = f"Deferred from #{source}:\n\n{finding}"
+    try:
+        locator = tracker.comment(loop.run.tracker, target_ticket, body)
+    except tracker.TrackerError as error:
+        raise DriverError(str(error), ticket=target, pointer=str(loop.table_path)) from error
+    ruling = f"{finding} — deferred #{target} (comment: {locator})"
+    loop.deliver(source, launch, ruling)
     return 0
 
 
@@ -3772,6 +3920,17 @@ def build_parser():
     answer.add_argument(
         "--key", dest="keys", action="append", default=[], metavar="KEY",
         help="a permission-prompt key name; repeat for a sequence (Claude children only)",
+    )
+    defer = commands.add_parser(
+        "defer", help="comment a finding on a pending ticket, then deliver and record its placement"
+    )
+    defer.set_defaults(handler=run_defer)
+    defer.add_argument("--run-dir", required=True, help="the recorded run directory")
+    defer.add_argument("--ticket", required=True, help="the ticket whose finding is being placed")
+    defer.add_argument("--to", required=True, help="the pending target ticket in this Run plan")
+    defer.add_argument(
+        "--text", required=True,
+        help="the finding exactly as the child stated it, with pointers",
     )
     return parser
 

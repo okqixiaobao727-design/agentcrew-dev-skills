@@ -48,7 +48,8 @@ asking its sender for exactly what it lacks.
 and the child writes the edit: product code belongs to a child, merge-conflict resolution included.
 
 **Leftovers are yours to place.** A `wrap-up` lists what a finished ticket leaves behind; rule
-each line into this ticket, a new ticket you open seeded from that line, or dropped.
+each line into this ticket, a new ticket you open seeded from that line, an existing pending ticket
+you defer it to through the Driver, or dropped.
 
 **The human hears from you for a decision that is theirs** — product direction, a material change
 of architecture, a widening of product scope, an action with no undo — and asks you for anything

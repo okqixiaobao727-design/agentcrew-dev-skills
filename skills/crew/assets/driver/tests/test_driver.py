@@ -59,12 +59,14 @@ from harness import (
     UNREWRITABLE,
     WAITER_RECORD,
     WAKE_NAME,
+    WITNESS,
     WITNESS_BRIEF,
     WITNESS_BUDGET_USD,
     WITNESS_FAILURE,
     WITNESS_MODEL,
     WITNESS_OVERRUN,
     git,
+    run_plan,
     routing_naming,
 )
 
@@ -212,6 +214,74 @@ class ReportSelectionTests(unittest.TestCase):
             driver_module.report_rulings(records),
             [("7", "CREW RULED 7 — handed over")],
         )
+
+    def test_a_doc_conflict_deferred_placement_replaces_its_hand_over_in_the_report(self):
+        finding = "The later ticket owns this failure — skills/example.py:12"
+        locator = "https://github.example.invalid/issues/46#issuecomment-7001"
+        placement = f"{finding} — deferred #46 (comment: {locator})"
+        records = (
+            {
+                "event": "escalation",
+                "ticket": "45",
+                "message": f"{finding}\nCREW ASK 45 doc-conflict ts=1",
+            },
+            {
+                "event": "ruling",
+                "ticket": "45",
+                "message": "CREW RULED 45 — handed over",
+            },
+            {"event": "ruling", "ticket": "45", "message": placement},
+        )
+
+        self.assertEqual(driver_module.report_rulings(records), [("45", placement)])
+
+    def test_a_placement_does_not_discard_other_lines_from_the_same_ruling(self):
+        placement = "Carry the later work — opened #47"
+        instruction = "Proceed with approach B now; keep the old flag until then."
+        message = f"{placement}\n{instruction}"
+        records = (
+            {
+                "event": "escalation",
+                "ticket": "45",
+                "message": "The documents conflict\nCREW ASK 45 doc-conflict ts=1",
+            },
+            {
+                "event": "ruling",
+                "ticket": "45",
+                "message": "CREW RULED 45 — handed over",
+            },
+            {"event": "ruling", "ticket": "45", "message": message},
+        )
+
+        self.assertEqual(driver_module.report_rulings(records), [("45", message)])
+
+
+class DeferralDocumentationTests(unittest.TestCase):
+    def test_the_fourth_placement_and_tracker_comment_slice_are_documented(self):
+        crew_skill = TRIAGE.parent.parent / "SKILL.md"
+        repository = DRIVER.parents[4]
+        glossary = repository / "docs" / "glossary.md"
+        tracker_adr = (
+            repository / "docs" / "adr"
+            / "0019-tracker-owns-ticket-operations-callers-own-workflow.md"
+        )
+        trackers = repository / "references" / "trackers.md"
+
+        triage = TRIAGE.read_text(encoding="utf-8")
+        self.assertIn(
+            "<leftover line as the child wrote it> — deferred <ticket reference>", triage
+        )
+        self.assertIn("driver.py defer", triage)
+        self.assertIn("comment locator", triage)
+        self.assertIn("an existing pending ticket", crew_skill.read_text(encoding="utf-8"))
+        glossary_text = " ".join(glossary.read_text(encoding="utf-8").split())
+        self.assertIn("deferred to an existing pending ticket", glossary_text)
+        adr = tracker_adr.read_text(encoding="utf-8")
+        self.assertIn("comment landed in #174", adr)
+        self.assertIn("read, edit, mark and close remain deferred", adr)
+        tracker_text = trackers.read_text(encoding="utf-8")
+        self.assertIn("path:line", tracker_text)
+        self.assertIn("further `Crew:` comment block", " ".join(tracker_text.split()))
 
 
 class PreflightTests(DriverTestCase):
@@ -1294,10 +1364,15 @@ class LoopTests(DriverTestCase):
             git(self.fixture.repo, "add", "shared.txt")
         self.fixture.commit_feature()
 
-    def start(self, *tickets, shared=None, extra=(), env_overrides=None, routing=ROUTING):
+    def start(
+        self, *tickets, shared=None, extra=(), env_overrides=None, routing=ROUTING,
+        driver=DRIVER,
+    ):
         """A run with its first wave up and its loop running."""
         self.feature(*tickets, shared=shared, routing=routing)
-        process = self.fixture.launch(extra=extra, env_overrides=env_overrides)
+        process = self.fixture.launch(
+            extra=extra, env_overrides=env_overrides, driver=driver,
+        )
         for number, _ in tickets:
             if not _:
                 self.assertTrue(
@@ -2231,6 +2306,61 @@ class LoopTests(DriverTestCase):
         self.assertIn("resume", snapshot)
         self.assertIsNone(self.verdict("01"), "an answered ASK is not an outcome")
 
+    def test_hand_over_line_is_appended_only_after_the_wake_snapshot_lands(self):
+        observation = self.fixture.root / "hand-over-observation"
+        driver = self.fixture.driver_with_hand_over_log_hook()
+        process = self.start(("01", ()), driver=driver, env_overrides={
+            "AGENTCREW_TEST_HAND_OVER_OBSERVATION": str(observation),
+            "AGENTCREW_TEST_RUN_DIR": str(self.fixture.run_dir),
+        })
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        wake_path = self.fixture.run_dir / WAKE_NAME
+        hand_overs = self.instructions("01", "CREW RULED")
+        self.assertTrue(wake_path.is_file(), "the hand-over line exists without wake.json")
+        self.assertEqual(len(hand_overs), 1, hand_overs)
+        self.assertEqual(observation.read_text(), "present\n")
+        facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
+        self.assertFalse(facts.fact_check_running)
+        self.assertTrue(facts.awaiting_ruling)
+        self.assertEqual(json.loads(wake_path.read_text()), snapshot)
+
+    def test_a_snapshot_write_failure_leaves_no_hand_over_line_and_the_escalation_open(self):
+        process = self.start(("01", ()))
+        wake_path = self.fixture.run_dir / WAKE_NAME
+        wake_path.mkdir()
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.instructions("01", "CREW RULED"), [])
+        facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
+        self.assertTrue(facts.fact_check_running)
+        self.assertFalse(facts.awaiting_ruling)
+
+    def test_a_hand_over_log_failure_is_visible_and_leaves_the_escalation_open(self):
+        observation = self.fixture.root / "failed-hand-over-observation"
+        driver = self.fixture.driver_with_hand_over_log_hook()
+        process = self.start(("01", ()), driver=driver, env_overrides={
+            "AGENTCREW_TEST_HAND_OVER_APPEND": "fail",
+            "AGENTCREW_TEST_HAND_OVER_OBSERVATION": str(observation),
+            "AGENTCREW_TEST_RUN_DIR": str(self.fixture.run_dir),
+        })
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        result = self.fixture.ended(process)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub hand-over append failed", result.stderr)
+        self.assertEqual(observation.read_text(), "present\n")
+        self.assertTrue((self.fixture.run_dir / WAKE_NAME).is_file())
+        self.assertEqual(self.instructions("01", "CREW RULED"), [])
+        facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
+        self.assertTrue(facts.fact_check_running)
+        self.assertFalse(facts.awaiting_ruling)
+
     def test_a_wrap_up_crew_ask_wakes_the_coordinator_carrying_the_ticket_and_ask(self):
         """Wrap-up is an ordinary escalation rather than a settling receipt."""
         process = self.start(("01", ()))
@@ -2274,6 +2404,111 @@ class LoopTests(DriverTestCase):
         self.assertEqual(len(witness), 1, witness)
         self.assertEqual(witness[0]["outcome"], "failed")
         self.assertEqual(witness[0]["reason"], WITNESS_FAILURE)
+        self.assertEqual(witness[0]["covered_count"], 0)
+        self.assertEqual(witness[0]["uncovered_count"], 1)
+
+    def test_a_partial_witness_wakes_with_its_brief_reason_and_coverage(self):
+        brief = "README.md:1 — held — the fixture file exists"
+        structured_output = {
+            "cited": [{
+                "pointer": "README.md:1",
+                "status": "held",
+                "reason": "the fixture file exists",
+            }],
+            "uncited": [],
+        }
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
+            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
+        })
+
+        message = "CREW ASK 01 scope — check README.md:1, #130 and ADR-0004 ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["brief"], brief)
+        self.assertIn("#130", snapshot["witness_reason"])
+        self.assertIn("ADR-0004", snapshot["witness_reason"])
+        witness = self.events("witness", ticket="01")[0]
+        self.assertEqual(witness["outcome"], "partial")
+        self.assertEqual(witness["covered_count"], 1)
+        self.assertEqual(witness["uncovered_count"], 2)
+        self.assertEqual(snapshot["witness_reason"], witness["reason"])
+
+    def test_a_structural_partial_forwards_zero_uncovered_without_rederiving_it(self):
+        brief = "\n".join((
+            "README.md:1 — held — the fixture file exists",
+            "#130 — held — the ticket exists",
+            "ADR-0004 — held — the decision exists",
+            "uncited docs/context.md:7 — held — the extra context exists",
+        ))
+        structured_output = {
+            "cited": [
+                {
+                    "pointer": "README.md:1",
+                    "status": "held",
+                    "reason": "the fixture file exists",
+                },
+                {
+                    "pointer": "#130",
+                    "status": "held",
+                    "reason": "the ticket exists",
+                },
+                {
+                    "pointer": "ADR-0004",
+                    "status": "held",
+                    "reason": "the decision exists",
+                },
+                {
+                    "pointer": "docs/context.md:7",
+                    "status": "held",
+                    "reason": "the extra context exists",
+                },
+            ],
+            "uncited": [],
+        }
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
+            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
+        })
+
+        message = "CREW ASK 01 scope — check README.md:1, #130 and ADR-0004 ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        witness = self.events("witness", ticket="01")[0]
+        self.assertEqual(snapshot["brief"], brief)
+        self.assertIn("extra cited", snapshot["witness_reason"])
+        self.assertEqual(witness["outcome"], "partial")
+        self.assertEqual(witness["covered_count"], 3)
+        self.assertEqual(witness["uncovered_count"], 0)
+        self.assertEqual(snapshot["witness_reason"], witness["reason"])
+
+    def test_a_pointer_free_escalation_keeps_the_witness_uncited_brief(self):
+        brief = "uncited #200 — held — the follow-up ticket exists"
+        structured_output = {
+            "cited": [],
+            "uncited": [{
+                "pointer": "#200",
+                "status": "held",
+                "reason": "the follow-up ticket exists",
+            }],
+        }
+        process = self.start(("01", ()), env_overrides={
+            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
+            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
+        })
+
+        message = "CREW ASK 01 wrap-up — place the remaining follow-up ts=1"
+        self.fixture.says("01", message)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["brief"], brief)
+        self.assertNotIn("witness_reason", snapshot)
+        witness = self.events("witness", ticket="01")[0]
+        self.assertEqual(witness["outcome"], "checked")
+        self.assertEqual(witness["covered_count"], 0)
+        self.assertEqual(witness["uncovered_count"], 0)
 
     def test_an_overrun_witness_still_wakes_with_the_timeout_reason(self):
         process = self.start(("01", ()), env_overrides={
@@ -2344,6 +2579,8 @@ class LoopTests(DriverTestCase):
         self.assertEqual(witness[0]["model"], model)
         self.assertEqual(witness[0]["outcome"], "checked")
         self.assertEqual(witness[0]["reason"], "")
+        self.assertEqual(witness[0]["covered_count"], 1)
+        self.assertEqual(witness[0]["uncovered_count"], 0)
         self.assertGreaterEqual(witness[0]["duration_seconds"], 0)
         self.assertEqual(witness[0]["input_tokens"], 11)
         self.assertEqual(witness[0]["output_tokens"], 22)
@@ -3078,6 +3315,243 @@ class WakeWithNoWaiterTests(DriverTestCase):
         self.assertEqual(self.re_typed(), [self.resume_line(), self.resume_line()])
 
 
+class DeferTests(DriverTestCase):
+    def start(self, tracker="github", target_blocked=True):
+        self.fixture.configure(tracker=tracker)
+        self.fixture.ticket("01", "reviewed ticket")
+        self.fixture.ticket(
+            "02", "later ticket", blocked_by=(("01",) if target_blocked else ())
+        )
+        if tracker == "github":
+            ticket_path = self.fixture.feature_dir / "02.md"
+            ticket_path.write_text(
+                ticket_path.read_text(encoding="utf-8").replace(
+                    "# later ticket\n",
+                    "# later ticket\n\n"
+                    "Ticket: https://github.example.invalid/issues/02 — the issue body and every"
+                    " comment are this ticket; read all of it.\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+        self.fixture.commit_feature()
+        if tracker == "github":
+            self.fixture.issues({
+                "01": {"labels": [], "closed": False, "comments": []},
+                "02": {
+                    "labels": [],
+                    "closed": False,
+                    "comments": [],
+                    "url": "https://github.example.invalid/issues/02",
+                },
+            })
+        process = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "01 never launched",
+        )
+        if target_blocked:
+            self.assertIsNone(
+                self.fixture.launch_record("02"), "the later ticket already launched"
+            )
+        else:
+            self.assertTrue(
+                self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+                "02 never launched",
+            )
+        return process
+
+    def defer(self, *arguments, to="02"):
+        return subprocess.run(
+            [
+                sys.executable, str(DRIVER), "defer",
+                "--run-dir", str(self.fixture.run_dir),
+                "--ticket", "01", "--to", to, *arguments,
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+    def test_text_is_a_required_cli_argument(self):
+        with self.assertRaises(SystemExit):
+            driver_module.build_parser().parse_args([
+                "defer", "--run-dir", "run", "--ticket", "01", "--to", "02",
+            ])
+
+    def test_github_defer_comments_before_delivering_and_records_the_opaque_locator(self):
+        self.start()
+        finding = "The later ticket must keep this pointer — skills/example.py:12"
+        locator = "https://github.example.invalid/issues/02#issuecomment-1"
+        ruling = f"{finding} — deferred #02 (comment: {locator})"
+
+        first = self.defer("--text", finding)
+        second = self.defer("--text", finding)
+
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(
+            self.fixture.issues()["02"]["comments"],
+            [f"Deferred from #01:\n\n{finding}"],
+        )
+        comments = [
+            call for call in self.fixture.gh_calls()
+            if call["argv"][:3] == ["issue", "comment", "02"]
+        ]
+        self.assertEqual(len(comments), 1)
+        typed = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ]
+        self.assertEqual(typed[-2:][0][-1], ruling)
+        self.assertEqual(typed[-2:][1][-1], ruling)
+        rulings = self.events("ruling", ticket="01")
+        self.assertEqual([record["message"] for record in rulings[-2:]], [ruling, ruling])
+
+    def test_local_defer_writes_only_the_staged_copy_and_keeps_each_distinct_finding(self):
+        original = self.fixture.repo / "tickets" / "02.md"
+        original.parent.mkdir()
+        original.write_text("# Original local ticket\n", encoding="utf-8")
+        original_before = original.read_text(encoding="utf-8")
+        self.start(tracker="local")
+        staged = self.fixture.feature_dir / "02.md"
+        first = "First finding — alpha.py:10"
+        second = "Second finding — beta.py:20"
+
+        first_result = self.defer("--text", first)
+        second_result = self.defer("--text", second)
+
+        self.assertEqual(first_result.returncode, 0, first_result.stdout + first_result.stderr)
+        self.assertEqual(second_result.returncode, 0, second_result.stdout + second_result.stderr)
+        self.assertEqual(original.read_text(encoding="utf-8"), original_before)
+        staged_text = staged.read_text(encoding="utf-8")
+        self.assertIn(f"Crew: Deferred from #01:\n\n{first}", staged_text)
+        self.assertIn(f"Crew: Deferred from #01:\n\n{second}", staged_text)
+        rulings = self.events("ruling", ticket="01")[-2:]
+        staged_lines = staged_text.splitlines()
+        for record, finding in zip(rulings, (first, second), strict=True):
+            prefix = f"{finding} — deferred #02 (comment: "
+            self.assertTrue(record["message"].startswith(prefix), record["message"])
+            match = re.search(r"\(comment: (.*):(\d+)\)$", record["message"])
+            self.assertIsNotNone(match, record["message"])
+            self.assertEqual(match.group(1), str(staged))
+            line = int(match.group(2))
+            self.assertEqual(staged_lines[line - 1], "Crew: Deferred from #01:")
+            self.assertIn(finding, "\n".join(staged_lines[line - 1:line + 3]))
+
+    def test_a_target_outside_the_plan_or_equal_to_the_source_is_refused_without_effects(self):
+        self.start()
+        before_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+
+        for target, state in (("99", "outside-run-plan"), ("01", "source")):
+            with self.subTest(target=target):
+                result = self.defer("--text", "Finding — pointer.py:1", to=target)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                snapshot = self.snapshot(result)
+                self.assertEqual(snapshot["reason"], "driver-error")
+                self.assertEqual(snapshot["ticket"], target)
+                self.assertIn(f"ticket {target}", snapshot["detail"])
+                self.assertIn(f"state {state}", snapshot["detail"])
+
+        self.assertEqual(self.fixture.issues()["02"]["comments"], [])
+        after_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+        self.assertEqual(after_typed, before_typed)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_github_target_first_turn_reaches_the_comment_before_the_target_launches(self):
+        process = self.start()
+        finding = "Finding for the later child — pointer.py:1"
+        result = self.defer("--text", finding)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        self.fixture.completes("01")
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the target never launched after its comment landed",
+        )
+        self.assertIsNone(process.poll(), "the run stopped before the target could read its ticket")
+        self.assertEqual(
+            self.fixture.issues()["02"]["comments"],
+            [f"Deferred from #01:\n\n{finding}"],
+        )
+        ticket_path = self.fixture.feature_dir / "02.md"
+        self.assertIn("https://github.example.invalid/issues/02", ticket_path.read_text())
+        turn = (self.fixture.run_dir / "launch" / "02.turn.txt").read_text()
+        self.assertIn(str(ticket_path), turn)
+        self.assertIn("read its body and every comment", turn)
+
+    def test_local_target_first_turn_reaches_the_staged_comment_before_launch(self):
+        process = self.start(tracker="local")
+        finding = "Finding for the later child — pointer.py:1"
+        result = self.defer("--text", finding)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ticket_path = self.fixture.feature_dir / "02.md"
+        expected = f"Crew: Deferred from #01:\n\n{finding}"
+        self.assertIn(expected, ticket_path.read_text())
+
+        self.fixture.completes("01")
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the target never launched after its staged comment landed",
+        )
+        self.assertIsNone(process.poll(), "the run stopped before the target could read its ticket")
+        self.assertIn(expected, ticket_path.read_text())
+        turn = (self.fixture.run_dir / "launch" / "02.turn.txt").read_text()
+        self.assertIn(str(ticket_path), turn)
+
+    def test_any_launched_target_is_refused_without_reading_its_live_state(self):
+        self.start(target_blocked=False)
+        before_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+
+        result = self.defer("--text", "Finding — pointer.py:1")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn("ticket 02 has state launched, not pending", snapshot["detail"])
+        self.assertEqual(self.fixture.issues()["02"]["comments"], [])
+        after_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+        self.assertEqual(after_typed, before_typed)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_a_tracker_comment_failure_writes_no_delivery_or_ruling(self):
+        self.start()
+        (self.fixture.stub_dir / "gh-comment-fails").touch()
+        before_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+
+        result = self.defer("--text", "Finding — pointer.py:1")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn("tracker refused the comment", snapshot["detail"])
+        self.assertEqual(self.fixture.issues()["02"]["comments"], [])
+        after_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+        self.assertEqual(after_typed, before_typed)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+
 class AnswerTests(DriverTestCase):
     def start(self, routing=ROUTING):
         self.fixture.ticket("01", "first thing", routing=routing)
@@ -3125,6 +3599,74 @@ class AnswerTests(DriverTestCase):
         self.assertEqual(ruling["role"], "coordinator")
         self.assertEqual(ruling["to"], "stub-child-1")
         self.assertEqual(ruling["message"], text)
+
+    def test_answer_accepts_the_run_directory_from_the_wake_resume_command(self):
+        process = self.start()
+        self.fixture.says("01", "CREW ASK 01 design — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+        resume = shlex.split(snapshot["resume"])
+        run_dir = resume[resume.index(str(LAUNCH)) + 1]
+        text = "Use the existing retention_audit table"
+
+        result = subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer", "--run-dir", run_dir,
+                "--ticket", "01", "--text", text,
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        ruling = self.events("ruling", ticket="01")[-1]
+        self.assertEqual(ruling["message"], text)
+
+    def test_witness_ask_accepts_the_run_directory_from_the_wake_resume_command(self):
+        process = self.start()
+        self.fixture.says("01", "CREW ASK 01 design — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+        resume = shlex.split(snapshot["resume"])
+        run_dir = resume[resume.index(str(LAUNCH)) + 1]
+        environment = self.fixture.environment()
+        environment["AGENTCREW_STUB_WITNESS_BRIEF"] = WITNESS_BRIEF
+        environment["AGENTCREW_STUB_WITNESS_OUTPUT"] = json.dumps({
+            "claims": [{"claim": "Use the existing table", "pointers": ["#01"]}],
+        })
+
+        result = subprocess.run(
+            [
+                sys.executable, str(WITNESS), "ask", "--run", run_dir,
+                "--ticket", "01", "--question", "Which table should the ticket use?",
+            ],
+            capture_output=True, text=True,
+            env=environment, cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], "Use the existing table — #01")
+
+    def test_answer_reports_the_checked_path_and_accepted_forms_for_a_wrong_directory(self):
+        run_dir = self.fixture.feature_dir / "missing-run"
+
+        result = subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer", "--run-dir", str(run_dir),
+                "--ticket", "01", "--text", "Use the existing table",
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(
+            str(run_dir / run_plan.CREW_STATE_DIR_NAME / "wave-table.json"),
+            snapshot["detail"],
+        )
+        self.assertIn("<feature-dir>/.crew", snapshot["detail"])
 
     def test_text_left_in_the_composer_is_not_recorded_as_delivered(self):
         self.start()

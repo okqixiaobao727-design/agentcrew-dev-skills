@@ -8,6 +8,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- Dashboard rows and the run summary now show a Witness fact-check with elapsed seconds while it
+  runs. An escalation becomes awaiting-ruling only after its atomic wake snapshot has landed, so
+  an in-progress check no longer looks like a missed ASK (#173).
 - The machine-log tests no longer inherit the ambient `CLAUDE_CODE_SESSION_ID`. An install scopes
   its hook to the session it ran in, so a suite run from inside a Claude Code session pinned a
   session the tests never send and the bounded-read hook silently passed the tool through.

@@ -40,6 +40,10 @@ MONITOR_SPEC.loader.exec_module(MONITOR_MODULE)
 LAUNCH_TS = "2026-08-13T09:00:00Z"
 NOW_TS = "2026-08-13T09:12:31Z"
 LIVE_ELAPSED = "00:12:31"
+# The example in #173: 09:10:08 to the drawn moment is exactly 143 whole seconds.
+FACT_CHECK_TS = "2026-08-13T09:10:08Z"
+FACT_CHECK_ANNOTATION = "fact-check running · 143s"
+FACT_CHECK_RUNNING = "⏳ fact-check running"
 SETTLED_TS = "2026-08-13T09:41:07Z"
 SETTLED_ELAPSED = "00:41:07"
 # The moment a merge blew up on a ticket that already had its receipt, and the moment the wave
@@ -1174,13 +1178,105 @@ class DashboardTests(MonitorTestCase):
         result = self.fixture.dashboard()
 
         self.assertEqual(frame(result.stdout), "\n".join([
-            f"crew {RUN_ID} — wave 1/2 · pending=1 running=1 waiting=1 · elapsed {LIVE_ELAPSED}",
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=1 waiting=1 · "
+            f"{FACT_CHECK_RUNNING} · elapsed {LIVE_ELAPSED}",
             header(),
             row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
             row("1", "07", TITLES["07"], CODEX_LANE, "waiting", LIVE_ELAPSED),
+            "  ↳ fact-check running · 0s",
             f"  ↳ last event: escalation · {NOW_TS}",
             row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
         ]))
+
+    def test_an_escalation_draws_its_fact_check_elapsed_in_the_row_and_summary(self):
+        self.launch_wave_one()
+        self.fixture.append(
+            REVIEW_TS, "escalation", ticket="07", role="child",
+            message="CREW ASK 07 design — first occurrence",
+        )
+        self.fixture.append(
+            REVIEW_TS, "ruling", ticket="07", role="coordinator",
+            message="CREW RULED 07 — this escalation was handed to the coordinator",
+        )
+        self.fixture.append(
+            REVIEW_TS, "ruling", ticket="07", role="coordinator", message="Choose option A."
+        )
+        self.fixture.append(
+            FACT_CHECK_TS, "escalation", ticket="07", role="child",
+            message="CREW ASK 07 design — newer occurrence",
+        )
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f" · {FACT_CHECK_RUNNING} · elapsed {LIVE_ELAPSED}", result.stdout)
+        self.assertIn(f"\n  ↳ {FACT_CHECK_ANNOTATION}\n", result.stdout)
+        self.assertNotIn("fact-check running · 151s", result.stdout)
+        self.assertNotIn(AWAITING_RULING, result.stdout)
+
+    def test_every_witness_outcome_remains_fact_check_running_until_hand_over(self):
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        outcomes = {
+            "checked": {"reason": "", "covered_count": 1, "uncovered_count": 0},
+            "partial": {
+                "reason": "one pointer was omitted", "covered_count": 1,
+                "uncovered_count": 1,
+            },
+            "failed": {"reason": "witness failed", "covered_count": 0, "uncovered_count": 1},
+        }
+        for outcome, fields in outcomes.items():
+            with self.subTest(outcome=outcome):
+                self.fixture.append(
+                    FACT_CHECK_TS, "escalation", ticket="07", role="child",
+                    message=f"CREW ASK 07 design — {outcome}",
+                )
+                self.fixture.append(
+                    NOW_TS, "witness", ticket="07", outcome=outcome,
+                    executor="claude", model=MODEL, duration_seconds=143, **fields,
+                )
+
+                result = self.fixture.dashboard()
+
+                self.assertIn(FACT_CHECK_RUNNING, result.stdout)
+                self.assertIn(FACT_CHECK_ANNOTATION, result.stdout)
+                self.assertNotIn(AWAITING_RULING, result.stdout)
+                self.fixture.append(
+                    NOW_TS, "ruling", ticket="07", role="coordinator",
+                    message="CREW RULED 07 — this escalation was handed to the coordinator",
+                )
+                self.fixture.append(
+                    NOW_TS, "ruling", ticket="07", role="coordinator",
+                    message="Choose option A.",
+                )
+
+    def test_hand_over_replaces_fact_check_with_awaiting_ruling_until_the_answer(self):
+        self.launch_wave_one()
+        self.fixture.append(
+            FACT_CHECK_TS, "escalation", ticket="07", role="child",
+            message="CREW ASK 07 design — choose the projection fact",
+        )
+        self.fixture.append(
+            NOW_TS, "ruling", ticket="07", role="coordinator",
+            message="CREW RULED 07 — this escalation was handed to the coordinator",
+        )
+        self.fixture.live({"06": "busy", "07": "busy"})
+
+        handed_over = self.fixture.dashboard()
+
+        self.assertNotIn(FACT_CHECK_RUNNING, handed_over.stdout)
+        self.assertNotIn(FACT_CHECK_ANNOTATION, handed_over.stdout)
+        self.assertIn(AWAITING_RULING, handed_over.stdout)
+
+        self.fixture.append(
+            NOW_TS, "ruling", ticket="07", role="coordinator", message="Choose option A."
+        )
+        answered = self.fixture.dashboard()
+
+        self.assertNotIn(FACT_CHECK_RUNNING, answered.stdout)
+        self.assertNotIn(AWAITING_RULING, answered.stdout)
 
     def test_a_ticket_under_review_carries_the_review_lane_state_and_elapsed_beneath_it(self):
         self.launch_wave_one()
@@ -2433,6 +2529,10 @@ class PinTests(MonitorTestCase):
 
     def test_the_frame_is_the_dashboards_frame_for_the_same_run_at_the_same_moment(self):
         self.live_run()
+        self.fixture.append(
+            FACT_CHECK_TS, "escalation", ticket="07", role="child",
+            message="CREW ASK 07 design — choose the projection fact",
+        )
         self.fixture.pin()
 
         drawn = self.fixture.pin_frame()
@@ -2442,8 +2542,10 @@ class PinTests(MonitorTestCase):
         self.assertEqual(ANSI.sub("", drawn.stdout), dashboard.stdout)
         self.assertEqual(
             frame(dashboard.stdout).splitlines()[0],
-            f"crew {RUN_ID} — wave 1/2 · pending=1 running=2 · elapsed {LIVE_ELAPSED}",
+            f"crew {RUN_ID} — wave 1/2 · pending=1 running=2 · {FACT_CHECK_RUNNING} · "
+            f"elapsed {LIVE_ELAPSED}",
         )
+        self.assertIn(f"\n  ↳ {FACT_CHECK_ANNOTATION}\n", dashboard.stdout)
 
     def test_the_state_column_is_coloured_even_though_stdout_is_a_pipe(self):
         self.live_run()
@@ -3646,7 +3748,8 @@ class CostTests(MonitorTestCase):
         )
         self.fixture.append(
             LAUNCH_TS, "witness", ticket="06", executor="codex",
-            model="gpt-5.6-luna", outcome="checked", reason="",
+            model="gpt-5.6-luna", outcome="partial", reason="uncovered pointer",
+            covered_count=10, uncovered_count=2,
             duration_seconds=2.5, input_tokens=1, output_tokens=2,
             cache_read_tokens=3, cache_creation_tokens=4, total_tokens=10,
         )

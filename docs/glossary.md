@@ -283,17 +283,22 @@ public interface that the child cannot make alone, most often before its first e
 phase's decision points travel as one `design` escalation, the child's own pick marked on each.
 
 **Witness brief** — A pointer-backed, fact-only result from one fresh, read-only, budget-capped
-Witness session. An escalation `check` marks each cited pointer held, contradicted or missing and is
-launched automatically by the driver, or by the child before sending in a run without a driver. An
-`ask` is coordinator-initiated and returns independently stated factual claims, each with at least
-one pointer. Both carry no recommendation or ruling.
+Witness session. An escalation `check` receives the normalised cited-pointer list as an exact,
+numbered input and marks each covered pointer held, contradicted or missing. `checked` carries all
+findings and no reason; `partial` carries the usable covered findings plus a reason naming each
+omitted or structurally rejected expected pointer. Repeated and out-of-order expected pointers stay
+out of the brief, while extra cited pointers become uncited findings. `failed` carries no brief. The
+Driver launches `check` automatically, or a child launches
+it before sending in a run without a driver. An `ask` is coordinator-initiated and returns
+independently stated factual claims, each with at least one pointer. Both operations carry no
+recommendation or ruling.
 _Avoid_: research, verification
 
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers
 remain: one line per leftover — what it is, its pointer, and whether it touches only this ticket
 or another ticket or a public interface — with no recommendation. The coordinator rules each line:
-fixed in this ticket, opened as a ticket seeded from that line, or dropped. A completion with no
-leftovers is a receipt, not a wrap-up.
+fixed in this ticket, opened as a ticket seeded from that line, deferred to an existing pending
+ticket through the Driver, or dropped. A completion with no leftovers is a receipt, not a wrap-up.
 _Avoid_: tail, follow-up list
 
 **Bounded read** — The coordinator's file boundary is a kind line. Maintainer-authored judgment
@@ -362,6 +367,12 @@ frame is drawn is different. The window is unchanged and stays the default
 ([ADR-0008](adr/0008-the-pinned-dashboard-lives-in-claude-codes-statusline.md)).
 
 ## Artefacts
+
+**Run directory** — Either accepted path spelling for one recorded Run: its `<feature-dir>`, which
+is the form `/crew` and wake snapshots print, or its `<feature-dir>/.crew` **state directory**.
+The state directory holds the Wave table, Machine log and live run records. Operator-facing readers
+use `run_plan.resolve_run_dir` to resolve either form to that state directory and reject a path that
+holds no recorded Run.
 
 **Crew worktree** — A Run's dedicated checkout. The Driver performs the run's Git operations there
 while the checkout from which the Coordinator invoked `/crew` remains untouched.

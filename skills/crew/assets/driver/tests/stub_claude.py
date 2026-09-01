@@ -103,10 +103,15 @@ def main():
             shaped = line.removeprefix("uncited ")
             pointer, status, reason = shaped.split(" — ", 2)
             target.append({"pointer": pointer, "status": status, "reason": reason})
+        structured_output = os.environ.get("AGENTCREW_STUB_WITNESS_OUTPUT")
         print(json.dumps({
             "is_error": False,
             "result": os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
-            "structured_output": {"cited": cited, "uncited": uncited},
+            "structured_output": (
+                json.loads(structured_output)
+                if structured_output is not None
+                else {"cited": cited, "uncited": uncited}
+            ),
             "usage": usage,
         }))
         return 0

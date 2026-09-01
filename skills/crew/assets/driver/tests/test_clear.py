@@ -9,6 +9,7 @@ confirmation decision.
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,11 +19,15 @@ import unittest
 from harness import (
     BASE_BRANCH,
     DRIVER,
+    DriverTestCase,
     Fixture,
     INTEGRATION_BRANCH,
+    LAUNCH,
     REPAIR_MODEL,
+    ROUTING,
     TRACKER,
     git,
+    run_plan,
 )
 
 sys.path.insert(0, str(DRIVER.parent))
@@ -77,6 +82,48 @@ class StrictClearReadTests(unittest.TestCase):
         self.log.write_bytes(b"\xff\xfe")
         with self.assertRaisesRegex(driver_module.ClearError, "is unreadable"):
             driver_module.clear_records(self.log)
+
+
+class RunDirectoryClearTests(DriverTestCase):
+    def test_clear_accepts_the_run_directory_from_the_wake_resume_command(self):
+        self.fixture.ticket("01", "first thing", routing=ROUTING)
+        self.fixture.commit_feature()
+        process = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "01 never launched",
+        )
+        self.fixture.says("01", "CREW ASK 01 design — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+        resume = shlex.split(snapshot["resume"])
+        run_dir = resume[resume.index(str(LAUNCH)) + 1]
+
+        result = subprocess.run(
+            [sys.executable, str(DRIVER), "clear", "--run-dir", run_dir],
+            input="n\n", capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("clear cancelled", result.stdout)
+
+    def test_clear_reports_the_checked_path_and_accepted_forms_for_a_wrong_directory(self):
+        run_dir = self.fixture.feature_dir / "missing-run"
+
+        result = subprocess.run(
+            [sys.executable, str(DRIVER), "clear", "--run-dir", str(run_dir)],
+            input="n\n", capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(
+            str(run_dir / run_plan.CREW_STATE_DIR_NAME / "wave-table.json"),
+            snapshot["detail"],
+        )
+        self.assertIn("<feature-dir>/.crew", snapshot["detail"])
 
 
 class ClearTests(unittest.TestCase):
@@ -138,7 +185,9 @@ class ClearTests(unittest.TestCase):
 
         git(self.fixture.repo, "branch", UNRECORDED_BRANCH, BASE_BRANCH)
 
-        self.run_dir = self.fixture.feature_dir / ".crew"
+        self.run_dir = (
+            self.fixture.feature_dir / run_plan.CREW_STATE_DIR_NAME
+        )
         self.codex_dir = self.run_dir / "codex"
         self.run_dir.mkdir()
         self.codex_dir.mkdir()

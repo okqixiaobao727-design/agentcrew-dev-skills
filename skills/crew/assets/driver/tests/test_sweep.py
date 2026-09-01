@@ -16,7 +16,7 @@ import subprocess
 import sys
 import unittest
 
-from harness import BASE_BRANCH, DRIVER, REPAIR_MODEL, TRACKER, DriverTestCase, git
+from harness import BASE_BRANCH, DRIVER, REPAIR_MODEL, TRACKER, DriverTestCase, git, run_plan
 
 
 MACHINE_LOG = DRIVER.parents[1] / "machine_log.py"
@@ -55,7 +55,7 @@ class SeededRun:
         self.repo = fixture.repo
         self.feature_dir = fixture.repo / "features" / name
         self.feature_dir.mkdir(parents=True)
-        self.run_dir = self.feature_dir / ".crew"
+        self.run_dir = self.feature_dir / run_plan.CREW_STATE_DIR_NAME
         self.run_dir.mkdir()
         self.log_path = self.run_dir / "log.jsonl"
         self.integration_branch = f"crew/{name}"

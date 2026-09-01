@@ -79,6 +79,7 @@ sys.path.insert(0, str(DRIVER_DIR))
 import bounded_read  # noqa: E402
 import driver  # noqa: E402  (the path above is what makes this importable)
 import run_plan  # noqa: E402
+import tracker  # noqa: E402
 
 RUN_ROOT = "crewtask"
 SPEC_NAME = "spec.md"
@@ -113,11 +114,6 @@ ROUTING_OPTIONAL = ("review", "account")
 # ticket an agent's.
 HUMAN_WORKFLOW = "acceptance"
 AGENT_ROLE, HUMAN_ROLE = driver.PICKUP_LABELS
-
-# The local tracker's comment: the ticket file is the tracker, so the staged command goes on a line
-# of its own, the same file-is-the-tracker analogue `Status:` already is.
-CREW_KEY = "Crew:"
-
 
 class Blocked(Exception):
     """The blocking items that stopped this staging run, each carrying its own fix."""
@@ -233,6 +229,7 @@ def read_ticket(kind, repo, reference):
             "url": issue.get("url"),
             "comment_count": len(issue.get("comments") or []),
             "path": None,
+            "repository": repo,
             "closed": (issue.get("state") or "").upper() == GH_STATE_CLOSED,
         }
     number, path = local_read(repo, reference)
@@ -243,6 +240,7 @@ def read_ticket(kind, repo, reference):
         "body": text,
         "text": text,
         "path": path,
+        "repository": repo,
         "closed": local_status(text) == driver.STATUS_FINISHED,
     }
 
@@ -428,7 +426,7 @@ def project_edges(text, dependencies, stripped):
     return "".join([*lines[:start], *section, *lines[end:]])
 
 
-# --- the tracker's edit, mark and comment operations ---------------------------------------------
+# --- the tracker's edit and mark operations ------------------------------------------------------
 
 
 def gh_write(repo, arguments, reference, operation, body=None):
@@ -489,26 +487,6 @@ def mark(kind, repo, ticket, role):
             gh_write(repo, ["edit", ticket["id"], *arguments], ticket["id"], "mark")
         return
     edit_body(kind, repo, ticket, local_marked(ticket["body"], role))
-
-
-def local_commented(text, command):
-    """That ticket file carrying exactly one `Crew:` line, whatever it carried before."""
-    kept = [
-        line for line in text.splitlines(keepends=True)
-        if not line.startswith(f"{CREW_KEY} ")
-    ]
-    return "".join(kept).rstrip("\n") + f"\n\n{CREW_KEY} {command}\n"
-
-
-def comment(kind, repo, ticket, command):
-    """**comment** — put the staged command where the ticket's own work state lives."""
-    if kind == driver.TRACKER_GITHUB:
-        held = gh_read(repo, ticket["id"], fields="comments")["comments"]
-        if command in [entry.get("body") for entry in held]:
-            return
-        gh_write(repo, ["comment", ticket["id"], "--body", command], ticket["id"], "comment")
-        return
-    edit_body(kind, repo, ticket, local_commented(ticket["body"], command))
 
 
 # --- the approved routing --------------------------------------------------------------------
@@ -797,7 +775,7 @@ def candidate_run(repo, directory, config):
     )
     head = driver.git_output(repo, "rev-parse", "HEAD") or LATER
     return driver.run_section(
-        args, repo, directory, directory / driver.RUN_DIR_NAME,
+        args, repo, directory, run_plan.crew_state_dir(directory),
         base_branch=None, base_commit=head, config=config,
     )
 
@@ -992,9 +970,13 @@ def stage(args):
     # routing writes nothing to the tracker at all, and the comment is a tracker write like the
     # others — that entrance stages a directory and says whether it starts, nothing more.
     command = f"/crew {RUN_ROOT}/{number}"
+    pickup_prefix = f"/crew {RUN_ROOT}/"
     if table:
         for ticket in [parent] if parent else tickets:
-            comment(kind, repo, ticket, command)
+            try:
+                tracker.comment(kind, ticket, command, supersedes=pickup_prefix)
+            except tracker.TrackerError as error:
+                raise Blocked([str(error)]) from error
     return command
 
 

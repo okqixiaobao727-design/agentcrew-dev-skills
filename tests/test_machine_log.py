@@ -473,6 +473,62 @@ class RunProjectionTests(unittest.TestCase):
         self.assertEqual(checked_second.ticket("7").escalation, second)
         self.assertEqual(checked_second.ticket("7").witness, second_witness)
 
+    def test_fact_check_runs_from_each_escalation_until_its_hand_over_ruling(self):
+        escalation = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — choose the projection fact",
+        }
+        hand_over = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": (
+                "CREW RULED 7 — this escalation was handed to the coordinator, which is where "
+                "it is answered."
+            ),
+        }
+
+        self.assertTrue(machine_log.project([escalation]).ticket("7").fact_check_running)
+        for outcome in ("checked", "partial", "failed"):
+            with self.subTest(outcome=outcome):
+                witness = {"event": "witness", "ticket": "7", "outcome": outcome}
+                before_hand_over = machine_log.project([escalation, witness]).ticket("7")
+                self.assertTrue(before_hand_over.fact_check_running)
+                self.assertFalse(before_hand_over.awaiting_ruling)
+
+                after_hand_over = machine_log.project([
+                    escalation, witness, hand_over,
+                ]).ticket("7")
+                self.assertFalse(after_hand_over.fact_check_running)
+                self.assertTrue(after_hand_over.awaiting_ruling)
+
+    def test_the_newest_escalation_governs_the_fact_check_episode(self):
+        first = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — first",
+        }
+        hand_over = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": "CREW RULED 7 — this escalation was handed to the coordinator",
+        }
+        coordinator_ruling = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": "Choose option A.",
+        }
+        second = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 scope — second",
+        }
+
+        ruled = machine_log.project([first, hand_over, coordinator_ruling]).ticket("7")
+        self.assertFalse(ruled.fact_check_running)
+        self.assertFalse(ruled.awaiting_ruling)
+
+        newest = machine_log.project([
+            first, hand_over, coordinator_ruling, second,
+        ]).ticket("7")
+        self.assertEqual(newest.escalation, second)
+        self.assertTrue(newest.fact_check_running)
+        self.assertFalse(newest.awaiting_ruling)
+
     def test_only_receipt_evidence_consumes_a_valid_completion_claim(self):
         claim = {
             "event": "message", "ticket": "7", "role": "child",
@@ -844,6 +900,7 @@ class EventTests(MachineLogTestCase):
             "--model", "claude-sonnet-5",
             "--outcome", "failed", "--reason", "witness session timed out",
             "--duration-seconds", "900.125",
+            "--covered-count", "0", "--uncovered-count", "3",
             "--input-tokens", "11", "--output-tokens", "22",
             "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
             "--total-tokens", "110", log=self.log,
@@ -859,11 +916,58 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["outcome"], "failed")
         self.assertEqual(entry["reason"], "witness session timed out")
         self.assertEqual(entry["duration_seconds"], 900.125)
+        self.assertEqual(entry["covered_count"], 0)
+        self.assertEqual(entry["uncovered_count"], 3)
         self.assertEqual(entry["input_tokens"], 11)
         self.assertEqual(entry["output_tokens"], 22)
         self.assertEqual(entry["cache_read_tokens"], 33)
         self.assertEqual(entry["cache_creation_tokens"], 44)
         self.assertEqual(entry["total_tokens"], 110)
+
+    def test_a_partial_witness_records_its_required_coverage_counts(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "partial", "--reason", "uncovered pointers: c.py:11, c.py:12",
+            "--duration-seconds", "12.5",
+            "--covered-count", "10", "--uncovered-count", "2", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["outcome"], "partial")
+        self.assertEqual(entry["covered_count"], 10)
+        self.assertEqual(entry["uncovered_count"], 2)
+
+    def test_a_structural_partial_can_cover_every_expected_pointer(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "partial",
+            "--reason", "structural rejection (extra cited): docs/context.md:7",
+            "--duration-seconds", "12.5",
+            "--covered-count", "3", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["outcome"], "partial")
+        self.assertEqual(entry["covered_count"], 3)
+        self.assertEqual(entry["uncovered_count"], 0)
+
+    def test_a_pointer_free_checked_witness_records_zero_coverage(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--covered-count", "0", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["outcome"], "checked")
+        self.assertEqual(entry["covered_count"], 0)
+        self.assertEqual(entry["uncovered_count"], 0)
 
     def test_a_passing_base_gate_records_its_argv_without_a_ticket(self):
         result = run_cli(
@@ -909,6 +1013,7 @@ class EventTests(MachineLogTestCase):
             "witness", "--ticket", "07", "--executor", "claude",
             "--model", "claude-sonnet-5",
             "--outcome", "unknown", "--reason", "why", "--duration-seconds", "1",
+            "--covered-count", "0", "--uncovered-count", "0",
             log=self.log,
         )
 
@@ -919,7 +1024,19 @@ class EventTests(MachineLogTestCase):
         result = run_cli(
             "witness", "--ticket", "07", "--model", "claude-sonnet-5",
             "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--covered-count", "1", "--uncovered-count", "0",
             log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+
+    def test_a_witness_without_both_coverage_counts_is_refused(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--covered-count", "1", log=self.log,
         )
 
         self.assertEqual(result.returncode, 2)
@@ -929,19 +1046,40 @@ class EventTests(MachineLogTestCase):
         cases = (
             ("checked with a failure reason", [
                 "--outcome", "checked", "--reason", "failed", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
             ]),
             ("failed without a reason", [
                 "--outcome", "failed", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "0", "--uncovered-count", "1",
+            ]),
+            ("partial without a reason", [
+                "--outcome", "partial", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "10", "--uncovered-count", "2",
+            ]),
+            ("partial without covered pointers", [
+                "--outcome", "partial", "--reason", "uncovered", "--duration-seconds", "1",
+                "--covered-count", "0", "--uncovered-count", "2",
+            ]),
+            ("failed with a covered pointer", [
+                "--outcome", "failed", "--reason", "failed", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
             ]),
             ("negative duration", [
                 "--outcome", "checked", "--reason", "", "--duration-seconds", "-1",
+                "--covered-count", "1", "--uncovered-count", "0",
+            ]),
+            ("negative coverage", [
+                "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "-1", "--uncovered-count", "0",
             ]),
             ("partial cost", [
                 "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
                 "--input-tokens", "11",
             ]),
             ("wrong total", [
                 "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
                 "--input-tokens", "11", "--output-tokens", "22",
                 "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
                 "--total-tokens", "111",
