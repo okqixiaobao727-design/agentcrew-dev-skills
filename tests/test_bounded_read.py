@@ -288,6 +288,154 @@ class BoundedReadHookTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "")
 
+    def test_prose_arguments_are_never_read_hunts(self):
+        for command in (
+            "python3 /plugin/driver.py answer --run-dir /run --ticket 44 --text "
+            "$'It is settled by evidence, not by the reviewer\\'s note: run scripts/test.py'",
+            'python3 /plugin/driver.py answer --run-dir /run --ticket 44 --text '
+            '"Behaviour-pinning tests, characterization tests, and grep -R notes"',
+            "python3 /plugin/driver.py answer --text 'Run `ls -la` first'",
+            "gh issue comment 46 --body-file /tmp/x.md",
+            "git commit -m 'support cat output'",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_a_heredoc_fed_read_command_writes_rather_than_reads(self):
+        command = (
+            "gh issue comment 46 --body \"$(cat <<'EOF'\n"
+            "A ruling with \" and ' and # and `ls -la` inside it.\n"
+            "It cites sed -n '1,80p' docs/x.md as a pointer.\n"
+            "EOF\n"
+            ")\""
+        )
+
+        result = self.run_hook("Bash", {"command": command})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_comment_does_not_hide_a_later_read(self):
+        result = self.run_hook("Bash", {"command": "ls -d /tmp # note\ncat /etc/passwd"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_a_hash_inside_a_word_does_not_start_a_comment(self):
+        result = self.run_hook("Bash", {"command": "gh issue view '#176' --json body"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_the_substitution_and_pipeline_read_shapes_are_refused(self):
+        for command in (
+            "x=$(cat /repo/ticket.md)",
+            "cat /repo/ticket.md | grep needle",
+            "cat <<EOF\n$(cat /etc/passwd)\nEOF",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_a_redirected_or_default_directory_read_is_refused(self):
+        for command in (
+            "cat</etc/passwd",
+            "cat <<EOF < /etc/passwd\nbody\nEOF",
+            "ls <<'EOF'\nbody\nEOF",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_an_arithmetic_expansion_is_not_a_command(self):
+        result = self.run_hook("Bash", {"command": "echo $((head + 1))"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_nested_shell_body_is_decoded_before_it_is_scanned(self):
+        for command in (
+            "bash -c $'cat\\x20/etc/passwd'",
+            "bash -lc 'cat /etc/passwd'",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_unbalanced_parentheses_fail_closed(self):
+        for command in ("echo (", "echo )"):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+                self.assertIn("could not be parsed", decision["permissionDecisionReason"])
+
+    def test_a_substitution_inside_arithmetic_is_still_a_command(self):
+        result = self.run_hook("Bash", {"command": "echo $(( $(cat /dev/null) + 1 ))"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("Matched `cat`", decision["permissionDecisionReason"])
+
+    def test_an_escape_outside_unicode_fails_closed_rather_than_crashing(self):
+        result = self.run_hook("Bash", {"command": "bash -c $'printf\\x20\\UFFFFFFFF'"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("could not be parsed", decision["permissionDecisionReason"])
+
+    def test_a_parameter_expansion_is_read_as_data(self):
+        for command in ("echo ${x:-)}", 'gh issue view 176 --json body > "${TMPDIR}/x"'):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_a_substitution_inside_a_parameter_expansion_is_still_a_command(self):
+        result = self.run_hook("Bash", {"command": "echo ${x:-$(cat /etc/passwd)}"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_the_denial_names_the_token_it_matched(self):
+        result = self.run_hook(
+            "Bash", {"command": "python3 /plugin/driver.py answer --help 2>&1 | head -40"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn(bounded_read.DENIAL_REASON, decision["permissionDecisionReason"])
+        self.assertIn("Matched `head` in `head -40`.", decision["permissionDecisionReason"])
+
+    def test_an_unparseable_command_says_so(self):
+        result = self.run_hook("Bash", {"command": "echo 'unterminated"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("could not be parsed", decision["permissionDecisionReason"])
+
     def test_tools_that_do_not_read_files_pass_through(self):
         result = self.run_hook("SendMessage", {"to": "child", "message": "continue"})
 
