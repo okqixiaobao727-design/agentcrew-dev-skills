@@ -7,6 +7,33 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A live driver accepts a coordinator handover in place (ADR-0025). A run whose coordinator session
+  has gone is no longer undirectable: `/crew <run-dir>` typed in a new session resolves one
+  immutable coordinator context and hands it to the driver already on the run, which records it,
+  re-anchors every live child whose address changed, re-scopes the coordinator hook, re-pins the
+  dashboard and retires the old waiter before the new invocation reports success. A driver-side
+  authorized-action boundary refuses an answer from any address that is no longer the run's, so a
+  stale coordinator reaches neither a child nor the machine log. Coordinator control owns the whole
+  start / attach / hand-over decision, and the launcher no longer inspects run metadata to make it
+  (#112).
+
+### Fixed
+- The shipped default `[hooks.on-child-launch] command = ""` no longer stops preflight with
+  `run: launch_hook.command is not a non-empty string`. An empty command declares no hook, as the
+  config's own comment says and as the dispatch consumer has always read it, so every
+  default-shaped `agentcrew.toml` stages again. The normalized wave table omits the key rather than
+  persisting an empty string, and a non-empty command still reaches the plan verbatim with its
+  `env` (#138).
+- A `CREW COMPLETE` that arrives after the run has settled is no longer lost. Before returning a
+  terminal run's old report, `adopt` observes each strictly correlated, unlanded Codex child once
+  through the bridge that owns its thread; a message appended by that observation is ordered after
+  the old ending and reaches the loop's existing rule table, so a parked ticket resumed by hand
+  merges, closes its tracker entry and dispatches its blocked descendants instead of `/crew`
+  returning `run-complete` with the run untouched. Identity is re-verified against the recorded
+  launch — executor, ticket, thread and machine log — and a mismatch is a driver error rather than
+  a silent skip (#171).
+
 ## [0.9.16] - 2026-09-01
 
 ### Fixed
