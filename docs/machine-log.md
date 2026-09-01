@@ -59,6 +59,7 @@ class TicketFacts:
     unanswered_child_message: Mapping[str, object] | None
     escalation: Mapping[str, object] | None
     witness: Mapping[str, object] | None
+    fact_check_running: bool
     awaiting_receipt: bool
     awaiting_ruling: bool
     outstanding_nudge: bool
@@ -92,6 +93,10 @@ re-derive a named projection fact from them.
   and clears the second until its own witness event arrives, so an older fact-check cannot be
   paired with a newer escalation. The handed-over ruling consumes the pending message but retains
   this factual pair for audit and report readers.
+- `fact_check_running` is true from the newest escalation until its later
+  `CREW RULED <NN> — handed to the coordinator` line. A `witness` event of any outcome does not
+  clear it: that event says the check process ended, not that the wake snapshot reached disk. A
+  later escalation starts a new occurrence and governs the fact.
 - `latest_settling_event` means the last receipt or outcome with a non-empty value. It answers
   whether the ticket has received a settling event.
 - `settlement_state` retains the closed Machine-log vocabulary and its category precedence: a valid

@@ -370,6 +370,15 @@ class ClearPlan:
     dashboard_window: str | None
 
 
+@dataclass(frozen=True)
+class HandOverIntent:
+    """The one Machine-log acknowledgement to append after its wake snapshot lands."""
+
+    ticket: str
+    launch: object
+    message: str
+
+
 class Wake(Exception):
     """A state the rule table settles by handing it to judgment; the loop exits on it.
 
@@ -377,11 +386,14 @@ class Wake(Exception):
     second time, and a state the table has no row for. Everything else the loop settles itself.
     """
 
-    def __init__(self, reason, ticket=None, pointer=None, **fields):
+    def __init__(self, reason, ticket=None, pointer=None, hand_over=None, **fields):
         super().__init__(reason)
         self.reason = reason
         self.ticket = ticket
         self.pointer = pointer
+        # Internal workflow intent, deliberately kept out of the JSON snapshot fields. The loop
+        # records it only after that snapshot has reached disk.
+        self.hand_over = hand_over
         self.fields = fields
 
 
@@ -458,6 +470,9 @@ def snapshot(reason, ticket=None, pointer=None, **fields):
     second: a coordinator that pastes the resume command the instant it is woken must not find a
     pid that was about to stop and attach to a driver already on its way out. The file is put in
     place by rename, because a waiter reading it half-written would read no wake at all.
+
+    Returns whether that atomic write landed. A caller whose next log fact promises the snapshot
+    exists can therefore append that fact only on success.
     """
     record = {"reason": reason, "ticket": ticket, "pointer": pointer}
     record.update(fields)
@@ -466,7 +481,7 @@ def snapshot(reason, ticket=None, pointer=None, **fields):
     run_dir = _run_in_hand
     put_down_run()
     if run_dir is None:
-        return
+        return False
     path = run_dir / WAKE_NAME
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
@@ -480,8 +495,9 @@ def snapshot(reason, ticket=None, pointer=None, **fields):
         temporary.unlink(missing_ok=True)
         print(f"crew: the wake snapshot could not be left in {path}: {error}",
               file=sys.stderr, flush=True)
-        return
+        return False
     re_type_resume(run_dir)
+    return True
 
 
 def re_type_resume(run_dir):
@@ -2738,13 +2754,16 @@ class Loop:
         return document
 
     def hand_over(self, ticket, launch, message):
-        """Record that this escalation is the coordinator's now, and wake it; never returns.
+        """Check this escalation and raise the wake that hands it to the coordinator; never returns.
 
-        Written as the escalation is handed over rather than when the run comes back, because the
-        one thing the driver knows for certain is which escalation it is exiting on. Acknowledging
-        at resume instead would take in every escalation standing at that moment: two children
-        asking at once means one snapshot and two acknowledgements, and the ASK nobody was shown
-        would be settled unread.
+        The loop writes the wake snapshot atomically before it records the hand-over line. Written
+        there rather than when the run comes back, because the one thing the driver knows for
+        certain is which escalation it is exiting on. Acknowledging at resume instead would take in
+        every escalation standing at that moment: two children asking at once means one snapshot
+        and two acknowledgements, and the ASK nobody was shown would be settled unread. If the
+        snapshot write fails, no hand-over line is recorded and this escalation remains standing
+        for the next Driver. If the later log append fails, the complete wake remains authoritative,
+        the failure is printed in the Driver pane, and the escalation likewise remains open.
 
         The line is what the log has of the answer, too. A ruling sent through a child's tmux pane
         — the channel a permission prompt answers on — passes no hook and reaches no log, so
@@ -2752,11 +2771,14 @@ class Loop:
         never go on.
         """
         witness_result = self.run_witness(ticket, launch, message)
-        self.record_ruling(ticket, launch, HANDED_OVER.format(
-            marker=HANDED_OVER_MARKER, ticket=ticket
-        ))
+        handed_over = HandOverIntent(
+            ticket=ticket,
+            launch=launch,
+            message=HANDED_OVER.format(marker=HANDED_OVER_MARKER, ticket=ticket),
+        )
         raise Wake(
             JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
+            hand_over=handed_over,
             detail=message, brief=witness_result["brief"],
             child=launch.get("child"), window=launch.get("window"),
             **(
@@ -3618,9 +3640,19 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
             print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
         return loop.run_until_woken()
     except Wake as wake:
-        snapshot(
+        landed = snapshot(
             wake.reason, ticket=wake.ticket, pointer=wake.pointer, resume=resume, **wake.fields
         )
+        if landed and wake.hand_over is not None:
+            try:
+                loop.record_ruling(
+                    wake.hand_over.ticket, wake.hand_over.launch, wake.hand_over.message
+                )
+            except DriverError as error:
+                # The coordinator already has the complete escalation snapshot. Keep that one
+                # coherent wake, leave the escalation open in the log, and make the append failure
+                # visible in the driver's own pane instead of emitting a conflicting second wake.
+                print(f"crew: {error}", file=sys.stderr, flush=True)
         return 0
     except DriverError as error:
         snapshot(

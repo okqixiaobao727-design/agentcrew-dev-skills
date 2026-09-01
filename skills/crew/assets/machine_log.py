@@ -174,6 +174,7 @@ class TicketFacts:
     unanswered_child_message: Mapping | None = None
     escalation: Mapping | None = None
     witness: Mapping | None = None
+    fact_check_running: bool = False
     awaiting_receipt: bool = False
     awaiting_ruling: bool = False
     outstanding_nudge: bool = False
@@ -305,6 +306,7 @@ def project(records):
                 "unanswered_child_message": None,
                 "escalation": None,
                 "witness": None,
+                "fact_check_running": False,
                 "awaiting_receipt": False,
                 "awaiting_ruling": False,
                 "outstanding_nudge": False,
@@ -319,6 +321,7 @@ def project(records):
             if event == "escalation":
                 episode["escalation"] = record
                 episode["witness"] = None
+                episode["fact_check_running"] = True
             episode["awaiting_ruling"] = False
             episode["outstanding_nudge"] = False
         elif event == "witness":
@@ -358,6 +361,8 @@ def project(records):
             if any(message.lstrip().startswith(marker) for marker in RECEIPT_WAIT_MARKERS):
                 episode["awaiting_receipt"] = True
             episode["awaiting_ruling"] = message.lstrip().startswith(HANDED_OVER_MARKER)
+            if episode["awaiting_ruling"]:
+                episode["fact_check_running"] = False
             if message.lstrip().startswith(NUDGE_MARKER):
                 episode["outstanding_nudge"] = True
             elif not message.lstrip().startswith(HANDED_OVER_MARKER):
@@ -444,6 +449,7 @@ def project(records):
             unanswered_child_message=episode.get("unanswered_child_message"),
             escalation=episode.get("escalation"),
             witness=episode.get("witness"),
+            fact_check_running=episode.get("fact_check_running", False),
             awaiting_receipt=episode.get("awaiting_receipt", False),
             awaiting_ruling=episode.get("awaiting_ruling", False),
             outstanding_nudge=episode.get("outstanding_nudge", False),

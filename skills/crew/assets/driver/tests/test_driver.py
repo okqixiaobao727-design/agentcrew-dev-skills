@@ -1296,10 +1296,15 @@ class LoopTests(DriverTestCase):
             git(self.fixture.repo, "add", "shared.txt")
         self.fixture.commit_feature()
 
-    def start(self, *tickets, shared=None, extra=(), env_overrides=None, routing=ROUTING):
+    def start(
+        self, *tickets, shared=None, extra=(), env_overrides=None, routing=ROUTING,
+        driver=DRIVER,
+    ):
         """A run with its first wave up and its loop running."""
         self.feature(*tickets, shared=shared, routing=routing)
-        process = self.fixture.launch(extra=extra, env_overrides=env_overrides)
+        process = self.fixture.launch(
+            extra=extra, env_overrides=env_overrides, driver=driver,
+        )
         for number, _ in tickets:
             if not _:
                 self.assertTrue(
@@ -2232,6 +2237,61 @@ class LoopTests(DriverTestCase):
         self.assertIn("which table?", snapshot["detail"])
         self.assertIn("resume", snapshot)
         self.assertIsNone(self.verdict("01"), "an answered ASK is not an outcome")
+
+    def test_hand_over_line_is_appended_only_after_the_wake_snapshot_lands(self):
+        observation = self.fixture.root / "hand-over-observation"
+        driver = self.fixture.driver_with_hand_over_log_hook()
+        process = self.start(("01", ()), driver=driver, env_overrides={
+            "AGENTCREW_TEST_HAND_OVER_OBSERVATION": str(observation),
+            "AGENTCREW_TEST_RUN_DIR": str(self.fixture.run_dir),
+        })
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        snapshot = self.woken(process, "judgment-needed")
+
+        wake_path = self.fixture.run_dir / WAKE_NAME
+        hand_overs = self.instructions("01", "CREW RULED")
+        self.assertTrue(wake_path.is_file(), "the hand-over line exists without wake.json")
+        self.assertEqual(len(hand_overs), 1, hand_overs)
+        self.assertEqual(observation.read_text(), "present\n")
+        facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
+        self.assertFalse(facts.fact_check_running)
+        self.assertTrue(facts.awaiting_ruling)
+        self.assertEqual(json.loads(wake_path.read_text()), snapshot)
+
+    def test_a_snapshot_write_failure_leaves_no_hand_over_line_and_the_escalation_open(self):
+        process = self.start(("01", ()))
+        wake_path = self.fixture.run_dir / WAKE_NAME
+        wake_path.mkdir()
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        self.woken(process, "judgment-needed")
+
+        self.assertEqual(self.instructions("01", "CREW RULED"), [])
+        facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
+        self.assertTrue(facts.fact_check_running)
+        self.assertFalse(facts.awaiting_ruling)
+
+    def test_a_hand_over_log_failure_is_visible_and_leaves_the_escalation_open(self):
+        observation = self.fixture.root / "failed-hand-over-observation"
+        driver = self.fixture.driver_with_hand_over_log_hook()
+        process = self.start(("01", ()), driver=driver, env_overrides={
+            "AGENTCREW_TEST_HAND_OVER_APPEND": "fail",
+            "AGENTCREW_TEST_HAND_OVER_OBSERVATION": str(observation),
+            "AGENTCREW_TEST_RUN_DIR": str(self.fixture.run_dir),
+        })
+
+        self.fixture.says("01", "CREW ASK 01 scope — which table? ts=1")
+        result = self.fixture.ended(process)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub hand-over append failed", result.stderr)
+        self.assertEqual(observation.read_text(), "present\n")
+        self.assertTrue((self.fixture.run_dir / WAKE_NAME).is_file())
+        self.assertEqual(self.instructions("01", "CREW RULED"), [])
+        facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
+        self.assertTrue(facts.fact_check_running)
+        self.assertFalse(facts.awaiting_ruling)
 
     def test_a_wrap_up_crew_ask_wakes_the_coordinator_carrying_the_ticket_and_ask(self):
         """Wrap-up is an ordinary escalation rather than a settling receipt."""

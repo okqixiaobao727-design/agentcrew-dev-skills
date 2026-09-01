@@ -353,9 +353,9 @@ class Fixture:
             capture_output=True, text=True, env=self.environment(), cwd=str(self.repo),
         )
 
-    def start_argv(self, extra=()):
+    def start_argv(self, extra=(), driver=DRIVER):
         return [
-            sys.executable, str(DRIVER), "start",
+            sys.executable, str(driver), "start",
             "--feature-dir", str(self.feature_dir),
             "--coordinator-name", COORDINATOR_NAME,
             "--coordinator-pid", str(COORDINATOR_PID),
@@ -370,6 +370,41 @@ class Fixture:
             *extra,
         ]
 
+    def driver_with_hand_over_log_hook(self):
+        """A release copy whose Machine-log append observes or refuses a hand-over line.
+
+        The hook sits immediately before the copied writer's one `os.write`, which lets a Driver
+        CLI test observe the real filesystem order without exposing a test seam in shipped code.
+        """
+        release_copy = self.root / "observed-release"
+        crew_copy = release_copy / "skills" / "crew"
+        shutil.copytree(DRIVER.parents[2], crew_copy)
+        shutil.copytree(DRIVER.parents[4] / "config", release_copy / "config")
+        machine_log = crew_copy / "assets" / "machine_log.py"
+        source = machine_log.read_text()
+        write = "        os.write(descriptor, line)\n"
+        hook = (
+            "        hand_over = (\n"
+            "            record.get('event') == 'ruling'\n"
+            "            and str(record.get('message', '')).startswith('CREW RULED ')\n"
+            "        )\n"
+            "        if hand_over:\n"
+            "            observation = os.environ.get('AGENTCREW_TEST_HAND_OVER_OBSERVATION')\n"
+            "            if observation:\n"
+            "                wake = pathlib.Path(\n"
+            "                    os.environ['AGENTCREW_TEST_RUN_DIR']\n"
+            "                ) / 'wake.json'\n"
+            "                pathlib.Path(observation).write_text(\n"
+            "                    'present\\n' if wake.is_file() else 'missing\\n'\n"
+            "                )\n"
+            "            if os.environ.get('AGENTCREW_TEST_HAND_OVER_APPEND') == 'fail':\n"
+            "                raise OSError('stub hand-over append failed')\n"
+        )
+        if source.count(write) != 1:
+            raise AssertionError("the Machine-log append seam changed")
+        machine_log.write_text(source.replace(write, hook + write))
+        return crew_copy / "assets" / "driver" / "driver.py"
+
     def start(self, extra=(), env_overrides=None):
         """Start a run and wait for it to end, which a run nobody drives does on its timeout."""
         return subprocess.run(
@@ -378,14 +413,14 @@ class Fixture:
             cwd=str(self.repo),
         )
 
-    def launch(self, extra=(), env_overrides=None):
+    def launch(self, extra=(), env_overrides=None, driver=DRIVER):
         """Start a run and leave its loop running; returns the driver process.
 
         The loop is the driver now, so a test that watches a run drives it while it runs rather
         than reading what it left behind.
         """
         process = subprocess.Popen(
-            self.start_argv(extra),
+            self.start_argv(extra, driver),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=self.environment(env_overrides), cwd=str(self.repo),
         )
