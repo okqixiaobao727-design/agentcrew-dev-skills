@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-09-01
+
 ### Fixed
 - The coordinator's bounded-read hook no longer refuses a reader fed by a pipe. `gh issue view N |
   head -40`, `git log --oneline | head -20`, `git status | grep modified` and
