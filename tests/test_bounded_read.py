@@ -24,7 +24,7 @@ SESSION_ID = "9d1f4c2a-0000-4000-8000-000000000133"
 class BoundedReadHookTests(unittest.TestCase):
     def run_hook(
         self, tool_name, tool_input, session_id=SESSION_ID, configured_session_id=None,
-        run_dir=None,
+        run_dir=None, cwd=None,
     ):
         command = [sys.executable, str(SCRIPT), "hook", "--crew-dir", str(CREW_DIR)]
         if configured_session_id is not None:
@@ -37,6 +37,7 @@ class BoundedReadHookTests(unittest.TestCase):
                 "session_id": session_id,
                 "tool_name": tool_name,
                 "tool_input": tool_input,
+                **({} if cwd is None else {"cwd": cwd}),
             }),
             capture_output=True,
             text=True,
@@ -419,14 +420,16 @@ class BoundedReadHookTests(unittest.TestCase):
 
     def test_the_denial_names_the_token_it_matched(self):
         result = self.run_hook(
-            "Bash", {"command": "python3 /plugin/driver.py answer --help 2>&1 | head -40"}
+            "Bash", {"command": "python3 /plugin/driver.py --help 2>&1 | head -40 /repo/x.py"}
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         decision = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
         self.assertIn(bounded_read.DENIAL_REASON, decision["permissionDecisionReason"])
-        self.assertIn("Matched `head` in `head -40`.", decision["permissionDecisionReason"])
+        self.assertIn(
+            "Matched `head` in `head -40 /repo/x.py`.", decision["permissionDecisionReason"]
+        )
 
     def test_an_unparseable_command_says_so(self):
         result = self.run_hook("Bash", {"command": "echo 'unterminated"})
@@ -435,6 +438,118 @@ class BoundedReadHookTests(unittest.TestCase):
         decision = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
         self.assertIn("could not be parsed", decision["permissionDecisionReason"])
+
+    def test_a_pipe_fed_reader_reads_the_pipe_rather_than_a_file(self):
+        """A reader with no file operands at the tail of a pipeline consumes the previous
+        command's output, so nothing enters context that the pipeline was not already producing.
+        `SKILL.md` keeps `gh issue view` open, and that promise only holds if this shape passes."""
+        for command in (
+            "gh issue view 179 | head -40",
+            "git log --oneline | head -20",
+            "git status | grep modified",
+            "docker ps | tail -3",
+            "python3 /plugin/driver.py answer --help 2>&1 | head -40",
+            "echo hi | sed -n '1,5p'",
+            "printf x | cat",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_a_pipe_fed_reader_naming_a_file_is_still_a_read(self):
+        for command in (
+            "gh issue view 179 | grep needle /repo/src/x.py",
+            "gh issue view 179 | head -40 /repo/src/x.py",
+            "cat /repo/ticket.md | head -40",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_only_a_pipe_feeds_the_command_after_a_separator(self):
+        """`||`, `&&`, `;` and `&` start a command whose stdin is still the terminal."""
+        for command in (
+            "false || cat",
+            "true && cat",
+            "true ; cat",
+            "true & cat",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command})
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_a_newline_does_not_carry_a_pipe_into_the_next_command(self):
+        result = self.run_hook("Bash", {"command": "gh issue view 179 | head -40\ncat"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_the_run_directory_may_be_listed(self):
+        """The run directory is this run's own operational state, not a repository source fact."""
+        for command in (
+            "ls -la %s" % RUN_DIR,
+            "ls %s %s" % (RUN_DIR, RUN_DIR / "codex-opening-skill.md"),
+            "ls -la %s | head -20" % RUN_DIR,
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command}, run_dir=RUN_DIR)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_a_listing_reaching_outside_the_run_directory_is_refused(self):
+        for command in (
+            "ls -la %s" % (PLUGIN_ROOT / "skills"),
+            "ls -la %s /etc" % RUN_DIR,
+            "ls -la %s/.." % RUN_DIR,
+            "ls",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook("Bash", {"command": command}, run_dir=RUN_DIR)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decision = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_a_listing_without_a_run_directory_is_refused(self):
+        result = self.run_hook("Bash", {"command": "ls -la %s" % RUN_DIR})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+
+    def test_a_relative_listing_resolves_against_the_sessions_directory(self):
+        for cwd, allowed in ((str(RUN_DIR), True), (str(PLUGIN_ROOT), False)):
+            with self.subTest(cwd=cwd):
+                result = self.run_hook(
+                    "Bash", {"command": "ls -la ."}, run_dir=RUN_DIR, cwd=cwd
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout == "", allowed)
+
+    def test_reading_a_run_file_through_the_shell_is_still_refused(self):
+        """The wake snapshot comes back as the waiter task's own output; a run file that does
+        need reading is read with an offset and a limit, which the denial names."""
+        result = self.run_hook(
+            "Bash",
+            {"command": "cat %s/codex-opening-skill.md" % RUN_DIR},
+            run_dir=RUN_DIR,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("offset", decision["permissionDecisionReason"])
 
     def test_tools_that_do_not_read_files_pass_through(self):
         result = self.run_hook("SendMessage", {"to": "child", "message": "continue"})

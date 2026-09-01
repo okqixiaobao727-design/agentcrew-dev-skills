@@ -7,6 +7,21 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- The coordinator's bounded-read hook no longer refuses a reader fed by a pipe. `gh issue view N |
+  head -40`, `git log --oneline | head -20`, `git status | grep modified` and
+  `driver.py answer --help 2>&1 | head -40` were all denied, contradicting SKILL.md's own promise
+  that `gh issue view` stays open because the tracker is the ticket. A reader with no file operands
+  at the tail of a pipeline reads the previous command's output, not a file; the scanner now
+  records whether a lone `|` preceded a command, and `grep`, `rg` and `sed` no longer count the
+  pattern or script they spend their first operand on as a file (#179).
+
+### Added
+- `ls` of the run's own directory is permitted, joining the existing `ls -d` exemption: a run
+  directory holds the run's operational state, not a repository source fact. Operands are compared
+  by realpath against the run directory (ADR-0007), and one reaching outside it, or that will not
+  resolve, leaves the listing refused (#179).
+
 ## [0.9.15] - 2026-09-01
 
 ### Added
