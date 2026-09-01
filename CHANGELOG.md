@@ -7,10 +7,33 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-09-01
+
+### Added
+- `driver.py defer` carries a ruling that places a finding on a later ticket into the tracker the
+  later child actually reads. It verifies the target has never launched, writes a
+  `Deferred from #<source>:` comment through Tracker, and only then delivers and records
+  `<line> — deferred #<target> (comment: <locator>)`. `deferred <ticket reference>` joins the
+  placements the triage rule table names, and the identical-comment retry is idempotent (#174).
+
 ### Fixed
 - Dashboard rows and the run summary now show a Witness fact-check with elapsed seconds while it
   runs. An escalation becomes awaiting-ruling only after its atomic wake snapshot has landed, so
   an in-progress check no longer looks like a missed ASK (#173).
+- A Witness fact-check that covers some of an escalation's pointers now delivers what it verified
+  instead of dropping the whole brief. Pointers are normalised before the structured check —
+  non-file citations such as `#NN`, branch names and ADR ids are held apart from the files — and
+  the uncovered ones are named in `witness_reason`, so a partial brief reaches the coordinator
+  rather than an empty one (#175).
+- The coordinator's bounded-read hook reads a Bash command the way bash does. A single-pass scanner
+  replaces the `shlex` tokenizer: it tracks `'…'`, `"…"`, `$'…'`, backticks, `$(…)`, `${…}`,
+  `$((…))` and heredoc bodies, matches a read command only in command position, and never inspects
+  quoted argument text. `driver.py answer --text` carrying an apostrophe or the word
+  `characterization`, and `gh issue comment --body "$(cat <<'EOF' … EOF)"`, are no longer refused,
+  while `ls -d /tmp # x⏎cat /etc/passwd` no longer slips through (#176).
+- `driver.py answer` accepts the run directory the wake snapshot's `resume` command and SKILL.md
+  use. Every entry point resolves `.crew` through one resolver, the older `.crew` path still works,
+  and a driver error now names the path it looked in and the form it expects (#177).
 - The machine-log tests no longer inherit the ambient `CLAUDE_CODE_SESSION_ID`. An install scopes
   its hook to the session it ran in, so a suite run from inside a Claude Code session pinned a
   session the tests never send and the bounded-read hook silently passed the tool through.
