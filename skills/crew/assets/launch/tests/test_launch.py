@@ -281,6 +281,12 @@ class Fixture:
             return []
         return [json.loads(line) for line in path.read_text().splitlines() if line]
 
+    def handover_calls(self):
+        path = self.stub_dir / "driver-handover-calls.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
 
 def flag(argv, name):
     """The value that follows `name` on that command line, or None where it does not appear."""
@@ -478,6 +484,17 @@ class LaunchTests(unittest.TestCase):
     def test_a_missing_registry_entry_aborts_and_names_the_flags_to_pass(self):
         """Nothing above this process is a session the harness recorded, so nothing is resolved."""
         self.fixture.transcript([PERMISSION_MODE])
+
+        result = self.fixture.launch()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--coordinator-pid", result.stderr)
+        self.assertIn("--coordinator-name", result.stderr)
+        self.assertEqual(self.fixture.driver_calls(), [])
+
+    def test_a_live_driver_does_not_bypass_coordinator_context_resolution(self):
+        self.fixture.record_driver(os.getpid())
+        self.fixture.wake(DEFAULT_WAKE)
 
         result = self.fixture.launch()
 
@@ -733,6 +750,107 @@ class DetachmentTests(unittest.TestCase):
         self.assertEqual(self.fixture.driver_calls(), [], "a live run was driven twice")
         self.assertEqual(self.fixture.windows(), [])
 
+    def test_a_different_coordinator_hands_over_the_live_driver_without_a_wake_gap(self):
+        """The old waiter loses ownership only after the replacement waiter has gained it."""
+        self.fixture.registry(os.getpid())
+        self.fixture.transcript([PERMISSION_MODE])
+        first = self.fixture.start_launch(env_overrides={
+            "AGENTCREW_STUB_DRIVER_HOLD": "10",
+            "AGENTCREW_STUB_DRIVER_SERVICE": "1",
+            TMUX_PANE: COORDINATOR_PANE,
+        })
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.recorded_driver() is not None),
+            "the original Driver never named itself",
+        )
+        driver_pid = self.fixture.recorded_driver()
+        second_session = "7dc60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        second_address = "uds:/private/tmp/cc-socks-501/2601.sock"
+        second_pane = "%8"
+        second_display = "$8"
+        (self.fixture.stub_dir / "tmux-session").write_text(second_display)
+
+        second = self.fixture.start_launch(extra=[
+            "--coordinator-pid", "2601",
+            "--coordinator-name", "crew-coordinator-2a",
+            "--coordinator-session", second_session,
+            "--coordinator-address", second_address,
+            "--permission-mode", SWITCHED_MODE,
+        ], env_overrides={TMUX_PANE: second_pane})
+
+        first_out, first_err = first.communicate(timeout=LAUNCH_TIMEOUT)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(first_out.strip(),
+                         "crew: this waiter was superseded by a coordinator handover")
+        self.assertEqual(first_err, "")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.fixture.handover_calls()) == 1),
+            "the live Driver never applied the Coordinator handover",
+        )
+        self.assertIsNone(second.poll(), "the new waiter returned before the Run woke")
+        self.assertEqual(self.fixture.recorded_driver(), driver_pid)
+        self.assertEqual(len(self.fixture.driver_calls()), 1, "handover started a second Driver")
+        self.assertEqual(self.fixture.recorded_waiters(), [str(second.pid)])
+        self.assertEqual(self.fixture.handover_calls(), [{
+            "name": "crew-coordinator-2a",
+            "pid": 2601,
+            "harness_session": second_session,
+            "address": second_address,
+            "pane": second_pane,
+            "permission_mode": SWITCHED_MODE,
+            "display_session": second_display,
+        }])
+
+        (self.fixture.stub_dir / "wake-after-handover").touch()
+        self.assertEqual(self.wake(second), DEFAULT_WAKE)
+        self.assertEqual(self.fixture.recorded_waiters(), [])
+
+    def test_concurrent_handover_requests_are_serviced_in_arrival_order(self):
+        self.fixture.registry(os.getpid())
+        self.fixture.transcript([PERMISSION_MODE])
+        first = self.fixture.start_launch(env_overrides={
+            "AGENTCREW_STUB_DRIVER_HOLD": "10",
+            "AGENTCREW_STUB_DRIVER_SERVICE": "1",
+            "AGENTCREW_STUB_DRIVER_SERVICE_GATE": "1",
+        })
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.recorded_driver() is not None),
+            "the original Driver never named itself",
+        )
+
+        def handover(pid, name, session, address):
+            return self.fixture.start_launch(extra=[
+                "--coordinator-pid", str(pid),
+                "--coordinator-name", name,
+                "--coordinator-session", session,
+                "--coordinator-address", address,
+                "--permission-mode", SWITCHED_MODE,
+            ])
+
+        second_address = "uds:/private/tmp/cc-socks-501/2601.sock"
+        third_address = "uds:/private/tmp/cc-socks-501/3601.sock"
+        second = handover(2601, "crew-coordinator-2a", "session-2a", second_address)
+        self.assertTrue(
+            self.fixture.wait_for(lambda: second.pid in map(int, self.fixture.recorded_waiters())),
+            "the first handover request never reached attendance",
+        )
+        third = handover(3601, "crew-coordinator-3a", "session-3a", third_address)
+        time.sleep(0.2)
+        (self.fixture.stub_dir / "service-enabled").touch()
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.fixture.handover_calls()) == 2, timeout=3),
+            f"the concurrent handovers were not both serviced: {self.fixture.handover_calls()}",
+        )
+        self.assertEqual(
+            [call["address"] for call in self.fixture.handover_calls()],
+            [second_address, third_address],
+        )
+        (self.fixture.stub_dir / "wake-after-handover").touch()
+        first.communicate(timeout=LAUNCH_TIMEOUT)
+        second.communicate(timeout=LAUNCH_TIMEOUT)
+        self.assertEqual(self.wake(third), DEFAULT_WAKE)
+
     def test_a_run_whose_driver_has_gone_is_driven_again(self):
         """The record names a process that is not running, which is a run with no driver."""
         self.fixture.record_driver(self.fixture.dead_pid())
@@ -867,6 +985,17 @@ class WaiterLivenessTests(unittest.TestCase):
         self.assertIsNotNone(
             calls[0]["waiter"], "the driver started before a waiter had named itself"
         )
+
+    def test_a_waiter_record_failure_is_said_but_does_not_withhold_the_run_wake(self):
+        record = self.fixture.crew_dir / WAITER_RECORD
+        record.mkdir(parents=True)
+
+        result = self.fixture.launch()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), DEFAULT_WAKE)
+        self.assertIn("this waiter could not name itself", result.stderr)
+        self.assertEqual(len(self.fixture.driver_calls()), 1)
 
     # --- the three deliberate endings ----------------------------------------------------------
 

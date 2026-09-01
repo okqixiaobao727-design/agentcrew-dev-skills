@@ -61,10 +61,11 @@ a second time, the children keep the worktrees and windows they have, their hook
 where their worktrees still stand, a coordinator that restarted re-anchors the run and the live
 children it answers, the dashboard is drawn again, and the loop picks the run up from its log —
 which is where every count it acts on lives, so an adopted run and an uninterrupted one are the
-same code path. What ends adoption is the log's own final advance decision, which is the monitor's
-predicate asked rather than restated: a run that has completed is not adopted, and the driver says
-so and points at the run's report. So re-typing the crew command is the whole of what an
-interruption, a driver crash or a coordinator restart costs.
+same code path. Before returning an old report for a final advance decision, the Driver observes
+each strictly correlated, unlanded Codex child once. No new protocol message preserves the final
+decision; a new one is appended before its Codex cursor advances and returns to the same rule
+table. So re-typing the crew command is the whole of what an interruption, a driver crash or a
+coordinator restart costs, including one resumed child that spoke after settlement.
 
 **The wave loop is a rule table, and the rule table is exhaustive.** Between the launch and the
 report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
@@ -141,6 +142,7 @@ sys.path.insert(0, str(ASSETS))
 import machine_log  # noqa: E402
 # Account bindings become process environments only through the account module.
 import accounts  # noqa: E402
+import coordinator_control  # noqa: E402
 import run_plan  # noqa: E402
 import tracker  # noqa: E402
 import witness as witness_runner  # noqa: E402
@@ -833,7 +835,7 @@ def config_value(config, keys):
 def launch_hook(config):
     """The project's `[hooks.on-child-launch]`, or nothing where it declares none."""
     section = config_value(config, LAUNCH_HOOK_SECTION)
-    return section if isinstance(section, dict) and section else None
+    return section if isinstance(section, dict) else None
 
 
 def declared_accounts(config):
@@ -897,7 +899,7 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, base_commit, conf
         },
     }
     hook = launch_hook(config)
-    if hook:
+    if hook is not None:
         run["launch_hook"] = hook
     return run
 
@@ -1217,16 +1219,20 @@ def clear_launches(records):
     return list(launches.values())
 
 
+def codex_state_path(codex, ticket):
+    """Return one ticket's state-file path under a Run's configured Codex state directory."""
+    return pathlib.Path(codex.state_dir) / f"{ticket}.json"
+
+
 def clear_codex_state_files(run, launches):
     """The state files named by recorded Codex ticket ids, never a directory glob."""
-    state_dir = pathlib.Path(run.codex.state_dir) if run.codex else None
-    if state_dir is None:
+    if run.codex is None:
         return []
     state_files = []
     for launch in launches:
         if launch.get("executor") != CODEX:
             continue
-        state_file = state_dir / f"{launch['ticket']}.json"
+        state_file = codex_state_path(run.codex, launch["ticket"])
         if state_file not in state_files:
             state_files.append(state_file)
     return state_files
@@ -1847,6 +1853,105 @@ def run_start(args):
     return wave_loop(args, run_dir, table_path, starting=True)
 
 
+def terminal_identity_error(ticket, log, detail):
+    """Return the Driver error for a recorded terminal-child identity mismatch."""
+    return DriverError(
+        f"ticket {ticket}'s recorded launch failed re-verification: {detail}",
+        ticket=ticket,
+        pointer=str(log),
+    )
+
+
+def verified_terminal_codex_state_files(plan, projection, log):
+    """Return strictly correlated state files for observable, unlanded terminal children."""
+    state_files = []
+    for ticket in plan.tickets:
+        facts = projection.ticket(ticket.id)
+        launch = facts.launch
+        if launch is None or facts.merge_landed:
+            continue
+        planned_codex = ticket.executor == CODEX
+        recorded_codex = lane_of(launch) == CODEX
+        if not planned_codex and not recorded_codex:
+            continue
+
+        if not planned_codex or not recorded_codex:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"executor mismatch: the table approved {ticket.executor},"
+                f" the latest launch records {launch.get('executor')}",
+            )
+        if str(launch.get("ticket")) != ticket.id:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"ticket mismatch: the latest launch records {launch.get('ticket')},"
+                f" the table approved {ticket.id}",
+            )
+        if plan.run.codex is None:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                "the Run plan carries no Codex bridge configuration",
+            )
+        state_file = codex_state_path(plan.run.codex, ticket.id)
+        try:
+            identity = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(identity, dict) or not {"machineLog", "ticket"} <= identity.keys():
+            continue
+        worktree = launch.get("worktree")
+        try:
+            state = dispatch.verify_codex_child(ticket, worktree, state_file)
+        except (dispatch.LaunchError, KeyError, OSError) as error:
+            raise terminal_identity_error(ticket.id, log, error) from error
+        thread = launch.get("child")
+        if not isinstance(thread, str) or not thread or state.get("threadId") != thread:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"thread mismatch: the state file names {state.get('threadId')},"
+                f" the latest launch records {thread}",
+            )
+        if str(state.get("ticket")) != ticket.id:
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"ticket mismatch: the state file names {state.get('ticket')},"
+                f" the latest launch records {ticket.id}",
+            )
+        recorded_log = state.get("machineLog")
+        if (
+            not isinstance(recorded_log, str)
+            or os.path.realpath(recorded_log) != os.path.realpath(log)
+        ):
+            raise terminal_identity_error(
+                ticket.id,
+                log,
+                f"Machine log mismatch: the state file names {recorded_log},"
+                f" this Run records {log}",
+            )
+        state_files.append(state_file)
+    return state_files
+
+
+def reconcile_terminal_codex_messages(plan, projection, log):
+    """Observe each correlated unlanded Codex child once, then return the refreshed facts."""
+    state_files = verified_terminal_codex_state_files(plan, projection, log)
+    if not state_files:
+        return projection
+    run_command(
+        [
+            sys.executable, str(plan.run.codex.bridge), "watch", "--once", *state_files,
+        ],
+        "the terminal Run's Codex messages could not be observed",
+        pointer=str(log),
+    )
+    return machine_log.project(machine_log.read_records(log))
+
+
 def adopt(args, run_dir, table_path):
     """Take over the unfinished run this feature already carries; returns the exit code it earns.
 
@@ -1855,15 +1960,12 @@ def adopt(args, run_dir, table_path):
     worktrees, branches and windows the interrupted run left them, and what they lost — the process
     watching them — is what this puts back.
 
-    One thing stands between the log and the loop: a run the monitor's `over` calls finished has
-    nothing to adopt — an `advance` decision of `complete`, or the `stopped` this loop appends
-    when a chain halted for good. A wave that escalated or was interrupted is neither: it is
-    re-run by the run that adopts it, which is how such a run carries on at all. The question is
-    asked of the monitor so the loop and the operator's surfaces can never disagree about it. A
-    finished run earns saying so and pointing at its report, and nothing else a re-typed command
-    may do to it. Everything an unfinished one needs is the loop's own — what it puts back before
-    it starts polling is `Loop.adopt`, and what it reads from the log is what it would have read
-    had it never stopped.
+    One thing stands between the log and the loop: before a terminal Run returns its old report,
+    each unlanded recorded Codex child is observed once through the bridge that owns its thread.
+    No new protocol message leaves the terminal facts unchanged. A message appended by that
+    observation is ordered after the old ending, so the refreshed projection hands it to the
+    loop's existing rule table. A wave that escalated or was interrupted is already unfinished and
+    takes the same loop without this terminal observation.
     """
     try:
         plan = run_plan.load(table_path)
@@ -1873,6 +1975,8 @@ def adopt(args, run_dir, table_path):
     log = run_dir / LOG_NAME
     records = machine_log.read_records(log)
     projection = machine_log.project(records)
+    if projection.ended:
+        projection = reconcile_terminal_codex_messages(plan, projection, log)
     if projection.ended:
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
@@ -1887,7 +1991,7 @@ def adopt(args, run_dir, table_path):
     return wave_loop(args, run_dir, table_path, adopting=True)
 
 
-def start_dashboard(args, repo, run_dir):
+def start_dashboard(context, repo, run_dir):
     """Point the operator's dashboard at the run, on whichever surface the repo chose.
 
     Idempotent, and run by every driver that takes the run up rather than only by the one that
@@ -1896,8 +2000,8 @@ def start_dashboard(args, repo, run_dir):
     """
     arguments = [
         sys.executable, MONITOR, "window",
-        "--run-dir", run_dir, "--session", args.tmux_session,
-        "--coordinator-pid", args.coordinator_pid,
+        "--run-dir", run_dir, "--session", context.display_session,
+        "--coordinator-pid", context.pid,
     ]
     config = repo / CONFIG_NAME
     if config.exists():
@@ -2397,7 +2501,7 @@ class WaveActivation:
             if ticket.executor == CLAUDE:
                 entry = dispatch.verify_child(ticket, worktree, 0)
                 return {**launch, "child": entry.get("name") or launch.get("child")}
-            state_file = pathlib.Path(self.loop.run.codex.state_dir) / f"{ticket.id}.json"
+            state_file = codex_state_path(self.loop.run.codex, ticket.id)
             state = dispatch.verify_codex_child(ticket, worktree, state_file)
             return {**launch, "child": state.get("threadId") or launch.get("child")}
         except (dispatch.LaunchError, KeyError, OSError) as error:
@@ -2468,6 +2572,7 @@ class WaveActivation:
 
     def activate(self, wave):
         """Make named `wave` ready for normal polling and restore its hooks; return nothing."""
+        self.loop.service_coordinator()
         try:
             records = self.loop.records()
             projection = machine_log.project(records)
@@ -2522,10 +2627,62 @@ class Loop:
         except run_plan.RunPlanError as error:
             raise DriverError(str(error), pointer=str(table_path)) from error
         self.run = self.plan.run
+        self.coordinator = coordinator_control.CoordinatorContext(
+            name=getattr(args, "coordinator_name", None) or self.run.coordinator_name,
+            pid=getattr(args, "coordinator_pid", None) or self.run.coordinator_pid,
+            harness_session=(
+                getattr(args, "coordinator_session", None) or self.run.coordinator_session
+            ),
+            address=getattr(args, "coordinator_address", None) or self.run.coordinator_address,
+            pane=getattr(args, "coordinator_pane", None),
+            permission_mode=(
+                getattr(args, "permission_mode", None) or self.run.permission_mode
+            ),
+            display_session=getattr(args, "tmux_session", None) or self.run.tmux_session,
+        )
+        self.coordinator_control = coordinator_control.CoordinatorControl(run_dir)
         self.repo_root = pathlib.Path(self.run.repo_root)
         self.crew_worktree = validate_recorded_crew_worktree(self.run)
         self.monitors = []
         self.activation = WaveActivation(self)
+
+    def service_coordinator(self):
+        """Service Coordinator control before Driver activation or polling."""
+        self.coordinator = self.coordinator_control.service(
+            self.coordinator, self.apply_coordinator
+        )
+
+    def apply_coordinator(self, context):
+        """Apply one Coordinator context while Coordinator control holds the handover boundary."""
+        previous_address = self.run.coordinator_address
+        self.coordinator = context
+        attend_coordinator(context.pane)
+
+        run = replace(
+            self.run,
+            coordinator_name=context.name,
+            coordinator_pid=context.pid,
+            coordinator_session=context.harness_session,
+            coordinator_address=context.address,
+            permission_mode=context.permission_mode,
+        )
+        plan = replace(self.plan, run=run)
+        try:
+            plan.write(self.table_path)
+        except run_plan.RunPlanError as error:
+            raise DriverError(str(error), pointer=str(self.table_path)) from error
+        self.run = run
+        self.plan = plan
+
+        install_hook(
+            self.log,
+            self.repo_root / SETTINGS_PATH,
+            COORDINATOR_ROLE,
+            session_id=context.harness_session,
+            run_dir=self.run_dir.parent,
+        )
+        self.reanchor(machine_log.project(self.records()), previous_address)
+        start_dashboard(context, self.crew_worktree, self.run_dir)
 
     # --- what it reads --------------------------------------------------------------------
 
@@ -3231,7 +3388,7 @@ class Loop:
 
     def open_wave(self):
         """Open or restore this run's dashboard for normal Wave polling; return nothing."""
-        start_dashboard(self.args, self.crew_worktree, self.run_dir)
+        start_dashboard(self.coordinator, self.crew_worktree, self.run_dir)
 
     def close_merged(self):
         """Close every merged ticket in the run's tracker, recording each undo; returns nothing."""
@@ -3276,7 +3433,7 @@ class Loop:
         projection = machine_log.project(records)
         install_hook(
             self.log, self.repo_root / SETTINGS_PATH, COORDINATOR_ROLE,
-            session_id=self.args.coordinator_session,
+            session_id=self.coordinator.harness_session,
             run_dir=self.run_dir.parent,
         )
         for ticket, facts in sorted(projection.tickets.items()):
@@ -3286,9 +3443,9 @@ class Loop:
             worktree = launch.get("worktree")
             if worktree and pathlib.Path(worktree).is_dir():
                 install_hook(self.log, pathlib.Path(worktree) / SETTINGS_PATH, CHILD_ROLE, ticket)
-        self.reanchor(projection)
+        self.service_coordinator()
 
-    def reanchor(self, projection):
+    def reanchor(self, projection, previous_address):
         """Point the run and its live children at the coordinator driving it now; returns nothing.
 
         A coordinator that restarted binds a new socket, so every Claude child of the run is
@@ -3306,26 +3463,8 @@ class Loop:
         instruction that landed and could not be recorded is a driver error, and it wakes the
         coordinator here as it does everywhere else.
         """
-        name = self.args.coordinator_name
-        pid = self.args.coordinator_pid
-        session = self.args.coordinator_session
-        address = self.args.coordinator_address
-        if (
-            self.run.coordinator_name,
-            self.run.coordinator_pid,
-            self.run.coordinator_session,
-            self.run.coordinator_address,
-        ) == (name, pid, session, address):
-            return
-        channel_changed = self.run.coordinator_address != address
-        self.run = replace(
-            self.run, coordinator_name=name, coordinator_pid=pid,
-            coordinator_session=session, coordinator_address=address,
-        )
-        self.plan = replace(self.plan, run=self.run)
-        self.plan.write(self.table_path)
         # A restart that moves only the hook scope leaves the address a child sends to standing.
-        if not channel_changed:
+        if previous_address == self.coordinator.address:
             return
         for ticket, facts in sorted(projection.tickets.items()):
             launch = facts.launch
@@ -3335,7 +3474,10 @@ class Loop:
                 continue
             with contextlib.suppress(Unreachable):
                 self.deliver(ticket, launch, ANCHOR_TEMPLATE.format(
-                    marker=ANCHOR_MARKER, ticket=ticket, name=name, address=address,
+                    marker=ANCHOR_MARKER,
+                    ticket=ticket,
+                    name=self.coordinator.name,
+                    address=self.coordinator.address,
                 ))
 
     # --- the loop itself ----------------------------------------------------------------------
@@ -3404,6 +3546,7 @@ class Loop:
 
     def poll(self, wave):
         """One turn of the loop over one wave; returns the wave to work next, or None when done."""
+        self.service_coordinator()
         records = self.records()
         projection = machine_log.project(records)
         if self.rule_on_messages(projection):
@@ -3664,7 +3807,6 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
     that cannot be carried on does.
     """
     loop = Loop(args, run_dir, table_path)
-    resume = resume_command(args)
     try:
         if adopting:
             loop.adopt()
@@ -3676,7 +3818,11 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
         return loop.run_until_woken()
     except Wake as wake:
         landed = snapshot(
-            wake.reason, ticket=wake.ticket, pointer=wake.pointer, resume=resume, **wake.fields
+            wake.reason,
+            ticket=wake.ticket,
+            pointer=wake.pointer,
+            resume=resume_command(loop.args, loop.coordinator),
+            **wake.fields,
         )
         if landed and wake.hand_over is not None:
             try:
@@ -3692,14 +3838,14 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
     except DriverError as error:
         snapshot(
             DRIVER_ERROR, ticket=error.ticket, pointer=error.pointer,
-            detail=str(error), resume=resume,
+            detail=str(error), resume=resume_command(loop.args, loop.coordinator),
         )
         return DRIVER_ERROR_EXIT
     finally:
         disarm(loop.monitors)
 
 
-def resume_command(args):
+def resume_command(args, coordinator):
     """The one command that puts the loop back where it left off, for the snapshot to carry.
 
     The launcher rather than this driver's own `resume`, because every driver of a run belongs in
@@ -3710,7 +3856,7 @@ def resume_command(args):
     """
     return shlex.join([
         sys.executable, str(LAUNCH), str(args.feature_dir),
-        "--coordinator-pid", str(args.coordinator_pid),
+        "--coordinator-pid", str(coordinator.pid),
     ])
 
 
@@ -3766,8 +3912,14 @@ def run_answer(args):
             f"unsupported answer key(s): {', '.join(unsupported)}",
             ticket=ticket, pointer=str(loop.log),
         )
-    loop.deliver(ticket, launch, args.text, args.keys)
-    return 0
+    control = coordinator_control.CoordinatorControl(run_dir)
+    try:
+        return control.authorized_action(
+            lambda: loop.deliver(ticket, launch, args.text, args.keys) or 0
+        )
+    except coordinator_control.CoordinatorControlError as error:
+        print(str(error), flush=True)
+        return DRIVER_ERROR_EXIT
 
 
 def plan_ticket(loop, reference):

@@ -47,7 +47,7 @@ class CodexConfig:
 
 @dataclass(frozen=True)
 class LaunchHook:
-    command: str
+    command: str | None
     env: tuple[tuple[str, str], ...]
 
 
@@ -509,7 +509,7 @@ def configuration_problems(
     return problems
 
 
-def _metadata(values):
+def _metadata(values, persisted=False):
     if not isinstance(values, dict):
         raise RunPlanError(["run: metadata is not an object"])
     required = (
@@ -581,7 +581,6 @@ def _metadata(values):
     if hook is not None:
         if not isinstance(hook, dict):
             raise RunPlanError(["run: launch_hook is not an object"])
-        command = _string(hook, "command", "launch_hook.command")
         environment = hook.get("env", {})
         if not isinstance(environment, dict):
             raise RunPlanError(["run: launch_hook.env is not an object"])
@@ -590,7 +589,20 @@ def _metadata(values):
             for name, value in environment.items()
         ):
             raise RunPlanError(["run: launch_hook.env must map non-empty strings to strings"])
-        hook_value = LaunchHook(command, tuple(environment.items()))
+        # Project config spells no command as an empty string. The normalized Wave-table omits the
+        # key when command is None, so only metadata loaded from that persistence form may lack it.
+        if "command" not in hook:
+            if not persisted:
+                raise RunPlanError(["run: launch_hook.command is not a string"])
+            command = None
+        else:
+            command = hook["command"]
+            if not isinstance(command, str):
+                raise RunPlanError(["run: launch_hook.command is not a string"])
+            if command == "":
+                command = None
+        if command is not None or environment:
+            hook_value = LaunchHook(command, tuple(environment.items()))
     return RunMetadata(
         repo_root=repo_root,
         crew_worktree=crew_worktree,
@@ -644,10 +656,9 @@ def _metadata_object(run):
     if run.codex is not None:
         document["codex"] = {"bridge": run.codex.bridge, "state_dir": run.codex.state_dir}
     if run.launch_hook is not None:
-        document["launch_hook"] = {
-            "command": run.launch_hook.command,
-            "env": dict(run.launch_hook.env),
-        }
+        document["launch_hook"] = {"env": dict(run.launch_hook.env)}
+        if run.launch_hook.command is not None:
+            document["launch_hook"]["command"] = run.launch_hook.command
     return document
 
 
@@ -767,7 +778,7 @@ def _loaded_plan(document):
         ))
     if not waves:
         raise RunPlanError(["run: the plan carries no waves"])
-    return _validate(RunPlan(_metadata(document["run"]), tuple(waves)))
+    return _validate(RunPlan(_metadata(document["run"], persisted=True), tuple(waves)))
 
 
 def crew_state_dir(path):

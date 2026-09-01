@@ -7,6 +7,7 @@ import pathlib
 import sys
 import tempfile
 import tomllib
+import types
 import unittest
 from unittest import mock
 
@@ -14,8 +15,10 @@ from unittest import mock
 ASSETS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "crew" / "assets"
 PLUGIN_ROOT = ASSETS.parents[2]
 sys.path.insert(0, str(ASSETS))
+sys.path.insert(0, str(ASSETS / "driver"))
 
 import run_plan  # noqa: E402
+import driver  # noqa: E402
 
 
 WITNESS_MODEL = "claude-sonnet-5"
@@ -113,6 +116,134 @@ class RunPlanTests(unittest.TestCase):
             f"{routing}",
             encoding="utf-8",
         )
+
+    def plan_from_config(self, hook=...):
+        """Build, persist, and reload the Run plan through the Driver's config seam."""
+        config = {
+            "repair": {"model": "claude-sonnet-5"},
+            "witness": {"model": WITNESS_MODEL, "budget_usd": WITNESS_BUDGET_USD},
+            "tracker": {"kind": "local"},
+        }
+        if hook is not ...:
+            config["hooks"] = {"on-child-launch": hook}
+        args = types.SimpleNamespace(
+            spec=None,
+            coordinator_name="crew-coordinator",
+            coordinator_pid=1234,
+            coordinator_session="session-1",
+            coordinator_address="uds:/tmp/cc-socks/1234.sock",
+            tmux_session="$1:",
+            permission_mode="acceptEdits",
+            codex_bridge=None,
+        )
+        with mock.patch.object(
+            driver, "coordinator_config_home", return_value=str(self.account)
+        ):
+            metadata = driver.run_section(
+                args,
+                self.root,
+                self.feature,
+                self.feature / ".crew",
+                "main",
+                "a" * 40,
+                config,
+            )
+        plan = run_plan.build(self.feature, metadata)
+        path = self.root / "wave-table.json"
+        plan.write(path)
+        return plan, json.loads(path.read_text(encoding="utf-8")), run_plan.load(path)
+
+    def test_an_absent_launch_hook_round_trips_as_no_launch_hook(self):
+        self.ticket("01", "Foundation")
+
+        plan, document, reloaded = self.plan_from_config()
+
+        self.assertIsNone(plan.run.launch_hook)
+        self.assertNotIn("launch_hook", document["run"])
+        self.assertEqual(reloaded, plan)
+
+    def test_an_empty_command_and_environment_round_trip_as_no_launch_hook(self):
+        self.ticket("01", "Foundation")
+
+        plan, document, reloaded = self.plan_from_config({"command": "", "env": {}})
+
+        self.assertIsNone(plan.run.launch_hook)
+        self.assertNotIn("launch_hook", document["run"])
+        self.assertEqual(reloaded, plan)
+
+    def test_an_environment_without_a_command_round_trips_without_a_command_key(self):
+        self.ticket("01", "Foundation")
+        environment = {"AGENTCREW_HOOK_TOKEN": "hook-token"}
+
+        plan, document, reloaded = self.plan_from_config(
+            {"command": "", "env": environment}
+        )
+
+        self.assertEqual(
+            plan.run.launch_hook,
+            run_plan.LaunchHook(None, (("AGENTCREW_HOOK_TOKEN", "hook-token"),)),
+        )
+        self.assertEqual(document["run"]["launch_hook"], {"env": environment})
+        self.assertEqual(reloaded, plan)
+
+    def test_an_active_command_and_environment_round_trip_verbatim(self):
+        self.ticket("01", "Foundation")
+        environment = {"AGENTCREW_HOOK_TOKEN": "hook-token"}
+
+        plan, document, reloaded = self.plan_from_config(
+            {"command": "prepare-child", "env": environment}
+        )
+
+        self.assertEqual(
+            plan.run.launch_hook,
+            run_plan.LaunchHook(
+                "prepare-child", (("AGENTCREW_HOOK_TOKEN", "hook-token"),)
+            ),
+        )
+        self.assertEqual(
+            document["run"]["launch_hook"],
+            {"command": "prepare-child", "env": environment},
+        )
+        self.assertEqual(reloaded, plan)
+
+    def test_only_an_empty_string_spells_no_command_in_project_config(self):
+        self.ticket("01", "Foundation")
+
+        for hook in (
+            {},
+            {"env": {"AGENTCREW_HOOK_TOKEN": "hook-token"}},
+            {"command": None, "env": {}},
+            {"command": 0, "env": {}},
+        ):
+            with self.subTest(hook=hook):
+                with self.assertRaisesRegex(
+                    run_plan.RunPlanError, "launch_hook.command.*string"
+                ):
+                    self.plan_from_config(hook)
+
+    def test_a_whitespace_only_command_is_active_and_preserved_verbatim(self):
+        self.ticket("01", "Foundation")
+
+        plan, document, reloaded = self.plan_from_config({"command": "  ", "env": {}})
+
+        self.assertEqual(plan.run.launch_hook, run_plan.LaunchHook("  ", ()))
+        self.assertEqual(
+            document["run"]["launch_hook"], {"command": "  ", "env": {}}
+        )
+        self.assertEqual(reloaded, plan)
+
+    def test_an_environment_without_a_command_keeps_fail_closed_environment_validation(self):
+        self.ticket("01", "Foundation")
+        cases = (
+            ({"command": "", "env": []}, "launch_hook.env.*object"),
+            ({"command": "", "env": {"": "value"}}, "launch_hook.env.*non-empty"),
+            ({"command": "", "env": {"PORT": 123}}, "launch_hook.env.*non-empty"),
+        )
+
+        for hook, message in cases:
+            with self.subTest(hook=hook):
+                with self.assertRaisesRegex(run_plan.RunPlanError, message):
+                    self.plan_from_config(hook)
 
     def test_build_returns_immutable_ordered_values_and_assigns_dependency_waves(self):
         self.ticket("01", "Foundation")

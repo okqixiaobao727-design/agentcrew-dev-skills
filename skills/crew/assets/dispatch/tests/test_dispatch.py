@@ -1526,6 +1526,52 @@ class CodexRenderTests(DispatchTestCase):
         self.assertIn(CODEX_MODEL, line)
 
 
+class LaunchHookContractTests(DispatchTestCase):
+    def mixed_tickets(self):
+        return [
+            self.fixture.ticket("06", "claude-child"),
+            self.fixture.ticket(
+                "07", "codex-child", executor="codex", model=CODEX_MODEL,
+                effort=CODEX_EFFORT,
+                review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+            ),
+        ]
+
+    def test_an_environment_without_a_command_reaches_both_launchers_without_running_a_hook(self):
+        environment = {"AGENTCREW_HOOK_TOKEN": "env-only"}
+        table = self.fixture.table(self.mixed_tickets(), launch_hook={"env": environment})
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse(self.fixture.hook_marker.exists())
+        self.assertEqual(self.fixture.launches()[0]["env"], environment)
+        self.assertEqual(self.fixture.codex_launches()[0]["env"], environment)
+
+    def test_an_active_hook_runs_exactly_once_for_each_claude_and_codex_child(self):
+        environment = {"AGENTCREW_HOOK_TOKEN": "active"}
+        command = (
+            "printf '%s\\n' \"$AGENTCREW_CHILD_CWD\" >> "
+            + shlex.quote(str(self.fixture.hook_marker))
+        )
+        table = self.fixture.table(
+            self.mixed_tickets(), launch_hook={"command": command, "env": environment}
+        )
+
+        result = self.fixture.run_dispatch("dispatch", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(
+            sorted(self.fixture.hook_marker.read_text().splitlines()),
+            sorted([
+                str(self.fixture.repo / ".claude" / "worktrees" / "06-claude-child"),
+                str(self.fixture.repo / ".claude" / "worktrees" / "07-codex-child"),
+            ]),
+        )
+        self.assertEqual(self.fixture.launches()[0]["env"], environment)
+        self.assertEqual(self.fixture.codex_launches()[0]["env"], environment)
+
+
 class DispatchLaunchTests(DispatchTestCase):
     def setUp(self):
         super().setUp()

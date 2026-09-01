@@ -11,6 +11,8 @@ resume|resume_keeps_logging_configuration|test_resume_keeps_logging_configuratio
 resume|unmarked_turn_is_watched|test_unmarked_turn_is_watched
 telemetry|missed_edge_is_still_logged_once|test_missed_edge_is_still_logged_once
 telemetry|unrecorded_turn_survives_a_later_turn|test_unrecorded_turn_survives_a_later_turn
+telemetry|one_shot_append_before_cursor|test_one_shot_append_before_cursor
+telemetry|send_append_failure_stays_best_effort|test_send_append_failure_stays_best_effort
 inputs|model_effort_overrides|test_model_effort_overrides
 inputs|without_model_effort_overrides|test_without_model_effort_overrides
 resume|resume_keeps_pinned_model_effort|test_resume_keeps_pinned_model_effort
@@ -389,6 +391,11 @@ watch() { # <out-file> <state-file...>
   "$PYTHON" "$BRIDGE" watch --interval 0.3 --timeout 30 "$@" > "$out" 2>"$out.err"
 }
 
+watch_once() { # <out-file> <state-file...>
+  local out="$1"; shift
+  "$PYTHON" "$BRIDGE" watch --once "$@" > "$out" 2>"$out.err"
+}
+
 fail_next_pane_reads() { # <count>
   printf '%s\n' "$1" > "$TMUX_LIST_PANES_FAILURES"
   : > "$TMUX_LIST_PANES_FAILED"
@@ -561,6 +568,79 @@ test_unrecorded_turn_survives_a_later_turn() {
   assert_log_event "$log" 0 message child 23 "$CHILD_MESSAGE" \
     && ok "unrecorded-turn: the finished turn's message still reached the log" \
     || fail "unrecorded-turn: a later turn buried the message"
+}
+
+# --- Test 32: a one-shot observation records the message before advancing its cursor ---
+test_one_shot_append_before_cursor() {
+  local dir; dir=$(make_child t32 message)
+  local sf="$WORK/t32.state.json" out="$WORK/t32.launch.json"
+  local log="$WORK/t32.log.jsonl" failed="$WORK/t32.once-failed.json"
+  launch_with_options "$dir" "$sf" 32 "$out" \
+    --machine-log "$log" --ticket 32 \
+    || { fail "one-shot: launch exited $?"; return; }
+  sleep 1
+  printf 'x' > "$dir/stub-typed-turn-held"
+
+  rm -f "$log"
+  mkdir "$log"
+  if watch_once "$failed" "$sf"; then
+    fail "one-shot: an unwritable Machine log was reported as success"
+    return
+  fi
+  [ -z "$(json_field "$sf" finalMessage)" ] \
+    && ok "one-shot: failed append left finalMessage unchanged" \
+    || { fail "one-shot: failed append advanced finalMessage"; return; }
+
+  rmdir "$log"
+  : > "$log"
+  watch_once "$WORK/t32.once-retry.json" "$sf" \
+    || { fail "one-shot: retry exited $? ($(cat "$WORK/t32.once-retry.json.err"))"; return; }
+  [ "$(json_field "$WORK/t32.once-retry.json" sessions 0 status)" = "busy" ] \
+    && ok "one-shot: one evaluation returned the busy session" \
+    || fail "one-shot: the busy session did not return after one evaluation"
+  assert_log_event "$log" 0 message child 32 "$CHILD_MESSAGE" \
+    && ok "one-shot: retry observed and appended the same message" \
+    || { fail "one-shot: retry lost the unrecorded message"; return; }
+  [ "$(json_field "$sf" finalMessage)" = "$CHILD_MESSAGE" ] \
+    && ok "one-shot: successful append advanced finalMessage" \
+    || fail "one-shot: successful append left finalMessage behind"
+  watch_once "$WORK/t32.once-again.json" "$sf" \
+    || { fail "one-shot: repeated observation exited $?"; return; }
+  assert_log_count "$log" 1 \
+    && ok "one-shot: repeated observation did not duplicate the message" \
+    || fail "one-shot: repeated observation duplicated the message"
+}
+
+# --- Test 33: a send keeps its existing best-effort log copy after delivering the turn ---
+test_send_append_failure_stays_best_effort() {
+  local dir; dir=$(make_child t33 question)
+  local sf="$WORK/t33.state.json" out="$WORK/t33.launch.json"
+  local log="$WORK/t33.log.jsonl" old_marker
+  launch_with_options "$dir" "$sf" 33 "$out" \
+    --machine-log "$log" --ticket 33 \
+    || { fail "send-append: launch exited $?"; return; }
+  watch "$WORK/t33.watch.json" "$sf" \
+    || { fail "send-append: first watch exited $?"; return; }
+  old_marker=$(json_field "$sf" marker)
+  rm -f "$log"
+  mkdir "$log"
+
+  "$PYTHON" "$BRIDGE" send --state-file "$sf" --prompt "Use the existing interface." \
+    > "$WORK/t33.send.json" 2> "$WORK/t33.send.err" \
+    || { fail "send-append: delivered turn was reported failed"; return; }
+  [ "$(json_field "$sf" status)" = "busy" ] \
+    && [ "$(json_field "$sf" marker)" != "$old_marker" ] \
+    && ok "send-append: state advanced after the best-effort log copy failed" \
+    || { fail "send-append: delivered turn left stale state"; return; }
+
+  rmdir "$log"
+  : > "$log"
+  watch "$WORK/t33.follow-up.json" "$sf" \
+    || { fail "send-append: delivered turn was not observable"; return; }
+  case "$(json_field "$WORK/t33.follow-up.json" sessions 0 finalMessage)" in
+    *"CREW COMPLETE"*) ok "send-append: the delivered follow-up completed" ;;
+    *) fail "send-append: the follow-up turn was not delivered" ;;
+  esac
 }
 
 # --- Test 11: pinned model and effort reach both Codex argv lists and state ---

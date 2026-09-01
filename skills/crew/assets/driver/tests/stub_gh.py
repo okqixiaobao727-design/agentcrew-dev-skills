@@ -84,6 +84,9 @@ def issue(argv):
         save(table)
         return 0
     if action == "close":
+        if (state_dir() / "gh-close-fails").exists():
+            print("stub issue close failed", file=sys.stderr)
+            return 1
         record["closed"] = True
         save(table)
         return 0

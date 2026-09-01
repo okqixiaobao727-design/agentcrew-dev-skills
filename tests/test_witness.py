@@ -576,9 +576,11 @@ class WitnessTests(unittest.TestCase):
         self.assertTrue(document["reason"])
 
     def test_tree_changes_fail_closed_after_process_failure_and_timeout(self):
+        # One second leaves process-startup margin for the stub to write the stray file before its
+        # 30-second sleep reaches the timeout; the timeout path itself is still exercised.
         for behaviour, extra in (
             ("witness-fail-write", ()),
-            ("witness-timeout-write", ("--timeout-seconds", "0.05")),
+            ("witness-timeout-write", ("--timeout-seconds", "1")),
         ):
             with self.subTest(behaviour=behaviour):
                 document = self.assert_failed_result(self.run_witness(behaviour, *extra))

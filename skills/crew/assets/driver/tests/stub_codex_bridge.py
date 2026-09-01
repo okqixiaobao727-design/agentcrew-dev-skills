@@ -35,16 +35,40 @@ def main():
             return 1
         path = state_dir / "codex-statuses.json"
         statuses = json.loads(path.read_text()) if path.exists() else {}
+        messages_path = state_dir / "codex-thread-messages.json"
+        messages = json.loads(messages_path.read_text()) if messages_path.exists() else {}
+        once = "--once" in argv
+        appended = False
         sessions = []
-        for state_file in argv[1:]:
+        for state_file in (argument for argument in argv[1:] if argument != "--once"):
             ticket = pathlib.Path(state_file).stem
             status = statuses.get(ticket)
-            if status is not None:
+            state = json.loads(pathlib.Path(state_file).read_text())
+            message = messages.get(ticket)
+            if message and message != state.get("finalMessage"):
+                command = [
+                    sys.executable, str(MACHINE_LOG), "--log", state["machineLog"], "message",
+                    "--role", "child", "--ticket", state["ticket"], "--message", message,
+                ]
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                if result.returncode != 0:
+                    print(result.stderr or result.stdout, file=sys.stderr)
+                    return result.returncode
+                state["finalMessage"] = message
+                pathlib.Path(state_file).write_text(json.dumps(state))
+                appended = True
+            if once:
+                status = status or state.get("status") or "idle"
+                sessions.append({"stateFile": state_file, "status": status})
+            elif status is not None:
                 sessions.append({"stateFile": state_file, "status": status})
                 if status == "idle":
                     statuses[ticket] = "busy"
         if path.exists():
             path.write_text(json.dumps(statuses))
+        if once and appended and (state_dir / "codex-once-fails-after-append").exists():
+            print("the one-shot observer was interrupted after append", file=sys.stderr)
+            return 1
         print(json.dumps({"sessions": sessions}))
         return 0
 
@@ -81,6 +105,10 @@ def main():
         "cwd": os.path.realpath(flag(argv, "--cwd")),
         "model": flag(argv, "--model"),
         "effort": flag(argv, "--effort"),
+        "machineLog": os.path.realpath(flag(argv, "--machine-log")),
+        "ticket": flag(argv, "--ticket"),
+        "status": "busy",
+        "finalMessage": None,
     }))
     print(json.dumps({"ok": True, "windowId": "@codex-1", "threadId": "stub-thread"}))
     return 0

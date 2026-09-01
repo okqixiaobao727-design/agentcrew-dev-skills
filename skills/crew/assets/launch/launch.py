@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Start a crew run from a run directory alone: resolve the coordinator, then launch the driver.
 
-The driver's `start` needs five facts about the session driving it — the pid the dashboard pins
-and the driver detects a restart by, the name a child reads as a label, the address a child sends
-to, the session ID that scopes coordinator hooks, and the permission mode every child launches
-under. A coordinator session cannot see any of them from inside itself, and the turns it spends
-hunting for them are the whole of `/crew`'s start-up cost. This script reads them off the
-harness's own on-disk records instead:
+The Driver needs one immutable context for the session driving it: the five recorded identity
+facts below, plus the invoking pane used for no-Waiter recovery and the tmux display session used
+for the dashboard. A Coordinator session cannot see the five identity facts from inside itself,
+and the turns it spends hunting for them are the whole of `/crew`'s start-up cost. This script
+reads them off the harness's own on-disk records instead:
 
 - **pid** — the invoking shell's parent, found by walking up the process ancestry to the first
   process the harness has a session registry entry for. The shell in between is why the walk
@@ -25,8 +24,9 @@ These are harness-internal formats, so every resolution failure aborts with the 
 the value by hand. Nothing is defaulted and nothing is guessed: a wrong name or pid strands the
 run's rulings, and a wrong mode launches every child of the run in the wrong permission regime.
 
-Starting and adopting are the driver's own distinction, not this script's: it composes `start`,
-which adopts a run the directory already holds rather than beginning a second one.
+Attendance owns the Run-control distinction here. With no live Driver it composes `start`; with a
+live Driver the same Coordinator address attaches another Waiter, while a different address waits
+for that Driver to complete an in-place Coordinator handover.
 
 What this script does *not* do any more is become that driver. A driver held as a background task
 of the coordinator's session is a driver the harness may end at any moment — it did, silently,
@@ -42,9 +42,8 @@ the coordinator's pane itself; the dashboard says so until one attaches. Which p
 process is the only one that can say — it is the only part of the run that runs inside it — so it
 reads `$TMUX_PANE` out of its own environment and hands it to the driver.
 
-That makes the command idempotent in one more way than before. A run whose driver is already alive
-— named in the run directory, and answering to a signal — is attached to rather than started
-again, so `/crew` stays safe to type at any moment and no run is ever driven twice.
+That keeps the command idempotent: a Run whose Driver is already alive is never driven twice, even
+when the invoking Coordinator must first take ownership from a different address.
 
     python3 launch.py <run-dir> [--coordinator-pid N] [--coordinator-name NAME]
                                 [--coordinator-session ID] [--coordinator-address uds:PATH]
@@ -53,7 +52,6 @@ again, so `/crew` stays safe to type at any moment and no run is ever driven twi
 
 import argparse
 import contextlib
-import fcntl
 import json
 import os
 import pathlib
@@ -76,16 +74,16 @@ START_COMMAND = "start"
 MONITOR = SCRIPT_DIR.parent / "monitor" / "monitor.py"
 sys.path.insert(0, str(MONITOR.parent))
 import monitor  # noqa: E402
+import coordinator_control  # noqa: E402
 import run_plan  # noqa: E402
 
-# The run's own directory inside the feature, and the three files this end of the run uses: the
-# wake snapshot the driver leaves for this waiter, the driver's own output now that no task output
-# file collects it, and the lock that makes "is a driver alive, and start one if not" one decision.
-# The fourth — the pid record the whole judgment rests on — belongs to the driver, so the renderer
-# that owns it is asked rather than read here.
+# The run's own directory inside the feature, and the two public files attendance consumes: the
+# wake snapshot the Driver leaves for its Waiter, and the Driver's output now that no task output
+# file collects it. Coordinator control owns its private run-local state; the pid record the whole
+# liveness judgment rests on belongs to the Driver, so the renderer that owns it is asked rather
+# than read here.
 WAKE_NAME = "wake.json"
 DRIVER_LOG_NAME = "driver.log"
-DRIVER_LOCK_NAME = "driver.lock"
 # The window the driver runs in, named as the run's other windows are so an operator reading the
 # session's window list can tell what it is. Killing it, or Ctrl-C in it, stops the run's driver
 # and nothing else.
@@ -109,11 +107,6 @@ PERMISSION_MODE_SECONDS = float(
 # How often the launcher rereads state it is waiting on. Neither the first permission-mode record
 # nor a run's wake is a hot path, so polling keeps both waits simple and bounded.
 POLL_SECONDS = 0.5
-# How long a released run is watched before its silence is called a deliberate stop. A driver
-# releases the run an instant before it writes its wake, so this only has to outlast one file
-# rename — it is seconds rather than milliseconds because nothing is waiting on it.
-RELEASE_GRACE_SECONDS = 3.0
-
 # The harness's two records, each as the three parts `monitor.py` spells them in: the variable
 # that moves the home, the home's own name under `~`, and the fixed subdirectory inside it.
 SESSION_REGISTRY = ("CLAUDE_CONFIG_DIR", ".claude", "sessions")
@@ -336,31 +329,43 @@ def coordinator_pane():
     return os.environ.get(TMUX_PANE_VARIABLE) or None
 
 
-def driver_command(args, session, resolved, run_dir):
+def coordinator_context(args):
+    """Resolve the invoking Coordinator once, before any Run-control decision."""
+    pid, name, harness_session, address, mode = resolve(args)
+    return coordinator_control.CoordinatorContext(
+        name=name,
+        pid=pid,
+        harness_session=harness_session,
+        address=address,
+        pane=coordinator_pane(),
+        permission_mode=mode,
+        display_session=tmux_session(),
+    )
+
+
+def driver_command(args, context, run_dir):
     """The driver command line this run starts on, `start` because start is what adopts."""
-    pid, name, coordinator_session, address, mode = resolved
     command = [
         sys.executable, str(pathlib.Path(args.driver).resolve()), START_COMMAND,
         "--feature-dir", str(run_dir.parent),
-        "--coordinator-name", name,
-        "--coordinator-pid", str(pid),
-        "--coordinator-session", coordinator_session,
-        "--coordinator-address", address,
-        "--permission-mode", mode,
-        "--tmux-session", session,
+        "--coordinator-name", context.name,
+        "--coordinator-pid", str(context.pid),
+        "--coordinator-session", context.harness_session,
+        "--coordinator-address", context.address,
+        "--permission-mode", context.permission_mode,
+        "--tmux-session", context.display_session,
     ]
-    pane = coordinator_pane()
-    return command + ["--coordinator-pane", pane] if pane else command
+    return command + ["--coordinator-pane", context.pane] if context.pane else command
 
 
 # --- the driver's own window ------------------------------------------------------------------
 
 
 def tmux_session():
-    """The tmux session this run's windows belong to: the one this command was typed in.
+    """The invoking Coordinator's tmux display session: the one this command was typed in.
 
-    Asked of tmux exactly as the driver asks it, because the driver's window and the run's child
-    windows have to land in one session for the operator to have one place to watch the run from.
+    A new Run starts its Driver and execution windows there. A live handover uses it only to re-pin
+    the dashboard; the existing Driver and child windows stay in the Run's recorded session.
     """
     try:
         result = subprocess.run(
@@ -413,9 +418,10 @@ def open_window(command, session, log):
 def await_driver(run_dir, deadline):
     """Wait for the spawned driver to name itself in the run directory; returns nothing.
 
-    Held under the launch lock, so that the next `/crew` typed at this run sees the driver this one
-    started rather than an empty run directory it would start a second driver for. A driver that
-    got as far as a wake — a preflight failure is over before its first poll — has answered too.
+    Held inside Coordinator attendance, so the next `/crew` typed at this Run sees the Driver this
+    one started rather than an empty run directory it would start a second Driver for. A Driver
+    that got as far as a wake — a preflight failure is over before its first poll — has answered
+    too.
     """
     while time.monotonic() < deadline:
         if monitor.live_driver(run_dir) or wake_path(run_dir).exists():
@@ -452,103 +458,13 @@ def wake_path(run_dir):
     return run_dir / WAKE_NAME
 
 
-@contextlib.contextmanager
-def launch_lock(run_dir):
-    """Hold the run for the whole of the check-and-start; released before anything is waited on.
-
-    Two `/crew` commands typed at one run inside a second both find no driver and both start one
-    without this, which is the one thing adopt exists to prevent. It is not held across the wait:
-    a waiter blocks for as long as the run takes, and nothing may be shut out for that.
-    """
-    with (run_dir / DRIVER_LOCK_NAME).open("w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def start_driver(args, run_dir):
-    """Start this run's driver unless one is already driving it; returns nothing.
-
-    The record the driver keeps of itself is the whole judgment: a pid that answers to a signal is
-    a driver, and this attaches to it. Anything else — no record, or one naming a process that has
-    gone — is a run to put a driver back on.
-
-    Whose driver it is, this does not ask. A driver carries the coordinator it was started for for
-    its whole life — the pid every child authenticates a ruling against — so one that outlived its
-    session is a driver a new session cannot rule through. Detaching the driver is what made that
-    state reachable, and closing it means re-anchoring the run's children as well as its driver,
-    which is its own piece of work rather than this one's (#112).
-    """
-    with launch_lock(run_dir):
-        if monitor.live_driver(run_dir):
-            return
-        # Resolved before tmux is asked for anything, so that the three values a run cannot be
-        # started without are still what a failed launch reports, whatever else is wrong.
-        resolved = resolve(args)
-        session = tmux_session()
-        command = driver_command(args, session, resolved, run_dir)
-        # The wake of the cycle just ended, taken away before the driver that would write the next
-        # one starts: a waiter that found the old one would answer its coordinator with a snapshot
-        # that has already been ruled on.
-        with contextlib.suppress(OSError):
-            wake_path(run_dir).unlink(missing_ok=True)
-        open_window(command, session, run_dir / DRIVER_LOG_NAME)
-        await_driver(run_dir, time.monotonic() + HANDSHAKE_SECONDS)
-
-
-def wait_for_wake(run_dir):
-    """Block until this run has something to say, print it, and end; returns the exit code.
-
-    The one line printed is the driver's own wake snapshot, unchanged — this waiter composes
-    nothing and judges nothing, so what a coordinator reads is what the driver wrote.
-
-    Two endings are not snapshots, and neither is dressed up as one: a coordinator handed an
-    invented snapshot would go off ruling on a run nobody is driving. A driver whose record still
-    stands over a process that is gone was killed — the same judgment the dashboard's own banner
-    makes, said here so this waiter does not block on it forever the way the coordinator's task
-    used to. A driver that put the run down and left no wake ended without asking for anything: an
-    interrupt in its own window is the ordinary reason, and a wake it could not write is the other,
-    so the line says both and points at the log that tells them apart.
-
-    All three endings are reached by running code, and `main` releases the run's waiter record on
-    each of them. The harness reaps a main session's background shells under memory pressure, and
-    nothing runs on the way out of that — so a record left standing over a process that is gone is
-    a waiter that was killed, and it is the only thing that can say so (#127).
-    """
-    settled = None
-    while True:
-        try:
-            wake = wake_path(run_dir).read_text(encoding="utf-8").strip()
-        except OSError:
-            wake = None
-        if wake:
-            print(wake, flush=True)
-            return 0
-        driver = monitor.recorded_driver(run_dir)
-        if driver is not None and not monitor.alive(driver):
-            print(
-                f"crew: the driver of {run_dir.parent} was killed; it left no wake snapshot."
-                f" /crew {run_dir.parent} puts a driver back on the run",
-                flush=True,
-            )
-            return 0
-        if driver is not None:
-            settled = None
-        elif settled is None:
-            # A deliberate exit releases the run and writes its wake immediately after, so a
-            # released record on its own proves nothing until that instant has passed.
-            settled = time.monotonic() + RELEASE_GRACE_SECONDS
-        elif time.monotonic() >= settled:
-            print(
-                f"crew: the driver of {run_dir.parent} ended without leaving a wake snapshot —"
-                f" stopped in its own window, or unable to write one; {run_dir / DRIVER_LOG_NAME}"
-                f" says which. /crew {run_dir.parent} starts it again",
-                flush=True,
-            )
-            return 0
-        time.sleep(POLL_SECONDS)
+def start_driver(args, run_dir, context):
+    """Start the missing Driver selected by Coordinator attendance; returns nothing."""
+    command = driver_command(args, context, run_dir)
+    with contextlib.suppress(OSError):
+        wake_path(run_dir).unlink(missing_ok=True)
+    open_window(command, context.display_session, run_dir / DRIVER_LOG_NAME)
+    await_driver(run_dir, time.monotonic() + HANDSHAKE_SECONDS)
 
 
 def build_parser():
@@ -580,31 +496,17 @@ def build_parser():
     return parser
 
 
-def attach_waiter(run_dir):
-    """Name this process as the run's waiter; returns nothing.
-
-    Said and carried on where it fails. A waiter that cannot name itself still carries this run's
-    wake back, which is the thing it exists to do; what it loses is the dashboard's banner and the
-    driver's own re-type, and stopping here to protect those would cost the coordinator the very
-    ruling it is waiting for.
-    """
-    try:
-        monitor.record_waiter(run_dir, os.getpid())
-    except monitor.MonitorError as error:
-        print(f"crew: this waiter could not name itself in {run_dir}: {error}",
-              file=sys.stderr, flush=True)
-
-
 def carry_the_wake(args, run_dir):
-    """Put a driver on that run if it has none, and carry its wake back; returns the exit code."""
+    """Resolve one Coordinator and attend the Run through Coordinator control."""
     try:
-        start_driver(args, run_dir)
-    except LaunchError as error:
+        context = coordinator_context(args)
+        control = coordinator_control.CoordinatorControl(
+            run_dir, liveness=monitor, poll_seconds=POLL_SECONDS
+        )
+        return control.attend(context, lambda current: start_driver(args, run_dir, current))
+    except (LaunchError, coordinator_control.CoordinatorControlError) as error:
         print(f"launch: {error}", file=sys.stderr)
         return LAUNCH_ERROR_EXIT
-    # Everything after this point is disposable. The run belongs to the driver's own window now,
-    # and this process only carries its wake back — so whatever ends it, ends nothing.
-    return wait_for_wake(run_dir)
 
 
 def main(argv=None):
@@ -614,14 +516,7 @@ def main(argv=None):
     except LaunchError as error:
         print(f"launch: {error}", file=sys.stderr)
         return LAUNCH_ERROR_EXIT
-    # Named before any driver exists, and not at the point this starts blocking: a driver that
-    # reached its wake first — a preflight failure is over well inside the handshake — would read
-    # an empty record and re-type `/crew` at a coordinator that already has a waiter coming (#127).
-    attach_waiter(run_dir)
-    try:
-        return carry_the_wake(args, run_dir)
-    finally:
-        monitor.release_waiter(run_dir, os.getpid())
+    return carry_the_wake(args, run_dir)
 
 
 if __name__ == "__main__":

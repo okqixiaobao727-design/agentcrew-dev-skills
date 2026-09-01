@@ -118,8 +118,11 @@ re-derive a named projection fact from them.
   that SHA consumes it; an unrelated receipt, ruling or outcome cannot hide it. Record position
   stays private; callers receive the selected record, not an index.
 - `current_wave` starts at 1 and follows the last integer-like `advance=launched` record.
-- `ended` is an ever rule: any `advance=complete|stopped` ends the run. `halted` is a latest rule:
-  the last advance is `escalated|interrupted`. They are separate facts, not one run-state enum.
+- `ended` is an ordered current fact. `advance=complete|stopped` makes it true; a later protocol
+  message that the existing Driver rule table can act on makes it false; a subsequent
+  final advance makes it true again. Plain child conversation does not reopen a Run. `halted` is a
+  latest rule: the last advance is `escalated|interrupted`. They remain separate facts, not one
+  run-state enum, and no `reopened` event is persisted.
 
 ### Reading and error contracts
 
@@ -508,10 +511,13 @@ A `PostToolUse` hook matching `SendMessage` copies the message that was just sen
 It is installed on both sides of the channel: coordinator-side it captures rulings, child-side it
 captures escalations. Nothing about it costs a model token.
 
-The Codex bridge records a child's non-empty final turn when `watch` observes it finish, and a
-coordinator's prompt when `send` submits it. A launch given `--machine-log` and `--ticket` stores
-those values in the state file, so later `watch` and `send` calls use the state for the correct
-ticket; callers without a log path remain unlogged.
+The Codex bridge records a child's non-empty final turn when `watch` observes it, and a
+coordinator's prompt when `send` submits it. `watch --once` performs exactly one evaluation round,
+including a latest finished turn behind a currently busy turn. A launch given `--machine-log` and
+`--ticket` stores those values in the state file, so later `watch` and `send` calls use the state
+for the correct ticket; callers without a log path remain unlogged. A new observed message is
+appended successfully before the state file's `finalMessage` cursor advances. If append fails, the
+cursor stays unchanged and the next observation retries that message.
 
 Installing it is the `install` entry point, run once per side against the settings file that side
 starts with — the coordinator's own, and each child's `.claude/settings.local.json` in its

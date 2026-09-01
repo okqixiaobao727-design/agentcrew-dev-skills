@@ -524,12 +524,15 @@ class Fixture:
 
     def answers(self, ticket, text):
         """Deliver the coordinator's ruling the way the coordinator delivers one."""
+        environment = self.environment({
+            "CLAUDE_CODE_MESSAGING_SOCKET": COORDINATOR_ADDRESS.removeprefix("uds:")
+        })
         subprocess.run(
             [
                 sys.executable, str(DRIVER), "answer", "--run-dir", str(self.run_dir),
                 "--ticket", ticket, "--text", text,
             ],
-            check=True, capture_output=True, env=self.environment(), cwd=str(self.repo),
+            check=True, capture_output=True, env=environment, cwd=str(self.repo),
         )
 
     def agents_path(self, home=None):
@@ -571,6 +574,13 @@ class Fixture:
         statuses = json.loads(path.read_text()) if path.exists() else {}
         statuses[ticket] = status
         path.write_text(json.dumps(statuses))
+
+    def codex_says_in_thread(self, ticket, message):
+        """Leave one finished turn in the recorded Codex thread, outside the Machine log."""
+        path = self.stub_dir / "codex-thread-messages.json"
+        messages = json.loads(path.read_text()) if path.exists() else {}
+        messages[ticket] = message
+        path.write_text(json.dumps(messages))
 
     def vanishes(self, ticket):
         """Take that child's session off its account's list, as a session that died leaves it.

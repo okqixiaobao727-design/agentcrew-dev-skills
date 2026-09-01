@@ -5,7 +5,8 @@
 Scripts append what they did — a child launched, a receipt verified, a branch merged, a ticket
 settled, a wave advanced or halted — and a `PostToolUse` hook on `SendMessage` copies every
 outgoing message in verbatim, so escalations and rulings land in the log as the messages are sent
-rather than costing a coordinator turn to transcribe (ADR-0001).
+rather than costing a coordinator turn to transcribe (ADR-0001). The Coordinator's matching
+`PreToolUse` hook authorizes its address before `SendMessage` can deliver.
 
 The file is JSON Lines: one object per line, appended and never rewritten, every line stamped
 `%Y-%m-%dT%H:%M:%SZ` in UTC — the run's one timestamp format, so any two lines subtract to a
@@ -50,17 +51,19 @@ HOOK_EVENT = "PostToolUse"
 # lets a ruling addressed to it be correlated back to the ticket that asked (ADR-0023).
 SENDER_SOCKET_VARIABLE = "CLAUDE_CODE_MESSAGING_SOCKET"
 ADDRESS_SCHEME = "uds:"
-BOUNDED_HOOK_EVENT = "PreToolUse"
+PRE_TOOL_EVENT = "PreToolUse"
 BOUNDED_TOOLS = "Read|Grep|Glob|Bash"
 # What a registered hook runs, and the subcommand that marks a registration as one of ours.
 PYTHON = "python3"
 HOOK_SUBCOMMAND = "hook"
+GUARD_SUBCOMMAND = "guard"
 # The name the run's own copy of this script is installed under, beside the log it writes. The
 # copy is what keeps a registered command version-independent: the plugin directory a run installs
 # from carries the version in its path, so an upgrade would leave the entry naming a file that is
 # no longer there, while the run directory outlives every upgrade (#37).
 SCRIPT_NAME = "machine_log.py"
 BOUNDED_SCRIPT_NAME = "bounded_read.py"
+COORDINATOR_CONTROL_SCRIPT_NAME = "coordinator_control.py"
 # The directory a settings file lives in when it belongs to a checkout: `<project>/.claude/`.
 SETTINGS_DIRECTORY = ".claude"
 
@@ -318,6 +321,13 @@ def project(records):
         child_message = event in ("message", "escalation") and record.get("role") == CHILD
         if child_message:
             episode["unanswered_child_message"] = record
+            verb, _line = final_verb(message)
+            if ended and (
+                event == "escalation"
+                or verb in (COMPLETE_VERB, PARKED_VERB, FAILED_VERB)
+                or malformed_receipt(message) is not None
+            ):
+                ended = False
             if event == "escalation":
                 episode["escalation"] = record
                 episode["witness"] = None
@@ -703,13 +713,64 @@ def run_hook(args):
     record = hook_record(payload, args.role, args.ticket, sender_address())
     if record is None:
         return 0
+
+    def record_send():
+        try:
+            append(args.log, record)
+        except OSError as error:
+            # The one channel left that no model reads. Reporting it any louder — stderr, a nonzero
+            # exit — would feed the model a failure of bookkeeping it is not meant to know about.
+            json.dump({"systemMessage": f"machine log: {args.log}: {error}"}, sys.stdout)
+        return 0
+
+    if args.role != COORDINATOR:
+        return record_send()
+    coordinator_control = _coordinator_control()
     try:
-        append(args.log, record)
-    except OSError as error:
-        # The one channel left that no model reads. Reporting it any louder — stderr, a nonzero
-        # exit — would feed the model a failure of bookkeeping it is not meant to know about.
-        json.dump({"systemMessage": f"machine log: {args.log}: {error}"}, sys.stdout)
+        return coordinator_control.CoordinatorControl(
+            pathlib.Path(args.log).parent
+        ).authorized_action(record_send)
+    except coordinator_control.CoordinatorControlError as error:
+        json.dump({"systemMessage": str(error)}, sys.stdout)
+        return 0
+
+
+def run_guard(args):
+    """Deny a stale Coordinator before SendMessage can deliver; returns zero for the hook."""
+    coordinator_control = _coordinator_control()
+    try:
+        payload = json.loads(sys.stdin.read())
+    except (ValueError, OSError):
+        return 0
+    if (
+        not isinstance(payload, dict)
+        or payload.get("tool_name") != MESSAGE_TOOL
+        or not sent_from_scope(payload, args.scope)
+    ):
+        return 0
+    try:
+        coordinator_control.CoordinatorControl(
+            pathlib.Path(args.log).parent
+        ).authorized_action(lambda: None)
+    except coordinator_control.CoordinatorControlError as error:
+        json.dump({
+            "hookSpecificOutput": {
+                "hookEventName": PRE_TOOL_EVENT,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": str(error),
+            }
+        }, sys.stdout)
     return 0
+
+
+def _coordinator_control():
+    """Import and return the control module beside the run-local hook copy.
+
+    Child hooks do not need the module, and old run-local copies do not carry it. Delaying this
+    import until a Coordinator hook executes keeps those version-independent child hooks usable.
+    """
+    import coordinator_control
+    return coordinator_control
 
 
 def absolute(path):
@@ -739,6 +800,15 @@ def hook_command(script, log, role, ticket, scope):
         command += f" --ticket {shlex.quote(ticket)}"
     command += f" --scope {shlex.quote(absolute(scope))}"
     return command
+
+
+def guard_command(script, log, scope):
+    """The Coordinator's PreToolUse SendMessage authorization command."""
+    return (
+        f"{shlex.quote(PYTHON)} {shlex.quote(absolute(script))}"
+        f" --log {shlex.quote(absolute(log))} {GUARD_SUBCOMMAND}"
+        f" --scope {shlex.quote(absolute(scope))}"
+    )
 
 
 def bounded_hook_command(script, log, crew_dir, run_dir, session_id=None):
@@ -816,7 +886,8 @@ def settings_shape_is_sound(settings):
         return False
     for event, matcher in (
         (HOOK_EVENT, MESSAGE_TOOL),
-        (BOUNDED_HOOK_EVENT, BOUNDED_TOOLS),
+        (PRE_TOOL_EVENT, BOUNDED_TOOLS),
+        (PRE_TOOL_EVENT, MESSAGE_TOOL),
     ):
         events = hooks.get(event, [])
         if not isinstance(events, list):
@@ -842,7 +913,10 @@ def command_log(command):
         words = shlex.split(command)
     except ValueError:
         return None
-    if HOOK_SUBCOMMAND not in words or "--role" not in words:
+    if not (
+        (HOOK_SUBCOMMAND in words and "--role" in words)
+        or (GUARD_SUBCOMMAND in words and "--scope" in words)
+    ):
         return None
     for index, word in enumerate(words):
         if word == "--log" and index + 1 < len(words):
@@ -877,10 +951,19 @@ def message_blocks(settings):
 
 def bounded_blocks(settings):
     """Every block of the settings document that claims the bounded-read matchers."""
-    events = settings.get("hooks", {}).get(BOUNDED_HOOK_EVENT, [])
+    events = settings.get("hooks", {}).get(PRE_TOOL_EVENT, [])
     return [
         block for block in events
         if isinstance(block, dict) and block.get("matcher") == BOUNDED_TOOLS
+    ]
+
+
+def guard_blocks(settings):
+    """Every PreToolUse block that claims the outgoing-message matcher."""
+    events = settings.get("hooks", {}).get(PRE_TOOL_EVENT, [])
+    return [
+        block for block in events
+        if isinstance(block, dict) and block.get("matcher") == MESSAGE_TOOL
     ]
 
 
@@ -933,7 +1016,7 @@ def install_hook(settings, command, log):
 def install_bounded_hook(settings, command, log):
     """Return settings with one bounded-read entry for `log` and other hooks preserved."""
     hooks = settings.setdefault("hooks", {})
-    events = hooks.setdefault(BOUNDED_HOOK_EVENT, [])
+    events = hooks.setdefault(PRE_TOOL_EVENT, [])
     blocks = bounded_blocks(settings)
     if blocks:
         block = blocks[0]
@@ -947,13 +1030,30 @@ def install_bounded_hook(settings, command, log):
     return settings
 
 
+def install_guard_hook(settings, command, log):
+    """Return settings with this Run's Coordinator SendMessage guard installed once."""
+    hooks = settings.setdefault("hooks", {})
+    events = hooks.setdefault(PRE_TOOL_EVENT, [])
+    blocks = guard_blocks(settings)
+    if blocks:
+        block = blocks[0]
+    else:
+        block = {"matcher": MESSAGE_TOOL, "hooks": []}
+        events.append(block)
+    block["hooks"] = [
+        hook for hook in block.get("hooks", []) if not registered_for(hook, log)
+    ]
+    block["hooks"].append({"type": "command", "command": command})
+    return settings
+
+
 def uninstall_hook(settings, log):
     """The settings document with every entry installed for `log` taken out of it.
 
-    Every other hook stays exactly where it is, and a block this leaves empty goes with the entry
-    that was its only occupant — an empty matcher block registers nothing and was not there before
-    the install. Returns whether anything was removed, so a file with nothing of ours in it is
-    left byte for byte as it was found.
+    Every unrelated hook stays exactly where it is, and a block this leaves empty goes with the
+    entry that was its only occupant — an empty matcher block registers nothing and was not there
+    before the install. Returns whether anything was removed, so a file with nothing of ours in it
+    is left byte for byte as it was found.
     """
     removed = False
     events = settings.get("hooks", {}).get(HOOK_EVENT, [])
@@ -972,10 +1072,26 @@ def uninstall_hook(settings, log):
 def uninstall_bounded_hook(settings, log):
     """Return whether this run's bounded-read entry was removed from settings."""
     removed = False
-    events = settings.get("hooks", {}).get(BOUNDED_HOOK_EVENT, [])
+    events = settings.get("hooks", {}).get(PRE_TOOL_EVENT, [])
     for block in bounded_blocks(settings):
         registered = block.get("hooks", [])
         kept = [hook for hook in registered if not bounded_registered_for(hook, log)]
+        if len(kept) == len(registered):
+            continue
+        removed = True
+        block["hooks"] = kept
+        if not kept:
+            events.remove(block)
+    return removed
+
+
+def uninstall_guard_hook(settings, log):
+    """Return whether this Run's Coordinator SendMessage guard was removed."""
+    removed = False
+    events = settings.get("hooks", {}).get(PRE_TOOL_EVENT, [])
+    for block in guard_blocks(settings):
+        registered = block.get("hooks", [])
+        kept = [hook for hook in registered if not registered_for(hook, log)]
         if len(kept) == len(registered):
             continue
         removed = True
@@ -1033,14 +1149,24 @@ def run_install(args):
         print(problem, file=sys.stderr)
         return 1
     try:
+        source = pathlib.Path(__file__).resolve()
         script = (
             absolute(args.hook_script) if args.hook_script is not None
-            else str(materialise_script(pathlib.Path(__file__).resolve(), run_script(args.log)))
+            else str(materialise_script(source, run_script(args.log)))
         )
         bounded_script = None
         if args.role == COORDINATOR:
+            control_source = source.with_name(COORDINATOR_CONTROL_SCRIPT_NAME)
+            if not control_source.exists() and args.crew_dir is not None:
+                control_source = (
+                    pathlib.Path(args.crew_dir) / "assets" / COORDINATOR_CONTROL_SCRIPT_NAME
+                )
+            materialise_script(
+                control_source,
+                pathlib.Path(args.log).parent / COORDINATOR_CONTROL_SCRIPT_NAME,
+            )
             bounded_script = materialise_script(
-                pathlib.Path(__file__).resolve().with_name(BOUNDED_SCRIPT_NAME),
+                source.with_name(BOUNDED_SCRIPT_NAME),
                 bounded_run_script(args.log),
             )
     except OSError as error:
@@ -1050,7 +1176,7 @@ def run_install(args):
     command = hook_command(script, args.log, args.role, args.ticket, scope)
     install_hook(settings, command, args.log)
     if args.role == COORDINATOR:
-        source = pathlib.Path(__file__).resolve()
+        install_guard_hook(settings, guard_command(script, args.log, scope), args.log)
         crew_dir = args.crew_dir
         if crew_dir is None and source.parent.name == "assets":
             crew_dir = source.parent.parent
@@ -1073,10 +1199,10 @@ def run_install(args):
 def run_uninstall(args):
     """Take this run's hooks out of a settings file; returns 0, or 1 on a file it must not touch.
 
-    What it removes is every entry writing this run's log, whichever version of this script
-    installed it, and nothing else. Idempotent by construction: a file that carries none of ours
-    is left exactly as it was found and a second call has nothing left to do. Every other hook
-    in the file — the guard hooks, another run's entry, a watcher — stays where it is.
+    What it removes is every message, authorization and bounded-read entry owned by this Run's
+    log, whichever version of this script installed it, and nothing else. Idempotent by
+    construction: a file that carries none of ours is left exactly as it was found and a second
+    call has nothing left to do. Another Run's entry and unrelated hooks stay where they are.
     """
     path = pathlib.Path(args.settings)
     if not path.exists():
@@ -1087,6 +1213,7 @@ def run_uninstall(args):
         return 1
     removed = uninstall_hook(settings, args.log)
     removed = uninstall_bounded_hook(settings, args.log) or removed
+    removed = uninstall_guard_hook(settings, args.log) or removed
     if not removed:
         return 0
     return write_settings(path, settings)
@@ -1339,6 +1466,15 @@ def build_parser():
     hook.add_argument(
         "--scope",
         help="the directory whose sends this hook copies; anything else is another side's",
+    )
+
+    guard = subcommands.add_parser(
+        "guard", help="deny a stale Coordinator before SendMessage delivery"
+    )
+    guard.set_defaults(handler=run_guard)
+    guard.add_argument(
+        "--scope",
+        help="the directory whose sends this Coordinator guard authorizes",
     )
 
     install = subcommands.add_parser("install", help="register that hook in a settings file")

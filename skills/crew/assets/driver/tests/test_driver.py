@@ -285,6 +285,20 @@ class DeferralDocumentationTests(unittest.TestCase):
 
 
 class PreflightTests(DriverTestCase):
+    def test_the_shipped_default_config_passes_preflight_without_a_launch_hook(self):
+        shipped = DRIVER.parents[4] / "config" / "agentcrew.default.toml"
+        (self.fixture.repo / "agentcrew.toml").write_text(
+            shipped.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        git(self.fixture.repo, "add", "agentcrew.toml")
+        git(self.fixture.repo, "commit", "-m", "use the shipped config")
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+
+        self.started()
+
+        self.assertNotIn("launch_hook", self.fixture.table()["run"])
+
     def test_a_foreign_worktree_at_the_crew_path_is_named_and_preserved(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
@@ -1237,13 +1251,19 @@ class LaunchTests(DriverTestCase):
         driver's log before this driver runs at all."""
         self.start_a_run()
 
+        public_layout = {
+            "wave-table.json", "log.jsonl", "launch", "parked-paths",
+            "bounded_read.py", "dashboard-window", "dashboard-window.lock", "machine_log.py",
+            DRIVER_RECORD,
+        }
+        private_control_layout = {
+            driver_module.coordinator_control._STATE_NAME,
+            driver_module.coordinator_control._LOCK_NAME,
+            pathlib.Path(driver_module.coordinator_control.__file__).name,
+        }
         self.assertEqual(
-            sorted(path.name for path in self.fixture.run_dir.iterdir()),
-            sorted([
-                "wave-table.json", "log.jsonl", "launch", "parked-paths",
-                "bounded_read.py", "dashboard-window", "dashboard-window.lock", "machine_log.py",
-                DRIVER_RECORD,
-            ]),
+            {path.name for path in self.fixture.run_dir.iterdir()},
+            public_layout | private_control_layout,
         )
 
     def test_the_coordinator_and_the_child_carry_this_run_s_hooks(self):
@@ -3563,14 +3583,19 @@ class AnswerTests(DriverTestCase):
         )
         return process
 
-    def answer(self, *arguments):
+    def answer(self, *arguments, sender=COORDINATOR_ADDRESS.removeprefix("uds:"), run_dir=None):
+        environment = self.fixture.environment()
+        if sender is None:
+            environment.pop("CLAUDE_CODE_MESSAGING_SOCKET", None)
+        else:
+            environment["CLAUDE_CODE_MESSAGING_SOCKET"] = sender
         return subprocess.run(
             [
                 sys.executable, str(DRIVER), "answer",
-                "--run-dir", str(self.fixture.run_dir), "--ticket", "01", *arguments,
+                "--run-dir", str(run_dir or self.fixture.run_dir), "--ticket", "01", *arguments,
             ],
             capture_output=True, text=True,
-            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+            env=environment, cwd=str(self.fixture.repo),
         )
 
     def kill_window(self, window):
@@ -3608,14 +3633,7 @@ class AnswerTests(DriverTestCase):
         run_dir = resume[resume.index(str(LAUNCH)) + 1]
         text = "Use the existing retention_audit table"
 
-        result = subprocess.run(
-            [
-                sys.executable, str(DRIVER), "answer", "--run-dir", run_dir,
-                "--ticket", "01", "--text", text,
-            ],
-            capture_output=True, text=True,
-            env=self.fixture.environment(), cwd=str(self.fixture.repo),
-        )
+        result = self.answer("--text", text, run_dir=run_dir)
 
         self.assertEqual(result.returncode, 0, result.stdout)
         ruling = self.events("ruling", ticket="01")[-1]
@@ -3667,6 +3685,36 @@ class AnswerTests(DriverTestCase):
             snapshot["detail"],
         )
         self.assertIn("<feature-dir>/.crew", snapshot["detail"])
+    def test_a_stale_coordinator_is_rejected_before_delivery_or_ruling(self):
+        self.start()
+        text = "Use the stale coordinator's answer"
+        sent_before = len([
+            call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]
+        ])
+
+        result = self.answer("--text", text, sender="/tmp/stale-coordinator.sock")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("crew: this Coordinator no longer owns the run", result.stdout)
+        self.assertEqual(
+            len([call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["send-keys"]]),
+            sent_before,
+        )
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_an_answer_without_a_caller_socket_is_rejected_without_guessing(self):
+        self.start()
+        text = "Use an address guessed from another identity"
+
+        result = self.answer("--text", text, sender=None)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "crew: no coordinator address in this environment"
+            " (CLAUDE_CODE_MESSAGING_SOCKET unset)",
+            result.stdout,
+        )
+        self.assertEqual(self.events("ruling", ticket="01"), [])
 
     def test_text_left_in_the_composer_is_not_recorded_as_delivered(self):
         self.start()
@@ -3963,6 +4011,353 @@ class AdoptionTests(DriverTestCase):
         }
         with (self.fixture.run_dir / "log.jsonl").open("a") as handle:
             handle.write(json.dumps(record) + "\n")
+
+    def parked_run(self, *tickets):
+        """A terminal Codex run whose first ticket parked with descendants still blocked."""
+        process = self.running(*tickets, routing=CODEX_ROUTING)
+        root = tickets[0][0]
+        self.fixture.says(root, f"CREW PARKED /tmp/parked-{root}.md")
+        self.woken(process, "run-complete")
+        projection = driver_module.machine_log.project(self.fixture.log_records())
+        self.assertTrue(projection.ended)
+        self.assertEqual(projection.ticket(root).settlement_state, "parked")
+        return root
+
+    def stage_verified_completion(self, ticket):
+        """Return the SHA after staging its completion and verification in the log."""
+        sha = self.fixture.commit_work(ticket)
+        self.fixture.says(ticket, f"CREW COMPLETE {sha}")
+        result = subprocess.run(
+            [
+                sys.executable, str(driver_module.MONITOR), "verify",
+                "--ticket", ticket,
+                "--worktree", str(self.fixture.worktree(ticket)),
+                "--sha", sha,
+                "--base", self.fixture.table()["run"]["integration_base_commit"],
+                "--log", str(self.fixture.run_dir / "log.jsonl"),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.fixture.environment(),
+            cwd=str(self.fixture.repo),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(len(self.events("receipt", ticket=ticket, verdict="landable")), 1)
+        return sha
+
+    def stage_merged_wave(self, wave="1"):
+        """Land one verified Wave without running the Driver steps that follow the merge."""
+        result = subprocess.run(
+            [
+                sys.executable, str(driver_module.ADVANCE), "advance",
+                "--table", str(self.fixture.run_dir / "wave-table.json"),
+                "--wave", wave,
+                "--log", str(self.fixture.run_dir / "log.jsonl"),
+                "--out-dir", str(self.fixture.run_dir / driver_module.LAUNCH_DIR_NAME),
+                "--repair-model", str(self.fixture.table()["run"]["repair_model"]),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.fixture.environment(),
+            cwd=str(self.fixture.repo),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_a_stopped_run_with_no_new_message_returns_its_unchanged_report(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        records = self.fixture.log_records()
+        report = (self.fixture.feature_dir / REPORT_NAME).read_bytes()
+        calls = len(self.fixture.codex_calls())
+
+        result = self.fixture.start()
+
+        self.assertEqual(self.snapshot(result)["reason"], "run-complete")
+        self.assertEqual(self.fixture.log_records(), records)
+        self.assertEqual((self.fixture.feature_dir / REPORT_NAME).read_bytes(), report)
+        observations = [
+            call["argv"] for call in self.fixture.codex_calls()[calls:]
+            if call["argv"][:2] == ["watch", "--once"]
+        ]
+        self.assertEqual(observations, [[
+            "watch", "--once", str(self.fixture.run_dir / "codex" / f"{root}.json"),
+        ]])
+
+    def test_a_late_completion_already_in_the_log_uses_the_normal_next_wave_path(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.says(root, completion)
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the late completion did not activate the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_a_late_completion_only_in_the_thread_is_appended_once_then_uses_the_same_path(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+
+        adopted = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.verified_launch("02") is not None, timeout=10.0
+            ),
+            "the thread-only completion did not activate the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+
+        matching = [
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_thread_append_resumes_without_duplicate_work(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+        failure = self.fixture.stub_dir / "codex-once-fails-after-append"
+        failure.write_text("yes\n")
+
+        interrupted = self.fixture.start()
+
+        interrupted_snapshot = json.loads([
+            line for line in interrupted.stdout.splitlines() if line.strip()
+        ][-1])
+        self.assertEqual(interrupted_snapshot["reason"], "driver-error")
+        self.assertEqual(len([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]), 1)
+        self.assertEqual(self.events("receipt", ticket=root, verdict="landable"), [])
+        failure.unlink()
+
+        resumed = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the append checkpoint did not resume into the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]), 1)
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_verification_resumes_without_duplicate_work(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        self.stage_verified_completion(root)
+
+        resumed = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the verified checkpoint did not resume into the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_merge_resumes_without_duplicate_work(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        self.stage_verified_completion(root)
+        self.stage_merged_wave()
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+
+        resumed = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the merged checkpoint did not resume into the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+
+    def test_an_interruption_after_activation_resumes_without_duplicate_work(self):
+        self.fixture.configure(tracker="github")
+        self.fixture.issues({
+            "01": {"labels": ["ready-for-agent"], "closed": False},
+            "02": {"labels": ["ready-for-agent"], "closed": False},
+        })
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        self.stage_verified_completion(root)
+        failure = self.fixture.stub_dir / "gh-close-fails"
+        failure.write_text("yes\n")
+
+        interrupted = self.fixture.start()
+
+        interrupted_snapshot = json.loads([
+            line for line in interrupted.stdout.splitlines() if line.strip()
+        ][-1])
+        self.assertEqual(interrupted_snapshot["reason"], "driver-error")
+        self.assertIsNotNone(self.fixture.verified_launch("02"))
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(
+            len(self.events("advance", wave="2", decision="launched")), 1
+        )
+        self.assertEqual(self.events("outcome", ticket=root, outcome="completed"), [])
+        failure.unlink()
+
+        resumed = self.fixture.launch()
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(len(self.events("launch", ticket="02")), 1)
+        self.assertTrue(self.fixture.issues()[root]["closed"])
+        self.assertTrue(self.fixture.issues()["02"]["closed"])
+
+    def test_a_late_thread_completion_reopens_a_run_completed_with_a_parked_leaf(self):
+        root = self.parked_run(("01", ()))
+        self.assertEqual(self.events("advance")[-1]["decision"], "complete")
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+
+        result = self.fixture.start()
+
+        snapshot = json.loads([line for line in result.stdout.splitlines() if line.strip()][-1])
+        self.assertEqual(snapshot["reason"], "run-complete", snapshot)
+        self.assertEqual(len([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ]), 1)
+        self.assertEqual(len(self.events("receipt", ticket=root, verdict="landable")), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+        self.assertEqual(len(self.events("outcome", ticket=root, outcome="completed")), 1)
+        self.assertEqual(self.events("advance")[-1]["decision"], "complete")
+
+    def test_a_late_thread_escalation_reaches_the_existing_rule_table(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        escalation = (
+            f"CREW ASK {root} design — choose the existing interface or a new one"
+            " ts=1788139000"
+        )
+        self.fixture.codex_says_in_thread(root, escalation)
+
+        result = self.fixture.start()
+
+        snapshot = json.loads([line for line in result.stdout.splitlines() if line.strip()][-1])
+        self.assertEqual(snapshot["reason"], "judgment-needed")
+        self.assertEqual(snapshot["ticket"], root)
+        matching = [
+            record for record in self.events("escalation", ticket=root)
+            if record.get("message") == escalation
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(self.events("merge", ticket=root), [])
+
+    def test_an_invalid_late_thread_completion_uses_the_existing_recheck_contract(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        invalid = "CREW COMPLETE " + "0" * 40
+        self.fixture.codex_says_in_thread(root, invalid)
+
+        adopted = self.fixture.launch()
+        rechecks = lambda: [
+            record for record in self.events("ruling", ticket=root)
+            if str(record.get("message", "")).startswith("CREW RECHECK")
+        ]
+        self.assertTrue(
+            self.fixture.wait_for(rechecks),
+            f"{root} was never sent a CREW RECHECK",
+        )
+        instruction = rechecks()[-1]["message"]
+
+        self.assertIn("0" * 40, instruction)
+        self.assertEqual(self.events("merge", ticket=root), [])
+        self.fixture.completes(root)
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the corrected completion did not activate the next Wave",
+        )
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+        self.assertEqual(len(rechecks()), 1)
+        self.assertEqual(len(self.events("merge", ticket=root)), 1)
+
+    def test_terminal_observation_skips_states_that_cannot_name_an_observable_child(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        state_file = self.fixture.run_dir / "codex" / f"{root}.json"
+        original = json.loads(state_file.read_text())
+        records = self.fixture.log_records()
+        report = (self.fixture.feature_dir / REPORT_NAME).read_bytes()
+        cases = (
+            ("missing", None),
+            ("unreadable", "{not-json"),
+            ("legacy", json.dumps({
+                key: value for key, value in original.items()
+                if key not in ("machineLog", "ticket")
+            })),
+        )
+
+        for name, content in cases:
+            with self.subTest(state=name):
+                if content is None:
+                    state_file.unlink(missing_ok=True)
+                else:
+                    state_file.write_text(content)
+                calls = len(self.fixture.codex_calls())
+
+                result = self.fixture.start()
+
+                self.assertEqual(self.snapshot(result)["reason"], "run-complete")
+                self.assertEqual(self.fixture.log_records(), records)
+                self.assertEqual((self.fixture.feature_dir / REPORT_NAME).read_bytes(), report)
+                self.assertEqual(self.fixture.codex_calls()[calls:], [])
+
+    def test_terminal_observation_refuses_recorded_identity_mismatches(self):
+        root = self.parked_run(("01", ()), ("02", ("01",)))
+        completion = f"CREW COMPLETE {self.fixture.commit_work(root)}"
+        self.fixture.codex_says_in_thread(root, completion)
+        state_file = self.fixture.run_dir / "codex" / f"{root}.json"
+        state = json.loads(state_file.read_text())
+        cases = (
+            ("threadId", "foreign-thread", "thread mismatch"),
+            ("ticket", "99", "ticket mismatch"),
+            ("machineLog", "/tmp/foreign-log.jsonl", "Machine log mismatch"),
+        )
+
+        for field, value, detail in cases:
+            with self.subTest(field=field):
+                changed = dict(state)
+                changed[field] = value
+                state_file.write_text(json.dumps(changed))
+
+                result = self.fixture.start()
+
+                snapshot = self.snapshot(result)
+                self.assertEqual(snapshot["reason"], "driver-error")
+                self.assertIn(detail, snapshot["detail"])
+        self.assertEqual([
+            record for record in self.events("message", ticket=root)
+            if record.get("message") == completion
+        ], [])
+        self.assertEqual(self.events("merge", ticket=root), [])
 
     def test_a_true_pre_launch_failure_is_dispatched_by_the_next_start(self):
         self.feature(("01", ()))
@@ -4422,6 +4817,183 @@ class AdoptionTests(DriverTestCase):
         ]
         self.assertEqual(len(launched), 1, "02 was not launched once")
         self.assertIn(RESTARTED_ADDRESS, json.dumps(launched[0]))
+
+    def test_crew_adopts_a_dead_drivers_run_under_the_new_coordinator_context(self):
+        """The public launcher starts one replacement Driver that applies its full context."""
+        self.interrupted(("01", ()))
+        second_session = "6dc60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        adopted = subprocess.Popen(
+            [
+                sys.executable, str(LAUNCH), str(self.fixture.feature_dir),
+                "--coordinator-name", "crew-coordinator-2a",
+                "--coordinator-pid", "2601",
+                "--coordinator-session", second_session,
+                "--coordinator-address", RESTARTED_ADDRESS,
+                "--permission-mode", "bypassPermissions",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.fixture.environment({"TMUX_PANE": "%8"}), cwd=str(self.fixture.repo),
+        )
+        self.fixture.running.append(adopted)
+
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.table()["run"]["coordinator_address"]
+                == RESTARTED_ADDRESS,
+                timeout=5,
+            ),
+            "the /crew adoption kept the Coordinator recorded by the dead Driver",
+        )
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.events("ruling", ticket="01")) == 1),
+            "the /crew adoption never re-anchored the live child",
+        )
+        self.fixture.completes("01")
+        stdout, stderr = adopted.communicate(timeout=30)
+
+        self.assertEqual(adopted.returncode, 0, stderr)
+        self.assertEqual(json.loads(stdout)["reason"], "run-complete")
+        run = self.fixture.table()["run"]
+        self.assertEqual(run["coordinator_pid"], 2601)
+        self.assertEqual(run["coordinator_session"], second_session)
+        self.assertEqual(run["permission_mode"], "bypassPermissions")
+
+    def test_a_live_driver_hands_over_in_place_before_its_next_poll_and_activation(self):
+        """The launcher waits while this same Driver switches every Coordinator-owned fact."""
+        self.fixture.configure(surface="pin")
+        self.fixture.ticket("01", "first thing")
+        self.fixture.ticket("02", "second thing", blocked_by=("01",))
+        self.fixture.commit_feature()
+        driver = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "wave 1 never launched",
+        )
+        driver_pid = int((self.fixture.run_dir / DRIVER_RECORD).read_text().strip())
+        before = self.fixture.table()["run"]
+        second_name = "crew-coordinator-2a"
+        second_pid = 2601
+        second_session = "7dc60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        second_mode = "bypassPermissions"
+        environment = self.fixture.environment({"TMUX_PANE": "%8"})
+        handover = subprocess.Popen(
+            [
+                sys.executable, str(LAUNCH), str(self.fixture.feature_dir),
+                "--coordinator-name", second_name,
+                "--coordinator-pid", str(second_pid),
+                "--coordinator-session", second_session,
+                "--coordinator-address", RESTARTED_ADDRESS,
+                "--permission-mode", second_mode,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=environment, cwd=str(self.fixture.repo),
+        )
+        self.fixture.running.append(handover)
+
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.table()["run"]["coordinator_address"]
+                == RESTARTED_ADDRESS
+            ),
+            "the live Driver never serviced the Coordinator handover",
+        )
+        after = self.fixture.table()["run"]
+        self.assertIsNone(driver.poll(), "handover replaced the live Driver")
+        self.assertIsNone(handover.poll(), "the new waiter returned before the Run woke")
+        self.assertEqual(
+            int((self.fixture.run_dir / DRIVER_RECORD).read_text().strip()), driver_pid
+        )
+        self.assertEqual(
+            {
+                key: after[key]
+                for key in (
+                    "coordinator_name", "coordinator_pid", "coordinator_session",
+                    "coordinator_address", "permission_mode",
+                )
+            },
+            {
+                "coordinator_name": second_name,
+                "coordinator_pid": second_pid,
+                "coordinator_session": second_session,
+                "coordinator_address": RESTARTED_ADDRESS,
+                "permission_mode": second_mode,
+            },
+        )
+        unchanged = set(before) - {
+            "coordinator_name", "coordinator_pid", "coordinator_session",
+            "coordinator_address", "permission_mode",
+        }
+        self.assertEqual({key: after[key] for key in unchanged},
+                         {key: before[key] for key in unchanged})
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.events("ruling", ticket="01")) == 1),
+            "the live child was never re-anchored",
+        )
+        settings = json.dumps(self.fixture.settings(
+            self.fixture.repo / ".claude" / "settings.local.json"
+        ))
+        self.assertIn(f"--session-id {second_session}", settings)
+        pin, = (self.fixture.config_dir / "agentcrew" / "pins").glob("*.json")
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: json.loads(pin.read_text())["coordinator_pid"] == second_pid
+            ),
+            "the dashboard pin kept the old Coordinator pid",
+        )
+
+        self.fixture.completes("01")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "wave 2 never activated under the handed-over Coordinator",
+        )
+        second_launch = [
+            call for call in self.fixture.launches()
+            if str(self.fixture.worktree("02")) in json.dumps(call)
+        ]
+        self.assertEqual(len(second_launch), 1)
+        self.assertIn(RESTARTED_ADDRESS, json.dumps(second_launch[0]))
+        self.assertIn(second_mode, json.dumps(second_launch[0]))
+        second_window = self.fixture.windows()[self.fixture.launch_record("02")["window"]]
+        self.assertEqual(second_window["target"], before["tmux_session"])
+
+        self.fixture.completes("02")
+        self.woken(driver, "run-complete")
+        handover_out, handover_err = handover.communicate(timeout=30)
+        self.assertEqual(handover.returncode, 0, handover_err)
+        self.assertEqual(json.loads(handover_out)["reason"], "run-complete")
+
+    def test_a_failed_live_handover_wakes_forward_under_the_new_coordinator(self):
+        """A failed apply emits the existing Driver error and never restores old ownership."""
+        driver = self.running(("01", ()))
+        second_pid = 2601
+        second_session = "8dc60d75-fa21-4d9c-adf2-b4073f60fbb6"
+        settings = self.fixture.repo / ".claude" / "settings.local.json"
+        settings.write_text('{"hooks": ')
+        handover = subprocess.Popen(
+            [
+                sys.executable, str(LAUNCH), str(self.fixture.feature_dir),
+                "--coordinator-name", "crew-coordinator-2a",
+                "--coordinator-pid", str(second_pid),
+                "--coordinator-session", second_session,
+                "--coordinator-address", RESTARTED_ADDRESS,
+                "--permission-mode", "bypassPermissions",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.fixture.environment({"TMUX_PANE": "%8"}), cwd=str(self.fixture.repo),
+        )
+        self.fixture.running.append(handover)
+
+        snapshot = self.woken(driver, "driver-error")
+        handover_out, handover_err = handover.communicate(timeout=30)
+        handed_over = self.fixture.table()["run"]
+
+        self.assertEqual(handover.returncode, 0, handover_err)
+        self.assertEqual(json.loads(handover_out)["reason"], "driver-error")
+        self.assertIn(f"--coordinator-pid {second_pid}", snapshot["resume"])
+        self.assertIn("could not be installed", snapshot["detail"])
+        self.assertEqual(handed_over["coordinator_pid"], second_pid)
+        self.assertEqual(handed_over["coordinator_session"], second_session)
+        self.assertEqual(handed_over["coordinator_address"], RESTARTED_ADDRESS)
 
     def test_a_same_address_new_session_adoption_updates_the_hook_without_reanchoring(self):
         """The condition is the address: what a child was told to trust has not moved."""
