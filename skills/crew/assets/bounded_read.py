@@ -13,6 +13,9 @@ READ_TOOL = "Read"
 SEARCH_TOOLS = frozenset(("Grep", "Glob"))
 SHELL_READ_COMMANDS = frozenset(("cat", "sed", "head", "tail", "grep", "rg", "find", "ls"))
 STDIN_WHEN_OPERANDLESS = frozenset(("cat", "sed", "head", "tail", "grep", "rg"))
+PIPE_OPERATORS = frozenset(("|", "|&"))
+PATTERN_BEFORE_FILES = frozenset(("grep", "rg", "sed"))
+PATTERN_MOVED_TO_OPTION = ("-e", "-f", "--expression", "--file", "--regexp")
 ANSI_C_ESCAPES = {
     "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
     "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
@@ -35,7 +38,7 @@ DENIAL_REASON = (
 )
 UNPARSEABLE_DETAIL = "The command could not be parsed."
 Invocation = collections.namedtuple(
-    "Invocation", ("name", "arguments", "words", "heredoc", "input_file")
+    "Invocation", ("name", "arguments", "words", "heredoc", "input_file", "piped")
 )
 BashReadResult = collections.namedtuple("BashReadResult", ("reads", "detail"))
 
@@ -164,6 +167,7 @@ class ShellScanner:
         quoted = False
         heredoc = False
         input_file = False
+        piped = False
         expect = None
         strip_tabs = False
         pending = []
@@ -193,14 +197,15 @@ class ShellScanner:
             expect = None
 
         def finish_command():
-            nonlocal words, heredoc, input_file
+            nonlocal words, heredoc, input_file, piped
             finish_token()
-            invocation = simple_command(words, heredoc, input_file)
+            invocation = simple_command(words, heredoc, input_file, piped)
             if invocation is not None:
                 self.invocations.append(invocation)
             words = []
             heredoc = False
             input_file = False
+            piped = False
 
         text = self.text
         while self.index < len(text):
@@ -254,7 +259,9 @@ class ShellScanner:
                 for delimiter, delimiter_quoted, dashed in pending:
                     self.read_heredoc_body(delimiter, delimiter_quoted, dashed)
                 pending.clear()
+                continued = piped and not words
                 finish_command()
+                piped = continued
                 continue
             if character in "<>":
                 if token is not None and "".join(token).isdigit():
@@ -265,8 +272,10 @@ class ShellScanner:
                 continue
             if character in self.SEPARATORS:
                 finish_command()
+                start = self.index
                 while self.index < len(text) and text[self.index] in self.SEPARATORS:
                     self.index += 1
+                piped = text[start:self.index] in PIPE_OPERATORS
                 continue
             if character == "(":
                 finish_command()
@@ -467,7 +476,7 @@ def substitution_invocations(body):
     return scanner.invocations
 
 
-def simple_command(words, heredoc, input_file):
+def simple_command(words, heredoc, input_file, piped):
     """Return the invocation one simple command's words name, or None when they name none."""
     index = 0
     while index < len(words) and (
@@ -484,6 +493,7 @@ def simple_command(words, heredoc, input_file):
         words=tuple(words),
         heredoc=heredoc,
         input_file=input_file,
+        piped=piped,
     )
 
 
@@ -510,23 +520,72 @@ def nested_shell_body(invocation):
     return None
 
 
-def invocation_reads_file(invocation):
+def operands(invocation):
+    """Return the words one invocation names as operands rather than as options."""
+    return [word for word in invocation.arguments if not word.startswith("-")]
+
+
+def file_operands(invocation):
+    """Return the operands one reader names as files.
+
+    `grep`, `rg` and `sed` spend their first operand on the pattern or the script, so counting it
+    as a file would refuse `git status | grep modified`, which reads no file at all. An option
+    that supplies the pattern instead leaves every operand ambiguous, and the ambiguous reading
+    is the refusing one.
+    """
+    named = operands(invocation)
+    if invocation.name not in PATTERN_BEFORE_FILES:
+        return named
+    if any(word.startswith(PATTERN_MOVED_TO_OPTION) for word in invocation.arguments):
+        return named
+    return named[1:]
+
+
+def listing_stays_in_run(invocation, run_dir, cwd):
+    """Whether one `ls` names only paths inside the run's own directory.
+
+    A run directory holds the run's operational state, not a repository source fact, so listing
+    it is not the hunt the Contract forbids. Paths are compared by realpath (ADR-0007), and a
+    path that will not resolve leaves the listing refused.
+    """
+    if run_dir is None:
+        return False
+    named = operands(invocation)
+    if not named:
+        return False
+    try:
+        run_root = run_dir.resolve(strict=True)
+        for operand in named:
+            path = pathlib.Path(operand)
+            if not path.is_absolute():
+                if not isinstance(cwd, str) or not cwd:
+                    return False
+                path = pathlib.Path(cwd) / path
+            if not path_is_below(path.resolve(strict=True), run_root):
+                return False
+    except (OSError, RuntimeError):
+        return False
+    return True
+
+
+def invocation_reads_file(invocation, run_dir=None, cwd=None):
     """Return whether one parsed command invocation reads file or directory contents."""
     if invocation.name not in SHELL_READ_COMMANDS:
         return False
     if invocation.input_file:
         return True
-    if invocation.name == "ls" and (
-        "-d" in invocation.arguments or "--directory" in invocation.arguments
-    ):
-        return False
+    if invocation.name == "ls":
+        if "-d" in invocation.arguments or "--directory" in invocation.arguments:
+            return False
+        if listing_stays_in_run(invocation, run_dir, cwd):
+            return False
     if invocation.name not in STDIN_WHEN_OPERANDLESS:
         return True
-    operands = [word for word in invocation.arguments if not word.startswith("-")]
-    return not (invocation.heredoc and not operands)
+    fed_by_the_shell = invocation.heredoc or invocation.piped
+    return not (fed_by_the_shell and not file_operands(invocation))
 
 
-def bash_read_detail(command):
+def bash_read_detail(command, run_dir=None, cwd=None):
     """Classify one Bash command as reading a file, not reading one, or unreadable to us."""
     if not isinstance(command, str):
         return BashReadResult(None, UNPARSEABLE_DETAIL)
@@ -535,7 +594,7 @@ def bash_read_detail(command):
     except (ShellParseError, RecursionError):
         return BashReadResult(None, UNPARSEABLE_DETAIL)
     for invocation in invocations:
-        if invocation_reads_file(invocation):
+        if invocation_reads_file(invocation, run_dir, cwd):
             return BashReadResult(
                 True,
                 "Matched `%s` in `%s`." % (invocation.name, " ".join(invocation.words)),
@@ -571,7 +630,9 @@ def run_hook(args):
     if payload.get("tool_name") in SEARCH_TOOLS:
         return emit_denial()
     if payload.get("tool_name") == "Bash" and isinstance(tool_input, dict):
-        verdict = bash_read_detail(tool_input.get("command"))
+        verdict = bash_read_detail(
+            tool_input.get("command"), args.run_dir, payload.get("cwd")
+        )
         if verdict.reads is not False:
             return emit_denial(verdict.detail)
     if payload.get("tool_name") == READ_TOOL and isinstance(tool_input, dict):
