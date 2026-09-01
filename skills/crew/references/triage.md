@@ -22,22 +22,39 @@ on the lines *above* the verb line. The receipt verb is matched as a whole line;
 a child append prose to it produces a receipt the run refuses, which the driver bounces once and
 then settles `failed` (ADR-0015).
 
-## Place leftovers
+## Place findings and leftovers
 
-A `wrap-up` is ruled line by line: every leftover the child listed gets one of the three placements
-the Contract names, and the ruling is one message back on the child's channel. Write it so the
-report can set each line beside its placement — repeat the leftover's own line, then the placement:
+A ruling that places findings or leftovers is ruled line by line. Every line gets one of the four
+placements the Contract names. Write it so the report can set each line beside its placement —
+repeat the child's own line, then the placement:
 
 ```
 <leftover line as the child wrote it> — this ticket
 <leftover line as the child wrote it> — opened <ticket reference>
+<leftover line as the child wrote it> — deferred <ticket reference>
 <leftover line as the child wrote it> — dropped
 ```
 
 A line ruled *this ticket* keeps the child running: it makes the edit and sends its receipt when
 done. A line ruled *opened* names the ticket you opened (below) before the ruling is sent, so the
-child's receipt and the report both carry the reference. The ruling hook copies the message
-verbatim, so the placements need no second write.
+child's receipt and the report both carry the reference.
+
+A line ruled *deferred* names an existing pending ticket in this Run. The finding must be on the
+target ticket before the ruling reaches the source child, so use this one operation for either a
+Claude or Codex source instead of sending an ordinary answer:
+
+```bash
+python3 <crew-skill-dir>/assets/driver/driver.py defer \
+  --run-dir <run-dir> --ticket <source NN> --to <target NN> \
+  --text "<leftover line as the child wrote it>"
+```
+
+`driver.py defer` verifies that the target has never launched, writes a comment beginning
+`Deferred from #<source>:` through Tracker, then delivers and records
+`<line> — deferred #<target> (comment: <comment locator>)`. The command returns no ruling until
+the comment locator exists. Its identical-comment retry is idempotent; a different finding is a
+different comment. The report pairs any escalation ruling that lists placements, including
+`wrap-up` and `doc-conflict`.
 
 ## Open a ticket
 
@@ -123,9 +140,10 @@ so an ordinary ASK answer is logged by being sent. A Codex answer goes through `
 which relays it over the bridge; the bridge records the prompt as it sends it, and the marker it
 rotates is what makes the child's next turn visible to the watch. Permission answers go through
 `driver.py answer` too: it delivers first, then reuses the coordinator message event shape for the
-ruling. A delivery failure is surfaced and writes no ruling. The driver builds the report from
-these lines, so name the effect and its exact reversal inside the ruling itself whenever you
-approve something outside the worktree.
+ruling. A deferral goes through `driver.py defer`, whose Tracker comment locator is carried in that
+same ruling shape. A delivery failure is surfaced and writes no ruling. The driver builds the
+report from these lines, so name the effect and its exact reversal inside the ruling itself whenever
+you approve something outside the worktree.
 
 ## Park
 

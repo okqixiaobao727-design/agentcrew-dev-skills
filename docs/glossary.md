@@ -297,8 +297,8 @@ _Avoid_: research, verification
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers
 remain: one line per leftover — what it is, its pointer, and whether it touches only this ticket
 or another ticket or a public interface — with no recommendation. The coordinator rules each line:
-fixed in this ticket, opened as a ticket seeded from that line, or dropped. A completion with no
-leftovers is a receipt, not a wrap-up.
+fixed in this ticket, opened as a ticket seeded from that line, deferred to an existing pending
+ticket through the Driver, or dropped. A completion with no leftovers is a receipt, not a wrap-up.
 _Avoid_: tail, follow-up list
 
 **Bounded read** — The coordinator's file boundary is a kind line. Maintainer-authored judgment

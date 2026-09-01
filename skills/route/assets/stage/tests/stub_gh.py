@@ -9,7 +9,7 @@ staging calls, over the issues in `AGENTCREW_STUB_DIR/gh-issues.json`, keyed by 
   `--json comments` for the two the write operations have to read before they write.
 - **edit** — `issue edit <n> --body-file -`, replacing the body with what stdin carries.
 - **mark** — `issue edit <n> --add-label/--remove-label`, the pickup labels.
-- **comment** — `issue comment <n> --body <text>`, appended to the issue's comments.
+- **comment** — `issue comment <n> --body <text>` appends; the GraphQL update mutation replaces.
 - **sub-issue expansion** — `api repos/{owner}/{repo}/issues/<n>/sub_issues`, the native list, in
   the shape the REST endpoint answers with: an array of issues carrying at least `number`. An issue
   carrying a `page_size` has that list answered one JSON document per page, which is the other shape
@@ -57,14 +57,22 @@ def flag(argv, name):
 
 
 def known_fields(number, record):
+    issue_url = record.get("url", f"https://github.example.invalid/issues/{number}")
     return {
         "number": int(number),
         "title": record.get("title", ""),
         "body": record.get("body", ""),
         "state": record.get("state", "OPEN"),
-        "url": record.get("url", f"https://github.example.invalid/issues/{number}"),
+        "url": issue_url,
         "labels": [{"name": name} for name in record.get("labels", [])],
-        "comments": [{"body": body} for body in record.get("comments", [])],
+        "comments": [
+            {
+                "id": f"IC_{number}_{index}",
+                "body": body,
+                "url": f"{issue_url}#issuecomment-{index}",
+            }
+            for index, body in enumerate(record.get("comments", []), 1)
+        ],
     }
 
 
@@ -102,7 +110,38 @@ def comment(argv, table, number, record):
     record["comments"] = list(record.get("comments", [])) + [body]
     table[str(number)] = record
     save(table)
+    issue_url = record.get("url", f"https://github.example.invalid/issues/{number}")
+    print(f"{issue_url}#issuecomment-{len(record['comments'])}")
     return 0
+
+
+def raw_field(argv, name):
+    """One `gh api graphql -f name=value` string."""
+    for index, argument in enumerate(argv[:-1]):
+        value = argv[index + 1]
+        if argument == "-f" and value.startswith(f"{name}="):
+            return value.split("=", 1)[1]
+    return None
+
+
+def graphql(argv):
+    """Replace the comment selected by its stable GraphQL node ID."""
+    node = raw_field(argv, "id")
+    body = raw_field(argv, "body")
+    table = issues()
+    for number, record in table.items():
+        comments = list(record.get("comments", []))
+        for index, _held in enumerate(comments, 1):
+            if node != f"IC_{number}_{index}":
+                continue
+            comments[index - 1] = body
+            record["comments"] = comments
+            table[number] = record
+            save(table)
+            print(json.dumps({"data": {"updateIssueComment": {}}}))
+            return 0
+    print(f"could not resolve comment node {node}", file=sys.stderr)
+    return 1
 
 
 def issue(argv):
@@ -157,6 +196,8 @@ def main():
         handle.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
     if argv and argv[0] == "issue" and len(argv) > 1:
         return issue(argv)
+    if argv[:2] == ["api", "graphql"]:
+        return graphql(argv)
     if argv and argv[0] == "api" and len(argv) > 1:
         return api(argv)
     return 1

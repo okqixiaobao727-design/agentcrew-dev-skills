@@ -142,6 +142,7 @@ import machine_log  # noqa: E402
 # Account bindings become process environments only through the account module.
 import accounts  # noqa: E402
 import run_plan  # noqa: E402
+import tracker  # noqa: E402
 import witness as witness_runner  # noqa: E402
 # The monitor still owns process liveness, the driver pid record and every operator-facing surface;
 # Machine-log interpretation itself comes from the projection above.
@@ -262,6 +263,12 @@ NUDGE_MARKER = machine_log.NUDGE_MARKER
 MERGE_MARKER = machine_log.MERGE_MARKER
 ANCHOR_MARKER = machine_log.ANCHOR_MARKER
 HANDED_OVER_MARKER = machine_log.HANDED_OVER_MARKER
+PLACEMENT_MARKERS = (
+    " — this ticket",
+    " — dropped",
+    " — opened ",
+    " — deferred ",
+)
 
 # The tmux key names the permission-prompt command accepts, kept narrow so an answer cannot
 # accidentally become an unsupported tmux key sequence.
@@ -1986,74 +1993,102 @@ def report_terminal_details(records, ticket, outcome):
 
 
 def report_rulings(records):
-    """Every ruling for display, with wrap-up leftovers paired to their placements."""
-    wrap_ups = {}
+    """Every ruling for display, with escalation items paired to listed placements."""
+    escalations = {}
     rendered = []
     for position, record in enumerate(records):
         ticket = str(record.get("ticket") or "run")
         if record.get("event") == "escalation":
-            previous = wrap_ups.pop(ticket, None)
+            previous = escalations.pop(ticket, None)
             if previous and previous["handed_over"] is not None:
                 rendered.append(previous["handed_over"])
             message = str(record.get("message") or "")
             verb, verb_line = machine_log.final_verb(message)
             words = verb_line.split() if verb == machine_log.ESCALATION_VERB else []
-            if len(words) >= 4 and words[3] == "wrap-up":
+            if len(words) >= 4:
+                kind = words[3]
                 leftovers = [
                     line for line in message.splitlines()
                     if line.strip() and line != verb_line
                 ]
-                if not leftovers and " — " in verb_line:
+                if kind == "wrap-up" and not leftovers and " — " in verb_line:
                     body = re.sub(r" ts=\d+$", "", verb_line.split(" — ", 1)[1]).strip()
                     if body:
                         leftovers.append(body)
-                wrap_ups[ticket] = {"leftovers": leftovers, "handed_over": None}
+                escalations[ticket] = {
+                    "kind": kind,
+                    "leftovers": leftovers,
+                    "handed_over": None,
+                }
             continue
         if record.get("event") != "ruling":
             continue
         message = str(record.get("message") or "")
-        wrap_up = wrap_ups.get(ticket)
-        if wrap_up:
-            leftovers = wrap_up["leftovers"]
+        escalation = escalations.get(ticket)
+        if escalation:
             lines = message.splitlines()
-            placements = []
-            for leftover in leftovers:
-                closed = {
-                    f"{leftover} — this ticket",
-                    f"{leftover} — dropped",
-                }
-                placement = next(
-                    (
-                        line for line in lines
-                        if line in closed or line.startswith(f"{leftover} — opened ")
-                    ),
-                    None,
-                )
-                if placement is not None:
-                    placements.append(placement)
-            if len(placements) == len(leftovers):
-                rendered.extend(
-                    (position, order, ticket, placement)
-                    for order, placement in enumerate(placements)
-                )
-                wrap_ups.pop(ticket, None)
-                continue
             if message.startswith(f"{HANDED_OVER_MARKER} "):
-                wrap_up["handed_over"] = (position, 0, ticket, message)
+                escalation["handed_over"] = (position, 0, ticket, message)
                 continue
-            if wrap_up["handed_over"] is not None:
-                rendered.append(wrap_up["handed_over"])
-            wrap_ups.pop(ticket, None)
+            placements = [line for line in lines if placement_line(line)]
+            if escalation["kind"] == "wrap-up":
+                paired = []
+                for leftover in escalation["leftovers"]:
+                    placement = next(
+                        (
+                            line for line in placements
+                            if placement_belongs_to(line, leftover)
+                        ),
+                        None,
+                    )
+                    if placement is not None:
+                        paired.append(placement)
+                placements = paired if len(paired) == len(escalation["leftovers"]) else []
+            if placements:
+                other_lines = [
+                    line for line in lines
+                    if line.strip() and not placement_line(line)
+                ]
+                if other_lines:
+                    rendered.append((position, 0, ticket, message))
+                else:
+                    rendered.extend(
+                        (position, order, ticket, placement)
+                        for order, placement in enumerate(placements)
+                    )
+                escalations.pop(ticket, None)
+                continue
+            if escalation["handed_over"] is not None:
+                rendered.append(escalation["handed_over"])
+            escalations.pop(ticket, None)
         rendered.append((position, 0, ticket, message))
     rendered.extend(
-        wrap_up["handed_over"]
-        for wrap_up in wrap_ups.values()
-        if wrap_up["handed_over"] is not None
+        escalation["handed_over"]
+        for escalation in escalations.values()
+        if escalation["handed_over"] is not None
     )
     return [
         (ticket, message)
         for _position, _order, ticket, message in sorted(rendered)
     ]
+
+
+def placement_line(line):
+    """Whether one ruling line names one of the placement grammar's four outcomes."""
+    return any(
+        line.endswith(marker) if marker in PLACEMENT_MARKERS[:2] else marker in line
+        for marker in PLACEMENT_MARKERS
+    )
+
+
+def placement_belongs_to(line, leftover):
+    """Whether one placement line rules the named wrap-up leftover."""
+    return any(
+        line == f"{leftover}{marker}"
+        if marker in PLACEMENT_MARKERS[:2]
+        else line.startswith(f"{leftover}{marker}")
+        for marker in PLACEMENT_MARKERS
+    )
 
 
 def report_undo_effects(records):
@@ -3735,6 +3770,60 @@ def run_answer(args):
     return 0
 
 
+def plan_ticket(loop, reference):
+    """Resolve one reference through this Run plan or name its outside-plan state."""
+    reference = str(reference)
+    try:
+        return loop.plan.ticket(reference)
+    except run_plan.RunPlanError as error:
+        raise DriverError(
+            f"ticket {reference} has state outside-run-plan: {error}",
+            ticket=reference,
+            pointer=str(loop.table_path),
+        ) from error
+
+
+def run_defer(args):
+    """Put one finding on a pending target, then deliver and record that placement."""
+    run_dir = resolved_run_dir(args.run_dir)
+    loop = Loop(args, run_dir, run_dir / TABLE_NAME)
+    source_ticket = plan_ticket(loop, args.ticket)
+    target_ticket = plan_ticket(loop, args.to)
+    source = source_ticket.id
+    target = target_ticket.id
+    if source == target:
+        raise DriverError(
+            f"ticket {target} has state source, not pending", ticket=target, pointer=str(loop.log)
+        )
+    projection = machine_log.project(loop.records())
+    launch = projection.ticket(source).launch
+    if launch is None:
+        raise DriverError(
+            f"{source} has no recorded child in {loop.log}", ticket=source, pointer=str(loop.log)
+        )
+    if projection.ticket(target).launch is not None:
+        raise DriverError(
+            f"ticket {target} has state launched, not pending",
+            ticket=target,
+            pointer=str(loop.log),
+        )
+    finding = args.text
+    if not isinstance(finding, str) or not finding.strip():
+        raise DriverError(
+            "a deferral needs --text naming the finding and its pointers",
+            ticket=source,
+            pointer=str(loop.log),
+        )
+    body = f"Deferred from #{source}:\n\n{finding}"
+    try:
+        locator = tracker.comment(loop.run.tracker, target_ticket, body)
+    except tracker.TrackerError as error:
+        raise DriverError(str(error), ticket=target, pointer=str(loop.table_path)) from error
+    ruling = f"{finding} — deferred #{target} (comment: {locator})"
+    loop.deliver(source, launch, ruling)
+    return 0
+
+
 # --- entry point ------------------------------------------------------------------------------
 
 
@@ -3831,6 +3920,17 @@ def build_parser():
     answer.add_argument(
         "--key", dest="keys", action="append", default=[], metavar="KEY",
         help="a permission-prompt key name; repeat for a sequence (Claude children only)",
+    )
+    defer = commands.add_parser(
+        "defer", help="comment a finding on a pending ticket, then deliver and record its placement"
+    )
+    defer.set_defaults(handler=run_defer)
+    defer.add_argument("--run-dir", required=True, help="the recorded run directory")
+    defer.add_argument("--ticket", required=True, help="the ticket whose finding is being placed")
+    defer.add_argument("--to", required=True, help="the pending target ticket in this Run plan")
+    defer.add_argument(
+        "--text", required=True,
+        help="the finding exactly as the child stated it, with pointers",
     )
     return parser
 

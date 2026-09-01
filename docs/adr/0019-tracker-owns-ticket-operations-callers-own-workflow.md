@@ -1,5 +1,6 @@
 ---
-status: deferred — decided but not built; #123 was closed 2026-08-28 without implementing Tracker
+status: partial — comment landed in #174; read, edit, mark and close remain deferred, as does the
+  ticket-locator-through-wave-table slice
 ---
 
 # Tracker owns ticket operations; callers own workflow
@@ -40,6 +41,16 @@ The module has two internal adapters because two implementations are exercised e
 GitHub, through `gh`, and local, through files in the repository. They produce the same observable
 operation semantics. The public interface does not expose the adapters or a generic command
 runner; tests use private seams inside the module.
+
+The implemented
+`comment(run_tracker_fact, ticket_fact, body, *, supersedes=None) -> locator` slice takes the
+current Run-plan facts without a caller parsing tracker identity. Its locator names the comment
+just made: the GitHub comment URL or the local ticket fact's `path:line`. The Driver passes the
+staged copy as that fact, so a local deferral locator names the staged copy. That comment locator is
+distinct from the original ticket locator the deferred Run-plan slice above will eventually carry.
+Identical bodies return the existing locator; distinct local bodies remain as distinct `Crew:`
+comment blocks. A caller may name a `supersedes` body prefix when its workflow needs one matching
+comment replaced. Tracker owns that replacement operation but does not know what the prefix means.
 
 Only GitHub and local are supported now. `references/trackers.md` currently claims that GitLab,
 Jira, Linear and other trackers work from convention-document commands, while preflight rejects
