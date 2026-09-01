@@ -23,6 +23,9 @@ import unittest
 
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(TESTS_DIR.parents[1]))
+import run_plan  # noqa: E402
+
 LAUNCH = TESTS_DIR.parent / "launch.py"
 STUB_DRIVER = TESTS_DIR / "stub_driver.py"
 STUB_TMUX = TESTS_DIR / "stub_tmux.py"
@@ -57,7 +60,6 @@ PERMISSION_MODE = "acceptEdits"
 STARTUP_MODE = "default"
 SWITCHED_MODE = "bypassPermissions"
 
-RUN_DIR_NAME = ".crew"
 TABLE_NAME = "wave-table.json"
 
 
@@ -98,7 +100,7 @@ class Fixture:
     @property
     def crew_dir(self):
         """The run's own directory inside the feature, which the launcher makes."""
-        return self.run_dir / ".crew"
+        return self.run_dir / run_plan.CREW_STATE_DIR_NAME
 
     def recorded_driver(self):
         """The pid the run directory names as its driver, or None where it names none."""
@@ -214,7 +216,7 @@ class Fixture:
 
     def wave_table(self):
         """The record that makes this run one already in flight, which the driver's start adopts."""
-        table = self.run_dir / RUN_DIR_NAME / TABLE_NAME
+        table = self.crew_dir / TABLE_NAME
         table.parent.mkdir(parents=True, exist_ok=True)
         table.write_text(json.dumps({"run": {}, "waves": []}) + "\n")
         return table
@@ -236,9 +238,9 @@ class Fixture:
         environment.update(overrides or {})
         return environment
 
-    def argv(self, extra=()):
+    def argv(self, extra=(), run_dir=None):
         return [
-            sys.executable, str(LAUNCH), str(self.run_dir),
+            sys.executable, str(LAUNCH), str(run_dir if run_dir is not None else self.run_dir),
             "--driver", str(STUB_DRIVER), *extra,
         ]
 
@@ -322,6 +324,22 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(flag(call["argv"], "--permission-mode"), PERMISSION_MODE)
         # The driver's own wake is what the coordinator reads, and this waiter adds nothing to it.
         self.assertEqual(json.loads(result.stdout), DEFAULT_WAKE)
+
+    def test_the_state_directory_form_does_not_create_or_pass_a_nested_state_directory(self):
+        self.fixture.registry(os.getpid())
+        self.fixture.transcript([PERMISSION_MODE])
+        command = self.fixture.argv(run_dir=self.fixture.crew_dir)
+
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=LAUNCH_TIMEOUT,
+            env=self.fixture.environment(), cwd=str(self.fixture.root),
+        )
+
+        call = self.one_call(result)
+        self.assertEqual(flag(call["argv"], "--feature-dir"), str(self.fixture.run_dir))
+        self.assertFalse(
+            (self.fixture.crew_dir / run_plan.CREW_STATE_DIR_NAME).exists()
+        )
 
     def test_the_coordinator_is_found_above_the_shell_the_command_ran_in(self):
         """The pid is the session's, not the shell's: a walk up the ancestry finds the entry."""

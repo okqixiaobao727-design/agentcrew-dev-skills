@@ -23,6 +23,10 @@ import sys
 import time
 
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+import run_plan  # noqa: E402
+
+
 STDOUT_LINE = "stub driver ran"
 DEFAULT_WAKE = {"reason": "run-complete", "ticket": None, "pointer": "report.md"}
 
@@ -33,7 +37,10 @@ def flag(argv, name):
 
 def run_dir(argv):
     feature = flag(argv, "--feature-dir")
-    return pathlib.Path(feature).resolve() / ".crew" if feature else None
+    return (
+        pathlib.Path(feature).resolve() / run_plan.CREW_STATE_DIR_NAME
+        if feature else None
+    )
 
 
 def waiter(directory):

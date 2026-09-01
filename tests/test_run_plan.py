@@ -73,6 +73,30 @@ class RunPlanTests(unittest.TestCase):
             },
         }
 
+    def test_crew_state_dir_normalizes_both_run_directory_forms_without_nesting(self):
+        state_dir = self.feature / ".crew"
+        relative_feature = pathlib.Path("relative-feature")
+
+        self.assertEqual(run_plan.crew_state_dir(self.feature), state_dir.resolve())
+        self.assertEqual(run_plan.crew_state_dir(state_dir), state_dir.resolve())
+        self.assertEqual(
+            run_plan.crew_state_dir(relative_feature),
+            (pathlib.Path.cwd() / relative_feature / ".crew").resolve(),
+        )
+
+    def test_resolve_run_dir_names_the_argument_checked_path_and_accepted_forms(self):
+        feature_dir = self.root / "missing-run"
+
+        with self.assertRaises(run_plan.RunPlanError) as raised:
+            run_plan.resolve_run_dir(feature_dir)
+
+        self.assertEqual(
+            str(raised.exception),
+            f"run: {feature_dir} holds no run: no wave table at "
+            f"{run_plan.crew_state_dir(feature_dir) / 'wave-table.json'}; accepted forms are "
+            "<feature-dir> or <feature-dir>/.crew",
+        )
+
     def ticket(self, number, title, blocked_by=(), routing=None):
         blockers = "\n".join(f"- #{blocker}" for blocker in blocked_by)
         blocked_section = f"\n## Blocked by\n\n{blockers}\n" if blockers else ""

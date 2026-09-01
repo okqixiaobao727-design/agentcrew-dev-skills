@@ -363,6 +363,12 @@ frame is drawn is different. The window is unchanged and stays the default
 
 ## Artefacts
 
+**Run directory** — Either accepted path spelling for one recorded Run: its `<feature-dir>`, which
+is the form `/crew` and wake snapshots print, or its `<feature-dir>/.crew` **state directory**.
+The state directory holds the Wave table, Machine log and live run records. Operator-facing readers
+use `run_plan.resolve_run_dir` to resolve either form to that state directory and reject a path that
+holds no recorded Run.
+
 **Crew worktree** — A Run's dedicated checkout. The Driver performs the run's Git operations there
 while the checkout from which the Coordinator invoked `/crew` remains untouched.
 

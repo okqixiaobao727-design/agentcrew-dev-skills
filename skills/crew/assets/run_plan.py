@@ -18,6 +18,7 @@ BLOCKED_BY_SECTION = "blocked by"
 TEMPLATES = pathlib.Path(__file__).resolve().parent / "dispatch" / "templates" / "shapes.toml"
 DEFAULT_CONFIG = pathlib.Path(__file__).resolve().parents[3] / "config" / "agentcrew.default.toml"
 PROJECT_CONFIG_NAME = "agentcrew.toml"
+CREW_STATE_DIR_NAME = ".crew"
 EXECUTORS = ("claude", "codex")
 # The witness launcher is the Claude CLI; exposing that here makes its complete route available to
 # every consumer without making presentation code infer a vendor from a model name.
@@ -767,6 +768,25 @@ def _loaded_plan(document):
     if not waves:
         raise RunPlanError(["run: the plan carries no waves"])
     return _validate(RunPlan(_metadata(document["run"]), tuple(waves)))
+
+
+def crew_state_dir(path):
+    """Return the absolute state directory for either accepted Run-directory form."""
+    path = pathlib.Path(path).resolve()
+    return path if path.name == CREW_STATE_DIR_NAME else path / CREW_STATE_DIR_NAME
+
+
+def resolve_run_dir(path):
+    """Return an existing Run's state directory for either accepted input form."""
+    argument = pathlib.Path(path)
+    state_dir = crew_state_dir(argument)
+    state_table = state_dir / "wave-table.json"
+    if state_table.is_file():
+        return state_dir
+    raise RunPlanError([
+        f"run: {argument} holds no run: no wave table at {state_table}; "
+        f"accepted forms are <feature-dir> or <feature-dir>/{CREW_STATE_DIR_NAME}"
+    ])
 
 
 def load(path):

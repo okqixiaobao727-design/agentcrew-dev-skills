@@ -339,7 +339,7 @@ def ask(args):
     try:
         if not args.question.strip():
             return failed("question is empty", started)
-        run_dir = pathlib.Path(args.run).resolve(strict=True)
+        run_dir = run_plan.resolve_run_dir(args.run)
         plan = run_plan.load(run_dir / WAVE_TABLE)
         ticket = plan.ticket(args.ticket)
         worktree = checked_context(
