@@ -733,6 +733,48 @@ class StagingTests(unittest.TestCase):
         for number in ("61", "62"):
             self.assertEqual(self.fixture.tracker_comments(number), [f"/crew {RUN_ROOT}/1"])
 
+    def test_a_new_staged_command_supersedes_the_previous_pickup_comment(self):
+        old = f"/crew {RUN_ROOT}/99"
+        body = f"## What to build\n\nA fixture.\n\nCrew: {old}\n"
+        ticket = self.fixture.issue(
+            61,
+            body=body,
+            comments=((old,) if self.tracker == "github" else ()),
+        )
+        routing = self.fixture.routing_file({"61": dict(APPROVED)})
+
+        result = self.stage_approved(ticket, "--routing", routing)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.tracker_comments("61"), [f"/crew {RUN_ROOT}/1"])
+
+    def test_repo_root_keeps_the_github_comment_in_the_named_repository(self):
+        if self.tracker != "github":
+            self.skipTest("GitHub comments are the cwd-sensitive adapter this test covers")
+        first, second = self.two_tickets()
+        routing = self.fixture.routing_file({"61": dict(APPROVED), "62": dict(APPROVED)})
+
+        result = subprocess.run(
+            [
+                sys.executable, str(STAGE), first, second,
+                "--routing", routing, "--repo-root", str(self.fixture.repo),
+            ],
+            capture_output=True, text=True, env=self.fixture.environment(),
+            cwd=str(self.fixture.root),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [
+            json.loads(line)
+            for line in (self.fixture.stub_dir / "gh-calls.jsonl").read_text().splitlines()
+        ]
+        comments = [
+            call for call in calls
+            if call["argv"][:2] == ["issue", "comment"]
+        ]
+        self.assertEqual(len(comments), 2)
+        self.assertEqual({call["cwd"] for call in comments}, {str(self.fixture.repo)})
+
     def test_a_failed_self_check_comments_no_command(self):
         self.two_tickets()
         (self.fixture.repo / "README.md").write_text("edited\n")
@@ -782,6 +824,27 @@ class LocalTrackerTests(StagingTests):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.fixture.stub_dir / "gh-calls.jsonl").exists())
+
+    def test_a_new_staged_command_replaces_only_the_previous_staged_command(self):
+        body = (
+            "## What to build\n\nA fixture.\n\n"
+            "Crew: /crew crewtask/99\n\n"
+            "Crew: Deferred from #60:\n\nKeep this finding — pointer.py:1\n"
+        )
+        ticket = self.fixture.issue(61, body=body)
+        routing = self.fixture.routing_file({"61": dict(APPROVED)})
+
+        result = self.stage_approved(ticket, "--routing", routing)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.fixture.tracker_comments("61"),
+            [
+                "Deferred from #60:",
+                f"/crew {RUN_ROOT}/1",
+            ],
+        )
+        self.assertIn("Keep this finding — pointer.py:1", self.fixture.ticket_file("61"))
 
 
 class GithubStubTests(unittest.TestCase):

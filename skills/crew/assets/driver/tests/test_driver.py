@@ -215,6 +215,74 @@ class ReportSelectionTests(unittest.TestCase):
             [("7", "CREW RULED 7 — handed over")],
         )
 
+    def test_a_doc_conflict_deferred_placement_replaces_its_hand_over_in_the_report(self):
+        finding = "The later ticket owns this failure — skills/example.py:12"
+        locator = "https://github.example.invalid/issues/46#issuecomment-7001"
+        placement = f"{finding} — deferred #46 (comment: {locator})"
+        records = (
+            {
+                "event": "escalation",
+                "ticket": "45",
+                "message": f"{finding}\nCREW ASK 45 doc-conflict ts=1",
+            },
+            {
+                "event": "ruling",
+                "ticket": "45",
+                "message": "CREW RULED 45 — handed over",
+            },
+            {"event": "ruling", "ticket": "45", "message": placement},
+        )
+
+        self.assertEqual(driver_module.report_rulings(records), [("45", placement)])
+
+    def test_a_placement_does_not_discard_other_lines_from_the_same_ruling(self):
+        placement = "Carry the later work — opened #47"
+        instruction = "Proceed with approach B now; keep the old flag until then."
+        message = f"{placement}\n{instruction}"
+        records = (
+            {
+                "event": "escalation",
+                "ticket": "45",
+                "message": "The documents conflict\nCREW ASK 45 doc-conflict ts=1",
+            },
+            {
+                "event": "ruling",
+                "ticket": "45",
+                "message": "CREW RULED 45 — handed over",
+            },
+            {"event": "ruling", "ticket": "45", "message": message},
+        )
+
+        self.assertEqual(driver_module.report_rulings(records), [("45", message)])
+
+
+class DeferralDocumentationTests(unittest.TestCase):
+    def test_the_fourth_placement_and_tracker_comment_slice_are_documented(self):
+        crew_skill = TRIAGE.parent.parent / "SKILL.md"
+        repository = DRIVER.parents[4]
+        glossary = repository / "docs" / "glossary.md"
+        tracker_adr = (
+            repository / "docs" / "adr"
+            / "0019-tracker-owns-ticket-operations-callers-own-workflow.md"
+        )
+        trackers = repository / "references" / "trackers.md"
+
+        triage = TRIAGE.read_text(encoding="utf-8")
+        self.assertIn(
+            "<leftover line as the child wrote it> — deferred <ticket reference>", triage
+        )
+        self.assertIn("driver.py defer", triage)
+        self.assertIn("comment locator", triage)
+        self.assertIn("an existing pending ticket", crew_skill.read_text(encoding="utf-8"))
+        glossary_text = " ".join(glossary.read_text(encoding="utf-8").split())
+        self.assertIn("deferred to an existing pending ticket", glossary_text)
+        adr = tracker_adr.read_text(encoding="utf-8")
+        self.assertIn("comment landed in #174", adr)
+        self.assertIn("read, edit, mark and close remain deferred", adr)
+        tracker_text = trackers.read_text(encoding="utf-8")
+        self.assertIn("path:line", tracker_text)
+        self.assertIn("further `Crew:` comment block", " ".join(tracker_text.split()))
+
 
 class PreflightTests(DriverTestCase):
     def test_a_foreign_worktree_at_the_crew_path_is_named_and_preserved(self):
@@ -3245,6 +3313,243 @@ class WakeWithNoWaiterTests(DriverTestCase):
         self.woken(resumed, "run-complete")
 
         self.assertEqual(self.re_typed(), [self.resume_line(), self.resume_line()])
+
+
+class DeferTests(DriverTestCase):
+    def start(self, tracker="github", target_blocked=True):
+        self.fixture.configure(tracker=tracker)
+        self.fixture.ticket("01", "reviewed ticket")
+        self.fixture.ticket(
+            "02", "later ticket", blocked_by=(("01",) if target_blocked else ())
+        )
+        if tracker == "github":
+            ticket_path = self.fixture.feature_dir / "02.md"
+            ticket_path.write_text(
+                ticket_path.read_text(encoding="utf-8").replace(
+                    "# later ticket\n",
+                    "# later ticket\n\n"
+                    "Ticket: https://github.example.invalid/issues/02 — the issue body and every"
+                    " comment are this ticket; read all of it.\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+        self.fixture.commit_feature()
+        if tracker == "github":
+            self.fixture.issues({
+                "01": {"labels": [], "closed": False, "comments": []},
+                "02": {
+                    "labels": [],
+                    "closed": False,
+                    "comments": [],
+                    "url": "https://github.example.invalid/issues/02",
+                },
+            })
+        process = self.fixture.launch()
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "01 never launched",
+        )
+        if target_blocked:
+            self.assertIsNone(
+                self.fixture.launch_record("02"), "the later ticket already launched"
+            )
+        else:
+            self.assertTrue(
+                self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+                "02 never launched",
+            )
+        return process
+
+    def defer(self, *arguments, to="02"):
+        return subprocess.run(
+            [
+                sys.executable, str(DRIVER), "defer",
+                "--run-dir", str(self.fixture.run_dir),
+                "--ticket", "01", "--to", to, *arguments,
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+    def test_text_is_a_required_cli_argument(self):
+        with self.assertRaises(SystemExit):
+            driver_module.build_parser().parse_args([
+                "defer", "--run-dir", "run", "--ticket", "01", "--to", "02",
+            ])
+
+    def test_github_defer_comments_before_delivering_and_records_the_opaque_locator(self):
+        self.start()
+        finding = "The later ticket must keep this pointer — skills/example.py:12"
+        locator = "https://github.example.invalid/issues/02#issuecomment-1"
+        ruling = f"{finding} — deferred #02 (comment: {locator})"
+
+        first = self.defer("--text", finding)
+        second = self.defer("--text", finding)
+
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(
+            self.fixture.issues()["02"]["comments"],
+            [f"Deferred from #01:\n\n{finding}"],
+        )
+        comments = [
+            call for call in self.fixture.gh_calls()
+            if call["argv"][:3] == ["issue", "comment", "02"]
+        ]
+        self.assertEqual(len(comments), 1)
+        typed = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ]
+        self.assertEqual(typed[-2:][0][-1], ruling)
+        self.assertEqual(typed[-2:][1][-1], ruling)
+        rulings = self.events("ruling", ticket="01")
+        self.assertEqual([record["message"] for record in rulings[-2:]], [ruling, ruling])
+
+    def test_local_defer_writes_only_the_staged_copy_and_keeps_each_distinct_finding(self):
+        original = self.fixture.repo / "tickets" / "02.md"
+        original.parent.mkdir()
+        original.write_text("# Original local ticket\n", encoding="utf-8")
+        original_before = original.read_text(encoding="utf-8")
+        self.start(tracker="local")
+        staged = self.fixture.feature_dir / "02.md"
+        first = "First finding — alpha.py:10"
+        second = "Second finding — beta.py:20"
+
+        first_result = self.defer("--text", first)
+        second_result = self.defer("--text", second)
+
+        self.assertEqual(first_result.returncode, 0, first_result.stdout + first_result.stderr)
+        self.assertEqual(second_result.returncode, 0, second_result.stdout + second_result.stderr)
+        self.assertEqual(original.read_text(encoding="utf-8"), original_before)
+        staged_text = staged.read_text(encoding="utf-8")
+        self.assertIn(f"Crew: Deferred from #01:\n\n{first}", staged_text)
+        self.assertIn(f"Crew: Deferred from #01:\n\n{second}", staged_text)
+        rulings = self.events("ruling", ticket="01")[-2:]
+        staged_lines = staged_text.splitlines()
+        for record, finding in zip(rulings, (first, second), strict=True):
+            prefix = f"{finding} — deferred #02 (comment: "
+            self.assertTrue(record["message"].startswith(prefix), record["message"])
+            match = re.search(r"\(comment: (.*):(\d+)\)$", record["message"])
+            self.assertIsNotNone(match, record["message"])
+            self.assertEqual(match.group(1), str(staged))
+            line = int(match.group(2))
+            self.assertEqual(staged_lines[line - 1], "Crew: Deferred from #01:")
+            self.assertIn(finding, "\n".join(staged_lines[line - 1:line + 3]))
+
+    def test_a_target_outside_the_plan_or_equal_to_the_source_is_refused_without_effects(self):
+        self.start()
+        before_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+
+        for target, state in (("99", "outside-run-plan"), ("01", "source")):
+            with self.subTest(target=target):
+                result = self.defer("--text", "Finding — pointer.py:1", to=target)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                snapshot = self.snapshot(result)
+                self.assertEqual(snapshot["reason"], "driver-error")
+                self.assertEqual(snapshot["ticket"], target)
+                self.assertIn(f"ticket {target}", snapshot["detail"])
+                self.assertIn(f"state {state}", snapshot["detail"])
+
+        self.assertEqual(self.fixture.issues()["02"]["comments"], [])
+        after_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+        self.assertEqual(after_typed, before_typed)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_github_target_first_turn_reaches_the_comment_before_the_target_launches(self):
+        process = self.start()
+        finding = "Finding for the later child — pointer.py:1"
+        result = self.defer("--text", finding)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        self.fixture.completes("01")
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the target never launched after its comment landed",
+        )
+        self.assertIsNone(process.poll(), "the run stopped before the target could read its ticket")
+        self.assertEqual(
+            self.fixture.issues()["02"]["comments"],
+            [f"Deferred from #01:\n\n{finding}"],
+        )
+        ticket_path = self.fixture.feature_dir / "02.md"
+        self.assertIn("https://github.example.invalid/issues/02", ticket_path.read_text())
+        turn = (self.fixture.run_dir / "launch" / "02.turn.txt").read_text()
+        self.assertIn(str(ticket_path), turn)
+        self.assertIn("read its body and every comment", turn)
+
+    def test_local_target_first_turn_reaches_the_staged_comment_before_launch(self):
+        process = self.start(tracker="local")
+        finding = "Finding for the later child — pointer.py:1"
+        result = self.defer("--text", finding)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ticket_path = self.fixture.feature_dir / "02.md"
+        expected = f"Crew: Deferred from #01:\n\n{finding}"
+        self.assertIn(expected, ticket_path.read_text())
+
+        self.fixture.completes("01")
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("02") is not None),
+            "the target never launched after its staged comment landed",
+        )
+        self.assertIsNone(process.poll(), "the run stopped before the target could read its ticket")
+        self.assertIn(expected, ticket_path.read_text())
+        turn = (self.fixture.run_dir / "launch" / "02.turn.txt").read_text()
+        self.assertIn(str(ticket_path), turn)
+
+    def test_any_launched_target_is_refused_without_reading_its_live_state(self):
+        self.start(target_blocked=False)
+        before_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+
+        result = self.defer("--text", "Finding — pointer.py:1")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn("ticket 02 has state launched, not pending", snapshot["detail"])
+        self.assertEqual(self.fixture.issues()["02"]["comments"], [])
+        after_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+        self.assertEqual(after_typed, before_typed)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_a_tracker_comment_failure_writes_no_delivery_or_ruling(self):
+        self.start()
+        (self.fixture.stub_dir / "gh-comment-fails").touch()
+        before_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+
+        result = self.defer("--text", "Finding — pointer.py:1")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn("tracker refused the comment", snapshot["detail"])
+        self.assertEqual(self.fixture.issues()["02"]["comments"], [])
+        after_typed = len([
+            call for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ])
+        self.assertEqual(after_typed, before_typed)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
 
 
 class AnswerTests(DriverTestCase):

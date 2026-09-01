@@ -77,8 +77,9 @@ closes for merged tickets; wave advancement, monitor re-arming and the dashboard
 outcome table, the duration rows, the rulings, the undo list and the cost rollup with the
 coordinator's own row — is rendered by the driver from the machine log. The cost rollup gives each
 witness event its own `witness-<NN>` row, includes its tokens in the total and shows its recorded
-duration. The Rulings section renders every wrap-up leftover beside the placement the coordinator
-gave it; rulings for `design`, `scope`, `doc-conflict` and `stuck` keep their verbatim rendering.
+duration. The Rulings section renders any escalation item beside a listed placement: this ticket,
+opened, deferred to an existing pending ticket, or dropped. A ruling that lists no placement keeps
+its verbatim rendering.
 
 **The wake surface is exactly three items.** A `CREW ASK` of any kind; a semantic merge conflict a
 child has bounced back a second time; and any state the rule table has no row for, which includes a

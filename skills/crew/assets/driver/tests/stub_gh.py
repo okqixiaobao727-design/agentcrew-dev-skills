@@ -6,9 +6,10 @@ because that directory is the whole of how a real `gh` knows which repository it
 call carrying a filesystem path where the CLI wants an `OWNER/REPO` slug is the failure this stub
 has to be able to show.
 
-Issues live in `gh-issues.json` there, keyed by number, each carrying its `labels` and whether it
-is `closed`. `issue view --json labels` prints them, `issue edit --remove-label` takes one off, and
-`issue close` closes it. Anything else exits 1, as `gh` does on a subcommand it has no answer for.
+Issues live in `gh-issues.json` there, keyed by number, each carrying its `labels`, `comments` and
+whether it is `closed`. `issue view` prints labels or comments, `issue comment` appends one and
+prints its locator, `issue edit --remove-label` takes one off, and `issue close` closes it. Anything
+else exits 1, as `gh` does on a subcommand it has no answer for.
 """
 
 import json
@@ -45,9 +46,33 @@ def issue(argv):
     action = argv[1]
 
     if action == "view":
-        if flag(argv, "--json") != "labels":
+        field = flag(argv, "--json")
+        if field == "labels":
+            print(json.dumps({"labels": [{"name": name} for name in record["labels"]]}))
+            return 0
+        if field == "comments":
+            issue_url = record.get("url", f"https://github.example.invalid/issues/{number}")
+            print(json.dumps({"comments": [
+                {
+                    "id": f"IC_{number}_{index}",
+                    "body": body,
+                    "url": f"{issue_url}#issuecomment-{index}",
+                }
+                for index, body in enumerate(record.get("comments", []), 1)
+            ]}))
+            return 0
+        return 1
+    if action == "comment":
+        if (state_dir() / "gh-comment-fails").exists():
+            print("comment refused by tracker", file=sys.stderr)
             return 1
-        print(json.dumps({"labels": [{"name": name} for name in record["labels"]]}))
+        body = flag(argv, "--body")
+        if body is None:
+            return 1
+        record["comments"] = list(record.get("comments", [])) + [body]
+        save(table)
+        issue_url = record.get("url", f"https://github.example.invalid/issues/{number}")
+        print(f"{issue_url}#issuecomment-{len(record['comments'])}")
         return 0
     if action == "edit":
         removed = flag(argv, "--remove-label")
