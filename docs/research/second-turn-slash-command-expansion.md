@@ -55,7 +55,7 @@ Both skills under test are gated: `implement/SKILL.md:4` and `triage/SKILL.md:4`
 | 3b | Codex: same question, given `opening_skill_name` is start-anchored | **It still expands** — the structured item is suppressed, but the core text resolver rescues a *canonical-name* mention. Contradicts the brief | §4 |
 | 4a | Codex follow-up beginning `$implement <path>` injects the skill as a structured item resolved by path | **Yes** — one 611-char `<skill>` block | §4 |
 | 4b | Canonical-name form `$mattpocock-skills:implement` on a follow-up | **The bridge refuses to send it at all** — `BridgeError` before any network call. Contradicts the brief | §4 |
-| 5 | The ruling hook / machine log record the delivered slash-command answer verbatim | **Yes on Codex**, by artefact. **Was no on Claude** — #187's Run showed the child expanding it while the log kept a placeholder; the cause was the composer's clearing lag, fixed in [#191](https://github.com/okqixiaobao727-design/agentcrew-dev-skills/issues/191), and Claude now records it too | §5 |
+| 5 | The ruling hook / machine log record the delivered slash-command answer verbatim | **Yes on Codex**, by artefact. **Now yes on Claude** — was no until the composer's clearing lag was fixed (#191) | §5 |
 | 6 | The bounded-read / red-line guard hooks do not refuse the expanded skill's first actions | **No refusal on Claude.** On Codex the question does not arise — the guards are never installed for a Codex child | §6 |
 
 ## 1. Claude, fact 1: `/implement <path>` as a later turn
@@ -263,28 +263,21 @@ Two controls pinned it to the slash command rather than to the pane or the timin
 into that same pane two minutes later (`2026-09-02T21:17:07Z`) was recorded verbatim, and
 `$implement <path>` to the Codex child (`2026-09-02T21:24:14Z`) was too.
 
-**Cause, and the fix.** Neither `Enter` was at fault, and the autocomplete overlay §1 ruled out
-was not involved either: `type_into_pane` read the composer too early. #191's timing probe
-(Claude Code 2.1.258, a throwaway child driven with the real `composer_holds` and the same bytes)
-measured the driver's whole retry — first `Enter`, check, second `Enter`, check — completing in
-about 30ms, while a Claude composer takes about 20ms to clear prose and up to about 100ms to
-clear a slash command, whose name is resolved and whose skill body is loaded before the input is
-cleared. Both checks landed inside that lag, both read the typed line, and `stuck` was raised for
-a message the child had already received. The #187 child's single command record 99 is what this
-predicts: the first `Enter` submitted and the second fell on an empty composer.
+**Cause: the clearing lag, not the overlay.** #191 measured it on a throwaway child driven with
+the real `composer_holds` and the same bytes. A Claude composer clears prose in about 20ms and a
+slash command in up to about 100ms — the command is resolved and its skill body loaded before the
+input clears — while the driver's whole retry, first `Enter` through second check, completes in
+about 30ms. Both checks landed inside the lag, both read the typed line, and the delivery was
+called failed. The #187 child's single command record 99 is what that predicts: the first `Enter`
+submitted, the second fell on an empty composer. Neither `Enter` was at fault, and §1's
+autocomplete overlay is refuted a second time.
 
-`type_into_pane` now polls the composer for up to `COMPOSER_CLEAR_SECONDS` after each `Enter`
-before calling that `Enter` dropped, so a slash-command ruling Claude accepts on the first press
-is recorded once, verbatim (#191). The driver suite's tmux stub grew a `tmux-linger-reads` knob
-that holds the typed line in the composer for a set number of `capture-pane` reads, which is what
-lets `DiagnosingChildChainTests` and `AnswerTests` fail on the old single read and pass on the
-polled one.
-
-#191's own live acceptance ran both drivers against one scratch Run and the same live Claude child
-(Claude Code 2.1.258, Haiku 4.5, a 210x43 detached tmux window): the `crew/72` driver answered
-`01's instruction remained in the composer at @135` and wrote no `ruling`, while the child's pane
-shows it expanded `/mattpocock-skills:implement` all the same; the fixed driver recorded that same
-ruling verbatim, and a prose ruling on the same pane after it, each from a single submission.
+**The fixed driver records it.** #191 ran both drivers against one scratch Run and the same live
+child (Claude Code 2.1.258, Haiku 4.5, a 210x43 detached tmux window). The `crew/72` driver
+answered `01's instruction remained in the composer at @135` and wrote no `ruling`, while that
+child's pane shows it expanded `/mattpocock-skills:implement` all the same; the driver that waits
+for the composer recorded the same ruling verbatim, and a prose ruling after it, each from a
+single submission.
 
 Confidence: **high** for Codex; **high** for Claude, now by direct observation in a Run.
 
@@ -347,10 +340,9 @@ No contradiction with §2 at the newer version. Confidence: **high**.
 
 ## 9. Open questions
 
-- ~~**Does `record_ruling` log a Claude slash-command answer verbatim in a real Run?**~~ Closed
-  twice over. #187's live acceptance ran that driver run and found it did not, because
-  `type_into_pane` did not return for a slash command; #191 established why — the composer's
-  clearing lag, not the overlay §1 had left open — and fixed it, so it now does (§5).
+- ~~**Does `record_ruling` log a Claude slash-command answer verbatim in a real Run?**~~ #187's
+  live acceptance found it did not; #191 measured why — the composer's clearing lag, not the
+  overlay §1 had left open — and fixed it, so it now does (§5).
 - **Does the autocomplete overlay ever alter the submitted text when the command takes no
   argument?** Every Claude probe here ended in a path argument, which closes the popup. A ruling
   that is a bare `/implement` with no argument was not tested.

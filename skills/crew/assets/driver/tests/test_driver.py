@@ -4460,6 +4460,60 @@ class QueueTests(DriverTestCase):
         self.assertEqual(self.typed_lines()[-1], placement)
         self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement)
 
+    def test_a_retry_under_a_different_open_word_is_refused_rather_than_merged(self):
+        """The idempotency key is the source and the finding, so the open word must agree.
+
+        `--open` is not a detail of the retry: it is in the tracker body, the `queued` record, the
+        plan's `Queued` fact and the placement the child reads. Resuming under a different word
+        would leave the ticket already opened saying one thing and the plan and the child another,
+        with nothing to say which is the run's. The retry is refused with both words named.
+        """
+        self.start()
+        first = self.queue_finding(open="cause")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        number, _ = self.opened_issue()
+        table_after = self.fixture.table()
+        log_after = self.fixture.log_records()
+
+        second = self.queue_finding(open="reach")
+
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+        snapshot = self.snapshot(second)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(f"#{number}", snapshot["detail"])
+        self.assertIn("cause", snapshot["detail"])
+        self.assertIn("reach", snapshot["detail"])
+        self.assertEqual(len(self.creates()), 1)
+        self.assertEqual(self.fixture.table(), table_after)
+        self.assertEqual(self.fixture.log_records(), log_after)
+
+    def test_a_resume_is_not_blocked_by_a_queued_cell_that_changed_under_it(self):
+        """Routing is resolved for the ticket being opened, not for the one already open.
+
+        A resume's routing question was settled when the ticket was opened. Resolving the cell
+        before looking for the record meant a project that retargeted `[queued]` in between — or
+        broke it — failed the retry on a question it no longer had to answer, stranding a queue
+        that was one plan append away from complete.
+        """
+        self.start()
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        failed = self.queue_finding()
+        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
+        number, _ = self.opened_issue()
+        config = self.fixture.repo / "agentcrew.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8") + '\n[queued]\neffort = "hihg"\n',
+            encoding="utf-8",
+        )
+        (self.fixture.stub_dir / "tmux-ignore-enter").unlink()
+
+        retried = self.queue_finding()
+
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        placement = f"{QUEUE_FINDING} — queued #{number} (open: cause)"
+        self.assertEqual(self.typed_lines()[-1], placement)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement)
+
     def test_a_queue_fully_on_disk_delivers_nothing_a_second_time(self):
         """The other side of the two disk reads: a complete queue is left exactly as it is."""
         self.start()

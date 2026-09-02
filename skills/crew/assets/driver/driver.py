@@ -4374,27 +4374,33 @@ def queued_staged_path(loop, feature_dir, identifier, locator):
 def run_queue(args):
     """Open one diagnosis at the run's tracker, append it to the Run, and deliver its placement.
 
-    The order is the one that makes a failure recoverable, and every step after the first is
-    idempotent against what is already on disk, because a crash can land between any two of them:
+    The order is the one that makes a failure recoverable: every step after the tracker is
+    idempotent against what the previous one put on disk, because a crash can land between any
+    two of them.
 
-    1. Everything refusable is refused before the tracker is touched — the open word, the finding,
-       the title, the source, and the whole routing, which `run_plan.queued_routing` now holds to
-       exactly what an approved Wave table passes. A `--effort` the table would reject used to
-       open a real ticket and fail at the append, orphaning it.
-    2. The tracker is written first, because it is the only writer here that cannot be rolled
-       back, and a crash after it is caught by **create**'s own title-and-body idempotency.
-    3. The `queued` log line follows, before the plan append, because it is this command's
-       idempotency key: the identifier and locator it carries are what a retry resumes from
-       instead of recomputing a body the source child's later escalations would have changed.
-    4. The plan append and the placement delivery come last, each guarded by its own read of what
-       is on disk rather than by the log line alone. A retry appends only a ticket the plan does
-       not carry, and delivers only a placement no `ruling` holds — so a delivery that failed
-       after the log line was written is re-delivered rather than reported as a success nobody
-       received.
+    1. **Refuse before the tracker.** The open word, the finding, the title, the source and the
+       whole routing are judged first, the routing by exactly what an approved Wave table passes
+       — a `--effort` the table rejects would otherwise open a real ticket and then fail at the
+       append, leaving it orphaned. A call matching a recorded queue under a *different* open
+       word is refused here too: the key is the source and the finding alone, while the word is
+       in the ticket, the log, the plan and the line the child reads, so merging the two would
+       leave them disagreeing with nothing to say which is the run's.
+    2. **Open the ticket.** The tracker is the only writer here that cannot be rolled back, so it
+       goes first, and a crash after it is caught by **create**'s title-and-body idempotency.
+    3. **Record it.** The `queued` line is this command's idempotency key, so it lands before the
+       plan append: a retry resumes from the identifier and locator it carries rather than
+       recomputing a body the source child's later escalations would have changed.
+    4. **Append, then place**, each guarded by its own read of disk rather than by the log line.
+       A retry appends only a ticket the plan does not carry and delivers only a placement no
+       `ruling` holds, so a delivery that failed after the log line was written is re-delivered
+       rather than reported as a success nobody received. A resume resolves its routing here and
+       only where the append is owed — that question was settled when the ticket was opened, and
+       asking it again stranded a queue one append from complete under a `[queued]` cell the
+       project had changed in between.
 
-    One window remains open, and no ordering closes it: a crash between the tracker create and the
-    `queued` line leaves an issue this run has no record of. **create**'s idempotency covers it
-    for an identical body, which is every retry the source child did not escalate again inside.
+    One window stays open and no ordering closes it: a crash between the create and the `queued`
+    line leaves an issue this run has no record of. **create**'s idempotency covers every retry
+    the source child did not escalate inside.
     """
     open_word = args.open
     if open_word not in run_plan.OPEN_WORDS:
@@ -4419,12 +4425,31 @@ def run_queue(args):
             f"{source} has no recorded child in {loop.log}", ticket=source, pointer=str(loop.log)
         )
 
-    routing = queued_ticket_routing(loop, args)
-    binding = queued_binding(loop, args.account)
     feature_dir = run_dir.parent
-
     held = queued_already(records, source, finding)
+    if held is not None:
+        recorded_open = str(held.get("open") or "")
+        identifier = str(held.get("ticket") or "")
+        if recorded_open != open_word:
+            raise DriverError(
+                f"this finding from {source} is already queued as #{identifier} with open:"
+                f" {recorded_open}, and this call says open: {open_word}. The open word is in the"
+                " ticket that was opened, in this run's log, in the plan and in the line the"
+                f" child reads, so resuming under {open_word} would leave them disagreeing with"
+                " nothing to say which is the run's. Re-run it with --open"
+                f" {recorded_open}, or queue this as a finding of its own.",
+                ticket=source, pointer=str(loop.log),
+            )
+
+    # Resolved for the ticket this call opens, and only then: a resume's routing question was
+    # settled when the ticket was opened, and a `[queued]` cell the project retargeted or broke in
+    # between is no question this call has to answer. Asking it first stranded a queue that was
+    # one plan append away from complete.
+    routing = None
+    binding = None
     if held is None:
+        routing = queued_ticket_routing(loop, args)
+        binding = queued_binding(loop, args.account)
         body = queued_body(
             source, finding,
             queued_pointers(records, source, finding, launch.get("worktree") or loop.run.repo_root),
@@ -4466,7 +4491,6 @@ def run_queue(args):
         )
         records = loop.records()
     else:
-        identifier = str(held.get("ticket") or "")
         path = queued_staged_path(
             loop, feature_dir, identifier, str(held.get("locator") or "")
         )
@@ -4481,6 +4505,9 @@ def run_queue(args):
             if any(ticket.id == identifier for ticket in edit.plan.tickets):
                 plan = edit.plan
             else:
+                if routing is None:
+                    routing = queued_ticket_routing(loop, args)
+                    binding = queued_binding(loop, args.account)
                 plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
                     id=identifier,
                     title=title,

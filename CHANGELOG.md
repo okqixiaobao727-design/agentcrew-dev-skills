@@ -8,37 +8,30 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
-- A Wave-table write can no longer hand a reader a half-written run plan. `RunPlan.write`
-  truncated the table in place, while every reader of it — `advance.py`, the Driver's plan reload,
-  `dispatch` — loads it with no lock, deliberately: the hold `edit_plan` takes is a separate
-  `wave-table.json.lock` file precisely so a reader is never held up by a writer. A read landing
-  inside the truncate raised, escalating a healthy run, and a crash inside one left the run's sole
-  routing authority permanently unreadable. The table is now written to a temporary file beside
-  it, flushed, and renamed onto the name, so a reader sees one whole table or the other, and a
-  write that cannot be placed leaves the table that was already there (#191).
+- A Wave-table write can no longer hand a reader a half-written run plan. Every reader of that
+  table loads it without a lock, deliberately — the hold an edit takes is a separate lock file, so
+  a reader is never held up by a writer — and the write truncated the table in place. A read
+  landing inside the truncate raised and escalated a healthy run; a crash inside one left the
+  run's sole routing authority unreadable for good. The table is now replaced atomically, so a
+  reader sees one whole table or the other, and a write that cannot be placed leaves the table
+  that was already there (#191).
 - `driver.py queue` can no longer leave the tracker, the Run plan and the machine log disagreeing
-  after a crash. The `queued` log line is this command's idempotency key, so it is written before
-  the plan append rather than after it, and the two steps that follow it are each guarded by their
-  own read of what is on disk: the plan is appended only where it does not already carry the
-  ticket, and the placement is delivered only where no `ruling` holds it. A queue that crashed
-  between the log line and the append now finishes the append on the retry instead of failing
-  `is listed twice`, and one whose delivery failed re-delivers instead of reporting a success the
-  source child never received. The whole routing — executor, model, effort and the review lane,
-  not the workflow alone — is now held to exactly what an approved Wave table passes, in the
-  table's own words, before the tracker is touched, so a mistyped `--effort` no longer opens an
-  issue it then orphans (#191).
+  after a crash. Each step is now recoverable from what the previous one put on disk: a queue that
+  crashed before its plan append finishes it on the retry instead of failing `is listed twice`,
+  and one whose delivery failed re-delivers instead of reporting a success the source child never
+  received. A retry that contradicts the queue already recorded — the same finding under a
+  different `--open` — is refused rather than merged. The whole routing, not the workflow alone,
+  is held to exactly what an approved Wave table passes before the tracker is touched, so a
+  mistyped `--effort` no longer opens an issue it then orphans (#191).
 - A slash-command ruling delivered to a Claude child is recorded in the machine log again.
   `driver.py answer` read the child's composer once, immediately after the `Enter` that submitted
   the instruction, and a Claude composer takes up to about 100ms to clear a slash command — the
   command is resolved and its skill body loaded before the input clears — against about 20ms for
-  prose. Both of `type_into_pane`'s reads landed inside that lag, so a ruling the child had
-  received and expanded was called a failed delivery and `record_ruling` never ran, leaving the
-  run's log and report holding the hand-over placeholder. Each `Enter` is now given
-  `COMPOSER_CLEAR_SECONDS`, polled every `COMPOSER_POLL_SECONDS`, to empty the composer before it
-  counts as dropped; a composer that genuinely never clears still ends in the same `stuck`
-  Unreachable, and a dropped `Enter` is still rescued by the one retry. The driver suite's tmux
-  stub models the lag with a `tmux-linger-reads` knob, which is what lets the chain test see the
-  defect (#191).
+  prose. Both reads landed inside that lag, so a ruling the child had received and expanded was
+  called a failed delivery and never recorded, leaving the run's log and report holding the
+  hand-over placeholder. The driver now waits for the composer to clear, and settles on a stable
+  reading rather than one frame of a repaint. A composer that genuinely never clears still ends
+  the delivery as unreachable, and a dropped `Enter` is still rescued by the one retry (#191).
 
 ## [0.9.17] - 2026-09-01
 
