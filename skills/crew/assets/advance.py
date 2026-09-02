@@ -12,7 +12,10 @@ approved up front is the whole authority this needs (ADR-0001, ADR-0024).
 The four decisions recorded in the machine log as `advance` events:
 
     launched     written by the Driver after the next wave activates successfully
-    complete     that was the last wave; the run has nothing left to advance to
+    complete     that was the last wave; the run has nothing left to advance to. The plan is read
+                 back from the table after the merges and before this is written, because a Wave
+                 queued into the run while they ran is a following wave and this decision is not
+                 the run's to write over it
     escalated    a ticket failed, a parked ticket has descendants, or did not merge — the chain
                  stops here; the coordinator rules, woken by the child's own message rather than
                  by this script, which writes nothing into anybody's context
@@ -246,6 +249,14 @@ def advance_wave(plan, table_path, wave, options, interrupt):
     if interrupt.raised:
         return stop_short(wave, options), INTERRUPT_EXIT
     lines = land(table_path, wave, options)
+
+    # The plan is read back after the merges, because the merges take time and the Run grows while
+    # it runs: `driver.py queue` appends a trailing Wave from a process of its own, and the
+    # decision written below — `complete` above all — has to be the one the table says now rather
+    # than the one it said before the landing (ADR-0018, ADR-0028).
+    plan = run_plan.load(table_path)
+    following_wave = plan.following_wave(wave)
+    following = following_wave.number if following_wave else None
 
     records = machine_log.read_records(options["log"])
     projection = machine_log.project(records)

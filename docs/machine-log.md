@@ -119,7 +119,8 @@ re-derive a named projection fact from them.
   stays private; callers receive the selected record, not an index.
 - `current_wave` starts at 1 and follows the last integer-like `advance=launched` record.
 - `ended` is an ordered current fact. `advance=complete|stopped` makes it true; a later protocol
-  message that the existing Driver rule table can act on makes it false; a subsequent
+  message that the existing Driver rule table can act on makes it false, and so does a later
+  `advance=launched`, which is a Wave queued into the Run after it ended; a subsequent
   final advance makes it true again. Plain child conversation does not reopen a Run. `halted` is a
   latest rule: the last advance is `escalated|interrupted`. They remain separate facts, not one
   run-state enum, and no `reopened` event is persisted.

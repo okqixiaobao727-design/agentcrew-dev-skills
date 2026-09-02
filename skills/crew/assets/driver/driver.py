@@ -67,6 +67,14 @@ decision; a new one is appended before its Codex cursor advances and returns to 
 table. So re-typing the crew command is the whole of what an interruption, a driver crash or a
 coordinator restart costs, including one resumed child that spoke after settlement.
 
+**A run grows while it runs, and the plan on disk is the authority.** `queue` appends a Wave from
+a process of its own, so a driver reads the plan back before it advances past a settled wave,
+again before the decision that ends the run is written, and before a coordinator handover writes
+the table. An appended wave is the following wave and is activated through the one path every wave
+uses; a run whose log already holds a final decision is adopted onto a queued wave nobody launched
+into rather than reported over. A wave the run planned but never reached is not one of those: the
+halt that stopped short of it is the coordinator's to rule on.
+
 **The wave loop is a rule table, and the rule table is exhaustive.** Between the launch and the
 report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
 and, where it holds, settled in silence; an invalid receipt earns one re-ask and settles failed on
@@ -113,6 +121,7 @@ import argparse
 import contextlib
 from dataclasses import dataclass, replace
 import datetime
+import fcntl
 import json
 import os
 import pathlib
@@ -167,6 +176,9 @@ COORDINATOR_PANE_HELP = (
     " types nothing"
 )
 TABLE_NAME = "wave-table.json"
+# What one process holds while it reads, edits and writes that table back, beside the table
+# itself so that no way of writing the table can drop the hold and no plain reader waits on it.
+LOCK_SUFFIX = ".lock"
 LAUNCH_DIR_NAME = "launch"
 CODEX_DIR_NAME = "codex"
 PARKED_PATHS_NAME = "parked-paths"
@@ -1063,6 +1075,80 @@ def record_base_gate(log, gate):
     for value in gate or ():
         arguments.append(f"--argument={value}")
     run_command(arguments, "the base-gate result could not be recorded", pointer=str(log))
+
+
+def outstanding_queued_wave(plan, projection):
+    """The number of the first queued Wave of the plan the Run still owes work on, or None.
+
+    A Run grows while it runs: `driver.py queue` appends a Wave from a process of its own, so the
+    plan on disk is the authority and the copy a Driver loaded at start-up is a snapshot
+    (ADR-0018). Such a Wave is read from the plan and the log alone — the `Queued` fact the plan
+    persists, against the state the log settles its tickets into — because that is the whole of
+    the state a Driver keeps about one; there is no queued-ticket register beside it.
+
+    Two Waves are deliberately not one of these. A Wave the Run planned but never reached: its
+    tickets were in the table the run was approved on, and a halt that stopped short of them is
+    the coordinator's to rule on rather than this Driver's to launch past. And a queued Wave the
+    log has already settled or blocked — blocked is what a halt marks a queued descendant, and
+    relaunching it would drive the Run straight past the halt that marked it.
+    """
+    for wave in plan.waves:
+        if wave.tickets and all(
+            ticket.queued is not None
+            and projection.ticket(ticket.id).settlement_state == machine_log.LIVE
+            for ticket in wave.tickets
+        ):
+            return wave.number
+    return None
+
+
+class PlanEdit:
+    """One held read-modify-write of the wave table: the plan as loaded, and the plan to write."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.written = None
+
+    def write(self, plan):
+        """Hand back the plan to write when the hold ends; returns it."""
+        self.written = plan
+        return plan
+
+
+def table_lock_path(table_path):
+    """The file one process holds while it reads, edits and writes that wave table back."""
+    return table_path.parent / (table_path.name + LOCK_SUFFIX)
+
+
+@contextlib.contextmanager
+def edit_plan(table_path):
+    """Hold the wave table across one read-modify-write; yields the `PlanEdit` that carries it.
+
+    Two processes edit this table: a Driver servicing a Coordinator handover, and `driver.py
+    queue` appending a Wave. Each writes the whole of it, so without one hold across the read and
+    the write, whichever writes second overwrites what the other put there — and what is lost is
+    the run's sole routing authority (ADR-0003). The read is inside the hold because a lock over
+    the write alone protects nothing: the stale plan was already in hand.
+
+    The lock is a file beside the table rather than the table itself, so it survives however the
+    table comes to be written, and so a process that only reads the plan is never held up by it.
+    """
+    lock_path = table_lock_path(table_path)
+    try:
+        handle = lock_path.open("a+")
+    except OSError as error:
+        raise DriverError(
+            f"the wave table could not be held for editing: {error}", pointer=str(lock_path)
+        ) from error
+    with handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            edit = PlanEdit(run_plan.load(table_path))
+            yield edit
+            if edit.written is not None:
+                edit.written.write(table_path)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def launched_children(log):
@@ -1991,7 +2077,12 @@ def adopt(args, run_dir, table_path):
     projection = machine_log.project(records)
     if projection.ended:
         projection = reconcile_terminal_codex_messages(plan, projection, log)
-    if projection.ended:
+    # A Run whose log says `complete` is over only while the plan agrees. A Wave appended after
+    # that decision — a `queued` ruling on a message a settled child sent later — has never been
+    # launched, and no other command reaches it, so the Run this start adopts is the one the plan
+    # describes rather than the one the last advance decision left (ADR-0028).
+    appended = outstanding_queued_wave(plan, projection) if projection.ended else None
+    if projection.ended and appended is None:
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
         report = report_path(run_dir, plan.run)
@@ -2001,7 +2092,8 @@ def adopt(args, run_dir, table_path):
             crew_worktree=plan.run.crew_worktree,
         )
         return 0
-    print(f"crew adopted wave {projection.current_wave}, run directory {run_dir}", flush=True)
+    resumed = projection.current_wave if appended is None else appended
+    print(f"crew adopted wave {resumed}, run directory {run_dir}", flush=True)
     return wave_loop(args, run_dir, table_path, adopting=True)
 
 
@@ -2641,6 +2733,16 @@ class Loop:
         self.run_dir = run_dir
         self.log = run_dir / LOG_NAME
         self.table_path = table_path
+        # The hold's own file exists from the moment a Run is taken up rather than from its first
+        # edit, so the run directory holds one layout however the Run went — the two locks already
+        # there are made the same way.
+        try:
+            table_lock_path(table_path).touch()
+        except OSError as error:
+            raise DriverError(
+                f"the wave table's hold could not be opened: {error}",
+                pointer=str(table_lock_path(table_path)),
+            ) from error
         try:
             self.plan = run_plan.load(table_path)
         except run_plan.RunPlanError as error:
@@ -2677,17 +2779,20 @@ class Loop:
         self.coordinator = context
         attend_coordinator(context.pane)
 
-        run = replace(
-            self.run,
-            coordinator_name=context.name,
-            coordinator_pid=context.pid,
-            coordinator_session=context.harness_session,
-            coordinator_address=context.address,
-            permission_mode=context.permission_mode,
-        )
-        plan = replace(self.plan, run=run)
+        # The handover writes the whole table, so it reads it back inside the same hold: the copy
+        # this Loop is carrying predates any Wave appended to the Run since it loaded one, and
+        # writing that copy would erase the Wave the handover exists to carry through.
         try:
-            plan.write(self.table_path)
+            with edit_plan(self.table_path) as edit:
+                run = replace(
+                    edit.plan.run,
+                    coordinator_name=context.name,
+                    coordinator_pid=context.pid,
+                    coordinator_session=context.harness_session,
+                    coordinator_address=context.address,
+                    permission_mode=context.permission_mode,
+                )
+                plan = edit.write(replace(edit.plan, run=run))
         except run_plan.RunPlanError as error:
             raise DriverError(str(error), pointer=str(self.table_path)) from error
         self.run = run
@@ -2704,6 +2809,31 @@ class Loop:
         start_dashboard(context, self.crew_worktree, self.run_dir)
 
     # --- what it reads --------------------------------------------------------------------
+
+    def reload_plan(self):
+        """Read the Run plan back from the wave table; returns the plan now in force.
+
+        The plan a Run runs on grows while it runs — `driver.py queue` appends a Wave from a
+        process of its own — so the copy loaded at start-up is a snapshot and the table is the
+        authority. The reload is the caller's to ask for rather than a query that quietly does IO,
+        because the caller is what knows the moment its answer has to be current (ADR-0018).
+        """
+        try:
+            self.plan = run_plan.load(self.table_path)
+        except run_plan.RunPlanError as error:
+            raise DriverError(str(error), pointer=str(self.table_path)) from error
+        return self.plan
+
+    def pending_wave(self, projection):
+        """The Wave this Loop takes the Run up on, and whether the plan rather than the log named it.
+
+        A Run whose log holds a final decision still has a Wave to work when the plan holds a
+        queued one the Run still owes work on, and that Wave — not the settled one the log's
+        current wave names — is where the Loop starts, so it activates through the one path every
+        Wave uses (ADR-0024).
+        """
+        appended = outstanding_queued_wave(self.plan, projection) if projection.ended else None
+        return (projection.current_wave, False) if appended is None else (appended, True)
 
     def records(self):
         return machine_log.read_records(self.log)
@@ -3216,7 +3346,15 @@ class Loop:
         Advance classifies and lands the current Wave, then this Driver activates the following
         Wave. The existing `launched` decision is the commit point: it is written only after
         activation succeeds.
+
+        The plan is read back from the table on both sides of that classification, because a Wave
+        appended to the Run since this Loop loaded its plan is the following Wave and the Run may
+        not call itself complete while one is unlaunched. The read before is what the settled
+        Wave is classified against; the read after is what makes this Driver's answer at least as
+        current as the one `advance.py` reached from the same table a moment later, which is the
+        answer the run's final `complete` decision is written from.
         """
+        self.reload_plan()
         result = subprocess.run(
             [
                 sys.executable, str(ADVANCE), "advance",
@@ -3238,7 +3376,7 @@ class Loop:
                 f" {(result.stderr or result.stdout).strip()}",
                 pointer=str(self.log),
             )
-        following_wave = self.plan.following_wave(wave)
+        following_wave = self.reload_plan().following_wave(wave)
         if following_wave is None:
             self.close_merged()
             return None
@@ -3584,10 +3722,8 @@ class Loop:
         self.arm(wave, projection)
         return wave
 
-    def run_until_woken(self):
-        """Apply the rule table until it is done or something outside it needs judgment."""
-        projection = machine_log.project(self.records())
-        wave = projection.current_wave
+    def run_until_woken(self, wave):
+        """Apply the rule table to `wave` onward until it is done or judgment is needed."""
         deadline = time.monotonic() + self.args.timeout
         seen = None
         while True:
@@ -3830,11 +3966,18 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
         if adopting:
             loop.adopt()
         projection = machine_log.project(loop.records())
-        loop.activation.activate(projection.current_wave)
+        wave, appended = loop.pending_wave(projection)
+        loop.activation.activate(wave)
+        if appended:
+            # The same commit point every other Wave's activation has: written only once the Wave
+            # is up, and what takes the Run's `ended` fact back off the log it was left on, so the
+            # next Driver to adopt this Run reads it as the running Run it now is.
+            children = ", ".join(ticket.id for ticket in loop.tickets_of(wave))
+            loop.record_advance(wave, LAUNCHED, f"queued into the run: {children}")
         loop.open_wave()
         if starting:
             print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
-        return loop.run_until_woken()
+        return loop.run_until_woken(wave)
     except Wake as wake:
         landed = snapshot(
             wake.reason,
@@ -4211,20 +4354,23 @@ def run_queue(args):
                 f"the queued ticket {identifier} could not be written to {path}: {error}",
                 ticket=identifier, pointer=str(path),
             ) from error
+    # Under the same hold the live Driver's handover takes, and over the read as well as the
+    # write: the plan appended to is the plan on disk at this moment, not the one this process
+    # loaded when it started, so neither writer can lose the other's whole-table write.
     try:
-        plan = loop.plan.append(run_plan.PlannedTicket(
-            id=identifier,
-            title=title,
-            path=str(path),
-            workflow=routing.workflow,
-            executor=routing.executor,
-            model=routing.model,
-            effort=routing.effort,
-            binding=binding,
-            review=routing.review,
-            queued=run_plan.Queued(source, open_word),
-        ))
-        plan.write(loop.table_path)
+        with edit_plan(loop.table_path) as edit:
+            plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
+                id=identifier,
+                title=title,
+                path=str(path),
+                workflow=routing.workflow,
+                executor=routing.executor,
+                model=routing.model,
+                effort=routing.effort,
+                binding=binding,
+                review=routing.review,
+                queued=run_plan.Queued(source, open_word),
+            )))
     except run_plan.RunPlanError as error:
         raise DriverError(
             str(error), ticket=identifier, pointer=str(loop.table_path)
