@@ -235,6 +235,63 @@ class ReportSelectionTests(unittest.TestCase):
 
         self.assertEqual(driver_module.report_rulings(records), [("45", placement)])
 
+    def test_a_queued_placement_replaces_its_hand_over_beside_the_source_line(self):
+        finding = "The cause is not in this ticket — skills/example.py:12"
+        placement = f"{finding} — queued #46 (open: cause)"
+        records = (
+            {
+                "event": "escalation",
+                "ticket": "45",
+                "message": f"{finding}\nCREW ASK 45 doc-conflict ts=1",
+            },
+            {"event": "ruling", "ticket": "45", "message": "CREW RULED 45 — handed over"},
+            {"event": "ruling", "ticket": "45", "message": placement},
+        )
+
+        self.assertEqual(driver_module.report_rulings(records), [("45", placement)])
+
+    def test_a_queued_line_without_its_open_word_is_left_whole_as_an_unpaired_ruling(self):
+        finding = "The cause is not in this ticket — skills/example.py:12"
+        message = f"{finding} — queued #46"
+        records = (
+            {
+                "event": "escalation",
+                "ticket": "45",
+                "message": f"{finding}\nCREW ASK 45 doc-conflict ts=1",
+            },
+            {"event": "ruling", "ticket": "45", "message": "CREW RULED 45 — handed over"},
+            {"event": "ruling", "ticket": "45", "message": message},
+        )
+
+        self.assertEqual(
+            driver_module.report_rulings(records),
+            [("45", "CREW RULED 45 — handed over"), ("45", message)],
+        )
+
+    def test_a_wrap_up_leftover_is_paired_to_its_queued_placement(self):
+        records = (
+            {
+                "event": "escalation",
+                "ticket": "7",
+                "message": "A at a.py:1\nB at b.py:2\nCREW ASK 7 wrap-up ts=1",
+            },
+            {
+                "event": "ruling",
+                "ticket": "7",
+                "message": (
+                    "A at a.py:1 — queued #205 (open: approach)\nB at b.py:2 — this ticket"
+                ),
+            },
+        )
+
+        self.assertEqual(
+            driver_module.report_rulings(records),
+            [
+                ("7", "A at a.py:1 — queued #205 (open: approach)"),
+                ("7", "B at b.py:2 — this ticket"),
+            ],
+        )
+
     def test_a_placement_does_not_discard_other_lines_from_the_same_ruling(self):
         placement = "Carry the later work — opened #47"
         instruction = "Proceed with approach B now; keep the old flag until then."
@@ -3570,6 +3627,334 @@ class DeferTests(DriverTestCase):
         ])
         self.assertEqual(after_typed, before_typed)
         self.assertEqual(self.events("ruling", ticket="01"), [])
+
+
+QUEUE_TITLE = "crew: the shared cause behind both failures"
+QUEUE_FINDING = "The cause is upstream of this ticket — skills/example.py:12 and ADR-0028"
+QUEUE_ESCALATION = (
+    "The spec and the code disagree — skills/example.py:12, docs/glossary.md:8, #45\n"
+    "CREW ASK 01 doc-conflict ts=1"
+)
+QUEUE_POINTERS = ("skills/example.py:12", "docs/glossary.md:8", "#45", "ADR-0028")
+
+
+class QueueTests(DriverTestCase):
+    """`driver.py queue`: one finding opened, routed, appended to the Run and delivered back."""
+
+    def start(self, tracker="github", accounts=None):
+        self.fixture.configure(tracker=tracker, accounts=accounts)
+        self.fixture.ticket("01", "reviewed ticket")
+        self.fixture.commit_feature()
+        if tracker == "github":
+            self.fixture.issues({"01": {"labels": [], "closed": False, "comments": []}})
+        process = self.fixture.launch(env_overrides={
+            "CLAUDE_CODE_SESSION_ID": "",
+            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+        })
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "01 never launched",
+        )
+        self.fixture.says("01", QUEUE_ESCALATION)
+        self.woken(process, "judgment-needed")
+
+    def queue(self, *arguments, ticket="01"):
+        return subprocess.run(
+            [
+                sys.executable, str(DRIVER), "queue",
+                "--run-dir", str(self.fixture.run_dir), "--ticket", ticket, *arguments,
+            ],
+            capture_output=True, text=True,
+            env=self.fixture.environment(), cwd=str(self.fixture.repo),
+        )
+
+    def queue_finding(
+        self, *arguments, text=QUEUE_FINDING, title=QUEUE_TITLE, open="cause", ticket="01"
+    ):
+        return self.queue(
+            "--open", open, "--title", title, "--text", text, *arguments, ticket=ticket
+        )
+
+    def opened_issue(self, title=QUEUE_TITLE):
+        """The one issue the stubbed tracker holds under that title, with its number."""
+        held = {
+            number: record for number, record in self.fixture.issues().items()
+            if record.get("title") == title
+        }
+        self.assertEqual(len(held), 1, held)
+        return next(iter(held.items()))
+
+    def typed_lines(self):
+        return [
+            call["argv"][-1] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"] and "-l" in call["argv"]
+        ]
+
+    def creates(self):
+        return [
+            call for call in self.fixture.gh_calls() if call["argv"][:2] == ["issue", "create"]
+        ]
+
+    def appended(self):
+        """The one ticket of the Wave the plan now ends on."""
+        waves = self.fixture.table()["waves"]
+        self.assertEqual(waves[-1]["wave"], len(waves))
+        ticket, = waves[-1]["tickets"]
+        return ticket
+
+    def test_a_github_queue_opens_routes_appends_records_and_delivers_the_placement(self):
+        self.start()
+        before_waves = len(self.fixture.table()["waves"])
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        number, record = self.opened_issue()
+        self.assertEqual(record["labels"], ["ready-for-agent"])
+        body = record["body"]
+        self.assertIn("Queued from #01", body)
+        self.assertIn(QUEUE_FINDING, body)
+        for pointer in QUEUE_POINTERS:
+            self.assertIn(pointer, body)
+        self.assertIn("## Routing", body)
+        self.assertIn("Workflow: tdd", body)
+        self.assertIn("Model: claude-opus-5", body)
+
+        staged = self.fixture.feature_dir / f"{number}.md"
+        text = staged.read_text(encoding="utf-8")
+        self.assertIn(f"# {QUEUE_TITLE}\n", text)
+        self.assertIn(f"https://github.example.invalid/issues/{number}", text)
+        self.assertIn("## Routing", text)
+        self.assertNotIn(QUEUE_FINDING, text)
+
+        self.assertEqual(len(self.fixture.table()["waves"]), before_waves + 1)
+        ticket = self.appended()
+        self.assertEqual(ticket["id"], number)
+        self.assertEqual(ticket["queued"], {"source": "01", "open": "cause"})
+        self.assertEqual(ticket["blocked_by"], ["01"])
+        self.assertEqual(ticket["path"], str(staged))
+        self.assertEqual(ticket["title"], QUEUE_TITLE)
+        self.assertEqual(ticket["account_mode"], "inherited")
+
+        events = self.events("queued", ticket=number)
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["source"], "01")
+        self.assertEqual(events[0]["open"], "cause")
+        self.assertEqual(
+            events[0]["locator"], f"https://github.example.invalid/issues/{number}"
+        )
+
+        placement = f"{QUEUE_FINDING} — queued #{number} (open: cause)"
+        self.assertEqual(self.typed_lines()[-1], placement)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement)
+        self.assertIn(f"#{number}", result.stdout)
+        self.assertIn(QUEUE_TITLE, result.stdout)
+
+    def test_the_printed_last_section_names_every_pending_queued_ticket_of_the_run(self):
+        self.start()
+        first = self.queue_finding()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        first_number, _ = self.opened_issue()
+
+        second = self.queue_finding(
+            text="A second finding — skills/other.py:3", title="crew: the second diagnosis",
+            open="reach",
+        )
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        second_number, _ = self.opened_issue("crew: the second diagnosis")
+        self.assertIn(f"#{second_number}", second.stdout)
+        self.assertIn(f"#{first_number} — {QUEUE_TITLE}", second.stdout)
+        self.assertIn(f"#{second_number} — crew: the second diagnosis", second.stdout)
+
+    def test_the_open_word_is_required_and_closed_to_three_before_anything_is_written(self):
+        self.start()
+        before_table = self.fixture.table()
+        before_typed = len(self.typed_lines())
+
+        for arguments in ((), ("--open", "scope")):
+            with self.subTest(arguments=arguments):
+                result = self.queue("--title", QUEUE_TITLE, "--text", QUEUE_FINDING, *arguments)
+
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                snapshot = self.snapshot(result)
+                self.assertEqual(snapshot["reason"], "driver-error")
+                for word in ("cause", "approach", "reach"):
+                    self.assertIn(word, snapshot["detail"])
+
+        self.assertEqual(self.fixture.table(), before_table)
+        self.assertEqual(self.creates(), [])
+        self.assertEqual(self.events("queued"), [])
+        self.assertEqual(len(self.typed_lines()), before_typed)
+
+    def test_a_tracker_failure_leaves_the_plan_the_directory_and_the_log_untouched(self):
+        self.start()
+        (self.fixture.stub_dir / "gh-create-fails").touch()
+        before_table = self.fixture.table()
+        before_files = sorted(path.name for path in self.fixture.feature_dir.glob("*.md"))
+        before_log = self.fixture.log_records()
+
+        result = self.queue_finding(open="approach")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn("the tracker refused the create", snapshot["detail"])
+        self.assertEqual(self.fixture.table(), before_table)
+        self.assertEqual(
+            sorted(path.name for path in self.fixture.feature_dir.glob("*.md")), before_files
+        )
+        self.assertEqual(self.fixture.log_records(), before_log)
+
+    def test_an_identical_finding_from_the_same_source_is_idempotent(self):
+        self.start()
+        first = self.queue_finding()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        number, _ = self.opened_issue()
+        table_after = self.fixture.table()
+        log_after = self.fixture.log_records()
+        typed_after = len(self.typed_lines())
+
+        second = self.queue_finding()
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn(f"#{number}", second.stdout)
+        self.assertEqual(len(self.creates()), 1)
+        self.assertEqual(self.fixture.table(), table_after)
+        self.assertEqual(self.fixture.log_records(), log_after)
+        self.assertEqual(len(self.typed_lines()), typed_after)
+
+    def test_the_overrides_replace_the_cell_for_this_ticket_alone(self):
+        profile = self.fixture.profile("second")
+        self.start(accounts=["second"])
+        self.fixture.register(second=str(profile))
+
+        result = self.queue_finding(
+            "--workflow", "tdd", "--executor", "codex", "--model", CODEX_MODEL,
+            "--effort", "high", "--account", "second",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ticket = self.appended()
+        self.assertEqual(ticket["workflow"], "tdd")
+        self.assertEqual(ticket["executor"], "codex")
+        self.assertEqual(ticket["model"], CODEX_MODEL)
+        self.assertEqual(ticket["effort"], "high")
+        self.assertEqual(ticket["account"], str(profile))
+        self.assertEqual(ticket["account_mode"], "explicit")
+        _, record = self.opened_issue()
+        self.assertIn(f"Model: {CODEX_MODEL}", record["body"])
+        self.assertIn("Effort: high", record["body"])
+        self.assertIn("Account: second", record["body"])
+
+    def test_the_projects_own_queued_cell_routes_the_ticket_field_by_field(self):
+        self.start()
+        config = self.fixture.repo / "agentcrew.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8")
+            + f'\n[queued]\nmodel = "{CLAUDE_MODEL}"\neffort = "low"\n',
+            encoding="utf-8",
+        )
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ticket = self.appended()
+        self.assertEqual(ticket["model"], CLAUDE_MODEL)
+        self.assertEqual(ticket["effort"], "low")
+        # The fields the project cell left alone are still the shipped cell's.
+        self.assertEqual(ticket["workflow"], "tdd")
+        self.assertEqual(ticket["executor"], "claude")
+
+    def test_the_finding_is_carried_exactly_as_the_child_stated_it(self):
+        self.start()
+        spaced = f"  {QUEUE_FINDING}  "
+
+        result = self.queue_finding(text=spaced)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        number, record = self.opened_issue()
+        self.assertIn(f"Queued from #01\n\n{spaced}\n", record["body"])
+        placement = f"{spaced} — queued #{number} (open: cause)"
+        self.assertEqual(self.events("queued", ticket=number)[0]["finding"], spaced)
+        self.assertEqual(self.typed_lines()[-1], placement)
+        # What the log keeps of a delivery is `deliver`'s own record, which trims the line it
+        # composes for every command that sends one; the ticket and the child have it whole.
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement.strip())
+
+    def test_a_queued_cell_that_is_not_a_table_is_refused_in_the_resolvers_own_words(self):
+        self.start()
+        config = self.fixture.repo / "agentcrew.toml"
+        # Before the first table header, so the key is the top-level `queued` and not one of
+        # `[tracker]`'s own.
+        config.write_text(
+            'queued = "tdd"\n' + config.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn("is not a table of routing fields", snapshot["detail"])
+        self.assertEqual(self.creates(), [])
+
+    def test_a_queued_ticket_naming_no_account_inherits_the_coordinators_own(self):
+        self.start()
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.appended()["account_mode"], "inherited")
+
+    def test_a_local_queue_writes_the_run_directorys_own_ticket_file_and_calls_no_gh(self):
+        self.start(tracker="local")
+
+        result = self.queue_finding(open="reach")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        staged = self.fixture.feature_dir / "02.md"
+        text = staged.read_text(encoding="utf-8")
+        self.assertIn(f"# {QUEUE_TITLE}\n", text)
+        self.assertIn("Queued from #01", text)
+        self.assertIn(QUEUE_FINDING, text)
+        self.assertIn("## Routing", text)
+        self.assertIn("Status: ready-for-agent", text)
+        ticket = self.appended()
+        self.assertEqual(ticket["id"], "02")
+        self.assertEqual(ticket["path"], str(staged))
+        self.assertEqual(ticket["queued"], {"source": "01", "open": "reach"})
+        events = self.events("queued", ticket="02")
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["locator"], str(staged))
+        self.assertEqual(self.fixture.gh_calls(), [])
+        self.assertEqual(
+            self.typed_lines()[-1], f"{QUEUE_FINDING} — queued #02 (open: reach)"
+        )
+
+    def test_a_source_outside_the_plan_is_refused_without_effects(self):
+        self.start()
+        before_table = self.fixture.table()
+
+        result = self.queue_finding(ticket="99")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn("state outside-run-plan", snapshot["detail"])
+        self.assertEqual(self.creates(), [])
+        self.assertEqual(self.fixture.table(), before_table)
+
+    def test_the_title_and_the_finding_are_required_cli_arguments(self):
+        for missing in ("--title", "--text"):
+            arguments = [
+                "queue", "--run-dir", "run", "--ticket", "01", "--open", "cause",
+                "--title", QUEUE_TITLE, "--text", QUEUE_FINDING,
+            ]
+            index = arguments.index(missing)
+            del arguments[index:index + 2]
+            with self.subTest(missing=missing), self.assertRaises(SystemExit):
+                driver_module.build_parser().parse_args(arguments)
 
 
 class AnswerTests(DriverTestCase):

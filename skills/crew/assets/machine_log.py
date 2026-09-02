@@ -148,6 +148,10 @@ HALTED_DECISIONS = ("escalated", "interrupted")
 EXECUTORS = ("claude", "codex")
 WITNESS_OUTCOMES = ("checked", "partial", "failed")
 BASE_GATE_STATUSES = ("passed", "not-configured")
+# What a queued ticket's finding still leaves open (ADR-0028). The Run plan decides this
+# vocabulary; it is spelled again here because this file is installed as a hook and runs with no
+# crew module beside it, and `tests/test_machine_log.py` fails the moment the two disagree.
+OPEN_WORDS = ("cause", "approach", "reach")
 # Where a lane's live children were read from, when a dashboard had to read them from anywhere but
 # its first choice (ADR-0012). The set is closed on the sources a lane actually has, so a line
 # saying a dashboard fell back names something a reader can go and look at.
@@ -1381,6 +1385,26 @@ def build_parser():
     outcome = event_command("outcome", "a ticket's one report outcome")
     outcome.add_argument("--outcome", required=True, choices=OUTCOMES)
     outcome.add_argument("--detail")
+
+    queued = event_command(
+        "queued", "a finding this run opened a ticket for and queued into itself"
+    )
+    queued.add_argument(
+        "--source", required=True, help="the ticket whose child stated the finding"
+    )
+    queued.add_argument(
+        "--open", required=True, choices=OPEN_WORDS,
+        help="what the finding leaves open, which is what the queued child diagnoses first",
+    )
+    queued.add_argument(
+        "--locator", required=True,
+        help="the tracker's own opaque locator for the ticket that was opened",
+    )
+    queued.add_argument(
+        "--finding", required=True,
+        help="the finding line exactly as the source child stated it, which is what makes a"
+             " repeated queue of the same finding find its own line here",
+    )
 
     review = event_command("review", "one end of a ticket's trip through its review lane")
     review.add_argument(

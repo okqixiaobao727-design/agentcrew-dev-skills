@@ -111,8 +111,8 @@ ROUTING_ORDER = ("workflow", "executor", "model", "effort", "account", "review",
 ROUTING_OPTIONAL = ("review", "account")
 
 # The role strings classify.md names: an `acceptance` ticket is a human's to pick up, every other
-# ticket an agent's.
-HUMAN_WORKFLOW = "acceptance"
+# ticket an agent's. Which is which is the Driver's rule, because a ticket the Driver queues into
+# a Run is marked by the same one (ADR-0028).
 AGENT_ROLE, HUMAN_ROLE = driver.PICKUP_LABELS
 
 class Blocked(Exception):
@@ -185,34 +185,11 @@ def local_status(text):
     return None
 
 
-def section(text, wanted):
-    """One Markdown section, including its heading, exactly as the source carries it."""
-    lines = text.splitlines(keepends=True)
-    start = None
-    for index, line in enumerate(lines):
-        heading = run_plan.SECTION.match(line.rstrip("\n"))
-        if heading and start is not None:
-            return "".join(lines[start:index]).rstrip("\n")
-        if heading and heading.group(1).lower() == wanted:
-            start = index
-    return "" if start is None else "".join(lines[start:]).rstrip("\n")
-
-
-def ticket_pointer(url):
-    """The tracker-authority line shared by ticket and parent stubs."""
-    return f"Ticket: {url} — the issue body and every comment are this ticket; read all of it."
-
-
-def staged_text(kind, title, body, url=None):
-    """That ticket as the run directory holds it, pointing at its tracker authority."""
-    if kind == driver.TRACKER_GITHUB:
-        machine_sections = [
-            held for name in (run_plan.ROUTING_SECTION, run_plan.BLOCKED_BY_SECTION)
-            if (held := section(body, name))
-        ]
-        suffix = "".join(f"\n\n{held}" for held in machine_sections)
-        return f"# {title}\n\n{ticket_pointer(url)}{suffix}\n"
-    return body
+# What a Run directory's ticket file is, which the Run plan owns and the Driver renders from too:
+# staging is one of two writers of that shape, never its definition (ADR-0018, ADR-0028).
+section = run_plan.ticket_section
+ticket_pointer = run_plan.ticket_pointer
+staged_text = run_plan.staged_text
 
 
 def read_ticket(kind, repo, reference):
@@ -586,12 +563,6 @@ def with_routing(body, section):
     return "".join(written).rstrip("\n") + "\n"
 
 
-def role_of(entry):
-    """Which role string that routing's workflow names."""
-    workflow = str(entry.get("workflow", "")).strip().lower()
-    return HUMAN_ROLE if workflow == HUMAN_WORKFLOW else AGENT_ROLE
-
-
 def write_routing(kind, repo, tickets, table):
     """Write each approved `## Routing` section and role label back to the tracker.
 
@@ -609,7 +580,7 @@ def write_routing(kind, repo, tickets, table):
     for ticket in tickets:
         entry = table[ticket["id"]]
         edit_body(kind, repo, ticket, with_routing(ticket["body"], routing_section(entry)))
-        mark(kind, repo, ticket, role_of(entry))
+        mark(kind, repo, ticket, driver.pickup_label(entry.get("workflow", "")))
 
 
 # --- the run directory -----------------------------------------------------------------------
