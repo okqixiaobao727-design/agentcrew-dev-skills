@@ -361,6 +361,61 @@ class RunPlanTests(unittest.TestCase):
         table_path.write_text(json.dumps(replacement), encoding="utf-8")
         self.assertEqual(run_plan.load(table_path).ticket("01").title, "Replaced")
 
+    def test_a_write_never_leaves_a_reader_a_half_written_table(self):
+        """The Wave table is a run's sole routing authority, so it is replaced, never truncated.
+
+        The hold `edit_plan` takes is a *separate* `wave-table.json.lock` file, deliberately, so
+        that a process which only reads the plan is never held up by one editing it (#186). That
+        makes every reader unsynchronised against the writer: `advance.py`, `Loop.reload_plan` and
+        `dispatch` all `run_plan.load` with no lock. A `write_text` truncates in place, so a read
+        landing inside it saw an empty or partial file and raised — and a crash mid-write left the
+        table permanently unreadable. A rename is atomic for those readers, and it is exactly the
+        case that separate lock file was chosen for.
+        """
+        self.ticket("01", "Foundation")
+        table_path = self.root / "wave-table.json"
+        built = run_plan.build(self.feature, self.run)
+        built.write(table_path)
+        before = table_path.read_text(encoding="utf-8")
+        inode = table_path.stat().st_ino
+
+        replacement = dataclasses.replace(
+            built, waves=(dataclasses.replace(
+                built.waves[0],
+                tickets=(dataclasses.replace(built.waves[0].tickets[0], title="Replaced"),),
+            ),)
+        )
+        replacement.write(table_path)
+
+        # A rename puts a different file at the name, which is what makes an interleaved read see
+        # one whole table or the other and never a truncated one.
+        self.assertNotEqual(table_path.stat().st_ino, inode)
+        self.assertNotEqual(table_path.read_text(encoding="utf-8"), before)
+        self.assertEqual(run_plan.load(table_path).ticket("01").title, "Replaced")
+        # Nothing of the replacement is left beside the table for the next reader to trip on.
+        self.assertEqual(
+            sorted(path.name for path in self.root.glob("wave-table.json*")),
+            ["wave-table.json"],
+        )
+
+    def test_a_write_that_cannot_be_placed_leaves_the_table_that_was_there(self):
+        """A failed write is not a lost run plan: the temporary file never reaches the name."""
+        self.ticket("01", "Foundation")
+        table_path = self.root / "wave-table.json"
+        built = run_plan.build(self.feature, self.run)
+        built.write(table_path)
+        before = table_path.read_text(encoding="utf-8")
+
+        with mock.patch.object(run_plan.os, "replace", side_effect=OSError("no space")):
+            with self.assertRaisesRegex(run_plan.RunPlanError, "could not be written"):
+                built.write(table_path)
+
+        self.assertEqual(table_path.read_text(encoding="utf-8"), before)
+        self.assertEqual(
+            sorted(path.name for path in self.root.glob("wave-table.json*")),
+            ["wave-table.json"],
+        )
+
     def test_all_review_lane_vendor_combinations_survive_write_load_round_trip(self):
         expected = []
         for number, (executor, reviewer) in enumerate(REVIEW_LANE_MATRIX, start=1):

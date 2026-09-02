@@ -1,9 +1,12 @@
 """Build, validate, persist, and query the immutable meaning of a Wave table."""
 
+import contextlib
 from dataclasses import dataclass, replace
 import json
+import os
 import pathlib
 import re
+import tempfile
 import tomllib
 
 import accounts
@@ -211,14 +214,42 @@ class RunPlan:
         return _validate(RunPlan(self.run, self.waves + (appended,)))
 
     def write(self, path):
-        """Write the existing Wave-table JSON representation."""
+        """Write the existing Wave-table JSON representation, replacing the table atomically.
+
+        Written to a temporary file beside the table, flushed to disk, and renamed onto the name:
+        every reader of this table reads it without a lock, deliberately — the hold `edit_plan`
+        takes is a separate `wave-table.json.lock` file precisely so a reader is never held up by
+        a writer — so a truncating write would hand `advance.py`, `Loop.reload_plan` or `dispatch`
+        an empty or partial file, and a crash inside one would leave the run's sole routing
+        authority permanently unreadable. A rename gives them one whole table or the other.
+        """
         path = pathlib.Path(path)
+        text = json.dumps(_plan_object(_validate(self)), indent=2) + "\n"
+        handle = None
+        temporary = None
         try:
-            path.write_text(
-                json.dumps(_plan_object(_validate(self)), indent=2) + "\n", encoding="utf-8"
+            # In the table's own directory, because a rename is only atomic within one filesystem.
+            descriptor, temporary = tempfile.mkstemp(
+                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
             )
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            os.replace(temporary, path)
+            temporary = None
         except OSError as error:
             raise RunPlanError([f"run: {path} could not be written: {error}"]) from error
+        finally:
+            if handle is not None:
+                handle.close()
+            if temporary is not None:
+                # The name was never taken, so the table on disk is the one that was already
+                # there; what must not be left behind is this attempt's half of a file.
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
 
 
 def _wave_number(value):

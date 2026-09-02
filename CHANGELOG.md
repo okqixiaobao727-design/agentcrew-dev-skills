@@ -8,6 +8,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- A Wave-table write can no longer hand a reader a half-written run plan. `RunPlan.write`
+  truncated the table in place, while every reader of it — `advance.py`, the Driver's plan reload,
+  `dispatch` — loads it with no lock, deliberately: the hold `edit_plan` takes is a separate
+  `wave-table.json.lock` file precisely so a reader is never held up by a writer. A read landing
+  inside the truncate raised, escalating a healthy run, and a crash inside one left the run's sole
+  routing authority permanently unreadable. The table is now written to a temporary file beside
+  it, flushed, and renamed onto the name, so a reader sees one whole table or the other, and a
+  write that cannot be placed leaves the table that was already there (#191).
 - `driver.py queue` can no longer leave the tracker, the Run plan and the machine log disagreeing
   after a crash. The `queued` log line is this command's idempotency key, so it is written before
   the plan append rather than after it, and the two steps that follow it are each guarded by their
