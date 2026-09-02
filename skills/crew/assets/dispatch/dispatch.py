@@ -66,7 +66,9 @@ The wave table is one JSON object:
         "slug": optional, defaulting to the ticket file's name after its number,
         "base_commit": optional, defaulting to `--base-commit` or the run's base commit,
         "blocked_by": optional list of ticket ids — the dependency edges the advance driver
-                      follows; routing does not read them
+                      follows; routing does not read them,
+        "queued": optional {"source", "open"} — present only on a ticket this Run queued into
+                  itself, and the only thing that selects the diagnosing child (ADR-0028)
       }]}]
     }
 
@@ -384,16 +386,27 @@ def render_review_script(run, ticket, templates, log=None):
     ) + "\n"
 
 
+def skill_mention(ticket, name):
+    """The way this child's executor is asked to invoke one mattpocock skill from a turn's body.
+
+    Both executors take the canonical `plugin:skill` name here, because both resolve it from
+    anywhere in the message: Claude's composer rewrites a short name into it, and Codex's core
+    text resolver matches it wherever it appears (#182 fact 3b). An opening line is the one place
+    this form is wrong on Codex, and it comes from the template, not from here.
+    """
+    sigil = "$" if ticket.executor == "codex" else "/"
+    return f"{sigil}mattpocock-skills:{name}"
+
+
 def render_turn(run, ticket, templates, review_script, log=None):
     shape = templates["workflows"][ticket.workflow]
     turn = templates["turn"]
     has_review = review_script is not None
     caller_budget = block(templates["review"]["caller_budget"])
-    writing_skill = (
-        "$mattpocock-skills:writing-for-agents"
-        if ticket.executor == "codex"
-        else "/mattpocock-skills:writing-for-agents"
-    )
+    # A queued ticket's child diagnoses before it implements (ADR-0028). The Run plan's `queued`
+    # fact is what selects that variant and the only thing that does; everything else in the turn
+    # is the ticket's workflow, rendered exactly as an ordinary child's is.
+    queued = templates["queued"] if ticket.queued is not None else None
     values = {
         "<absolute ticket path>": ticket.path,
         "<absolute spec path>": run.spec_path,
@@ -408,7 +421,8 @@ def render_turn(run, ticket, templates, review_script, log=None):
         "<design bridge>": shape.get("design_bridge", ""),
         "<ticket comment rule>": block(templates["ticket"]["comment_rule"]),
         "<review caller budget>": f"\n  {caller_budget}" if has_review else "",
-        "<writing skill>": writing_skill,
+        "<writing skill>": skill_mention(ticket, "writing-for-agents"),
+        "<codebase-design skill>": skill_mention(ticket, "codebase-design"),
         "<commit step>": f"{4 if has_review else 3}. Commit.",
         "<completion step>": 5 if has_review else 4,
     }
@@ -436,13 +450,16 @@ def render_turn(run, ticket, templates, review_script, log=None):
     else:
         coordinator = block(turn["coordinator_codex"])
 
+    opening_template = shape if queued is None else queued
     opening_line = (
-        shape.get("opening_line_codex", shape["opening_line"])
+        opening_template.get("opening_line_codex", opening_template["opening_line"])
         if ticket.executor == "codex"
-        else shape["opening_line"]
+        else opening_template["opening_line"]
     )
+    step_one = turn["step_one"] if queued is None else queued["step"]
     text = block(turn["base"])
     text = text.replace("<opening line>", block(opening_line))
+    text = text.replace("<step one>", block(step_one))
     text = text.replace("<workflow block>", workflow_block)
     text = text.replace("<review step>", review_block)
     text = text.replace("<coordinator paragraph>", coordinator)

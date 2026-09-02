@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 from harness import (
     BASE_BRANCH,
@@ -73,6 +74,15 @@ from harness import (
 
 sys.path.insert(0, str(DRIVER.parent))
 import driver as driver_module  # noqa: E402
+
+# The bridge's own opening-skill resolver: a ruling delivered to a Codex child is a skill
+# invocation only if this is what names the skill in it (#182 fact 4b).
+sys.path.insert(0, str(DRIVER.parents[1] / "codex"))
+import codex_bridge as codex_bridge_module  # noqa: E402
+
+# Whatever `resolve_skill_path` would answer for the skill a turn opens on: this suite asserts
+# that a structured item is attached and under which name, never where the plugin is installed.
+SKILL_PATH = pathlib.Path("/installed/plugin/skills/engineering/skill/SKILL.md")
 
 # The address a restarted coordinator binds: a second socket in a second directory, so a re-anchor
 # that composed one out of the new pid would produce something else and be visible.
@@ -3883,6 +3893,170 @@ QUEUE_ESCALATION = (
     "CREW ASK 01 doc-conflict ts=1"
 )
 QUEUE_POINTERS = ("skills/example.py:12", "docs/glossary.md:8", "#45", "ADR-0028")
+
+
+class DiagnosingChildChainTests(DriverTestCase):
+    """diagnose → ruling → implement, over one queued Wave the Run appended to itself (ADR-0028).
+
+    The variant itself is dispatch's; what these drive is the chain around it — that the queued
+    child the Driver activates opens on `/triage`, that its one `design` escalation reaches the
+    coordinator carrying the brief's pointer, and that `driver.py answer` puts the ticket's own
+    opening line into the channel that child has, recorded in the run's log as it was delivered.
+    """
+
+    BRIEF_POINTER = "https://github.example.invalid/issues/02#issuecomment-7"
+    BRIEF_ASK = (
+        "CREW ASK 02 design — the brief is posted at"
+        f" {BRIEF_POINTER}; cause found, pick marked implement per brief"
+        " — ts=1"
+    )
+
+    def await_launch(self, ticket, complaint):
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch(ticket) is not None),
+            complaint,
+        )
+
+    def append(self, number, source="01", open_word="cause"):
+        """Append one queued Wave carrying `number`, the way `driver.py queue` appends it.
+
+        The routing is the planned ticket's, because none of this is about routing: what makes the
+        row a queued one is the `Queued` fact and the trailing Wave `append` puts it in.
+        """
+        self.fixture.ticket(number, f"diagnosis {number}")
+        path = self.fixture.run_dir / "wave-table.json"
+        plan = run_plan.load(path)
+        plan.append(dataclasses.replace(
+            plan.tickets[0],
+            id=number,
+            title=f"diagnosis {number}",
+            blocked_by=(),
+            path=str(self.fixture.feature_dir / f"{number}.md"),
+            queued=run_plan.Queued(source, open_word),
+        )).write(path)
+        return number
+
+    def start(self, routing=ROUTING):
+        """One planned ticket up and its loop running; the queued Wave is appended onto it."""
+        self.fixture.ticket("01", "thing 01", routing=routing)
+        self.fixture.commit_feature()
+        process = self.fixture.launch(
+            env_overrides={"AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF},
+        )
+        self.await_launch("01", "01 never launched")
+        return process
+
+    def answer(self, text, ticket="02"):
+        environment = self.fixture.environment()
+        environment["CLAUDE_CODE_MESSAGING_SOCKET"] = COORDINATOR_ADDRESS.removeprefix("uds:")
+        return subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer",
+                "--run-dir", str(self.fixture.run_dir), "--ticket", ticket, "--text", text,
+            ],
+            capture_output=True, text=True, env=environment, cwd=str(self.fixture.repo),
+        )
+
+    def queued_turn(self, routing=ROUTING):
+        """Run the chain to the queued child's launched first turn.
+
+        Returns the run process and that turn's text.
+        """
+        process = self.start(routing=routing)
+        self.append("02")
+        self.fixture.completes("01")
+        self.await_launch("02", "the queued wave never launched")
+        return process, (self.fixture.run_dir / "launch" / "02.turn.txt").read_text()
+
+    def ticket_path(self):
+        return str(self.fixture.feature_dir / "02.md")
+
+    def structured_skill_items(self, message):
+        """Every non-text item the bridge would put in a turn carrying `message`.
+
+        `resolve_skill_path` shells out to the installed Codex plugin, which is not this suite's
+        to depend on, so it is stood in for; what is under test is whether `turn_input` attaches
+        an item at all for this message, and under which name.
+        """
+        with mock.patch.object(
+            codex_bridge_module, "resolve_skill_path", return_value=SKILL_PATH
+        ):
+            items = codex_bridge_module.turn_input("marker", message)
+        return [item for item in items if item.get("type") != "text"]
+
+    def test_a_claude_queued_child_diagnoses_then_is_answered_with_its_own_opening_line(self):
+        process, turn = self.queued_turn()
+        path = self.ticket_path()
+        self.assertTrue(turn.startswith(f"/mattpocock-skills:triage {path}\n"), turn[:200])
+        self.assertIn("1. Diagnose before your first edit.", turn)
+        self.assertIn("/mattpocock-skills:codebase-design", turn)
+
+        self.fixture.says("02", self.BRIEF_ASK)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn(self.BRIEF_POINTER, snapshot["detail"])
+        ruling = f"/implement {path}"
+        window = self.fixture.launch_record("02")["window"]
+
+        result = self.answer(ruling)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-2:], [
+            ["send-keys", "-t", window, "-l", "--", ruling],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        recorded = self.events("ruling", ticket="02")[-1]
+        self.assertEqual(recorded["role"], "coordinator")
+        self.assertEqual(recorded["message"], ruling)
+
+    def test_a_codex_queued_child_is_answered_as_the_next_bridge_turn(self):
+        process, turn = self.queued_turn(routing=CODEX_ROUTING)
+        path = self.ticket_path()
+        self.assertTrue(turn.startswith(f"$triage {path}\n"), turn[:200])
+        self.assertNotIn("$mattpocock-skills:triage", turn)
+        self.assertIn("$mattpocock-skills:codebase-design", turn)
+
+        self.fixture.says("02", self.BRIEF_ASK)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn(self.BRIEF_POINTER, snapshot["detail"])
+        ruling = f"$implement {path}"
+
+        result = self.answer(ruling)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sends = [
+            call["argv"] for call in self.fixture.codex_calls() if call["argv"][:1] == ["send"]
+        ]
+        self.assertEqual(sends[-1], [
+            "send",
+            "--state-file", str(self.fixture.run_dir / "codex" / "02.json"),
+            "--machine-log", str(self.fixture.run_dir / "log.jsonl"),
+            "--ticket", "02",
+            "--prompt", ruling,
+        ])
+        self.assertEqual(self.events("ruling", ticket="02")[-1]["message"], ruling)
+        # What makes that prompt a skill invocation rather than prose, asserted against the
+        # function that builds the bridge's turn rather than against the resolver it calls: a
+        # ruling that stopped being given a structured item would still pass the resolver.
+        self.assertEqual(
+            self.structured_skill_items(ruling),
+            [{"type": "skill", "name": "implement", "path": str(SKILL_PATH)}],
+        )
+
+    def test_the_triage_opening_line_a_queued_codex_child_gets_is_injected_as_a_skill(self):
+        _, turn = self.queued_turn(routing=CODEX_ROUTING)
+
+        self.assertEqual(
+            self.structured_skill_items(turn),
+            [{"type": "skill", "name": "triage", "path": str(SKILL_PATH)}],
+        )
 
 
 class QueueTests(DriverTestCase):
