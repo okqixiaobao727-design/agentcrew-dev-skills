@@ -27,6 +27,8 @@ REVIEW_VENDORS = EXECUTORS
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ACCOUNT_MODES = accounts.ACCOUNT_MODES
 TRACKERS = ("github", "local")
+# The tracker whose Run-directory ticket file is a stub rather than the ticket itself.
+GITHUB_TRACKER = TRACKERS[0]
 # What a queued ticket's finding still leaves open, which is what its child diagnoses first
 # (ADR-0028). A finding whose cause and change site are both known is an edit, never a queued
 # ticket, so there is no fourth word.
@@ -259,6 +261,43 @@ def ticket_title(text, identifier):
         if line.startswith("# "):
             return line[2:].strip()
     return identifier
+
+
+def ticket_section(text, wanted):
+    """One Markdown section, including its heading, exactly as the source carries it."""
+    lines = text.splitlines(keepends=True)
+    start = None
+    for index, line in enumerate(lines):
+        heading = SECTION.match(line.rstrip("\n"))
+        if heading and start is not None:
+            return "".join(lines[start:index]).rstrip("\n")
+        if heading and heading.group(1).lower() == wanted:
+            start = index
+    return "" if start is None else "".join(lines[start:]).rstrip("\n")
+
+
+def ticket_pointer(url):
+    """The tracker-authority line shared by ticket and parent stubs."""
+    return f"Ticket: {url} — the issue body and every comment are this ticket; read all of it."
+
+
+def staged_text(kind, title, body, url=None):
+    """That ticket as a Run directory holds it, pointing at its tracker authority.
+
+    The Run directory's own form of a ticket, which is the Run plan's to say (ADR-0018): a github
+    ticket is a stub carrying the pointer and the two machine sections the plan reads, and a local
+    ticket is the file itself. Staging writes one at `/route` time and the Driver writes one for a
+    ticket the Run queues into itself (ADR-0028); both render it from here, so a run directory
+    holds one shape however the ticket got there.
+    """
+    if kind == GITHUB_TRACKER:
+        machine_sections = [
+            held for name in (ROUTING_SECTION, BLOCKED_BY_SECTION)
+            if (held := ticket_section(body, name))
+        ]
+        suffix = "".join(f"\n\n{held}" for held in machine_sections)
+        return f"# {title}\n\n{ticket_pointer(url)}{suffix}\n"
+    return body
 
 
 def ticket_dependencies(text):

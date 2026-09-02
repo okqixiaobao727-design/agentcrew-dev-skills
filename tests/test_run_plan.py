@@ -932,5 +932,77 @@ class RunPlanSourceGuardTests(unittest.TestCase):
         self.assertEqual(problems, [])
 
 
+
+class StagedTicketTextTests(unittest.TestCase):
+    """The run-directory ticket renderer the Run plan owns, which staging and the Driver share."""
+
+    GITHUB_BODY = (
+        "Prose the issue opens with.\n"
+        "\n"
+        "## Routing\n"
+        "\n"
+        "Workflow: tdd\n"
+        "\n"
+        "## Blocked by\n"
+        "\n"
+        "- #41\n"
+    )
+
+    def test_a_github_ticket_keeps_only_its_pointer_and_the_two_machine_sections(self):
+        text = run_plan.staged_text(
+            "github", "a queued title", self.GITHUB_BODY, "https://example.invalid/issues/42"
+        )
+
+        self.assertEqual(
+            text,
+            "# a queued title\n"
+            "\n"
+            f"{run_plan.ticket_pointer('https://example.invalid/issues/42')}\n"
+            "\n"
+            "## Routing\n"
+            "\n"
+            "Workflow: tdd\n"
+            "\n"
+            "## Blocked by\n"
+            "\n"
+            "- #41\n",
+        )
+
+    def test_a_github_ticket_with_no_machine_sections_is_its_pointer_alone(self):
+        text = run_plan.staged_text(
+            "github", "a queued title", "Prose alone.\n", "https://example.invalid/issues/42"
+        )
+
+        self.assertEqual(
+            text,
+            "# a queued title\n"
+            "\n"
+            f"{run_plan.ticket_pointer('https://example.invalid/issues/42')}\n",
+        )
+
+    def test_a_local_ticket_is_its_body_exactly(self):
+        self.assertEqual(
+            run_plan.staged_text("local", "a queued title", self.GITHUB_BODY),
+            self.GITHUB_BODY,
+        )
+
+    def test_the_pointer_line_names_the_body_and_every_comment_as_the_ticket(self):
+        pointer = run_plan.ticket_pointer("https://example.invalid/issues/42")
+
+        self.assertEqual(
+            pointer,
+            "Ticket: https://example.invalid/issues/42 — the issue body and every comment are"
+            " this ticket; read all of it.",
+        )
+
+    def test_one_section_is_returned_with_its_heading_and_without_the_next_one(self):
+        self.assertEqual(
+            run_plan.ticket_section(self.GITHUB_BODY, run_plan.ROUTING_SECTION),
+            "## Routing\n\nWorkflow: tdd",
+        )
+        self.assertEqual(run_plan.ticket_section(self.GITHUB_BODY, "absent"), "")
+
+
+
 if __name__ == "__main__":
     unittest.main()

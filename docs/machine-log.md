@@ -311,6 +311,20 @@ cannot say which merges cost a model anything.
 `ticket`, `outcome` (`completed`, `failed`, `parked`, or `blocked`), `detail`. These are the four
 outcomes the crew contract gives every ticket.
 
+### `queued` — a finding this run opened a ticket for
+
+`ticket`, `source`, `open`, `locator`, `finding`. One line per ticket the run queued into itself
+([ADR-0028](adr/0028-a-finding-is-queued-into-the-run-and-diagnosed-by-the-child-that-implements-it.md)),
+where `ticket` is the ticket that was opened, `source` is the ticket whose child stated the
+finding, `open` is `cause`, `approach` or `reach` — what the finding leaves open, which is what
+the queued child diagnoses first — `locator` is the tracker's own opaque handle on the new
+ticket, and `finding` is the finding line exactly as the source child stated it.
+
+The writer is `driver.py queue`, and this line is what makes a queue idempotent: an identical
+finding line from the same source finds its own line here and opens nothing a second time. Which
+child a queued ticket gets is read from the Wave table's `queued` fact, never from this line
+([ADR-0024](adr/0024-driver-activates-every-wave-through-one-path.md)).
+
 ### `review` — a ticket's trip through its review lane
 
 `ticket`, `lane` (the reviewing vendor and its model, as the wave table approved them), `state`

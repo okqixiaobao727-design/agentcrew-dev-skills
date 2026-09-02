@@ -217,6 +217,9 @@ STATUS_FINISHED = "done"
 # The labels a github ticket carries to say who may pick it up; a close takes the one it has off,
 # and the undo puts it back (`references/trackers.md`).
 PICKUP_LABELS = ("ready-for-agent", "ready-for-human")
+# The one workflow whose ticket a human picks up (`skills/route/references/classify.md`); every
+# other ticket is an agent's. Staging marks a routed ticket from here, and so does a queued one.
+HUMAN_WORKFLOW = "acceptance"
 GH = "gh"
 # The installed Review-Switch command a reviewed ticket's child runs. This repository ships no
 # review implementation and calls it across a process boundary (ADR-0020), so on a machine where
@@ -265,12 +268,23 @@ NUDGE_MARKER = machine_log.NUDGE_MARKER
 MERGE_MARKER = machine_log.MERGE_MARKER
 ANCHOR_MARKER = machine_log.ANCHOR_MARKER
 HANDED_OVER_MARKER = machine_log.HANDED_OVER_MARKER
-PLACEMENT_MARKERS = (
+# The two shapes a placement marker takes: one that is the whole end of the line, and one that
+# opens what the placement names. `queued` is the second kind with a closed tail — a queued line
+# that does not say what it leaves open is not a placement at all, and the report leaves the whole
+# ruling standing rather than rendering half a placement (ADR-0028).
+EXACT_PLACEMENT_MARKERS = (
     " — this ticket",
     " — dropped",
+)
+OPENING_PLACEMENT_MARKERS = (
     " — opened ",
     " — deferred ",
 )
+QUEUED_MARKER = " — queued "
+QUEUED_PLACEMENT = re.compile(
+    rf"{re.escape(QUEUED_MARKER)}#\d+ \(open: (?:{'|'.join(run_plan.OPEN_WORDS)})\)$"
+)
+PLACEMENT_MARKERS = EXACT_PLACEMENT_MARKERS + OPENING_PLACEMENT_MARKERS + (QUEUED_MARKER,)
 
 # The tmux key names the permission-prompt command accepts, kept narrow so an answer cannot
 # accidentally become an unsupported tmux key sequence.
@@ -2178,20 +2192,25 @@ def report_rulings(records):
 
 
 def placement_line(line):
-    """Whether one ruling line names one of the placement grammar's four outcomes."""
-    return any(
-        line.endswith(marker) if marker in PLACEMENT_MARKERS[:2] else marker in line
-        for marker in PLACEMENT_MARKERS
+    """Whether one ruling line names one of the placement grammar's five outcomes."""
+    if QUEUED_MARKER in line:
+        return QUEUED_PLACEMENT.search(line) is not None
+    return (
+        any(line.endswith(marker) for marker in EXACT_PLACEMENT_MARKERS)
+        or any(marker in line for marker in OPENING_PLACEMENT_MARKERS)
     )
 
 
 def placement_belongs_to(line, leftover):
     """Whether one placement line rules the named wrap-up leftover."""
-    return any(
-        line == f"{leftover}{marker}"
-        if marker in PLACEMENT_MARKERS[:2]
-        else line.startswith(f"{leftover}{marker}")
-        for marker in PLACEMENT_MARKERS
+    if not placement_line(line):
+        return False
+    return (
+        any(line == f"{leftover}{marker}" for marker in EXACT_PLACEMENT_MARKERS)
+        or any(
+            line.startswith(f"{leftover}{marker}")
+            for marker in OPENING_PLACEMENT_MARKERS + (QUEUED_MARKER,)
+        )
     )
 
 
@@ -3959,6 +3978,8 @@ def run_defer(args):
             ticket=target,
             pointer=str(loop.log),
         )
+    # The finding is carried exactly as it was given: the ticket body, the log line and the
+    # placement the source child receives are all the child's own words, unedited.
     finding = args.text
     if not isinstance(finding, str) or not finding.strip():
         raise DriverError(
@@ -3973,6 +3994,253 @@ def run_defer(args):
         raise DriverError(str(error), ticket=target, pointer=str(loop.table_path)) from error
     ruling = f"{finding} — deferred #{target} (comment: {locator})"
     loop.deliver(source, launch, ruling)
+    return 0
+
+
+def pickup_label(workflow):
+    """Which role label a ticket on that workflow is marked with when it is opened."""
+    agent, human = PICKUP_LABELS
+    return human if str(workflow).strip().lower() == HUMAN_WORKFLOW else agent
+
+
+# --- queueing one diagnosis into the run -------------------------------------------------------
+
+
+QUEUED_CELL = (run_plan.QUEUED_SECTION,)
+POINTERS_HEADING = "## Pointers"
+ROUTING_HEADING = f"## {run_plan.ROUTING_SECTION.title()}"
+
+
+def queued_ticket_routing(loop, args):
+    """The routing this ticket is opened on: the `[queued]` cell, under this call's overrides.
+
+    The overrides go into the cell rather than onto the resolved value, so a workflow named here
+    resolves its own review lane: a queued ticket routed onto a workflow that takes none carries
+    none, and one routed onto a workflow that takes a lane is refused where the cell holds no lane
+    to give it (ADR-0028).
+    """
+    cell = config_value(project_config(loop.repo_root), QUEUED_CELL)
+    if cell is None:
+        cell = {}
+    if isinstance(cell, dict):
+        cell = dict(cell)
+        for field in run_plan.QUEUED_FIELDS:
+            override = getattr(args, field, None)
+            if override is not None:
+                cell[field] = override
+    # A cell that is not a table of routing fields is handed on exactly as the project wrote it,
+    # so the resolver refuses it in its own words rather than this command reading past it.
+    try:
+        return run_plan.queued_routing(cell)
+    except run_plan.RunPlanError as error:
+        raise DriverError(str(error), pointer=str(loop.repo_root / CONFIG_NAME)) from error
+
+
+def queued_binding(loop, name):
+    """The account binding a queued ticket runs under: the one named, or the coordinator's own.
+
+    A queued ticket names no account unless this command names one, so the default is the run's
+    own configuration home — exactly what an account-less ticket of the approved table binds
+    (ADR-0014, ADR-0028).
+    """
+    if not name:
+        return accounts.inherited(loop.run.coordinator_config_home)
+    declared = loop.run.declared_accounts
+    config = pathlib.Path(loop.run.repo_root) / CONFIG_NAME
+    if declared and name not in declared:
+        raise DriverError(
+            f"the account `{name}` is not declared by {config} — it declares"
+            f" {', '.join(declared)}",
+            pointer=str(config),
+        )
+    try:
+        registry = accounts.registry_path()
+        directory = accounts.profile_directory(name, accounts.load_registry(registry))
+    except accounts.AccountsError as error:
+        raise DriverError(f"account: {error}", pointer=str(config)) from error
+    if not pathlib.Path(directory).is_dir():
+        raise DriverError(
+            f"the account `{name}` has no profile directory at {directory}, which the registry"
+            f" {registry} names",
+            pointer=str(registry),
+        )
+    return accounts.explicit(directory)
+
+
+def queued_routing_section(routing, account, source, open_word):
+    """The `## Routing` section a queued ticket is opened with, in the order staging writes one."""
+    lines = [
+        f"Workflow: {routing.workflow}",
+        f"Executor: {routing.executor}",
+        f"Model: {routing.model}",
+        f"Effort: {routing.effort}",
+    ]
+    if account:
+        lines.append(f"Account: {account}")
+    if routing.review is not None:
+        lines.append(
+            f"Review: {routing.review.vendor} {routing.review.model} {routing.review.effort}"
+        )
+    lines.append(
+        f"Reasons: queued from #{source} by a coordinator ruling; its {open_word} is what this"
+        " ticket's own child diagnoses first (ADR-0028)."
+    )
+    return f"{ROUTING_HEADING}\n\n" + "\n".join(lines)
+
+
+def queued_pointers(records, source, finding, worktree):
+    """Every pointer the source child cited, and every one this finding carries, once each."""
+    escalations = [
+        record for record in records
+        if record.get("event") == "escalation" and str(record.get("ticket") or "") == source
+    ]
+    cited = str(escalations[-1].get("message") or "") if escalations else ""
+    return [str(pointer) for pointer in witness_runner.pointers(f"{cited}\n{finding}", worktree)]
+
+
+def queued_body(source, finding, cited, section):
+    """The ticket body a queued finding is opened with, evidence and routing included."""
+    parts = [f"Queued from #{source}", finding]
+    if cited:
+        parts.append(POINTERS_HEADING + "\n\n" + "\n".join(f"- {pointer}" for pointer in cited))
+    parts.append(section)
+    return "\n\n".join(parts) + "\n"
+
+
+def queued_already(records, source, finding):
+    """The `queued` line this run already holds for that finding from that source, or None."""
+    for record in records:
+        if (
+            record.get("event") == "queued"
+            and str(record.get("source") or "") == source
+            and str(record.get("finding") or "") == finding
+        ):
+            return record
+    return None
+
+
+def queued_summary(loop, identifier):
+    """What the coordinator needs in front of it for its next ruling.
+
+    The reference this call placed, and every queued ticket of the Run no child has picked up yet:
+    a finding that shares a cause with one of those is deferred to it rather than queued again
+    (ADR-0028).
+    """
+    projection = machine_log.project(loop.records())
+    placed = loop.plan.ticket(identifier)
+    pending = [
+        f"- #{ticket.id} — {ticket.title}"
+        for ticket in loop.plan.tickets
+        if ticket.queued is not None and projection.ticket(ticket.id).launch is None
+    ]
+    return "\n".join([
+        f"queued #{placed.id} (open: {placed.queued.open}) — {placed.title}",
+        "",
+        "pending queued tickets of this run:",
+        *(pending or ["- none"]),
+    ])
+
+
+def run_queue(args):
+    """Open one diagnosis at the run's tracker, append it to the Run, and deliver its placement.
+
+    The order is the one that makes a failure recoverable: everything refusable is refused before
+    the tracker is touched, the tracker is written first because it is the only writer here that
+    cannot be rolled back, and the plan, the log and the child follow it. A tracker failure
+    therefore leaves a run exactly as it found it, and a crash after the ticket was opened is
+    caught on the retry by **create**'s own title-and-body idempotency.
+    """
+    open_word = args.open
+    if open_word not in run_plan.OPEN_WORDS:
+        raise DriverError(
+            "a queued finding says what it leaves open: --open is one of "
+            + ", ".join(run_plan.OPEN_WORDS)
+        )
+    finding = args.text
+    if not isinstance(finding, str) or not finding.strip():
+        raise DriverError("a queued finding needs --text naming the finding and its pointers")
+    if not isinstance(args.title, str) or not args.title.strip():
+        raise DriverError("a queued ticket needs --title naming what is to be diagnosed")
+    title = args.title.strip()
+
+    run_dir = resolved_run_dir(args.run_dir)
+    loop = Loop(args, run_dir, run_dir / TABLE_NAME)
+    source = plan_ticket(loop, args.ticket).id
+    records = loop.records()
+    launch = machine_log.project(records).ticket(source).launch
+    if launch is None:
+        raise DriverError(
+            f"{source} has no recorded child in {loop.log}", ticket=source, pointer=str(loop.log)
+        )
+    held = queued_already(records, source, finding)
+    if held is not None:
+        print(queued_summary(loop, str(held.get("ticket") or "")), flush=True)
+        return 0
+
+    routing = queued_ticket_routing(loop, args)
+    binding = queued_binding(loop, args.account)
+    body = queued_body(
+        source, finding,
+        queued_pointers(records, source, finding, launch.get("worktree") or loop.run.repo_root),
+        queued_routing_section(routing, args.account, source, open_word),
+    )
+    feature_dir = run_dir.parent
+    try:
+        created, locator = tracker.create(
+            loop.run.tracker, title, body,
+            role_label=pickup_label(routing.workflow),
+            # Where the ticket is placed: the run directory itself on the local tracker, whose
+            # ticket file is the file a run reads, and the repository on github, which is the whole
+            # of how `gh` knows which repository it is talking to.
+            directory=feature_dir if loop.run.tracker == TRACKER_LOCAL else loop.repo_root,
+        )
+    except tracker.TrackerError as error:
+        raise DriverError(str(error), ticket=source, pointer=str(loop.table_path)) from error
+
+    identifier = str(created["id"])
+    path = (
+        pathlib.Path(created["path"]) if created.get("path")
+        else feature_dir / f"{identifier}.md"
+    )
+    if not created.get("path"):
+        staged = run_plan.staged_text(loop.run.tracker, title, body, created.get("url"))
+        try:
+            path.write_text(staged, encoding="utf-8")
+        except OSError as error:
+            raise DriverError(
+                f"the queued ticket {identifier} could not be written to {path}: {error}",
+                ticket=identifier, pointer=str(path),
+            ) from error
+    try:
+        plan = loop.plan.append(run_plan.PlannedTicket(
+            id=identifier,
+            title=title,
+            path=str(path),
+            workflow=routing.workflow,
+            executor=routing.executor,
+            model=routing.model,
+            effort=routing.effort,
+            binding=binding,
+            review=routing.review,
+            queued=run_plan.Queued(source, open_word),
+        ))
+        plan.write(loop.table_path)
+    except run_plan.RunPlanError as error:
+        raise DriverError(
+            str(error), ticket=identifier, pointer=str(loop.table_path)
+        ) from error
+    loop.plan = plan
+    run_command(
+        [
+            sys.executable, MACHINE_LOG, "--log", loop.log, "queued",
+            "--ticket", identifier, "--source", source, "--open", open_word,
+            "--locator", locator, "--finding", finding,
+        ],
+        f"the queued ticket {identifier} could not be recorded",
+        ticket=identifier, pointer=str(loop.log),
+    )
+    loop.deliver(source, launch, f"{finding} — queued #{identifier} (open: {open_word})")
+    print(queued_summary(loop, identifier), flush=True)
     return 0
 
 
@@ -4083,6 +4351,32 @@ def build_parser():
     defer.add_argument(
         "--text", required=True,
         help="the finding exactly as the child stated it, with pointers",
+    )
+    queue = commands.add_parser(
+        "queue",
+        help="open a diagnosis at the run's tracker, append it to this run, and place it",
+    )
+    queue.set_defaults(handler=run_queue)
+    queue.add_argument("--run-dir", required=True, help="the recorded run directory")
+    queue.add_argument("--ticket", required=True, help="the ticket whose child stated the finding")
+    queue.add_argument(
+        "--open",
+        help="what the finding leaves open, which is what the queued child diagnoses first: one"
+             f" of {', '.join(run_plan.OPEN_WORDS)}",
+    )
+    queue.add_argument("--title", required=True, help="the title the new ticket is opened under")
+    queue.add_argument(
+        "--text", required=True,
+        help="the finding exactly as the child stated it, with pointers",
+    )
+    for field in run_plan.QUEUED_FIELDS:
+        queue.add_argument(
+            f"--{field}",
+            help=f"the {field} this one ticket is routed on, overriding the `[queued]` cell",
+        )
+    queue.add_argument(
+        "--account",
+        help="the account this one ticket runs on; naming none runs it on the coordinator's own",
     )
     return parser
 
