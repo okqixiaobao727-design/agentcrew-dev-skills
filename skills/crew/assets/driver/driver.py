@@ -369,6 +369,13 @@ DEFAULT_TIMEOUT_SECONDS = 7200.0
 GATE_OUTPUT_LINE_LIMIT = 20
 # How long a monitor asked to stop is given before it is killed.
 MONITOR_STOP_SECONDS = 5.0
+# How long an instruction typed into a child's composer is given to leave it after `Enter`, and
+# how often that is re-read. A Claude composer clears prose in about 20ms but a slash command in
+# up to about 100ms, because the command is resolved and its skill body loaded before the input is
+# cleared; the deadline is a second so a child with a larger context than the probe's still fits
+# inside it (#191).
+COMPOSER_CLEAR_SECONDS = 1.0
+COMPOSER_POLL_SECONDS = 0.03
 
 ADVANCE_ESCALATED_EXIT = 1
 ADVANCE_INTERRUPTED_EXIT = 130
@@ -748,6 +755,13 @@ def type_into_pane(window, text, unreachable, stuck):
     with S-Enter between lines so a multi-line instruction stays one message, and Enter at the
     end. One Enter is retried, because the composer sometimes still holds the line after the
     first; a second that also leaves it standing is `stuck` rather than a message anyone received.
+
+    Each Enter is given `COMPOSER_CLEAR_SECONDS` to empty the composer before it counts as
+    dropped, because a submit is not instantaneous: a slash command stands in the composer for
+    roughly five times as long as prose, since Claude Code resolves the command and loads the
+    skill body before clearing the input. Deciding on a single immediate read lost the whole
+    ruling — the child had received and expanded it, but the driver called the delivery failed and
+    never recorded it (#191).
     """
     lines = text.split("\n")
     for index, line in enumerate(lines):
@@ -756,9 +770,24 @@ def type_into_pane(window, text, unreachable, stuck):
             tmux(["send-keys", "-t", window, "S-Enter"], unreachable)
     for _attempt in range(2):
         tmux(["send-keys", "-t", window, "Enter"], unreachable)
-        if not composer_holds(window, text):
+        if composer_clears(window, text):
             return
     raise DriverError(stuck)
+
+
+def composer_clears(window, text):
+    """Whether the typed line leaves the composer within `COMPOSER_CLEAR_SECONDS`.
+
+    Polled rather than read once: a line that has left the composer at any point in that window
+    was submitted, and only a line still standing at the deadline is a delivery to retry.
+    """
+    deadline = time.monotonic() + COMPOSER_CLEAR_SECONDS
+    while True:
+        if not composer_holds(window, text):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(COMPOSER_POLL_SECONDS)
 
 
 def composer_holds(window, text):

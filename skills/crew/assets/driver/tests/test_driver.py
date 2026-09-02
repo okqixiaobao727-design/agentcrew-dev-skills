@@ -3999,6 +3999,11 @@ class DiagnosingChildChainTests(DriverTestCase):
         self.assertIn(self.BRIEF_POINTER, snapshot["detail"])
         ruling = f"/implement {path}"
         window = self.fixture.launch_record("02")["window"]
+        # What a real Claude child does with a slash command: the line stands in the composer for
+        # a while after the `Enter` that submitted it, because the command is resolved and its
+        # skill body loaded before the input clears (#191). A driver that reads once and gives up
+        # loses this ruling from the log while the child goes on to act on it.
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
 
         result = self.answer(ruling)
 
@@ -4559,6 +4564,30 @@ class AnswerTests(DriverTestCase):
 
     def test_whitespace_text_cannot_be_recorded_when_submission_is_not_observable(self):
         self.assert_blank_text_is_not_recorded("   ")
+
+    def test_a_slash_ruling_that_lingers_in_the_composer_is_recorded_on_the_first_enter(self):
+        self.start()
+        text = "/implement /tmp/feature/02.md"
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
+
+        result = self.answer("--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-2:], [
+            ["send-keys", "-t", window, "-l", "--", text],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 1)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], text)
 
     def test_text_delivery_retries_one_dropped_enter_before_recording_the_ruling(self):
         self.start()

@@ -7,6 +7,20 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- A slash-command ruling delivered to a Claude child is recorded in the machine log again.
+  `driver.py answer` read the child's composer once, immediately after the `Enter` that submitted
+  the instruction, and a Claude composer takes up to about 100ms to clear a slash command — the
+  command is resolved and its skill body loaded before the input clears — against about 20ms for
+  prose. Both of `type_into_pane`'s reads landed inside that lag, so a ruling the child had
+  received and expanded was called a failed delivery and `record_ruling` never ran, leaving the
+  run's log and report holding the hand-over placeholder. Each `Enter` is now given
+  `COMPOSER_CLEAR_SECONDS`, polled every `COMPOSER_POLL_SECONDS`, to empty the composer before it
+  counts as dropped; a composer that genuinely never clears still ends in the same `stuck`
+  Unreachable, and a dropped `Enter` is still rescued by the one retry. The driver suite's tmux
+  stub models the lag with a `tmux-linger-reads` knob, which is what lets the chain test see the
+  defect (#191).
+
 ## [0.9.17] - 2026-09-01
 
 ### Added
