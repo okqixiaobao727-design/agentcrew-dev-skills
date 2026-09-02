@@ -299,11 +299,43 @@ recommendation or ruling.
 _Avoid_: research, verification
 
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers
-remain: one line per leftover — what it is, its pointer, and whether it touches only this ticket
-or another ticket or a public interface — with no recommendation. The coordinator rules each line:
-fixed in this ticket, opened as a ticket seeded from that line, deferred to an existing pending
-ticket through the Driver, or dropped. A completion with no leftovers is a receipt, not a wrap-up.
+remain: one line per leftover — what it is and its pointer, at the cause where the child knows it
+and at the symptom where it does not — with no recommendation. The coordinator gives each line a
+Placement. A completion with no leftovers is a receipt, not a wrap-up.
 _Avoid_: tail, follow-up list
+
+**Finding** — Work a ruling surfaces beyond the ticket's stated scope, whichever escalation
+carried it: a `wrap-up` leftover, a `doc-conflict` position, a `scope` question. Every finding
+gets one Placement, and the Placement is decided by the kind of work the finding is, never by
+whether it falls inside the ticket's scope.
+
+**Edit / Diagnosis** — The two kinds of work a Finding can be, and the test behind its Placement.
+An **edit** is work whose cause and change site the child already knows, so only the typing is
+left; it stays with the child in front of the coordinator however far outside the ticket's scope
+it falls. A **diagnosis** is work whose cause, approach or reach is still open; it goes to a child
+of its own, because the diagnosing is the expensive part and a child at wrap-up has little context
+left to spend on it. A pointer at a cause and a named change site say edit; a pointer at a symptom
+says diagnosis. The line between them is the coordinator's judgment, not a size.
+_Avoid_: in scope / out of scope (scope is not the test), small / large (size is not the test)
+
+**Placement** — The coordinator's ruling on one Finding, one of five: *this ticket* (an edit, the
+child makes it and reports in its receipt), *queued* (a diagnosis, see Queued), *deferred* (to a
+pending ticket of this Run that already owns the area, through the Driver), *dropped* (no one
+acts on it), and *opened* (a ticket that leaves this Run, for work outside this feature
+altogether). *Queued* is the ordinary way a finding becomes a ticket; *opened* is the exception.
+A question is answered and a finding is placed: every escalation still receives its ruling, and a
+placement is never the answer to a question. A finding that shares a cause or an area with a
+queued ticket not yet launched is *deferred* to it, so one diagnosis covers them.
+_Avoid_: follow-up, action item
+
+**Queued** — A ticket the coordinator opens during a Run that the Run itself takes on: it is
+appended as a trailing Wave, one Wave per queued ticket in queue order, so its child starts from
+the code the Waves before it merged. That child is a **diagnosing child**: it triages the ticket
+and writes its agent brief first, escalates the brief once for a ruling, then implements from the
+context its own diagnosis built. A queued ticket whose cause an earlier Wave already fixed lands the
+test that proves it and is merged, not failed
+([ADR-0028](adr/0028-a-finding-is-queued-into-the-run-and-diagnosed-by-the-child-that-implements-it.md)).
+_Avoid_: follow-up ticket, re-run, second run
 
 **Bounded read** — The coordinator's file boundary is a kind line. Maintainer-authored judgment
 Markdown is read whole: top-level Markdown in the current staged run; repository ADRs, the
