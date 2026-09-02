@@ -80,9 +80,10 @@ import driver as driver_module  # noqa: E402
 sys.path.insert(0, str(DRIVER.parents[1] / "codex"))
 import codex_bridge as codex_bridge_module  # noqa: E402
 
-# Whatever `resolve_skill_path` would answer for the skill a turn opens on: this suite asserts
-# that a structured item is attached and under which name, never where the plugin is installed.
-SKILL_PATH = pathlib.Path("/installed/plugin/skills/engineering/skill/SKILL.md")
+# Whatever `resolve_skill_path` would answer for the skill a turn opens on. Deliberately not
+# spelled like an installed plugin's own layout: this suite asserts that a structured item is
+# attached and under which name, never where a plugin is installed.
+SKILL_PATH = pathlib.Path("/probe/resolved-skill-document.md")
 
 # The address a restarted coordinator binds: a second socket in a second directory, so a re-anchor
 # that composed one out of the new pid would produce something else and be visible.

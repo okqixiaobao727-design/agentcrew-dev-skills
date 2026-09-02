@@ -55,7 +55,7 @@ Both skills under test are gated: `implement/SKILL.md:4` and `triage/SKILL.md:4`
 | 3b | Codex: same question, given `opening_skill_name` is start-anchored | **It still expands** — the structured item is suppressed, but the core text resolver rescues a *canonical-name* mention. Contradicts the brief | §4 |
 | 4a | Codex follow-up beginning `$implement <path>` injects the skill as a structured item resolved by path | **Yes** — one 611-char `<skill>` block | §4 |
 | 4b | Canonical-name form `$mattpocock-skills:implement` on a follow-up | **The bridge refuses to send it at all** — `BridgeError` before any network call. Contradicts the brief | §4 |
-| 5 | The ruling hook / machine log record the delivered slash-command answer verbatim | **Yes on Codex**, by artefact. **Mechanism only on Claude** — this harness has no Run | §5 |
+| 5 | The ruling hook / machine log record the delivered slash-command answer verbatim | **Yes on Codex**, by artefact. **No on Claude** — closed by observation in #187's Run: the child expands it, the log keeps a placeholder ([#191](https://github.com/okqixiaobao727-design/agentcrew-dev-skills/issues/191)) | §5 |
 | 6 | The bounded-read / red-line guard hooks do not refuse the expanded skill's first actions | **No refusal on Claude.** On Codex the question does not arise — the guards are never installed for a Codex child | §6 |
 
 ## 1. Claude, fact 1: `/implement <path>` as a later turn
@@ -243,20 +243,29 @@ coordinator | 'Ruling: proceed.\n$implement /private/tmp/crew182-scratch/dummy-t
 Note the launch turn is *not* in that log — `log_message` is reached from `cmd_send`
 (`:848`) and from the watch loop (`:929`), not from `cmd_launch`.
 
-**Claude: mechanism identified, not exercised here.** For a Claude child the keys pass no hook, so
-`Loop.deliver` writes the instruction into the log itself via `record_ruling`
-(`driver.py:2809-2820`), recording `keys` and `text` joined by a space, and only after
-`type_into_pane` returned. The minimal harness this spike used has no Run, so no
-`.crew/log.jsonl` was written by it and **no slash-command payload was logged on the Claude
-side**. What *is* shown by artefact is that this Run's own log records a coordinator ruling
-verbatim: `crewtask/72/.crew/log.jsonl` holds `CREW ASK 182 design …` at
-`2026-09-02T15:09:30Z` (role `child`) and `CREW RULING 182 design …` at `2026-09-02T15:10:15Z`
-(role `coordinator`). That the same path carries a slash command unchanged is by inspection of
-`record_ruling`, which does no parsing — but it is not established by observation. A full driver
-run over a scratch Run plan is what would close this row.
+**Claude: no — established by observation, and the answer is negative.** For a Claude child the
+keys pass no hook, so `Loop.deliver` writes the instruction into the log itself via
+`record_ruling` (`driver.py:2809-2820`), recording `keys` and `text` joined by a space, and only
+after `type_into_pane` returned. That last clause is the row: `type_into_pane` did not return.
 
-Confidence: **high** for Codex; **medium** for Claude (code read plus an adjacent artefact, no
-direct observation).
+#187's live acceptance ran the full driver Run this row asked for — a scratch Run under `/tmp`
+on the local tracker, whose queued Claude child was answered with `driver.py answer --text
+'/implement <path>'`. The child's `design` escalation is in that Run's log at
+`2026-09-02T21:13:22Z` (`escalation`, ticket 02), and it received and expanded the ruling: its
+transcript record 99 is a `<command-name>/mattpocock-skills:implement</command-name>` block
+carrying the ticket path, and it went on to implement and complete at `9f25783`. **But the
+`answer` failed the composer check** — `02's instruction remained in the composer at @125` — so
+`record_ruling` never ran, and the only `ruling` line the log holds for that delivery, at
+`2026-09-02T21:15:22Z`, is the hand-over placeholder. The run report's Rulings section shows the
+same. So the slash command reached the child and did not reach the log.
+
+Two controls pin it to the slash command rather than to the pane or the timing. Prose typed into
+that same pane two minutes later (`2026-09-02T21:17:07Z`) was recorded verbatim, and
+`$implement <path>` to the Codex child (`2026-09-02T21:24:14Z`) was too. Which of
+`type_into_pane`'s two `Enter` presses is at fault is not established here; that is
+[#191](https://github.com/okqixiaobao727-design/agentcrew-dev-skills/issues/191).
+
+Confidence: **high** for Codex; **high** for Claude, now by direct observation in a Run.
 
 ## 6. Fact 6: do the guard hooks refuse the expanded skill's first actions?
 
@@ -317,13 +326,17 @@ No contradiction with §2 at the newer version. Confidence: **high**.
 
 ## 9. Open questions
 
-- **Does `record_ruling` log a Claude slash-command answer verbatim in a real Run?** Established
-  only by code read (§5). A full driver run over a scratch Run plan would settle it.
+- ~~**Does `record_ruling` log a Claude slash-command answer verbatim in a real Run?**~~ Closed by
+  #187's live acceptance, which ran that driver run: it does not, because `type_into_pane` does
+  not return for a slash command (§5). The defect is
+  [#191](https://github.com/okqixiaobao727-design/agentcrew-dev-skills/issues/191).
 - **Does the autocomplete overlay ever alter the submitted text when the command takes no
   argument?** Every Claude probe here ended in a path argument, which closes the popup. A ruling
   that is a bare `/implement` with no argument was not tested.
 - **Is the short-name canonicalisation (§1) guaranteed, or does it depend on the short name being
   unambiguous across installed plugins?** Only one `implement` skill is installed on this machine,
   so ambiguity was never exercised.
-- **`turn_input` and `opening_skill_name` have no test coverage.** No test in the repo exercises
-  either under `send`. Recorded here as a fact, per the ticket's out-of-scope note; not closed.
+- **`opening_skill_name` has no test coverage.** Narrowed by #187: `turn_input` is now exercised
+  under `send` by `DiagnosingChildChainTests.structured_skill_items`, which calls it with
+  `resolve_skill_path` stood in and asserts the structured item a ruling and a queued opening line
+  each produce. `opening_skill_name` is still reached only through it, never directly.
