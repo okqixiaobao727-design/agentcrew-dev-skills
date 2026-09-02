@@ -626,6 +626,21 @@ class RunProjectionTests(unittest.TestCase):
         self.assertFalse(resumed.ended)
         self.assertFalse(resumed.halted)
 
+    def test_a_wave_launched_after_a_final_decision_reopens_the_run_until_it_ends_again(self):
+        """A Wave queued into a Run after it ended is a Run that has not ended after all."""
+        complete = {"event": "advance", "decision": "complete", "wave": 1}
+        launched = {"event": "advance", "decision": "launched", "wave": 2}
+
+        self.assertTrue(machine_log.project([complete]).ended)
+        reopened = machine_log.project([complete, launched])
+        self.assertFalse(reopened.ended)
+        self.assertEqual(reopened.current_wave, 2)
+        self.assertTrue(machine_log.project([
+            complete,
+            launched,
+            {"event": "advance", "decision": "complete", "wave": 2},
+        ]).ended)
+
     def test_a_late_actionable_message_reopens_a_stopped_run_until_it_ends_again(self):
         stopped = {"event": "advance", "decision": "stopped", "wave": 1}
         completion = {

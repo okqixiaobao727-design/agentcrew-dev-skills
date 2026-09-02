@@ -10,6 +10,7 @@ recorded, and the repository's own branch state.
 The fixture itself lives in `harness.py`, beside this file; here are only the tests.
 """
 
+import dataclasses
 import fcntl
 import json
 import os
@@ -1311,6 +1312,7 @@ class LaunchTests(DriverTestCase):
         public_layout = {
             "wave-table.json", "log.jsonl", "launch", "parked-paths",
             "bounded_read.py", "dashboard-window", "dashboard-window.lock", "machine_log.py",
+            driver_module.TABLE_NAME + driver_module.LOCK_SUFFIX,
             DRIVER_RECORD,
         }
         private_control_layout = {
@@ -3088,6 +3090,251 @@ class LoopTests(DriverTestCase):
             self.assertEqual(
                 os.path.realpath(call["cwd"]), os.path.realpath(self.fixture.crew_worktree)
             )
+
+
+# One held read-modify-write of a run's wave table, run as a process of its own: the second
+# writer in the concurrency the hold exists for, so the test can stand where the first one is.
+HELD_APPEND = """
+import dataclasses, pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
+import driver
+
+with driver.edit_plan(pathlib.Path(sys.argv[2])) as edit:
+    edit.write(edit.plan.append(dataclasses.replace(
+        edit.plan.tickets[0],
+        id=sys.argv[3],
+        title="diagnosis " + sys.argv[3],
+        blocked_by=(),
+        path=sys.argv[4],
+        queued=driver.run_plan.Queued("01", "cause"),
+    )))
+"""
+
+
+class AppendedWaveTests(DriverTestCase):
+    """A Run that grows while it runs: a Wave appended to the plan is launched like any other.
+
+    The append is made through the Run plan's own `append` contract against the table on disk,
+    which is what `driver.py queue` does from a process of its own. What these drive is therefore
+    the Driver's reading of a plan that changed under it, not the queue command that changed it.
+    """
+
+    def start(self, *tickets):
+        """A run of those tickets with its first wave up and its loop running."""
+        for number, blockers in tickets:
+            self.fixture.ticket(number, f"thing {number}", blocked_by=blockers)
+        self.fixture.commit_feature()
+        process = self.fixture.launch()
+        for number, blockers in tickets:
+            if blockers:
+                continue
+            self.assertTrue(
+                self.fixture.wait_for(
+                    lambda number=number: self.fixture.verified_launch(number) is not None
+                ),
+                f"{number} never launched",
+            )
+        return process
+
+    def append(self, number, source="01", open_word="cause"):
+        """Append one queued Wave carrying `number` to the run's table; returns its ticket.
+
+        The routing is the first planned ticket's, because none of these is about routing: what
+        makes this row a queued one is the `Queued` fact and the trailing Wave `append` puts it in.
+        """
+        title = f"diagnosis {number}"
+        self.fixture.ticket(number, title)
+        path = self.fixture.run_dir / "wave-table.json"
+        plan = run_plan.load(path)
+        plan.append(dataclasses.replace(
+            plan.tickets[0],
+            id=number,
+            title=title,
+            blocked_by=(),
+            path=str(self.fixture.feature_dir / f"{number}.md"),
+            queued=run_plan.Queued(source, open_word),
+        )).write(path)
+        return number
+
+    def decisions(self):
+        """Every advance decision the run's log holds, as `(wave, decision)` in order."""
+        return [(str(record["wave"]), record["decision"]) for record in self.events("advance")]
+
+    def await_launch(self, ticket, complaint):
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch(ticket) is not None),
+            complaint,
+        )
+
+    def test_a_wave_appended_under_the_last_one_is_activated_and_the_run_does_not_complete(self):
+        process = self.start(("01", ()))
+
+        self.append("02")
+        self.fixture.completes("01")
+
+        self.await_launch("02", "the appended wave never launched")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: ("2", "launched") in self.decisions()),
+            "the appended wave was never recorded as launched",
+        )
+        self.assertNotIn(
+            ("1", "complete"), self.decisions(), "the run completed over an appended Wave"
+        )
+        self.fixture.completes("02")
+        self.woken(process, "run-complete")
+        self.assertEqual(self.decisions(), [("2", "launched"), ("2", "complete")])
+        self.assertEqual([self.verdict("01"), self.verdict("02")], ["completed", "completed"])
+        # The appended ticket reaches the report through the same three sections every other one
+        # does: the plan the report is rendered from is the plan the Wave was appended to.
+        report = (self.fixture.feature_dir / REPORT_NAME).read_text()
+        self.assertIn("| 02 | diagnosis 02 | completed |", report)
+        durations = report.split("## Durations", 1)[1].split("## ", 1)[0]
+        self.assertRegex(durations, r"(?m)^\| 02 \| tdd \|.*\| completed \|")
+        cost = report.split("## Cost", 1)[1]
+        self.assertIn("02", cost)
+
+    def test_a_wave_appended_mid_run_is_activated_after_the_wave_before_it_lands(self):
+        process = self.start(("01", ()), ("02", ("01",)))
+
+        self.append("03")
+        self.fixture.completes("01")
+
+        self.await_launch("02", "the run never advanced to wave 2")
+        self.assertIsNone(
+            self.fixture.verified_launch("03"), "the appended wave launched out of turn"
+        )
+        self.fixture.completes("02")
+        self.await_launch("03", "the appended wave never launched")
+        self.fixture.completes("03")
+        self.woken(process, "run-complete")
+        self.assertEqual(
+            self.decisions(), [("2", "launched"), ("3", "launched"), ("3", "complete")]
+        )
+
+    def test_a_wave_appended_after_the_run_completed_is_adopted_from_the_plan_alone(self):
+        finished = self.start(("01", ()))
+        self.fixture.completes("01")
+        self.woken(finished, "run-complete")
+        self.assertEqual(self.decisions(), [("1", "complete")])
+
+        self.append("02")
+        adopted = self.fixture.launch()
+
+        self.await_launch("02", "the appended wave was never adopted")
+        self.fixture.completes("02")
+        self.woken(adopted, "run-complete")
+        # The adopted Wave records the same `launched` commit point every other Wave does, which
+        # is what takes the Run's `ended` fact back off the `complete` it was left on.
+        self.assertEqual(
+            self.decisions(), [("1", "complete"), ("2", "launched"), ("2", "complete")]
+        )
+        self.assertEqual(self.verdict("02"), "completed")
+
+    def test_a_coordinator_handover_carries_the_appended_wave_through_its_table_write(self):
+        driver = self.start(("01", ()))
+        self.append("02")
+
+        handover = subprocess.Popen(
+            [
+                sys.executable, str(LAUNCH), str(self.fixture.feature_dir),
+                "--coordinator-name", "crew-coordinator-2a",
+                "--coordinator-pid", "2601",
+                "--coordinator-session", "7dc60d75-fa21-4d9c-adf2-b4073f60fbb6",
+                "--coordinator-address", RESTARTED_ADDRESS,
+                "--permission-mode", "bypassPermissions",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self.fixture.environment({"TMUX_PANE": "%8"}), cwd=str(self.fixture.repo),
+        )
+        self.fixture.running.append(handover)
+        self.assertTrue(
+            self.fixture.wait_for(
+                lambda: self.fixture.table()["run"]["coordinator_address"] == RESTARTED_ADDRESS
+            ),
+            "the live Driver never serviced the Coordinator handover",
+        )
+
+        waves = self.fixture.table()["waves"]
+        self.assertEqual(
+            [[ticket["id"] for ticket in wave["tickets"]] for wave in waves], [["01"], ["02"]],
+            "the handover's table write dropped the appended Wave",
+        )
+        self.fixture.completes("01")
+        self.await_launch("02", "the appended wave never launched after the handover")
+
+
+    def test_a_queued_wave_a_halt_blocked_is_not_launched_by_the_run_that_adopts_it(self):
+        """The halt that blocked it is the coordinator's to rule on, not this Driver's to pass."""
+        process = self.start(("01", ()))
+        self.append("02")
+        self.fixture.says("01", "CREW PARKED features/demo/checklist-01.md")
+        self.woken(process, "run-complete")
+        self.assertEqual(self.verdict("02"), "blocked")
+        launches = len(self.fixture.launches())
+
+        result = self.fixture.start()
+
+        self.assertEqual(self.snapshot(result)["reason"], "run-complete")
+        self.assertEqual(
+            len(self.fixture.launches()), launches, "a blocked queued Wave was launched"
+        )
+
+    def test_a_crash_after_the_adopted_wave_activated_is_adopted_again_without_relaunching(self):
+        finished = self.start(("01", ()))
+        self.fixture.completes("01")
+        self.woken(finished, "run-complete")
+        self.append("02")
+        adopted = self.fixture.launch()
+        self.await_launch("02", "the appended wave was never adopted")
+        adopted.kill()
+        adopted.communicate()
+        launches = len(self.fixture.launches())
+
+        resumed = self.fixture.launch()
+
+        self.fixture.completes("02")
+        self.woken(resumed, "run-complete")
+        self.assertEqual(
+            len(self.fixture.launches()), launches, "the adopted wave was dispatched twice"
+        )
+        self.assertEqual(self.verdict("02"), "completed")
+
+    def test_the_table_hold_covers_the_read_so_neither_whole_table_write_is_lost(self):
+        """The second writer loads only once the first has written, so it appends to that write."""
+        driver = self.start(("01", ()))
+        driver.kill()
+        driver.communicate()
+        table = self.fixture.run_dir / "wave-table.json"
+        self.fixture.ticket("02", "diagnosis 02")
+        held = (self.fixture.run_dir / "wave-table.json.lock").open("a+")
+        self.addCleanup(held.close)
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+
+        appending = subprocess.Popen(
+            [
+                sys.executable, "-c", HELD_APPEND, str(DRIVER), str(table),
+                "02", str(self.fixture.feature_dir / "02.md"),
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.fixture.running.append(appending)
+        self.assertFalse(
+            self.fixture.wait_for(lambda: appending.poll() is not None, timeout=2.0),
+            "the second writer did not wait for the hold",
+        )
+        document = json.loads(table.read_text())
+        document["run"]["coordinator_address"] = RESTARTED_ADDRESS
+        table.write_text(json.dumps(document, indent=2) + "\n")
+        fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+
+        out, errors = appending.communicate(timeout=30)
+        self.assertEqual(appending.returncode, 0, out + errors)
+        written = self.fixture.table()
+        self.assertEqual(written["run"]["coordinator_address"], RESTARTED_ADDRESS)
+        self.assertEqual(
+            [[ticket["id"] for ticket in wave["tickets"]] for wave in written["waves"]],
+            [["01"], ["02"]],
+        )
 
 
 class DriverLifecycleTests(DriverTestCase):

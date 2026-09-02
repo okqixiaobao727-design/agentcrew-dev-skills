@@ -299,6 +299,10 @@ def project(records):
             if decision in FINAL_DECISIONS:
                 ended = True
             if decision == "launched":
+                # A Wave launched after a final decision is a Run that has not ended after all:
+                # the Run grew, and the latest decision is the one that says where it stands. The
+                # walk is in log order, so a later `complete` says it has ended again.
+                ended = False
                 try:
                     current_wave = int(record.get("wave"))
                 except (TypeError, ValueError):

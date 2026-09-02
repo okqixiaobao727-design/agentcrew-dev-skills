@@ -7,6 +7,7 @@ Assertions are on external behaviour only — the frame the dashboard window dra
 was asked to display, the verdict line, the log lines that follow it, and the exit code.
 """
 
+import dataclasses
 import datetime
 import hashlib
 import importlib.util
@@ -115,6 +116,8 @@ WAVES = {1: ("06", "07"), 2: ("08",)}
 # children on two different accounts, and the Codex child whose lane has no account at all.
 MIXED_WAVE = ("06", "07", "08")
 MIXED_WAVES = {1: MIXED_WAVE}
+# The title of the diagnosis a queued Wave appends to the plan while the run is running.
+QUEUED_TITLE = "Queued diagnosis"
 REVIEW_TS = "2026-08-13T09:10:00Z"
 REVIEW_ELAPSED = "00:02:31"
 REVIEW_LANE = "codex gpt-5.6-sol"
@@ -1168,6 +1171,62 @@ class DashboardTests(MonitorTestCase):
             row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
             row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
         ]))
+
+    def append_queued(self, number, title, source="06", open_word="cause"):
+        """Append one queued Wave carrying `number`, through the plan contract `queue` uses.
+
+        The routing is the first planned ticket's: nothing here is about routing, and what makes
+        the row a queued one is the `Queued` fact and the trailing Wave `append` puts it in.
+        """
+        run_plan = MONITOR_MODULE.run_plan
+        plan = run_plan.load(self.fixture.table_path)
+        plan.append(dataclasses.replace(
+            plan.tickets[0],
+            id=number,
+            title=title,
+            blocked_by=(),
+            path=str(self.fixture.root / f"{number}.md"),
+            queued=run_plan.Queued(source, open_word),
+        )).write(self.fixture.table_path)
+
+    def test_a_wave_appended_to_the_plan_is_drawn_pending_in_its_own_wave(self):
+        """The appended ticket has no record in the machine log, so the row is the plan's alone."""
+        self.launch_wave_one()
+        self.fixture.live({"06": "busy", "07": "busy"})
+        self.append_queued("09", QUEUED_TITLE)
+
+        result = self.fixture.dashboard()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(frame(result.stdout), "\n".join([
+            f"crew {RUN_ID} — wave 1/3 · pending=2 running=2 · elapsed {LIVE_ELAPSED}",
+            header(),
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            row("1", "07", TITLES["07"], CODEX_LANE, "running", LIVE_ELAPSED),
+            row("2", "08", TITLES["08"], CLAUDE_LANE, "pending", NO_ELAPSED),
+            row("3", "09", QUEUED_TITLE, CLAUDE_LANE, "pending", NO_ELAPSED),
+        ]))
+
+    def test_a_run_adopted_onto_a_queued_wave_after_complete_keeps_refreshing(self):
+        """`complete` is not the end while a Wave queued into the run has been launched past it.
+
+        The dashboard holds its last frame for a run that is over, so a run that grew after its
+        final decision has to be a run the log no longer says is over — otherwise the wave that
+        reopened it is drawn once, if at all, and never again.
+        """
+        self.launch_wave_one()
+        self.fixture.worktree("08")
+        self.fixture.launch("08")
+        self.append_queued("09", QUEUED_TITLE)
+        self.fixture.append(NOW_TS, "advance", decision="complete", wave=2)
+        self.fixture.append(NOW_TS, "advance", decision="launched", wave=3)
+        self.fixture.live({"06": "busy", "07": "busy", "08": "busy"})
+
+        self.start_loop()
+
+        drawn = self.await_frames(2)
+        self.assertIn(QUEUED_TITLE, drawn)
+        self.assertIn(row("3", "09", QUEUED_TITLE, CLAUDE_LANE, "pending", NO_ELAPSED), drawn)
 
     def test_an_abnormal_row_explains_its_last_event_and_a_normal_row_stays_quiet(self):
         self.launch_wave_one()
