@@ -319,9 +319,9 @@ says diagnosis. The line between them is the coordinator's judgment, not a size.
 _Avoid_: in scope / out of scope (scope is not the test), small / large (size is not the test)
 
 **Placement** — The coordinator's ruling on one Finding, one of five: *this ticket* (an edit, the
-child makes it and reports in its receipt), *queued* (a diagnosis, see Queued), *deferred* (to a
-pending ticket of this Run that already owns the area, through the Driver), *dropped* (no one
-acts on it), and *opened* (a ticket that leaves this Run, for work outside this feature
+child makes it and reports in its receipt), *queued* (a diagnosis, see Queued), *deferred* (deferred
+to an existing pending ticket of this Run that already owns the area, through the Driver),
+*dropped* (no one acts on it), and *opened* (a ticket that leaves this Run, for work outside this feature
 altogether). *Queued* is the ordinary way a finding becomes a ticket; *opened* is the exception.
 A question is answered and a finding is placed: every escalation still receives its ruling, and a
 placement is never the answer to a question. A finding that shares a cause or an area with a
