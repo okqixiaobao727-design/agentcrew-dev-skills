@@ -113,6 +113,36 @@ executor = "claude"
 model = "claude-opus-5"
 effort = "medium"
 
+# --- Queued tickets ---------------------------------------------------------
+# The routing every ticket a Run queues into itself is opened on. A finding the coordinator rules a
+# *diagnosis* — cause, approach or reach still open — becomes a ticket the Run appends as a
+# trailing Wave, and its child diagnoses before it implements (ADR-0028).
+# No classification session runs mid-Run, so this cell is that classification's standing answer:
+# yours to retarget here, the coordinator's to override per ticket on the queue command.
+#
+# It is one cell rather than a table because the case is always the same one — a ticket whose
+# approach is open, written by a child that just diagnosed it — and it carries a `workflow` on top
+# of the three fields every other cell carries, because nothing upstream chose one. The default is
+# the reviewed workflow at the middle effort, with the shipped cross-vendor Reviewer of the
+# non-core × complex quadrant. `review` is read only on the workflows that carry a Review line
+# (`tdd` and `refactor`) and ignored on the four that carry none.
+#
+# Inherited cell-wise like every cell above: name only the fields you retarget. There is
+# deliberately no `account` key — which subscription pays is not a fact about the kind of work, so
+# a queued ticket names none and runs on the coordinator's own account unless the queue command
+# names one. A file that puts an `account` here stops the run in preflight rather than binding one.
+
+[queued]
+workflow = "tdd"
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+[queued.review]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
 # --- Hooks ------------------------------------------------------------------
 # `command` runs once per child agent at launch, and is empty by default — set it to wire your own
 # notification or session-tracking system to crew launches. `env` adds variables to the child's

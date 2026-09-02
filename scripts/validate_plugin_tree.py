@@ -101,6 +101,16 @@ IMPLEMENTER_CASES = {
 }
 # The reviewer table: the same two axes that chose the implementer.
 REVIEWER_CASES = ("core-complex", "core-routine", "non-core-complex", "non-core-routine")
+# The routing a queued ticket is opened on: one cell, because the case is always the same one
+# (ADR-0028). It carries a `workflow` on top of the three fields every other cell carries, since
+# nothing upstream chose one, and it is resolved field by field, so a project file naming one
+# field inherits the rest. `account` is refused by name rather than as an unknown field: a queued
+# ticket names no account, and the line has to say why. The workflow is checked against the
+# renderer's own templates rather than a list restated here.
+QUEUED = "queued"
+QUEUED_WORKFLOW = "workflow"
+QUEUED_REVIEW = "review"
+QUEUED_ACCOUNT = "account"
 
 CELL_FIELDS = ("executor", "model", "effort")
 EXECUTORS = ("claude", "codex")
@@ -157,6 +167,23 @@ def model_aliases(root, problems):
         return frozenset()
     listed = templates.get("models", {}).get("aliases", [])
     return frozenset(alias.lower() for alias in listed if isinstance(alias, str))
+
+
+def template_workflows(root, problems):
+    """Every workflow the renderer can render, from the templates it renders with.
+
+    Read rather than restated for the same reason the alias list is: the templates own the
+    vocabulary, so a workflow added there is accepted here without a second edit.
+    """
+    try:
+        templates = tomllib.loads((root / SHAPES).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        problems.append(
+            f"{SHAPES}: the workflow list the renderer renders is unreadable: {error}"
+        )
+        return frozenset()
+    listed = templates.get("workflows")
+    return frozenset(listed) if isinstance(listed, dict) else frozenset()
 
 
 def is_alias(model, aliases):
@@ -267,6 +294,24 @@ def check_skills(root, manifest, problems):
             problems.append(f"{SKILLS_DIR}/{path.name}: on disk but absent from {MANIFEST}")
 
 
+def check_routing_field(cell, key, field, label, required, aliases, problems):
+    """One executor/model/effort field of a routing cell, wherever that cell lives.
+
+    A field a cell leaves out is checked only where the cell has to answer it: every cell of the
+    shipped defaults, and any cell whose caller resolves it whole rather than field by field.
+    """
+    value = cell.get(field)
+    if value is None and not required:
+        return
+    if not isinstance(value, str) or not value.strip():
+        problems.append(f"{label}: [{key}] needs a non-empty {field}")
+        return
+    if field == "executor" and value not in EXECUTORS:
+        problems.append(f"{label}: [{key}] executor {value!r} is not one of {EXECUTORS}")
+    if field == "model" and is_alias(value, aliases):
+        problems.append(f"{label}: [{key}] model {value!r} is an alias, not a full model ID")
+
+
 def check_cell(config, key, label, complete, aliases, problems):
     """One vendor/model/effort cell of a model table."""
     cell = config
@@ -277,16 +322,7 @@ def check_cell(config, key, label, complete, aliases, problems):
                 problems.append(f"{label}: missing [{key}]")
             return
     for field in CELL_FIELDS:
-        value = cell.get(field)
-        if not isinstance(value, str) or not value.strip():
-            problems.append(f"{label}: [{key}] needs a non-empty {field}")
-    if isinstance(cell.get("executor"), str) and cell["executor"] not in EXECUTORS:
-        problems.append(
-            f"{label}: [{key}] executor {cell['executor']!r} is not one of {EXECUTORS}"
-        )
-    model = cell.get("model")
-    if isinstance(model, str) and model.strip() and is_alias(model, aliases):
-        problems.append(f"{label}: [{key}] model {model!r} is an alias, not a full model ID")
+        check_routing_field(cell, key, field, label, True, aliases, problems)
     for field in sorted(set(cell) - set(CELL_FIELDS)):
         problems.append(f"{label}: [{key}] carries an unknown field {field!r}")
 
@@ -301,10 +337,13 @@ def check_config(root, problems):
     except OSError as error:
         problems.append(f"{DEFAULT_CONFIG}: unreadable: {error}")
         return
-    check_config_text(text, DEFAULT_CONFIG, True, model_aliases(root, problems), problems)
+    check_config_text(
+        text, DEFAULT_CONFIG, True, model_aliases(root, problems),
+        template_workflows(root, problems), problems,
+    )
 
 
-def check_config_text(text, label, complete, aliases, problems):
+def check_config_text(text, label, complete, aliases, workflows, problems):
     """The config in `text`: every cell answered when `complete`, else only the cells it overrides.
 
     The shipped defaults answer every case, which is what lets a project file inherit the cells it
@@ -319,7 +358,7 @@ def check_config_text(text, label, complete, aliases, problems):
 
     expected = {
         "implementer", "reviewer", "hooks", ACCOUNTS, DASHBOARD, PREFLIGHT, REPAIR, WITNESS,
-        TRACKER,
+        TRACKER, QUEUED,
     }
     for section in sorted(set(config) - expected):
         problems.append(f"{label}: unknown section [{section}]")
@@ -338,6 +377,7 @@ def check_config_text(text, label, complete, aliases, problems):
     for case in REVIEWER_CASES:
         check_cell(config, f"reviewer.{case}", label, complete, aliases, problems)
 
+    check_queued(config, label, complete, aliases, workflows, problems)
     check_hook(config, label, complete, problems)
     check_accounts(config, label, problems)
     check_preflight(config, label, problems)
@@ -347,6 +387,62 @@ def check_config_text(text, label, complete, aliases, problems):
     # config this validates, the shipped defaults and a project file alike.
     check_repair(config, label, aliases, problems)
     check_tracker(config, label, problems)
+
+
+def check_queued(config, label, complete, aliases, workflows, problems):
+    """The `[queued]` cell: the routing every ticket a Run queues into itself is opened on.
+
+    Resolved field by field rather than whole-cell, because the Run plan resolves it that way: a
+    project file that retargets the effort keeps the shipped workflow, executor and model, and a
+    project file that names nothing inherits the cell entire.
+    """
+    queued = config.get(QUEUED)
+    if queued is None:
+        if complete:
+            problems.append(
+                f"{label}: missing [{QUEUED}] — nothing else names the routing a ticket this run"
+                f" queues into itself is opened on"
+            )
+        return
+    if not isinstance(queued, dict):
+        problems.append(f"{label}: [{QUEUED}] must be a table")
+        return
+    if QUEUED_ACCOUNT in queued:
+        problems.append(
+            f"{label}: [{QUEUED}] names an {QUEUED_ACCOUNT!r} — which subscription pays is not a"
+            " fact about the kind of work, so a queued ticket names none and runs on the"
+            " coordinator's own account"
+        )
+    known = {QUEUED_WORKFLOW, *CELL_FIELDS, QUEUED_REVIEW, QUEUED_ACCOUNT}
+    for field in sorted(set(queued) - known):
+        problems.append(f"{label}: [{QUEUED}] carries an unknown field {field!r}")
+    workflow = queued.get(QUEUED_WORKFLOW)
+    if workflow is not None or complete:
+        if not isinstance(workflow, str) or not workflow.strip():
+            problems.append(f"{label}: [{QUEUED}] needs a non-empty {QUEUED_WORKFLOW}")
+        elif workflow not in workflows:
+            problems.append(
+                f"{label}: [{QUEUED}] {QUEUED_WORKFLOW} {workflow!r} is not one of"
+                f" {tuple(sorted(workflows))}"
+            )
+    for field in CELL_FIELDS:
+        check_routing_field(queued, QUEUED, field, label, complete, aliases, problems)
+
+    key = f"{QUEUED}.{QUEUED_REVIEW}"
+    review = queued.get(QUEUED_REVIEW)
+    if review is None:
+        if complete:
+            problems.append(
+                f"{label}: missing [{key}] — the shipped queued workflow carries a review lane"
+            )
+        return
+    if not isinstance(review, dict):
+        problems.append(f"{label}: [{key}] must be a table")
+        return
+    for field in sorted(set(review) - set(CELL_FIELDS)):
+        problems.append(f"{label}: [{key}] carries an unknown field {field!r}")
+    for field in CELL_FIELDS:
+        check_routing_field(review, key, field, label, complete, aliases, problems)
 
 
 def check_witness(config, label, complete, aliases, problems):
@@ -546,7 +642,10 @@ def validate_project_config(path):
         return [f"{label}: missing"]
     except OSError as error:
         return [f"{label}: unreadable: {error}"]
-    check_config_text(text, label, False, model_aliases(PLUGIN_ROOT, problems), problems)
+    check_config_text(
+        text, label, False, model_aliases(PLUGIN_ROOT, problems),
+        template_workflows(PLUGIN_ROOT, problems), problems,
+    )
     return problems
 
 
