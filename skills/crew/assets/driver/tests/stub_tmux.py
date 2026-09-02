@@ -172,6 +172,21 @@ def linger_reads():
     return int(path.read_text().strip()) if path.exists() else 0
 
 
+def flickers_clear():
+    """Whether this one `capture-pane` reads clear on a composer that still holds its line.
+
+    Claude Code repaints the composer row while the child works, so a capture served between the
+    clear and the rewrite shows an empty row for one frame. The driver samples that row tens of
+    times per delivery, so a single clear read is not evidence of a submit; this knob is how a
+    test puts one such frame in the middle of a delivery that has to be retried.
+    """
+    path = state_dir() / "tmux-flicker-clear-once"
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
 def send_keys(argv):
     """Keys sent as a command are run; keys sent literally are typed and nothing else.
 
@@ -271,6 +286,8 @@ def serve_one_command():
                 del window["lingering"]
                 window["composer"] = ""
             save_windows(table)
+        if flickers_clear():
+            composer = ""
         print(f"❯ {composer.splitlines()[-1] if composer else ''}".rstrip())
         return 0
     if command == "display-message" and "-p" in argv:

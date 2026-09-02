@@ -376,6 +376,12 @@ MONITOR_STOP_SECONDS = 5.0
 # inside it (#191).
 COMPOSER_CLEAR_SECONDS = 1.0
 COMPOSER_POLL_SECONDS = 0.03
+# How many consecutive reads must find the composer clear before the line counts as submitted.
+# Claude Code repaints that row while the child works, so a capture served between the clear and
+# the rewrite reads clear for one frame; polling samples the row tens of times where the old check
+# sampled it once, and a single frame is no longer evidence. Two consecutive reads cost one poll
+# interval and keep a dropped Enter from being recorded as a delivery.
+COMPOSER_CLEAR_READS = 2
 
 ADVANCE_ESCALATED_EXIT = 1
 ADVANCE_INTERRUPTED_EXIT = 130
@@ -778,16 +784,35 @@ def type_into_pane(window, text, unreachable, stuck):
 def composer_clears(window, text):
     """Whether the typed line leaves the composer within `COMPOSER_CLEAR_SECONDS`.
 
-    Polled rather than read once: a line that has left the composer at any point in that window
-    was submitted, and only a line still standing at the deadline is a delivery to retry.
+    Polled rather than read once, and settled on `COMPOSER_CLEAR_READS` consecutive clear reads
+    rather than the first: the wait is what stops a slow submit being called a failure, and the
+    consecutive reads are what stop the repaint frame between a clear and a rewrite being called a
+    success. Only a line still standing at the deadline is a delivery to retry.
     """
+    if typed_tail(text) is None:
+        # Nothing was typed that a composer check can look for, so `composer_holds` answers the
+        # same on every read: polling could only spend the deadline to reach the decision the
+        # first read already made.
+        return False
     deadline = time.monotonic() + COMPOSER_CLEAR_SECONDS
+    cleared = 0
     while True:
-        if not composer_holds(window, text):
+        cleared = 0 if composer_holds(window, text) else cleared + 1
+        if cleared >= COMPOSER_CLEAR_READS:
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(COMPOSER_POLL_SECONDS)
+
+
+def typed_tail(text):
+    """The last non-blank line of what was typed — the one a composer check looks for, or None.
+
+    None is text that gives a composer check nothing to find: every read of the pane answers it
+    the same way, whatever the composer is holding.
+    """
+    typed = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return typed[-1] if typed else None
 
 
 def composer_holds(window, text):
@@ -804,11 +829,11 @@ def composer_holds(window, text):
         ["capture-pane", "-p", "-J", "-t", window, "-S", "0", "-E", cursor_y],
         f"the composer in {window} could not be read",
     )
-    typed_lines = [typed.rstrip() for typed in text.splitlines() if typed.strip()]
-    if not typed_lines:
+    tail = typed_tail(text)
+    if tail is None:
         return True
     cursor_line = line.splitlines()[-1] if line.splitlines() else ""
-    return typed_lines[-1] in cursor_line
+    return tail in cursor_line
 
 
 def notice_windows(session):

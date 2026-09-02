@@ -4565,6 +4565,64 @@ class AnswerTests(DriverTestCase):
     def test_whitespace_text_cannot_be_recorded_when_submission_is_not_observable(self):
         self.assert_blank_text_is_not_recorded("   ")
 
+    def test_blank_text_is_decided_without_polling_a_composer_check_that_cannot_change(self):
+        """A composer check needs a line to look for, and blank text gives it none.
+
+        `composer_holds` answers `True` on every read for text with no non-blank line, so polling
+        it can only spend the whole deadline twice over to reach the decision the first read
+        already made. The two Enters and the refusal are unchanged; what is asserted here is that
+        no composer was read at all.
+        """
+        self.start()
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        captures_before = len([
+            call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["capture-pane"]
+        ])
+
+        result = self.answer("--text", "   ")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 2)
+        self.assertEqual(
+            len([
+                call for call in self.fixture.tmux_calls()
+                if call["argv"][:1] == ["capture-pane"]
+            ]),
+            captures_before,
+        )
+
+    def test_one_flickering_clear_read_does_not_record_a_ruling_the_child_never_got(self):
+        """The inverse of #191: a delivery recorded as made when the composer still holds it.
+
+        Claude Code repaints the composer row while the child works, so a `capture-pane` served
+        between the clear and the rewrite reads as "not holding" for one frame. Polling samples
+        that row tens of times where the old code sampled it once, so a single clear read is no
+        longer evidence of a submit: the line must be gone from two consecutive reads. Here the
+        `Enter` is dropped outright and one read in the middle flickers clear — the delivery has
+        to be retried, not recorded.
+        """
+        self.start()
+        text = "Continue with the verified completion"
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-drop-enter-once").touch()
+        (self.fixture.stub_dir / "tmux-flicker-clear-once").touch()
+
+        result = self.answer("--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 2)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], text)
+
     def test_a_slash_ruling_that_lingers_in_the_composer_is_recorded_on_the_first_enter(self):
         self.start()
         text = "/implement /tmp/feature/02.md"
