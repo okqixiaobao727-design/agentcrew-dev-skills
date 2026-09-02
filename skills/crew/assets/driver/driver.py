@@ -4338,14 +4338,63 @@ def queued_summary(loop, identifier):
     ])
 
 
+def queued_placement(finding, identifier, open_word):
+    """The placement line the source child is given for one queued ticket."""
+    return f"{finding}{QUEUED_MARKER}#{identifier} (open: {open_word})"
+
+
+def queued_placed_already(records, source, identifier, open_word):
+    """Whether this run's log already holds the ruling that placed that queued ticket.
+
+    The `queued` line says a ticket was opened; only a `ruling` says the child that raised the
+    finding was told where it went. `deliver` trims the line it composes, so the tail is what is
+    matched rather than the whole message.
+    """
+    tail = f"{QUEUED_MARKER}#{identifier} (open: {open_word})"
+    return any(
+        record.get("event") == "ruling"
+        and str(record.get("ticket") or "") == source
+        and str(record.get("message") or "").rstrip().endswith(tail)
+        for record in records
+    )
+
+
+def queued_staged_path(loop, feature_dir, identifier, locator):
+    """Where the queued ticket's own file is: the local tracker's ticket, or the staged github one.
+
+    Reconstructed rather than remembered, so a retry that skips the tracker still knows the path
+    the first attempt wrote. The local tracker's locator *is* that path; on github the ticket is
+    staged beside the run's other tickets under the issue number.
+    """
+    if loop.run.tracker == TRACKER_LOCAL and locator:
+        return pathlib.Path(locator)
+    return feature_dir / f"{identifier}.md"
+
+
 def run_queue(args):
     """Open one diagnosis at the run's tracker, append it to the Run, and deliver its placement.
 
-    The order is the one that makes a failure recoverable: everything refusable is refused before
-    the tracker is touched, the tracker is written first because it is the only writer here that
-    cannot be rolled back, and the plan, the log and the child follow it. A tracker failure
-    therefore leaves a run exactly as it found it, and a crash after the ticket was opened is
-    caught on the retry by **create**'s own title-and-body idempotency.
+    The order is the one that makes a failure recoverable, and every step after the first is
+    idempotent against what is already on disk, because a crash can land between any two of them:
+
+    1. Everything refusable is refused before the tracker is touched — the open word, the finding,
+       the title, the source, and the whole routing, which `run_plan.queued_routing` now holds to
+       exactly what an approved Wave table passes. A `--effort` the table would reject used to
+       open a real ticket and fail at the append, orphaning it.
+    2. The tracker is written first, because it is the only writer here that cannot be rolled
+       back, and a crash after it is caught by **create**'s own title-and-body idempotency.
+    3. The `queued` log line follows, before the plan append, because it is this command's
+       idempotency key: the identifier and locator it carries are what a retry resumes from
+       instead of recomputing a body the source child's later escalations would have changed.
+    4. The plan append and the placement delivery come last, each guarded by its own read of what
+       is on disk rather than by the log line alone. A retry appends only a ticket the plan does
+       not carry, and delivers only a placement no `ruling` holds — so a delivery that failed
+       after the log line was written is re-delivered rather than reported as a success nobody
+       received.
+
+    One window remains open, and no ordering closes it: a crash between the tracker create and the
+    `queued` line leaves an issue this run has no record of. **create**'s idempotency covers it
+    for an identical body, which is every retry the source child did not escalate again inside.
     """
     open_word = args.open
     if open_word not in run_plan.OPEN_WORDS:
@@ -4369,77 +4418,88 @@ def run_queue(args):
         raise DriverError(
             f"{source} has no recorded child in {loop.log}", ticket=source, pointer=str(loop.log)
         )
-    held = queued_already(records, source, finding)
-    if held is not None:
-        print(queued_summary(loop, str(held.get("ticket") or "")), flush=True)
-        return 0
 
     routing = queued_ticket_routing(loop, args)
     binding = queued_binding(loop, args.account)
-    body = queued_body(
-        source, finding,
-        queued_pointers(records, source, finding, launch.get("worktree") or loop.run.repo_root),
-        queued_routing_section(routing, args.account, source, open_word),
-    )
     feature_dir = run_dir.parent
-    try:
-        created, locator = tracker.create(
-            loop.run.tracker, title, body,
-            role_label=pickup_label(routing.workflow),
-            # Where the ticket is placed: the run directory itself on the local tracker, whose
-            # ticket file is the file a run reads, and the repository on github, which is the whole
-            # of how `gh` knows which repository it is talking to.
-            directory=feature_dir if loop.run.tracker == TRACKER_LOCAL else loop.repo_root,
-        )
-    except tracker.TrackerError as error:
-        raise DriverError(str(error), ticket=source, pointer=str(loop.table_path)) from error
 
-    identifier = str(created["id"])
-    path = (
-        pathlib.Path(created["path"]) if created.get("path")
-        else feature_dir / f"{identifier}.md"
-    )
-    if not created.get("path"):
-        staged = run_plan.staged_text(loop.run.tracker, title, body, created.get("url"))
+    held = queued_already(records, source, finding)
+    if held is None:
+        body = queued_body(
+            source, finding,
+            queued_pointers(records, source, finding, launch.get("worktree") or loop.run.repo_root),
+            queued_routing_section(routing, args.account, source, open_word),
+        )
         try:
-            path.write_text(staged, encoding="utf-8")
-        except OSError as error:
-            raise DriverError(
-                f"the queued ticket {identifier} could not be written to {path}: {error}",
-                ticket=identifier, pointer=str(path),
-            ) from error
+            created, locator = tracker.create(
+                loop.run.tracker, title, body,
+                role_label=pickup_label(routing.workflow),
+                # Where the ticket is placed: the run directory itself on the local tracker, whose
+                # ticket file is the file a run reads, and the repository on github, which is the
+                # whole of how `gh` knows which repository it is talking to.
+                directory=feature_dir if loop.run.tracker == TRACKER_LOCAL else loop.repo_root,
+            )
+        except tracker.TrackerError as error:
+            raise DriverError(str(error), ticket=source, pointer=str(loop.table_path)) from error
+        identifier = str(created["id"])
+        path = (
+            pathlib.Path(created["path"]) if created.get("path")
+            else feature_dir / f"{identifier}.md"
+        )
+        if not created.get("path"):
+            staged = run_plan.staged_text(loop.run.tracker, title, body, created.get("url"))
+            try:
+                path.write_text(staged, encoding="utf-8")
+            except OSError as error:
+                raise DriverError(
+                    f"the queued ticket {identifier} could not be written to {path}: {error}",
+                    ticket=identifier, pointer=str(path),
+                ) from error
+        run_command(
+            [
+                sys.executable, MACHINE_LOG, "--log", loop.log, "queued",
+                "--ticket", identifier, "--source", source, "--open", open_word,
+                "--locator", locator, "--finding", finding,
+            ],
+            f"the queued ticket {identifier} could not be recorded",
+            ticket=identifier, pointer=str(loop.log),
+        )
+        records = loop.records()
+    else:
+        identifier = str(held.get("ticket") or "")
+        path = queued_staged_path(
+            loop, feature_dir, identifier, str(held.get("locator") or "")
+        )
+
     # Under the same hold the live Driver's handover takes, and over the read as well as the
     # write: the plan appended to is the plan on disk at this moment, not the one this process
-    # loaded when it started, so neither writer can lose the other's whole-table write.
+    # loaded when it started, so neither writer can lose the other's whole-table write. The read
+    # is also what makes the append idempotent — a plan that already carries this ticket is left
+    # exactly as it is, so a resumed queue cannot list it twice.
     try:
         with edit_plan(loop.table_path) as edit:
-            plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
-                id=identifier,
-                title=title,
-                path=str(path),
-                workflow=routing.workflow,
-                executor=routing.executor,
-                model=routing.model,
-                effort=routing.effort,
-                binding=binding,
-                review=routing.review,
-                queued=run_plan.Queued(source, open_word),
-            )))
+            if any(ticket.id == identifier for ticket in edit.plan.tickets):
+                plan = edit.plan
+            else:
+                plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
+                    id=identifier,
+                    title=title,
+                    path=str(path),
+                    workflow=routing.workflow,
+                    executor=routing.executor,
+                    model=routing.model,
+                    effort=routing.effort,
+                    binding=binding,
+                    review=routing.review,
+                    queued=run_plan.Queued(source, open_word),
+                )))
     except run_plan.RunPlanError as error:
         raise DriverError(
             str(error), ticket=identifier, pointer=str(loop.table_path)
         ) from error
     loop.plan = plan
-    run_command(
-        [
-            sys.executable, MACHINE_LOG, "--log", loop.log, "queued",
-            "--ticket", identifier, "--source", source, "--open", open_word,
-            "--locator", locator, "--finding", finding,
-        ],
-        f"the queued ticket {identifier} could not be recorded",
-        ticket=identifier, pointer=str(loop.log),
-    )
-    loop.deliver(source, launch, f"{finding} — queued #{identifier} (open: {open_word})")
+    if not queued_placed_already(records, source, identifier, open_word):
+        loop.deliver(source, launch, queued_placement(finding, identifier, open_word))
     print(queued_summary(loop, identifier), flush=True)
     return 0
 

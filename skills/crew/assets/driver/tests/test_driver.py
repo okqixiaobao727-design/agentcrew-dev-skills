@@ -4122,6 +4122,18 @@ class QueueTests(DriverTestCase):
             call for call in self.fixture.gh_calls() if call["argv"][:2] == ["issue", "create"]
         ]
 
+    def planned_tickets(self):
+        return [
+            ticket for wave in self.fixture.table()["waves"] for ticket in wave["tickets"]
+        ]
+
+    def drop_appended_wave(self):
+        """Take the last Wave back off the table, as a crash before the append leaves it."""
+        path = self.fixture.run_dir / "wave-table.json"
+        table = json.loads(path.read_text())
+        table["waves"] = table["waves"][:-1]
+        path.write_text(json.dumps(table, indent=2) + "\n")
+
     def appended(self):
         """The one ticket of the Wave the plan now ends on."""
         waves = self.fixture.table()["waves"]
@@ -4358,6 +4370,111 @@ class QueueTests(DriverTestCase):
         self.assertEqual(
             self.typed_lines()[-1], f"{QUEUE_FINDING} — queued #02 (open: reach)"
         )
+
+    def test_a_routing_the_wave_table_would_reject_is_refused_before_the_tracker(self):
+        """The overrides reach the `[queued]` cell, so the cell is held to the table's own words.
+
+        A routing the table rejects used to resolve, open a real tracker ticket, and only then
+        fail at the append — leaving the issue orphaned, and a retry with the corrected field
+        opening a second one, because the corrected routing changes the body **create** matches on.
+        """
+        self.start()
+        before_table = self.fixture.table()
+        before_log = self.fixture.log_records()
+
+        for override, detail in (
+            (("--effort", "hihg"), "Effort `hihg` is outside"),
+            (("--executor", "gemini"), "Executor `gemini` is outside"),
+            (("--model", "opus"), "Model `opus` is an alias"),
+            (("--workflow", "diagnose"), "Workflow `diagnose` is outside"),
+        ):
+            with self.subTest(override=override):
+                result = self.queue_finding(*override)
+
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                snapshot = self.snapshot(result)
+                self.assertEqual(snapshot["reason"], "driver-error")
+                self.assertIn(detail, snapshot["detail"])
+
+        self.assertEqual(self.creates(), [])
+        self.assertEqual(self.fixture.issues(), {"01": mock.ANY})
+        self.assertEqual(self.fixture.table(), before_table)
+        self.assertEqual(self.fixture.log_records(), before_log)
+
+    def test_a_queue_resumed_after_the_log_line_appends_the_plan_it_never_reached(self):
+        """The crash window between the `queued` line and the plan append.
+
+        The log line is this command's idempotency key and is written first, so the state a crash
+        leaves is a run whose log says a ticket was opened and whose plan does not carry it. The
+        retry has to finish that append, not read the log line and report success.
+        """
+        self.start()
+        first = self.queue_finding()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        number, _ = self.opened_issue()
+        self.drop_appended_wave()
+        self.assertNotIn(number, [ticket["id"] for ticket in self.planned_tickets()])
+
+        second = self.queue_finding()
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(len(self.creates()), 1)
+        self.assertEqual(len(self.events("queued", ticket=number)), 1)
+        ticket = self.appended()
+        self.assertEqual(ticket["id"], number)
+        self.assertEqual(ticket["queued"], {"source": "01", "open": "cause"})
+        self.assertIn(f"#{number}", second.stdout)
+
+    def test_a_placement_that_never_reached_the_child_is_delivered_on_the_retry(self):
+        """The crash window between the `queued` line and the delivery.
+
+        A dead pane fails the delivery after the ticket is opened, recorded and appended. The
+        retry used to match the `queued` line, print the summary and return 0 — so the coordinator
+        read success while the source child was still blocked, never told where its finding went.
+        """
+        self.start()
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+
+        failed = self.queue_finding()
+
+        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
+        number, _ = self.opened_issue()
+        self.assertEqual(len(self.events("queued", ticket=number)), 1)
+        placement = f"{QUEUE_FINDING} — queued #{number} (open: cause)"
+        # The escalation's own hand-over ruling stands; what no ruling says is where the finding
+        # went, which is the whole of what the source child is waiting on.
+        self.assertEqual(
+            [
+                event for event in self.events("ruling", ticket="01")
+                if event["message"] == placement
+            ],
+            [],
+        )
+
+        (self.fixture.stub_dir / "tmux-ignore-enter").unlink()
+        retried = self.queue_finding()
+
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(len(self.creates()), 1)
+        self.assertEqual(len(self.events("queued", ticket=number)), 1)
+        self.assertEqual(self.typed_lines()[-1], placement)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement)
+
+    def test_a_queue_fully_on_disk_delivers_nothing_a_second_time(self):
+        """The other side of the two disk reads: a complete queue is left exactly as it is."""
+        self.start()
+        first = self.queue_finding()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        table_after = self.fixture.table()
+        log_after = self.fixture.log_records()
+        typed_after = len(self.typed_lines())
+
+        second = self.queue_finding()
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.fixture.table(), table_after)
+        self.assertEqual(self.fixture.log_records(), log_after)
+        self.assertEqual(len(self.typed_lines()), typed_after)
 
     def test_a_source_outside_the_plan_is_refused_without_effects(self):
         self.start()

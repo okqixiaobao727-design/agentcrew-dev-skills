@@ -336,6 +336,54 @@ def _routing_vocabulary():
     }
 
 
+def routing_faults(workflow, executor, model, effort, vocabulary=None):
+    """Every fault in one ticket's four routing fields, in the Wave table's own words.
+
+    The single place those four are judged, so a routing resolved anywhere else — the `[queued]`
+    cell a coordinator queues a diagnosis on (ADR-0028) — is held to exactly what an approved
+    table passes, and is refused in the same words. `vocabulary` is the `_routing_vocabulary`
+    pair, passed in by a caller validating a whole table so the templates are read once.
+    """
+    workflows, aliases = vocabulary if vocabulary is not None else _routing_vocabulary()
+    faults = []
+    if workflow not in workflows:
+        faults.append(f"Workflow `{workflow}` is outside {', '.join(sorted(workflows))}")
+    if executor not in EXECUTORS:
+        faults.append(f"Executor `{executor}` is outside {', '.join(EXECUTORS)}")
+    if effort not in EFFORTS:
+        faults.append(f"Effort `{effort}` is outside {', '.join(EFFORTS)}")
+    fault = _alias_problem("Model", model, aliases)
+    if fault:
+        faults.append(fault)
+    return faults
+
+
+def review_faults(workflow, review, vocabulary=None):
+    """Every fault in one ticket's review lane against its workflow, in the same words."""
+    workflows, aliases = vocabulary if vocabulary is not None else _routing_vocabulary()
+    wants_lane = bool(workflow in workflows and workflows[workflow]["review_lane"])
+    if wants_lane and review is None:
+        return ["lacks Review, which its workflow requires"]
+    if review is None:
+        return []
+    if not wants_lane:
+        return [f"carries a Review, which workflow `{workflow}` takes none of"]
+    if not isinstance(review, ReviewLane):
+        return ["Review is not a review lane"]
+    faults = []
+    if review.vendor not in REVIEW_VENDORS:
+        faults.append(f"Review vendor `{review.vendor}` is outside {', '.join(REVIEW_VENDORS)}")
+    if not review.model:
+        faults.append("Review lacks model")
+    else:
+        fault = _alias_problem("Review model", review.model, aliases)
+        if fault:
+            faults.append(fault)
+    if review.effort not in EFFORTS:
+        faults.append(f"Review effort `{review.effort}` is outside {', '.join(EFFORTS)}")
+    return faults
+
+
 def model_problem(label, value):
     """Why one configured model is not a full model identifier, or None when it is."""
     _, aliases = _routing_vocabulary()
@@ -390,7 +438,7 @@ def _validation_problems(plan, check_wave_layout=True):
         plan.run.witness_budget_usd,
         plan.run.tracker,
     )
-    workflows, aliases = _routing_vocabulary()
+    vocabulary = _routing_vocabulary()
     numbers = [wave.number for wave in plan.waves]
     expected_numbers = list(range(1, len(plan.waves) + 1))
     if numbers != expected_numbers:
@@ -423,17 +471,9 @@ def _validation_problems(plan, check_wave_layout=True):
         if ticket.id in seen:
             faults.append("is listed twice")
         seen.add(ticket.id)
-        if ticket.workflow not in workflows:
-            faults.append(
-                f"Workflow `{ticket.workflow}` is outside {', '.join(sorted(workflows))}"
-            )
-        if ticket.executor not in EXECUTORS:
-            faults.append(f"Executor `{ticket.executor}` is outside {', '.join(EXECUTORS)}")
-        if ticket.effort not in EFFORTS:
-            faults.append(f"Effort `{ticket.effort}` is outside {', '.join(EFFORTS)}")
-        fault = _alias_problem("Model", ticket.model, aliases)
-        if fault:
-            faults.append(fault)
+        faults.extend(routing_faults(
+            ticket.workflow, ticket.executor, ticket.model, ticket.effort, vocabulary
+        ))
         binding = ticket.binding
         if not isinstance(binding, accounts.Binding):
             faults.append("lacks Account binding")
@@ -448,31 +488,7 @@ def _validation_problems(plan, check_wave_layout=True):
                 faults.append(
                     f"Account mode `{binding.mode}` is outside {', '.join(ACCOUNT_MODES)}"
                 )
-        wants_lane = bool(
-            ticket.workflow in workflows and workflows[ticket.workflow]["review_lane"]
-        )
-        if wants_lane and ticket.review is None:
-            faults.append("lacks Review, which its workflow requires")
-        elif ticket.review is not None and not wants_lane:
-            faults.append(f"carries a Review, which workflow `{ticket.workflow}` takes none of")
-        elif ticket.review is not None and not isinstance(ticket.review, ReviewLane):
-            faults.append("Review is not a review lane")
-        elif ticket.review is not None:
-            review = ticket.review
-            if review.vendor not in REVIEW_VENDORS:
-                faults.append(
-                    f"Review vendor `{review.vendor}` is outside {', '.join(REVIEW_VENDORS)}"
-                )
-            if not review.model:
-                faults.append("Review lacks model")
-            else:
-                fault = _alias_problem("Review model", review.model, aliases)
-                if fault:
-                    faults.append(fault)
-            if review.effort not in EFFORTS:
-                faults.append(
-                    f"Review effort `{review.effort}` is outside {', '.join(EFFORTS)}"
-                )
+        faults.extend(review_faults(ticket.workflow, ticket.review, vocabulary))
         if ticket.queued is not None:
             if not isinstance(ticket.queued, Queued):
                 faults.append("Queued is not a queued fact")
@@ -592,6 +608,11 @@ def queued_defaults():
     return queued
 
 
+def _queued_problems(faults):
+    """The validator's own fault text, said of the `[queued]` cell that resolved to it."""
+    return [f"queued: [{QUEUED_SECTION}] {fault}" for fault in faults]
+
+
 def _queued_field(cell, key, label):
     value = cell.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -633,13 +654,21 @@ def queued_routing(project_cell):
     resolved = {
         key: _queued_field(cell, key, QUEUED_SECTION) for key in QUEUED_FIELDS
     }
-    workflows, _ = _routing_vocabulary()
+    vocabulary = _routing_vocabulary()
+    workflows, _ = vocabulary
+    # Held to exactly what an approved Wave table passes, in the table's own words, and held here
+    # rather than at the append: the coordinator's `--effort`, `--executor` and `--model`
+    # overrides reach this cell, and everything refusable must be refused before `queue` opens a
+    # tracker ticket that no failure afterwards can take back.
+    faults = routing_faults(
+        resolved["workflow"], resolved["executor"], resolved["model"], resolved["effort"],
+        vocabulary,
+    )
     shape = workflows.get(resolved["workflow"])
     if shape is None:
-        raise RunPlanError([
-            f"queued: [{QUEUED_SECTION}] workflow `{resolved['workflow']}` is outside"
-            f" {', '.join(sorted(workflows))}"
-        ])
+        # Without a shape there is no saying whether a lane is owed, so this is as far as one
+        # resolution goes; the workflow fault is already in hand.
+        raise RunPlanError(_queued_problems(faults))
     review = None
     if shape["review_lane"]:
         lanes = []
@@ -662,6 +691,9 @@ def queued_routing(project_cell):
             _queued_field(lane, "model", label),
             _queued_field(lane, "effort", label),
         )
+    faults += review_faults(resolved["workflow"], review, vocabulary)
+    if faults:
+        raise RunPlanError(_queued_problems(faults))
     return QueuedRouting(review=review, **resolved)
 
 

@@ -879,6 +879,29 @@ class RunPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(run_plan.RunPlanError, "`account`"):
             run_plan.queued_routing({"account": "second"})
 
+    def test_queued_routing_holds_every_field_to_what_an_approved_table_passes(self):
+        """The resolved cell is a routing the Wave table accepts, refused in the table's words.
+
+        `queue`'s `--workflow/--executor/--model/--effort` overrides go into this cell, and the
+        tracker ticket is opened on the resolved value. A field only the append would have caught
+        opened a real ticket and then failed, orphaning it, so each is judged here — by the same
+        `routing_faults` an approved table is judged by, which is what keeps the two in step.
+        """
+        for cell, expected in (
+            ({"effort": "hihg"}, "Effort `hihg` is outside low, medium, high"),
+            ({"executor": "gemini"}, "Executor `gemini` is outside claude, codex"),
+            ({"model": "opus"}, "Model `opus` is an alias"),
+            ({"workflow": "diagnose"}, "Workflow `diagnose` is outside acceptance, direct"),
+            ({"review": {"effort": "hihg"}}, "Review effort `hihg` is outside low, medium, high"),
+            ({"review": {"executor": "gemini"}}, "Review vendor `gemini` is outside claude, codex"),
+        ):
+            with self.subTest(cell=cell):
+                with self.assertRaises(run_plan.RunPlanError) as raised:
+                    run_plan.queued_routing(cell)
+                problem, = raised.exception.problems
+                self.assertTrue(problem.startswith("queued: [queued] "), problem)
+                self.assertIn(expected, problem)
+
     def test_queued_routing_refuses_an_unknown_field_and_a_cell_that_is_not_a_table(self):
         with self.assertRaisesRegex(run_plan.RunPlanError, "budget_usd"):
             run_plan.queued_routing({"budget_usd": 2.0})

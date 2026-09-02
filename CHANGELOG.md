@@ -8,6 +8,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- `driver.py queue` can no longer leave the tracker, the Run plan and the machine log disagreeing
+  after a crash. The `queued` log line is this command's idempotency key, so it is written before
+  the plan append rather than after it, and the two steps that follow it are each guarded by their
+  own read of what is on disk: the plan is appended only where it does not already carry the
+  ticket, and the placement is delivered only where no `ruling` holds it. A queue that crashed
+  between the log line and the append now finishes the append on the retry instead of failing
+  `is listed twice`, and one whose delivery failed re-delivers instead of reporting a success the
+  source child never received. The whole routing — executor, model, effort and the review lane,
+  not the workflow alone — is now held to exactly what an approved Wave table passes, in the
+  table's own words, before the tracker is touched, so a mistyped `--effort` no longer opens an
+  issue it then orphans (#191).
 - A slash-command ruling delivered to a Claude child is recorded in the machine log again.
   `driver.py answer` read the child's composer once, immediately after the `Enter` that submitted
   the instruction, and a Claude composer takes up to about 100ms to clear a slash command — the
