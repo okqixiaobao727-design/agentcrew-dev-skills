@@ -155,5 +155,219 @@ class TrackerCommentTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class TrackerCreateTests(unittest.TestCase):
+    """**create** — open one ticket on either adapter and hand back what the Run plan needs."""
+
+    TITLE = "crew: the advance path drops a halted wave"
+    BODY = "Queued from #45 — open: cause\n\nskills/crew/assets/advance.py:120"
+    ROLE = "ready-for-agent"
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self.tickets = self.root / "crewtask" / "72"
+        self.tickets.mkdir(parents=True)
+
+    @staticmethod
+    def completed(argv, stdout="", stderr="", returncode=0):
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    @staticmethod
+    def look(search=None, limit="100"):
+        """The one issue-listing call create makes per look, recent first and then by search."""
+        arguments = ["gh", "issue", "list", "--state", "open", "--limit", limit,
+                     "--json", "number,title,body,url"]
+        if search is not None:
+            arguments += ["--search", search]
+        return arguments
+
+    def test_github_create_opens_the_issue_with_its_role_label_and_returns_the_ticket(self):
+        locator = "https://github.example.invalid/owner/name/issues/190"
+        results = [
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout=locator + "\n"),
+        ]
+
+        with mock.patch.object(tracker, "_run", side_effect=results) as run:
+            ticket, observed = tracker.create(
+                "github", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.root
+            )
+
+        self.assertEqual(observed, locator)
+        self.assertEqual(ticket, {
+            "id": "190",
+            "title": self.TITLE,
+            "body": self.BODY,
+            "path": None,
+            "url": locator,
+            "repository": str(self.root),
+        })
+        self.assertEqual(run.call_args_list, [
+            mock.call(self.look(), cwd=self.root),
+            mock.call(
+                self.look(f"{self.TITLE} in:title", limit="1000"), cwd=self.root
+            ),
+            mock.call(
+                ["gh", "issue", "create", "--title", self.TITLE, "--body", self.BODY,
+                 "--label", self.ROLE],
+                cwd=self.root,
+            ),
+        ])
+
+    def test_an_identical_open_github_issue_returns_its_locator_without_creating_one(self):
+        locator = "https://github.example.invalid/owner/name/issues/190"
+        held = [
+            {"number": 189, "title": self.TITLE, "body": "another body", "url": "other"},
+            {"number": 190, "title": self.TITLE, "body": self.BODY, "url": locator},
+        ]
+
+        with mock.patch.object(
+            tracker, "_run", return_value=self.completed([], stdout=json.dumps(held))
+        ) as run:
+            ticket, observed = tracker.create(
+                "github", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.root
+            )
+
+        self.assertEqual(observed, locator)
+        self.assertEqual(ticket["id"], "190")
+        run.assert_called_once()
+
+    def test_a_github_create_the_tracker_refuses_names_the_operation(self):
+        results = [
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stderr="could not add label: 'ready-for-agent' not found",
+                           returncode=1),
+        ]
+
+        with mock.patch.object(tracker, "_run", side_effect=results):
+            with self.assertRaisesRegex(tracker.TrackerError, "refused the create"):
+                tracker.create(
+                    "github", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.root
+                )
+
+    def test_the_search_look_is_read_to_githubs_cap_not_the_recent_windows_hundred(self):
+        """The bound on the second look is the platform's number, never one of ours."""
+        results = [
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout="https://github.example.invalid/owner/name/issues/1\n"),
+        ]
+
+        with mock.patch.object(tracker, "_run", side_effect=results) as run:
+            tracker.create(
+                "github", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.root
+            )
+
+        recent, searched = run.call_args_list[0].args[0], run.call_args_list[1].args[0]
+        self.assertEqual(recent[recent.index("--limit") + 1], tracker.GITHUB_RECENT_LOOK)
+        self.assertEqual(searched[searched.index("--limit") + 1], tracker.GITHUB_SEARCH_CAP)
+        self.assertNotEqual(tracker.GITHUB_SEARCH_CAP, tracker.GITHUB_RECENT_LOOK)
+        self.assertNotIn("--search", recent)
+        self.assertIn(f"{self.TITLE} {tracker.GITHUB_TITLE_SEARCH}", searched)
+
+    def test_an_issue_outside_the_recent_window_is_found_by_the_search_look(self):
+        """A ticket old enough to have scrolled out of the list is still not opened twice."""
+        locator = "https://github.example.invalid/owner/name/issues/12"
+        held = [{"number": 12, "title": self.TITLE, "body": self.BODY, "url": locator}]
+        results = [
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout=json.dumps(held)),
+        ]
+
+        with mock.patch.object(tracker, "_run", side_effect=results) as run:
+            ticket, observed = tracker.create(
+                "github", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.root
+            )
+
+        self.assertEqual((ticket["id"], observed), ("12", locator))
+        self.assertEqual(len(run.call_args_list), 2)
+
+    def test_a_github_create_that_returns_no_issue_number_is_refused(self):
+        results = [
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout=json.dumps([])),
+            self.completed([], stdout="opening in browser\n"),
+        ]
+
+        with mock.patch.object(tracker, "_run", side_effect=results):
+            with self.assertRaisesRegex(tracker.TrackerError, "no issue number"):
+                tracker.create(
+                    "github", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.root
+                )
+
+    def test_local_create_writes_the_next_numbered_file_with_its_status_role(self):
+        (self.tickets / "07.md").write_text("# Seventh\n", encoding="utf-8")
+        (self.tickets / "12-slug.md").write_text("# Twelfth\n", encoding="utf-8")
+        (self.tickets / "spec.md").write_text("# Spec\n", encoding="utf-8")
+
+        with mock.patch.object(tracker, "_run") as run:
+            ticket, locator = tracker.create(
+                "local", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.tickets
+            )
+
+        run.assert_not_called()
+        path = self.tickets / "13.md"
+        self.assertEqual(locator, str(path))
+        self.assertEqual(ticket, {
+            "id": "13",
+            "title": self.TITLE,
+            "body": self.BODY,
+            "path": str(path),
+            "url": None,
+            "repository": str(self.tickets),
+        })
+        self.assertEqual(
+            path.read_text(encoding="utf-8"),
+            f"# {self.TITLE}\n\n{self.BODY}\n\nStatus: {self.ROLE}\n",
+        )
+
+    def test_the_first_local_ticket_of_an_empty_directory_is_numbered_one(self):
+        ticket, locator = tracker.create(
+            "local", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.tickets
+        )
+
+        self.assertEqual(ticket["id"], "1")
+        self.assertEqual(locator, str(self.tickets / "1.md"))
+
+    def test_an_identical_local_ticket_is_returned_without_rewriting_the_directory(self):
+        first, locator = tracker.create(
+            "local", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.tickets
+        )
+        path = pathlib.Path(locator)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(self.ROLE, "ready-for-human"),
+            encoding="utf-8",
+        )
+        before = path.read_text(encoding="utf-8")
+
+        again, repeated = tracker.create(
+            "local", self.TITLE, self.BODY, role_label=self.ROLE, directory=self.tickets
+        )
+
+        self.assertEqual(repeated, locator)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual(sorted(p.name for p in self.tickets.iterdir()), ["1.md"])
+
+    def test_invalid_create_facts_are_refused_before_any_tracker_call(self):
+        cases = (
+            ("unknown", self.TITLE, self.BODY, self.ROLE, self.root, "does not support create"),
+            ("github", "  ", self.BODY, self.ROLE, self.root, "title is empty"),
+            ("github", self.TITLE, "\n", self.ROLE, self.root, "body is empty"),
+            ("github", self.TITLE, self.BODY, "triage", self.root, "ready-for-agent"),
+            ("local", self.TITLE, self.BODY, self.ROLE, None, "directory"),
+        )
+
+        with mock.patch.object(tracker, "_run") as run:
+            for kind, title, body, role, directory, detail in cases:
+                with self.subTest(kind=kind, detail=detail):
+                    with self.assertRaisesRegex(tracker.TrackerError, detail):
+                        tracker.create(
+                            kind, title, body, role_label=role, directory=directory
+                        )
+        run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

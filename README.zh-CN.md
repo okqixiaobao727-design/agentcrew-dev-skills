@@ -146,6 +146,33 @@ routine——是固定的产品判断：你配置的是结论，不是决策过�
 | `reviewer.non-core-complex` | `codex` / `gpt-5.6-luna` / `max` |
 | `reviewer.non-core-routine` | `claude` / `claude-opus-5` / `medium` |
 
+### `[queued]`——run 排进自己队列的 ticket 按什么 routing 开出来
+
+被 coordinator 判为 *diagnosis*（cause、approach 或 reach 仍然未定）的 finding，会成为这次 run 追加
+到自己末尾的一个 Wave，那张 ticket 的子 agent 先诊断再实现（ADR-0028）。run 进行中不会再跑一次分类
+会话，所以这个格子就是那次分类的常备答案。它是一个格子而不是一张表，因为 case 永远是同一个；它比上面
+每个格子多带一个 `workflow`，因为上游没有任何环节替它选过。
+
+| 字段 | 回答什么 | 默认值 |
+| --- | --- | --- |
+| `workflow` | 这张 ticket 按六种 workflow 中的哪一种来做 | `tdd` |
+| `executor` | 运行它的厂商 | `claude` |
+| `model` | 完整模型 ID，不能写别名 | `claude-opus-5` |
+| `effort` | 启动时的推理强度 | `medium` |
+| `review` | 它的 review lane 自己的 `executor`、`model` 和 `effort`；只有带 Review 行的两种 workflow 会读，其余四种忽略 | `codex` / `gpt-5.6-luna` / `max` |
+
+这个格子是按字段继承的，不是整格替换：只写你要改掉的字段，其余保持随插件发布的默认值。这里刻意没有
+`account` 键——哪个订阅付钱不是关于活儿性质的事实，所以 queued ticket 不指定账号，跑在 coordinator
+自己的账号上。在这里写 `account` 会让 run 停在 preflight，而不是真的绑定一个账号。
+
+```toml
+[queued]
+effort = "high"
+
+[queued.review]
+effort = "xhigh"
+```
+
 ### `[hooks.on-child-launch]`——唯一的扩展点
 
 两个字段默认都为空；两者都为空意味着子 agent 的启动方式与完全没有 hook 时一模一样。
