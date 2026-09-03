@@ -160,6 +160,33 @@ def kill_window(argv):
     return 0
 
 
+def linger_reads():
+    """How many `capture-pane` reads after an `Enter` still show the submitted line.
+
+    A real Claude Code composer does not clear the instant `Enter` is pressed: the line stands for
+    tens of milliseconds while the submission is processed, and longer for a slash command, whose
+    name is resolved and whose skill body is loaded before the input is cleared. Without this the
+    stub clears on the `Enter` itself and no test can see a driver that decides too early.
+    """
+    path = state_dir() / "tmux-linger-reads"
+    return int(path.read_text().strip()) if path.exists() else 0
+
+
+def flickers_clear():
+    """Whether this one `capture-pane` reads clear on a composer that still holds its line.
+
+    Claude Code repaints the composer row while the child works, so a capture served between the
+    clear and the rewrite shows an empty row for one frame. The driver samples that row tens of
+    times per delivery, so a single clear read is not evidence of a submit; this knob is how a
+    test puts one such frame in the middle of a delivery that has to be retried.
+    """
+    path = state_dir() / "tmux-flicker-clear-once"
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
 def send_keys(argv):
     """Keys sent as a command are run; keys sent literally are typed and nothing else.
 
@@ -200,6 +227,11 @@ def send_keys(argv):
         dropped = state_dir() / "tmux-drop-enter-once"
         if dropped.exists():
             dropped.unlink()
+            return 0
+        lingering = linger_reads()
+        if lingering > 0:
+            table[target]["lingering"] = lingering
+            save_windows(table)
             return 0
         table[target]["composer"] = ""
         save_windows(table)
@@ -244,7 +276,18 @@ def serve_one_command():
         if target not in windows():
             print(f"can't find window: {target}", file=sys.stderr)
             return 1
-        composer = windows()[target].get("composer", "")
+        table = windows()
+        window = table[target]
+        composer = window.get("composer", "")
+        lingering = window.get("lingering", 0)
+        if lingering:
+            window["lingering"] = lingering - 1
+            if window["lingering"] == 0:
+                del window["lingering"]
+                window["composer"] = ""
+            save_windows(table)
+        if flickers_clear():
+            composer = ""
         print(f"❯ {composer.splitlines()[-1] if composer else ''}".rstrip())
         return 0
     if command == "display-message" and "-p" in argv:

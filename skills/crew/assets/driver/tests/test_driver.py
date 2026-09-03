@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 from harness import (
     BASE_BRANCH,
@@ -73,6 +74,16 @@ from harness import (
 
 sys.path.insert(0, str(DRIVER.parent))
 import driver as driver_module  # noqa: E402
+
+# The bridge's own opening-skill resolver: a ruling delivered to a Codex child is a skill
+# invocation only if this is what names the skill in it (#182 fact 4b).
+sys.path.insert(0, str(DRIVER.parents[1] / "codex"))
+import codex_bridge as codex_bridge_module  # noqa: E402
+
+# Whatever `resolve_skill_path` would answer for the skill a turn opens on. Deliberately not
+# spelled like an installed plugin's own layout: this suite asserts that a structured item is
+# attached and under which name, never where a plugin is installed.
+SKILL_PATH = pathlib.Path("/probe/resolved-skill-document.md")
 
 # The address a restarted coordinator binds: a second socket in a second directory, so a re-anchor
 # that composed one out of the new pid would produce something else and be visible.
@@ -3885,6 +3896,175 @@ QUEUE_ESCALATION = (
 QUEUE_POINTERS = ("skills/example.py:12", "docs/glossary.md:8", "#45", "ADR-0028")
 
 
+class DiagnosingChildChainTests(DriverTestCase):
+    """diagnose → ruling → implement, over one queued Wave the Run appended to itself (ADR-0028).
+
+    The variant itself is dispatch's; what these drive is the chain around it — that the queued
+    child the Driver activates opens on `/triage`, that its one `design` escalation reaches the
+    coordinator carrying the brief's pointer, and that `driver.py answer` puts the ticket's own
+    opening line into the channel that child has, recorded in the run's log as it was delivered.
+    """
+
+    BRIEF_POINTER = "https://github.example.invalid/issues/02#issuecomment-7"
+    BRIEF_ASK = (
+        "CREW ASK 02 design — the brief is posted at"
+        f" {BRIEF_POINTER}; cause found, pick marked implement per brief"
+        " — ts=1"
+    )
+
+    def await_launch(self, ticket, complaint):
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch(ticket) is not None),
+            complaint,
+        )
+
+    def append(self, number, source="01", open_word="cause"):
+        """Append one queued Wave carrying `number`, the way `driver.py queue` appends it.
+
+        The routing is the planned ticket's, because none of this is about routing: what makes the
+        row a queued one is the `Queued` fact and the trailing Wave `append` puts it in.
+        """
+        self.fixture.ticket(number, f"diagnosis {number}")
+        path = self.fixture.run_dir / "wave-table.json"
+        plan = run_plan.load(path)
+        plan.append(dataclasses.replace(
+            plan.tickets[0],
+            id=number,
+            title=f"diagnosis {number}",
+            blocked_by=(),
+            path=str(self.fixture.feature_dir / f"{number}.md"),
+            queued=run_plan.Queued(source, open_word),
+        )).write(path)
+        return number
+
+    def start(self, routing=ROUTING):
+        """One planned ticket up and its loop running; the queued Wave is appended onto it."""
+        self.fixture.ticket("01", "thing 01", routing=routing)
+        self.fixture.commit_feature()
+        process = self.fixture.launch(
+            env_overrides={"AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF},
+        )
+        self.await_launch("01", "01 never launched")
+        return process
+
+    def answer(self, text, ticket="02"):
+        environment = self.fixture.environment()
+        environment["CLAUDE_CODE_MESSAGING_SOCKET"] = COORDINATOR_ADDRESS.removeprefix("uds:")
+        return subprocess.run(
+            [
+                sys.executable, str(DRIVER), "answer",
+                "--run-dir", str(self.fixture.run_dir), "--ticket", ticket, "--text", text,
+            ],
+            capture_output=True, text=True, env=environment, cwd=str(self.fixture.repo),
+        )
+
+    def queued_turn(self, routing=ROUTING):
+        """Run the chain to the queued child's launched first turn.
+
+        Returns the run process and that turn's text.
+        """
+        process = self.start(routing=routing)
+        self.append("02")
+        self.fixture.completes("01")
+        self.await_launch("02", "the queued wave never launched")
+        return process, (self.fixture.run_dir / "launch" / "02.turn.txt").read_text()
+
+    def ticket_path(self):
+        return str(self.fixture.feature_dir / "02.md")
+
+    def structured_skill_items(self, message):
+        """Every non-text item the bridge would put in a turn carrying `message`.
+
+        `resolve_skill_path` shells out to the installed Codex plugin, which is not this suite's
+        to depend on, so it is stood in for; what is under test is whether `turn_input` attaches
+        an item at all for this message, and under which name.
+        """
+        with mock.patch.object(
+            codex_bridge_module, "resolve_skill_path", return_value=SKILL_PATH
+        ):
+            items = codex_bridge_module.turn_input("marker", message)
+        return [item for item in items if item.get("type") != "text"]
+
+    def test_a_claude_queued_child_diagnoses_then_is_answered_with_its_own_opening_line(self):
+        process, turn = self.queued_turn()
+        path = self.ticket_path()
+        self.assertTrue(turn.startswith(f"/mattpocock-skills:triage {path}\n"), turn[:200])
+        self.assertIn("1. Diagnose before your first edit.", turn)
+        self.assertIn("/mattpocock-skills:codebase-design", turn)
+
+        self.fixture.says("02", self.BRIEF_ASK)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn(self.BRIEF_POINTER, snapshot["detail"])
+        ruling = f"/implement {path}"
+        window = self.fixture.launch_record("02")["window"]
+        # What a real Claude child does with a slash command: the line stands in the composer for
+        # a while after the `Enter` that submitted it, because the command is resolved and its
+        # skill body loaded before the input clears (#191). A driver that reads once and gives up
+        # loses this ruling from the log while the child goes on to act on it.
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
+
+        result = self.answer(ruling)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-2:], [
+            ["send-keys", "-t", window, "-l", "--", ruling],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        recorded = self.events("ruling", ticket="02")[-1]
+        self.assertEqual(recorded["role"], "coordinator")
+        self.assertEqual(recorded["message"], ruling)
+
+    def test_a_codex_queued_child_is_answered_as_the_next_bridge_turn(self):
+        process, turn = self.queued_turn(routing=CODEX_ROUTING)
+        path = self.ticket_path()
+        self.assertTrue(turn.startswith(f"$triage {path}\n"), turn[:200])
+        self.assertNotIn("$mattpocock-skills:triage", turn)
+        self.assertIn("$mattpocock-skills:codebase-design", turn)
+
+        self.fixture.says("02", self.BRIEF_ASK)
+        snapshot = self.woken(process, "judgment-needed")
+
+        self.assertEqual(snapshot["ticket"], "02")
+        self.assertIn(self.BRIEF_POINTER, snapshot["detail"])
+        ruling = f"$implement {path}"
+
+        result = self.answer(ruling)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sends = [
+            call["argv"] for call in self.fixture.codex_calls() if call["argv"][:1] == ["send"]
+        ]
+        self.assertEqual(sends[-1], [
+            "send",
+            "--state-file", str(self.fixture.run_dir / "codex" / "02.json"),
+            "--machine-log", str(self.fixture.run_dir / "log.jsonl"),
+            "--ticket", "02",
+            "--prompt", ruling,
+        ])
+        self.assertEqual(self.events("ruling", ticket="02")[-1]["message"], ruling)
+        # What makes that prompt a skill invocation rather than prose, asserted against the
+        # function that builds the bridge's turn rather than against the resolver it calls: a
+        # ruling that stopped being given a structured item would still pass the resolver.
+        self.assertEqual(
+            self.structured_skill_items(ruling),
+            [{"type": "skill", "name": "implement", "path": str(SKILL_PATH)}],
+        )
+
+    def test_the_triage_opening_line_a_queued_codex_child_gets_is_injected_as_a_skill(self):
+        _, turn = self.queued_turn(routing=CODEX_ROUTING)
+
+        self.assertEqual(
+            self.structured_skill_items(turn),
+            [{"type": "skill", "name": "triage", "path": str(SKILL_PATH)}],
+        )
+
+
 class QueueTests(DriverTestCase):
     """`driver.py queue`: one finding opened, routed, appended to the Run and delivered back."""
 
@@ -3941,6 +4121,18 @@ class QueueTests(DriverTestCase):
         return [
             call for call in self.fixture.gh_calls() if call["argv"][:2] == ["issue", "create"]
         ]
+
+    def planned_tickets(self):
+        return [
+            ticket for wave in self.fixture.table()["waves"] for ticket in wave["tickets"]
+        ]
+
+    def drop_appended_wave(self):
+        """Take the last Wave back off the table, as a crash before the append leaves it."""
+        path = self.fixture.run_dir / "wave-table.json"
+        table = json.loads(path.read_text())
+        table["waves"] = table["waves"][:-1]
+        path.write_text(json.dumps(table, indent=2) + "\n")
 
     def appended(self):
         """The one ticket of the Wave the plan now ends on."""
@@ -4179,6 +4371,165 @@ class QueueTests(DriverTestCase):
             self.typed_lines()[-1], f"{QUEUE_FINDING} — queued #02 (open: reach)"
         )
 
+    def test_a_routing_the_wave_table_would_reject_is_refused_before_the_tracker(self):
+        """The overrides reach the `[queued]` cell, so the cell is held to the table's own words.
+
+        A routing the table rejects used to resolve, open a real tracker ticket, and only then
+        fail at the append — leaving the issue orphaned, and a retry with the corrected field
+        opening a second one, because the corrected routing changes the body **create** matches on.
+        """
+        self.start()
+        before_table = self.fixture.table()
+        before_log = self.fixture.log_records()
+
+        for override, detail in (
+            (("--effort", "hihg"), "Effort `hihg` is outside"),
+            (("--executor", "gemini"), "Executor `gemini` is outside"),
+            (("--model", "opus"), "Model `opus` is an alias"),
+            (("--workflow", "diagnose"), "Workflow `diagnose` is outside"),
+        ):
+            with self.subTest(override=override):
+                result = self.queue_finding(*override)
+
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                snapshot = self.snapshot(result)
+                self.assertEqual(snapshot["reason"], "driver-error")
+                self.assertIn(detail, snapshot["detail"])
+
+        self.assertEqual(self.creates(), [])
+        self.assertEqual(self.fixture.issues(), {"01": mock.ANY})
+        self.assertEqual(self.fixture.table(), before_table)
+        self.assertEqual(self.fixture.log_records(), before_log)
+
+    def test_a_queue_resumed_after_the_log_line_appends_the_plan_it_never_reached(self):
+        """The crash window between the `queued` line and the plan append.
+
+        The log line is this command's idempotency key and is written first, so the state a crash
+        leaves is a run whose log says a ticket was opened and whose plan does not carry it. The
+        retry has to finish that append, not read the log line and report success.
+        """
+        self.start()
+        first = self.queue_finding()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        number, _ = self.opened_issue()
+        self.drop_appended_wave()
+        self.assertNotIn(number, [ticket["id"] for ticket in self.planned_tickets()])
+
+        second = self.queue_finding()
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(len(self.creates()), 1)
+        self.assertEqual(len(self.events("queued", ticket=number)), 1)
+        ticket = self.appended()
+        self.assertEqual(ticket["id"], number)
+        self.assertEqual(ticket["queued"], {"source": "01", "open": "cause"})
+        self.assertIn(f"#{number}", second.stdout)
+
+    def test_a_placement_that_never_reached_the_child_is_delivered_on_the_retry(self):
+        """The crash window between the `queued` line and the delivery.
+
+        A dead pane fails the delivery after the ticket is opened, recorded and appended. The
+        retry used to match the `queued` line, print the summary and return 0 — so the coordinator
+        read success while the source child was still blocked, never told where its finding went.
+        """
+        self.start()
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+
+        failed = self.queue_finding()
+
+        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
+        number, _ = self.opened_issue()
+        self.assertEqual(len(self.events("queued", ticket=number)), 1)
+        placement = f"{QUEUE_FINDING} — queued #{number} (open: cause)"
+        # The escalation's own hand-over ruling stands; what no ruling says is where the finding
+        # went, which is the whole of what the source child is waiting on.
+        self.assertEqual(
+            [
+                event for event in self.events("ruling", ticket="01")
+                if event["message"] == placement
+            ],
+            [],
+        )
+
+        (self.fixture.stub_dir / "tmux-ignore-enter").unlink()
+        retried = self.queue_finding()
+
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(len(self.creates()), 1)
+        self.assertEqual(len(self.events("queued", ticket=number)), 1)
+        self.assertEqual(self.typed_lines()[-1], placement)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement)
+
+    def test_a_retry_under_a_different_open_word_is_refused_rather_than_merged(self):
+        """The idempotency key is the source and the finding, so the open word must agree.
+
+        `--open` is not a detail of the retry: it is in the tracker body, the `queued` record, the
+        plan's `Queued` fact and the placement the child reads. Resuming under a different word
+        would leave the ticket already opened saying one thing and the plan and the child another,
+        with nothing to say which is the run's. The retry is refused with both words named.
+        """
+        self.start()
+        first = self.queue_finding(open="cause")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        number, _ = self.opened_issue()
+        table_after = self.fixture.table()
+        log_after = self.fixture.log_records()
+
+        second = self.queue_finding(open="reach")
+
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+        snapshot = self.snapshot(second)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn(f"#{number}", snapshot["detail"])
+        self.assertIn("cause", snapshot["detail"])
+        self.assertIn("reach", snapshot["detail"])
+        self.assertEqual(len(self.creates()), 1)
+        self.assertEqual(self.fixture.table(), table_after)
+        self.assertEqual(self.fixture.log_records(), log_after)
+
+    def test_a_resume_is_not_blocked_by_a_queued_cell_that_changed_under_it(self):
+        """Routing is resolved for the ticket being opened, not for the one already open.
+
+        A resume's routing question was settled when the ticket was opened. Resolving the cell
+        before looking for the record meant a project that retargeted `[queued]` in between — or
+        broke it — failed the retry on a question it no longer had to answer, stranding a queue
+        that was one plan append away from complete.
+        """
+        self.start()
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        failed = self.queue_finding()
+        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
+        number, _ = self.opened_issue()
+        config = self.fixture.repo / "agentcrew.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8") + '\n[queued]\neffort = "hihg"\n',
+            encoding="utf-8",
+        )
+        (self.fixture.stub_dir / "tmux-ignore-enter").unlink()
+
+        retried = self.queue_finding()
+
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        placement = f"{QUEUE_FINDING} — queued #{number} (open: cause)"
+        self.assertEqual(self.typed_lines()[-1], placement)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement)
+
+    def test_a_queue_fully_on_disk_delivers_nothing_a_second_time(self):
+        """The other side of the two disk reads: a complete queue is left exactly as it is."""
+        self.start()
+        first = self.queue_finding()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        table_after = self.fixture.table()
+        log_after = self.fixture.log_records()
+        typed_after = len(self.typed_lines())
+
+        second = self.queue_finding()
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.fixture.table(), table_after)
+        self.assertEqual(self.fixture.log_records(), log_after)
+        self.assertEqual(len(self.typed_lines()), typed_after)
+
     def test_a_source_outside_the_plan_is_refused_without_effects(self):
         self.start()
         before_table = self.fixture.table()
@@ -4384,6 +4735,88 @@ class AnswerTests(DriverTestCase):
 
     def test_whitespace_text_cannot_be_recorded_when_submission_is_not_observable(self):
         self.assert_blank_text_is_not_recorded("   ")
+
+    def test_blank_text_is_decided_without_polling_a_composer_check_that_cannot_change(self):
+        """A composer check needs a line to look for, and blank text gives it none.
+
+        `composer_holds` answers `True` on every read for text with no non-blank line, so polling
+        it can only spend the whole deadline twice over to reach the decision the first read
+        already made. The two Enters and the refusal are unchanged; what is asserted here is that
+        no composer was read at all.
+        """
+        self.start()
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        captures_before = len([
+            call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["capture-pane"]
+        ])
+
+        result = self.answer("--text", "   ")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 2)
+        self.assertEqual(
+            len([
+                call for call in self.fixture.tmux_calls()
+                if call["argv"][:1] == ["capture-pane"]
+            ]),
+            captures_before,
+        )
+
+    def test_one_flickering_clear_read_does_not_record_a_ruling_the_child_never_got(self):
+        """The inverse of #191: a delivery recorded as made when the composer still holds it.
+
+        Claude Code repaints the composer row while the child works, so a `capture-pane` served
+        between the clear and the rewrite reads as "not holding" for one frame. Polling samples
+        that row tens of times where the old code sampled it once, so a single clear read is no
+        longer evidence of a submit: the line must be gone from two consecutive reads. Here the
+        `Enter` is dropped outright and one read in the middle flickers clear — the delivery has
+        to be retried, not recorded.
+        """
+        self.start()
+        text = "Continue with the verified completion"
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-drop-enter-once").touch()
+        (self.fixture.stub_dir / "tmux-flicker-clear-once").touch()
+
+        result = self.answer("--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 2)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], text)
+
+    def test_a_slash_ruling_that_lingers_in_the_composer_is_recorded_on_the_first_enter(self):
+        self.start()
+        text = "/implement /tmp/feature/02.md"
+        window = self.fixture.launch_record("01")["window"]
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
+
+        result = self.answer("--text", text)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sent = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+        self.assertEqual(sent[-2:], [
+            ["send-keys", "-t", window, "-l", "--", text],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        enters = [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"] == ["send-keys", "-t", window, "Enter"]
+        ]
+        self.assertEqual(len(enters), 1)
+        self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], text)
 
     def test_text_delivery_retries_one_dropped_enter_before_recording_the_ruling(self):
         self.start()

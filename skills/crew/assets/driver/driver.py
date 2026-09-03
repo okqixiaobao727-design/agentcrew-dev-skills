@@ -369,6 +369,19 @@ DEFAULT_TIMEOUT_SECONDS = 7200.0
 GATE_OUTPUT_LINE_LIMIT = 20
 # How long a monitor asked to stop is given before it is killed.
 MONITOR_STOP_SECONDS = 5.0
+# How long an instruction typed into a child's composer is given to leave it after `Enter`, and
+# how often that is re-read. A Claude composer clears prose in about 20ms but a slash command in
+# up to about 100ms, because the command is resolved and its skill body loaded before the input is
+# cleared; the deadline is a second so a child with a larger context than the probe's still fits
+# inside it (#191).
+COMPOSER_CLEAR_SECONDS = 1.0
+COMPOSER_POLL_SECONDS = 0.03
+# How many consecutive reads must find the composer clear before the line counts as submitted.
+# Claude Code repaints that row while the child works, so a capture served between the clear and
+# the rewrite reads clear for one frame; polling samples the row tens of times where the old check
+# sampled it once, and a single frame is no longer evidence. Two consecutive reads cost one poll
+# interval and keep a dropped Enter from being recorded as a delivery.
+COMPOSER_CLEAR_READS = 2
 
 ADVANCE_ESCALATED_EXIT = 1
 ADVANCE_INTERRUPTED_EXIT = 130
@@ -748,6 +761,13 @@ def type_into_pane(window, text, unreachable, stuck):
     with S-Enter between lines so a multi-line instruction stays one message, and Enter at the
     end. One Enter is retried, because the composer sometimes still holds the line after the
     first; a second that also leaves it standing is `stuck` rather than a message anyone received.
+
+    Each Enter is given `COMPOSER_CLEAR_SECONDS` to empty the composer before it counts as
+    dropped, because a submit is not instantaneous: a slash command stands in the composer for
+    roughly five times as long as prose, since Claude Code resolves the command and loads the
+    skill body before clearing the input. Deciding on a single immediate read lost the whole
+    ruling — the child had received and expanded it, but the driver called the delivery failed and
+    never recorded it (#191).
     """
     lines = text.split("\n")
     for index, line in enumerate(lines):
@@ -756,9 +776,43 @@ def type_into_pane(window, text, unreachable, stuck):
             tmux(["send-keys", "-t", window, "S-Enter"], unreachable)
     for _attempt in range(2):
         tmux(["send-keys", "-t", window, "Enter"], unreachable)
-        if not composer_holds(window, text):
+        if composer_clears(window, text):
             return
     raise DriverError(stuck)
+
+
+def composer_clears(window, text):
+    """Whether the typed line leaves the composer within `COMPOSER_CLEAR_SECONDS`.
+
+    Polled rather than read once, and settled on `COMPOSER_CLEAR_READS` consecutive clear reads
+    rather than the first: the wait is what stops a slow submit being called a failure, and the
+    consecutive reads are what stop the repaint frame between a clear and a rewrite being called a
+    success. Only a line still standing at the deadline is a delivery to retry.
+    """
+    if typed_tail(text) is None:
+        # Nothing was typed that a composer check can look for, so `composer_holds` answers the
+        # same on every read: polling could only spend the deadline to reach the decision the
+        # first read already made.
+        return False
+    deadline = time.monotonic() + COMPOSER_CLEAR_SECONDS
+    cleared = 0
+    while True:
+        cleared = 0 if composer_holds(window, text) else cleared + 1
+        if cleared >= COMPOSER_CLEAR_READS:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(COMPOSER_POLL_SECONDS)
+
+
+def typed_tail(text):
+    """The last non-blank line of what was typed — the one a composer check looks for, or None.
+
+    None is text that gives a composer check nothing to find: every read of the pane answers it
+    the same way, whatever the composer is holding.
+    """
+    typed = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return typed[-1] if typed else None
 
 
 def composer_holds(window, text):
@@ -775,11 +829,11 @@ def composer_holds(window, text):
         ["capture-pane", "-p", "-J", "-t", window, "-S", "0", "-E", cursor_y],
         f"the composer in {window} could not be read",
     )
-    typed_lines = [typed.rstrip() for typed in text.splitlines() if typed.strip()]
-    if not typed_lines:
+    tail = typed_tail(text)
+    if tail is None:
         return True
     cursor_line = line.splitlines()[-1] if line.splitlines() else ""
-    return typed_lines[-1] in cursor_line
+    return tail in cursor_line
 
 
 def notice_windows(session):
@@ -4284,14 +4338,69 @@ def queued_summary(loop, identifier):
     ])
 
 
+def queued_placement(finding, identifier, open_word):
+    """The placement line the source child is given for one queued ticket."""
+    return f"{finding}{QUEUED_MARKER}#{identifier} (open: {open_word})"
+
+
+def queued_placed_already(records, source, identifier, open_word):
+    """Whether this run's log already holds the ruling that placed that queued ticket.
+
+    The `queued` line says a ticket was opened; only a `ruling` says the child that raised the
+    finding was told where it went. `deliver` trims the line it composes, so the tail is what is
+    matched rather than the whole message.
+    """
+    tail = f"{QUEUED_MARKER}#{identifier} (open: {open_word})"
+    return any(
+        record.get("event") == "ruling"
+        and str(record.get("ticket") or "") == source
+        and str(record.get("message") or "").rstrip().endswith(tail)
+        for record in records
+    )
+
+
+def queued_staged_path(loop, feature_dir, identifier, locator):
+    """Where the queued ticket's own file is: the local tracker's ticket, or the staged github one.
+
+    Reconstructed rather than remembered, so a retry that skips the tracker still knows the path
+    the first attempt wrote. The local tracker's locator *is* that path; on github the ticket is
+    staged beside the run's other tickets under the issue number.
+    """
+    if loop.run.tracker == TRACKER_LOCAL and locator:
+        return pathlib.Path(locator)
+    return feature_dir / f"{identifier}.md"
+
+
 def run_queue(args):
     """Open one diagnosis at the run's tracker, append it to the Run, and deliver its placement.
 
-    The order is the one that makes a failure recoverable: everything refusable is refused before
-    the tracker is touched, the tracker is written first because it is the only writer here that
-    cannot be rolled back, and the plan, the log and the child follow it. A tracker failure
-    therefore leaves a run exactly as it found it, and a crash after the ticket was opened is
-    caught on the retry by **create**'s own title-and-body idempotency.
+    The order is the one that makes a failure recoverable: every step after the tracker is
+    idempotent against what the previous one put on disk, because a crash can land between any
+    two of them.
+
+    1. **Refuse before the tracker.** The open word, the finding, the title, the source and the
+       whole routing are judged first, the routing by exactly what an approved Wave table passes
+       — a `--effort` the table rejects would otherwise open a real ticket and then fail at the
+       append, leaving it orphaned. A call matching a recorded queue under a *different* open
+       word is refused here too: the key is the source and the finding alone, while the word is
+       in the ticket, the log, the plan and the line the child reads, so merging the two would
+       leave them disagreeing with nothing to say which is the run's.
+    2. **Open the ticket.** The tracker is the only writer here that cannot be rolled back, so it
+       goes first, and a crash after it is caught by **create**'s title-and-body idempotency.
+    3. **Record it.** The `queued` line is this command's idempotency key, so it lands before the
+       plan append: a retry resumes from the identifier and locator it carries rather than
+       recomputing a body the source child's later escalations would have changed.
+    4. **Append, then place**, each guarded by its own read of disk rather than by the log line.
+       A retry appends only a ticket the plan does not carry and delivers only a placement no
+       `ruling` holds, so a delivery that failed after the log line was written is re-delivered
+       rather than reported as a success nobody received. A resume resolves its routing here and
+       only where the append is owed — that question was settled when the ticket was opened, and
+       asking it again stranded a queue one append from complete under a `[queued]` cell the
+       project had changed in between.
+
+    One window stays open and no ordering closes it: a crash between the create and the `queued`
+    line leaves an issue this run has no record of. **create**'s idempotency covers every retry
+    the source child did not escalate inside.
     """
     open_word = args.open
     if open_word not in run_plan.OPEN_WORDS:
@@ -4315,77 +4424,109 @@ def run_queue(args):
         raise DriverError(
             f"{source} has no recorded child in {loop.log}", ticket=source, pointer=str(loop.log)
         )
+
+    feature_dir = run_dir.parent
     held = queued_already(records, source, finding)
     if held is not None:
-        print(queued_summary(loop, str(held.get("ticket") or "")), flush=True)
-        return 0
-
-    routing = queued_ticket_routing(loop, args)
-    binding = queued_binding(loop, args.account)
-    body = queued_body(
-        source, finding,
-        queued_pointers(records, source, finding, launch.get("worktree") or loop.run.repo_root),
-        queued_routing_section(routing, args.account, source, open_word),
-    )
-    feature_dir = run_dir.parent
-    try:
-        created, locator = tracker.create(
-            loop.run.tracker, title, body,
-            role_label=pickup_label(routing.workflow),
-            # Where the ticket is placed: the run directory itself on the local tracker, whose
-            # ticket file is the file a run reads, and the repository on github, which is the whole
-            # of how `gh` knows which repository it is talking to.
-            directory=feature_dir if loop.run.tracker == TRACKER_LOCAL else loop.repo_root,
-        )
-    except tracker.TrackerError as error:
-        raise DriverError(str(error), ticket=source, pointer=str(loop.table_path)) from error
-
-    identifier = str(created["id"])
-    path = (
-        pathlib.Path(created["path"]) if created.get("path")
-        else feature_dir / f"{identifier}.md"
-    )
-    if not created.get("path"):
-        staged = run_plan.staged_text(loop.run.tracker, title, body, created.get("url"))
-        try:
-            path.write_text(staged, encoding="utf-8")
-        except OSError as error:
+        recorded_open = str(held.get("open") or "")
+        identifier = str(held.get("ticket") or "")
+        if recorded_open != open_word:
             raise DriverError(
-                f"the queued ticket {identifier} could not be written to {path}: {error}",
-                ticket=identifier, pointer=str(path),
-            ) from error
+                f"this finding from {source} is already queued as #{identifier} with open:"
+                f" {recorded_open}, and this call says open: {open_word}. The open word is in the"
+                " ticket that was opened, in this run's log, in the plan and in the line the"
+                f" child reads, so resuming under {open_word} would leave them disagreeing with"
+                " nothing to say which is the run's. Re-run it with --open"
+                f" {recorded_open}, or queue this as a finding of its own.",
+                ticket=source, pointer=str(loop.log),
+            )
+
+    # Resolved for the ticket this call opens, and only then: a resume's routing question was
+    # settled when the ticket was opened, and a `[queued]` cell the project retargeted or broke in
+    # between is no question this call has to answer. Asking it first stranded a queue that was
+    # one plan append away from complete.
+    routing = None
+    binding = None
+    if held is None:
+        routing = queued_ticket_routing(loop, args)
+        binding = queued_binding(loop, args.account)
+        body = queued_body(
+            source, finding,
+            queued_pointers(records, source, finding, launch.get("worktree") or loop.run.repo_root),
+            queued_routing_section(routing, args.account, source, open_word),
+        )
+        try:
+            created, locator = tracker.create(
+                loop.run.tracker, title, body,
+                role_label=pickup_label(routing.workflow),
+                # Where the ticket is placed: the run directory itself on the local tracker, whose
+                # ticket file is the file a run reads, and the repository on github, which is the
+                # whole of how `gh` knows which repository it is talking to.
+                directory=feature_dir if loop.run.tracker == TRACKER_LOCAL else loop.repo_root,
+            )
+        except tracker.TrackerError as error:
+            raise DriverError(str(error), ticket=source, pointer=str(loop.table_path)) from error
+        identifier = str(created["id"])
+        path = (
+            pathlib.Path(created["path"]) if created.get("path")
+            else feature_dir / f"{identifier}.md"
+        )
+        if not created.get("path"):
+            staged = run_plan.staged_text(loop.run.tracker, title, body, created.get("url"))
+            try:
+                path.write_text(staged, encoding="utf-8")
+            except OSError as error:
+                raise DriverError(
+                    f"the queued ticket {identifier} could not be written to {path}: {error}",
+                    ticket=identifier, pointer=str(path),
+                ) from error
+        run_command(
+            [
+                sys.executable, MACHINE_LOG, "--log", loop.log, "queued",
+                "--ticket", identifier, "--source", source, "--open", open_word,
+                "--locator", locator, "--finding", finding,
+            ],
+            f"the queued ticket {identifier} could not be recorded",
+            ticket=identifier, pointer=str(loop.log),
+        )
+        records = loop.records()
+    else:
+        path = queued_staged_path(
+            loop, feature_dir, identifier, str(held.get("locator") or "")
+        )
+
     # Under the same hold the live Driver's handover takes, and over the read as well as the
     # write: the plan appended to is the plan on disk at this moment, not the one this process
-    # loaded when it started, so neither writer can lose the other's whole-table write.
+    # loaded when it started, so neither writer can lose the other's whole-table write. The read
+    # is also what makes the append idempotent — a plan that already carries this ticket is left
+    # exactly as it is, so a resumed queue cannot list it twice.
     try:
         with edit_plan(loop.table_path) as edit:
-            plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
-                id=identifier,
-                title=title,
-                path=str(path),
-                workflow=routing.workflow,
-                executor=routing.executor,
-                model=routing.model,
-                effort=routing.effort,
-                binding=binding,
-                review=routing.review,
-                queued=run_plan.Queued(source, open_word),
-            )))
+            if any(ticket.id == identifier for ticket in edit.plan.tickets):
+                plan = edit.plan
+            else:
+                if routing is None:
+                    routing = queued_ticket_routing(loop, args)
+                    binding = queued_binding(loop, args.account)
+                plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
+                    id=identifier,
+                    title=title,
+                    path=str(path),
+                    workflow=routing.workflow,
+                    executor=routing.executor,
+                    model=routing.model,
+                    effort=routing.effort,
+                    binding=binding,
+                    review=routing.review,
+                    queued=run_plan.Queued(source, open_word),
+                )))
     except run_plan.RunPlanError as error:
         raise DriverError(
             str(error), ticket=identifier, pointer=str(loop.table_path)
         ) from error
     loop.plan = plan
-    run_command(
-        [
-            sys.executable, MACHINE_LOG, "--log", loop.log, "queued",
-            "--ticket", identifier, "--source", source, "--open", open_word,
-            "--locator", locator, "--finding", finding,
-        ],
-        f"the queued ticket {identifier} could not be recorded",
-        ticket=identifier, pointer=str(loop.log),
-    )
-    loop.deliver(source, launch, f"{finding} — queued #{identifier} (open: {open_word})")
+    if not queued_placed_already(records, source, identifier, open_word):
+        loop.deliver(source, launch, queued_placement(finding, identifier, open_word))
     print(queued_summary(loop, identifier), flush=True)
     return 0
 

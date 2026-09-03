@@ -361,6 +361,61 @@ class RunPlanTests(unittest.TestCase):
         table_path.write_text(json.dumps(replacement), encoding="utf-8")
         self.assertEqual(run_plan.load(table_path).ticket("01").title, "Replaced")
 
+    def test_a_write_never_leaves_a_reader_a_half_written_table(self):
+        """The Wave table is a run's sole routing authority, so it is replaced, never truncated.
+
+        The hold `edit_plan` takes is a *separate* `wave-table.json.lock` file, deliberately, so
+        that a process which only reads the plan is never held up by one editing it (#186). That
+        makes every reader unsynchronised against the writer: `advance.py`, `Loop.reload_plan` and
+        `dispatch` all `run_plan.load` with no lock. A `write_text` truncates in place, so a read
+        landing inside it saw an empty or partial file and raised — and a crash mid-write left the
+        table permanently unreadable. A rename is atomic for those readers, and it is exactly the
+        case that separate lock file was chosen for.
+        """
+        self.ticket("01", "Foundation")
+        table_path = self.root / "wave-table.json"
+        built = run_plan.build(self.feature, self.run)
+        built.write(table_path)
+        before = table_path.read_text(encoding="utf-8")
+        inode = table_path.stat().st_ino
+
+        replacement = dataclasses.replace(
+            built, waves=(dataclasses.replace(
+                built.waves[0],
+                tickets=(dataclasses.replace(built.waves[0].tickets[0], title="Replaced"),),
+            ),)
+        )
+        replacement.write(table_path)
+
+        # A rename puts a different file at the name, which is what makes an interleaved read see
+        # one whole table or the other and never a truncated one.
+        self.assertNotEqual(table_path.stat().st_ino, inode)
+        self.assertNotEqual(table_path.read_text(encoding="utf-8"), before)
+        self.assertEqual(run_plan.load(table_path).ticket("01").title, "Replaced")
+        # Nothing of the replacement is left beside the table for the next reader to trip on.
+        self.assertEqual(
+            sorted(path.name for path in self.root.glob("wave-table.json*")),
+            ["wave-table.json"],
+        )
+
+    def test_a_write_that_cannot_be_placed_leaves_the_table_that_was_there(self):
+        """A failed write is not a lost run plan: the temporary file never reaches the name."""
+        self.ticket("01", "Foundation")
+        table_path = self.root / "wave-table.json"
+        built = run_plan.build(self.feature, self.run)
+        built.write(table_path)
+        before = table_path.read_text(encoding="utf-8")
+
+        with mock.patch.object(run_plan.os, "replace", side_effect=OSError("no space")):
+            with self.assertRaisesRegex(run_plan.RunPlanError, "could not be written"):
+                built.write(table_path)
+
+        self.assertEqual(table_path.read_text(encoding="utf-8"), before)
+        self.assertEqual(
+            sorted(path.name for path in self.root.glob("wave-table.json*")),
+            ["wave-table.json"],
+        )
+
     def test_all_review_lane_vendor_combinations_survive_write_load_round_trip(self):
         expected = []
         for number, (executor, reviewer) in enumerate(REVIEW_LANE_MATRIX, start=1):
@@ -878,6 +933,29 @@ class RunPlanTests(unittest.TestCase):
     def test_queued_routing_refuses_a_cell_naming_an_account_by_that_key(self):
         with self.assertRaisesRegex(run_plan.RunPlanError, "`account`"):
             run_plan.queued_routing({"account": "second"})
+
+    def test_queued_routing_holds_every_field_to_what_an_approved_table_passes(self):
+        """The resolved cell is a routing the Wave table accepts, refused in the table's words.
+
+        `queue`'s `--workflow/--executor/--model/--effort` overrides go into this cell, and the
+        tracker ticket is opened on the resolved value. A field only the append would have caught
+        opened a real ticket and then failed, orphaning it, so each is judged here — by the same
+        `routing_faults` an approved table is judged by, which is what keeps the two in step.
+        """
+        for cell, expected in (
+            ({"effort": "hihg"}, "Effort `hihg` is outside low, medium, high"),
+            ({"executor": "gemini"}, "Executor `gemini` is outside claude, codex"),
+            ({"model": "opus"}, "Model `opus` is an alias"),
+            ({"workflow": "diagnose"}, "Workflow `diagnose` is outside acceptance, direct"),
+            ({"review": {"effort": "hihg"}}, "Review effort `hihg` is outside low, medium, high"),
+            ({"review": {"executor": "gemini"}}, "Review vendor `gemini` is outside claude, codex"),
+        ):
+            with self.subTest(cell=cell):
+                with self.assertRaises(run_plan.RunPlanError) as raised:
+                    run_plan.queued_routing(cell)
+                problem, = raised.exception.problems
+                self.assertTrue(problem.startswith("queued: [queued] "), problem)
+                self.assertIn(expected, problem)
 
     def test_queued_routing_refuses_an_unknown_field_and_a_cell_that_is_not_a_table(self):
         with self.assertRaisesRegex(run_plan.RunPlanError, "budget_usd"):
