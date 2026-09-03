@@ -518,6 +518,24 @@ class Fixture:
             check=True, capture_output=True,
         )
 
+    def pauses(self, ticket):
+        """Write what that child's own StopFailure hook writes when its vendor limit is hit."""
+        self.lifecycle(ticket, "pause")
+
+    def resumes(self, ticket):
+        """Write what that child's own Stop hook writes when an ordinary turn of its ends."""
+        self.lifecycle(ticket, "resume")
+
+    def lifecycle(self, ticket, subcommand):
+        """Run one end of the usage-limit pause through the same CLI the child's hook runs."""
+        subprocess.run(
+            [
+                sys.executable, str(MACHINE_LOG), "--log", str(self.run_dir / "log.jsonl"),
+                subcommand, "--ticket", ticket,
+            ],
+            check=True, capture_output=True,
+        )
+
     def completes(self, ticket, text="work\n", name=None):
         """The whole of what a child that finished does: commit the work, send the receipt."""
         self.says(ticket, f"CREW COMPLETE {self.commit_work(ticket, text, name)}")

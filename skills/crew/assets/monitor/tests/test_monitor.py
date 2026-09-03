@@ -1462,6 +1462,40 @@ class DashboardTests(MonitorTestCase):
         self.fixture.append(RULED_TS, "ruling", ticket="06", role="coordinator",
                             to=CHILDREN["06"], message=REWORK_INSTRUCTION)
 
+    def test_a_child_paused_on_its_vendors_usage_limit_is_drawn_paused_not_waiting(self):
+        """`waiting` means a human is needed, and a queued session needs nobody (#190).
+
+        The lane calls it `idle`, exactly as it calls a child that stopped without finishing;
+        only the child's own Machine-log records tell the two apart, so this is the one live word
+        the frame takes from the log rather than from the agents list.
+        """
+        self.launch_wave_one()
+        self.fixture.append(NOW_TS, "paused", ticket="06", role="child")
+        self.fixture.live({"06": "idle", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "paused", LIVE_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertIn("paused=1", result.stdout)
+        self.assertNotIn("waiting", result.stdout)
+
+    def test_a_resumed_child_that_is_still_idle_is_waiting_again(self):
+        self.launch_wave_one()
+        self.fixture.append(NOW_TS, "paused", ticket="06", role="child")
+        self.fixture.append(RULED_TS, "resumed", ticket="06", role="child")
+        self.fixture.live({"06": "idle", "07": "busy"})
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "waiting", LIVE_ELAPSED),
+            frame(result.stdout),
+        )
+        self.assertNotIn("paused", result.stdout)
+
     def test_a_child_reworking_a_semantic_conflict_is_drawn_reworking_rather_than_waiting(self):
         self.rework_sent()
         self.fixture.live({"06": "busy", "07": "busy"})
@@ -1832,6 +1866,16 @@ class ToastTests(MonitorTestCase):
                 "crew 07 stopped without finishing",
             ]),
         )
+
+    def test_a_child_paused_on_a_usage_limit_is_not_toasted_as_one_that_stopped(self):
+        """A toast sends the operator somewhere. Nobody has anywhere to go for a limit reset."""
+        self.launch_wave_one()
+        self.fixture.append(NOW_TS, "paused", ticket="06", role="child")
+        self.fixture.live({"06": "idle", "07": "idle"})
+
+        self.fixture.dashboard()
+
+        self.assertEqual(self.fixture.toasts(), ["crew 07 stopped without finishing"])
 
     def test_a_wave_whose_every_ticket_is_settled_toasts_once(self):
         self.launch_wave_one()

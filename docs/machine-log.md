@@ -63,6 +63,7 @@ class TicketFacts:
     awaiting_receipt: bool
     awaiting_ruling: bool
     outstanding_nudge: bool
+    paused: bool
     merge_result: str | None
     merge_landed: bool
     semantic_conflict_detail: str | None
@@ -117,6 +118,11 @@ re-derive a named projection fact from them.
   receipt claim remains unanswered until a receipt with the claimed SHA or a `CREW RECHECK` naming
   that SHA consumes it; an unrelated receipt, ruling or outcome cannot hide it. Record position
   stays private; callers receive the selected record, not an index.
+- `paused` is true while the latest record the child authored for the ticket is a `paused` one.
+  A `resumed` record, any later message or escalation from the child, and a later `launch` all end
+  it; a ruling and a driver event leave it exactly as it was. A `paused` record also clears
+  `outstanding_nudge`: the turn a standing nudge started ended on the vendor's limit rather than on
+  silence, so the child that comes back from the wait comes back to a fresh one.
 - `current_wave` starts at 1 and follows the last integer-like `advance=launched` record.
 - `ended` is an ordered current fact. `advance=complete|stopped` makes it true; a later protocol
   message that the existing Driver rule table can act on makes it false, and so does a later
@@ -460,6 +466,21 @@ a gap in the log. That covers a transcript the cost pass could not read, a revie
 result carried no counters — a rollout whose figures contradict each other counts as none — and a
 review that never returned a result to read one from at all.
 
+### `paused`, `resumed` — the two ends of a vendor usage-limit wait
+
+`ticket`, `role` (always `child`). Written by the child's own lifecycle hooks below, never by
+hand. A ticket is **paused** exactly while the latest record the child is the author of — these
+two, plus the escalations and messages the SendMessage hook copies — is a `paused` one. So a
+`resumed` record ends the wait, and so does any later word from the child, because a child that
+has escalated or sent a receipt is plainly not waiting any more. A ruling and a driver event say
+nothing about it either way: both are written while a child sleeps as readily as while it works. A
+`launch` ends it too, and is the one thing here that is not the child's own record: the child
+that was waiting is not the child a relaunch put in its place.
+
+Both ends being records, the fact re-derives from the log alone and nothing holds it anywhere
+else, which is what lets a Driver that adopts a run mid-pause read the wait it did not see start
+([ADR-0017](adr/0017-machine-log-owns-run-facts-driver-owns-workflow-policy.md)).
+
 ### `escalation`, `ruling`, `message` — an outgoing message, copied verbatim
 
 Claude messages are written by the SendMessage hook below; Codex turn messages are written by
@@ -509,6 +530,8 @@ machine_log.py --log <path> live-source --lane claude|codex \
 machine_log.py --log <path> monitor-error --monitor NAME --reason TEXT
 machine_log.py --log <path> message --role coordinator|child [--ticket NN] [--to NAME] \
                                     --message TEXT
+machine_log.py --log <path> pause   --ticket NN
+machine_log.py --log <path> resume  --ticket NN
 machine_log.py --log <path> session-cost --ticket NN --executor claude|codex --model ID \
                                     [--lane "VENDOR MODEL"] [--session IDS] \
                                     [--input-tokens N] [--output-tokens N] \
@@ -519,6 +542,10 @@ machine_log.py --log <path> session-cost --ticket NN --executor claude|codex --m
 Each call appends exactly one line and exits 0. A value outside a closed set is a usage error:
 nothing is appended and the exit code is 2, because a log that accepts an unknown verdict is a
 log a later agent cannot trust.
+
+`pause` and `resume` are the two exceptions, because they are hooks rather than script events:
+`resume` appends only while the ticket is paused, and both stay silent and exit 0 when the log
+cannot be written at all, on the same reasoning as [the SendMessage hook](#zero-token-output).
 
 ## The SendMessage hook
 
@@ -625,6 +652,29 @@ nor near miss.
 A child's own `CREW COMPLETE` is a claim about a sha, not a verified receipt, so it is copied in
 as a `message`. Only the script that checked the sha writes a `receipt`, and the log therefore
 carries exactly one per launched ticket.
+
+### The usage-limit hooks
+
+A child install registers two more command hooks in the same settings write, and the coordinator's
+registers neither: a pause is a fact about one child, and the coordinator's install serves every
+child at once and knows no ticket to attribute a wait to.
+
+| Harness event | Matcher | Command | What it does |
+| --- | --- | --- | --- |
+| `StopFailure` | `rate_limit` | `pause --ticket NN` | appends `paused` |
+| `Stop` | — | `resume --ticket NN` | appends `resumed`, but only while the ticket is paused |
+
+Claude Code ends a turn that hit the account's session limit with `StopFailure` carrying the error
+type `rate_limit`, and fires no `Stop` for that turn — the two are exclusive — so the limit is
+the one turn ending the pause hook sees, and every ordinary turn ending is a candidate resume.
+Neither entry carries `--scope`: the message hook needs one because a child's session loads the
+enclosing checkout's settings too and both files register it, while these two live in the child's
+own settings alone.
+
+Each is registered with a timeout of a few seconds, because they run on the way out of a child's
+turn and a child's turn must never wait on this file's bookkeeping. `uninstall` takes them out
+wherever it takes the message hook out, on the same identity — the log the entry writes — and a
+block or event list it empties goes with its only occupant.
 
 ### Zero-token output
 

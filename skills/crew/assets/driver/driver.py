@@ -3398,7 +3398,14 @@ class Loop:
         and is waiting for the answer, and a nudge there asks a child with nothing to report to
         report something — which it honestly answers `CREW PARKED`, settling a ticket whose
         question the coordinator had already answered.
+
+        Nothing is asked of a child paused on its vendor's usage limit either. That child is not
+        silent, it is queued: the harness resumes the session by itself when the limit resets, and
+        a nudge sent into the wait only hits the same limit again a second later, which the old
+        rule read as the second silence and settled `failed` (#190).
         """
+        if facts.paused:
+            return False
         if facts.awaiting_ruling:
             return False
         if facts.instruction_count(RESEND_MARKER):
@@ -3813,6 +3820,19 @@ class Loop:
         self.arm(wave, projection)
         return wave
 
+    def paused_ticket(self, wave):
+        """Return the first live ticket of `wave` waiting on a usage limit, or None for none.
+
+        Asked only when the inactivity deadline has run out, because that is the one moment the
+        answer changes anything and the question costs a whole read of the log.
+        """
+        projection = machine_log.project(self.records())
+        for ticket in self.tickets_of(wave):
+            facts = projection.ticket(ticket.id)
+            if facts.settlement_state == machine_log.LIVE and facts.paused:
+                return ticket.id
+        return None
+
     def run_until_woken(self, wave):
         """Apply the rule table to `wave` onward until it is done or judgment is needed."""
         deadline = time.monotonic() + self.args.timeout
@@ -3824,6 +3844,12 @@ class Loop:
             here = (following, len(self.records()), len(self.monitors))
             if here != seen:
                 seen, deadline = here, time.monotonic() + self.args.timeout
+            elif time.monotonic() >= deadline and self.paused_ticket(following):
+                # A wave holding a child paused on its vendor's usage limit is not a wave doing
+                # nothing: the wait has a known end the harness itself keeps, and it outlasts any
+                # inactivity deadline worth setting for the states that really are stalls. The
+                # deadline runs again from the moment the log says the pause is over.
+                deadline = time.monotonic() + self.args.timeout
             elif time.monotonic() >= deadline:
                 raise DriverError(
                     f"wave {wave} has done nothing for {self.args.timeout:g} seconds, which the"

@@ -2454,6 +2454,169 @@ class LoopTests(DriverTestCase):
 
         self.assertEqual(self.verdict("01"), "completed")
 
+    # --- the vendor usage-limit pause, which is a wait rather than a silence -----------------
+
+    def test_a_launched_childs_settings_carry_its_two_usage_limit_hooks(self):
+        """The records the pause rung reads are written by the child's own session, or by nobody.
+
+        Nothing else in this suite proves the wiring: every other pause test writes the records
+        through the same CLI the hooks run, which says what the CLI does and not that a child was
+        ever given it.
+        """
+        process = self.start(("01", ()))
+        path = self.fixture.worktree("01") / ".claude" / "settings.local.json"
+        log = str(self.fixture.run_dir / "log.jsonl")
+
+        def registered(event, matcher, subcommand):
+            return [
+                hook for block in self.fixture.settings(path).get("hooks", {}).get(event, [])
+                if block.get("matcher") == matcher
+                for hook in block.get("hooks", [])
+                if log in hook.get("command", "")
+                and f" {subcommand} --ticket 01" in hook.get("command", "")
+            ]
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: registered("StopFailure", "rate_limit", "pause")),
+            "the child was never given the hook that records its usage-limit wait",
+        )
+        for event, matcher, subcommand in (
+            ("StopFailure", "rate_limit", "pause"), ("Stop", None, "resume")
+        ):
+            entries = registered(event, matcher, subcommand)
+            self.assertEqual(len(entries), 1, self.fixture.settings(path))
+            self.assertEqual(entries[0]["timeout"], 5)
+
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+    def test_a_paused_child_reported_idle_is_neither_nudged_nor_settled(self):
+        """The wait a usage limit is, told apart from the silence the idle rung exists for.
+
+        Claude Code reports a session queued behind an account's session limit as plain `idle` —
+        there is no other status for it — so the rule table cannot read the difference off the
+        monitor. It reads it off the child's own two records instead (#190).
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.pauses("01")
+        self.fixture.goes("01", "idle")
+        time.sleep(QUIET_SECONDS)
+
+        self.assertEqual(self.instructions("01", "CREW NUDGE"), [])
+        self.assertIsNone(self.verdict("01"))
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+        # The limit resets, the session carries on by itself, and the ticket lands as it always
+        # would have: the pause held the ticket rather than parking the run on it.
+        self.fixture.resumes("01")
+        self.fixture.goes("01", "busy")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_child_nudged_before_it_paused_is_not_failed_on_the_next_idle(self):
+        """The observed failure on run crewtask/72: nudge, limit, idle, `failed` ten seconds on.
+
+        The nudge's own Enter starts a turn that hits the limit again within a second, so the
+        second idle the old rule settled on was the nudge's own doing.
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "idle")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.pauses("01")
+        time.sleep(QUIET_SECONDS)
+
+        self.assertIsNone(self.verdict("01"))
+        self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
+        self.fixture.resumes("01")
+        self.fixture.goes("01", "busy")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_child_nudged_before_it_paused_is_nudged_afresh_once_it_resumes(self):
+        """The whole of run crewtask/72's timeline, and what the rule table owes it at the end.
+
+        The nudge went in, the nudge's own turn hit the limit, and the wait ran to the reset. The
+        silence that nudge was sent into ended with that turn, so the child that comes back is at
+        a new silence and is owed its own nudge — then the failure, if that one goes unanswered
+        too.
+        """
+        process = self.start(("01", ()))
+
+        self.fixture.goes("01", "idle")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        self.fixture.pauses("01")
+        self.fixture.resumes("01")
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.instructions("01", "CREW NUDGE")) == 2),
+            "the silence after the wait was failed on the nudge the limit had swallowed",
+        )
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 2)
+
+    def test_a_receipt_sent_after_a_pause_settles_through_the_existing_path(self):
+        process = self.start(("01", ()))
+
+        self.fixture.pauses("01")
+        self.fixture.goes("01", "idle")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+        self.assertEqual(self.events("receipt", ticket="01")[-1]["verdict"], "landable")
+
+    def test_a_resumed_child_earns_the_one_nudge_and_fails_on_the_silence_after_it(self):
+        """Once the pause is over the ladder is the one it always was, from its first rung."""
+        process = self.start(("01", ()))
+
+        self.fixture.pauses("01")
+        self.fixture.goes("01", "idle")
+        time.sleep(QUIET_SECONDS)
+        self.assertEqual(self.instructions("01", "CREW NUDGE"), [])
+
+        self.fixture.resumes("01")
+        self.wait_for_instruction("01", "CREW NUDGE")
+        self.wait_for_verdict("01", "failed")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(len(self.instructions("01", "CREW NUDGE")), 1)
+
+    def test_a_pause_holds_the_inactivity_deadline_and_a_resume_lets_it_run(self):
+        """A limit wait outlasts any deadline worth setting, and changes nothing the timer reads.
+
+        The wave, the log length and the armed monitors all stand still through it, so a driver
+        that only stopped nudging would still halt the run on this timer a few hours short of the
+        reset. The deadline is held while the projection reports the pause, and runs as it always
+        did once the log says the pause is over.
+        """
+        self.feature(("01", ()))
+        process = self.fixture.launch(extra=("--timeout", "3"))
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
+            "the run never launched its only ticket",
+        )
+
+        self.fixture.pauses("01")
+        time.sleep(8.0)
+        self.assertIsNone(process.poll(), "the paused run halted on the inactivity deadline")
+
+        self.fixture.resumes("01")
+        result = self.fixture.ended(process)
+        snapshot = json.loads(
+            [line for line in result.stdout.splitlines() if line.strip()][-1]
+        )
+
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertIn("nothing", snapshot["detail"])
+
     # --- the escalation, which is never anything but a wake ---------------------------------
 
     def test_a_crew_ask_wakes_the_coordinator_carrying_the_ticket_and_the_ask_itself(self):

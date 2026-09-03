@@ -18,6 +18,7 @@ schema this writes.
                                   message ...
                                                               # a script's own event
     machine_log.py --log <path> hook --role coordinator|child  # a hook, on stdin
+    machine_log.py --log <path> pause|resume --ticket NN       # a child's usage-limit wait
     machine_log.py --log <path> install|uninstall --settings <file> ...  # register it, or not
 
 The hook never speaks on a channel a model reads: it writes nothing to stdout on the happy path,
@@ -53,10 +54,33 @@ SENDER_SOCKET_VARIABLE = "CLAUDE_CODE_MESSAGING_SOCKET"
 ADDRESS_SCHEME = "uds:"
 PRE_TOOL_EVENT = "PreToolUse"
 BOUNDED_TOOLS = "Read|Grep|Glob|Bash"
+# The two harness events that bracket a child's wait on its vendor's usage limit, and the matchers
+# that pick them out. Claude Code ends such a turn with `StopFailure` carrying the error type
+# `rate_limit` and fires no `Stop` for it — the two are exclusive — so the limit is the one turn
+# ending the pause hook sees, and every ordinary turn ending is a candidate resume. `Stop`
+# takes no matcher, and a block written without one is how this file spells that.
+PAUSE_EVENT = "StopFailure"
+PAUSE_MATCHER = "rate_limit"
+RESUME_EVENT = "Stop"
+RESUME_MATCHER = None
+# What a lifecycle hook is given to finish in. It appends one line, so seconds are generous; the
+# point of naming it at all is that a child's turn must never wait on this file's bookkeeping.
+LIFECYCLE_HOOK_TIMEOUT_SECONDS = 5
 # What a registered hook runs, and the subcommand that marks a registration as one of ours.
 PYTHON = "python3"
 HOOK_SUBCOMMAND = "hook"
 GUARD_SUBCOMMAND = "guard"
+PAUSE_SUBCOMMAND = "pause"
+RESUME_SUBCOMMAND = "resume"
+# The whole of what a lifecycle hook is, one row each: the harness event, the matcher that picks it
+# out of that event, and the subcommand that writes its end of the wait. The shape check, the
+# install, the uninstall and the command reader all read this table rather than each carrying the
+# triple, so a third hook is a row here and nothing else.
+LIFECYCLE_HOOKS = (
+    (PAUSE_EVENT, PAUSE_MATCHER, PAUSE_SUBCOMMAND),
+    (RESUME_EVENT, RESUME_MATCHER, RESUME_SUBCOMMAND),
+)
+LIFECYCLE_SUBCOMMANDS = tuple(subcommand for _event, _matcher, subcommand in LIFECYCLE_HOOKS)
 # The name the run's own copy of this script is installed under, beside the log it writes. The
 # copy is what keeps a registered command version-independent: the plugin directory a run installs
 # from carries the version in its path, so an upgrade would leave the entry naming a file that is
@@ -114,6 +138,12 @@ VERB_GRAMMAR = (
         ),
     ),
 )
+
+# The two ends of a vendor usage-limit wait, written by the child's own lifecycle hooks. They are
+# events rather than a state anyone holds: both are in the log, so the answer to "is this child
+# waiting" is a function of log order and survives every restart that reprojects it (ADR-0017).
+PAUSED = "paused"
+RESUMED = "resumed"
 
 LIVE = "live"
 LANDABLE = "landable"
@@ -185,6 +215,7 @@ class TicketFacts:
     awaiting_receipt: bool = False
     awaiting_ruling: bool = False
     outstanding_nudge: bool = False
+    paused: bool = False
     merge_result: str | None = None
     merge_landed: bool = False
     semantic_conflict_detail: str | None = None
@@ -238,6 +269,35 @@ def _current_settlement_epoch(records):
         None,
     )
     return records[relaunched:] if relaunched is not None else records
+
+
+def child_paused(records, ticket):
+    """Return whether this ticket's child is waiting on its vendor's usage limit, per log order.
+
+    A pause is read off the child's own side of the log: the latest record the child is the author
+    of. A `resumed` record ends it, and so does any later word from the child, because a child that
+    has escalated or sent a receipt is plainly not waiting any more. The coordinator's rulings and
+    the driver's own events say nothing about it either way — they are written while a child
+    sleeps as readily as while it works.
+
+    A `launch` ends it too, and is the one thing here that is not the child's own record. The child
+    that was waiting is not the child a relaunch put in its place, and a pause left standing across
+    that boundary would be a ticket the idle rung never touches again.
+
+    Both ends being records, re-projecting the log from scratch reaches the same answer, which is
+    what keeps the Driver from holding any state of its own about the wait (ADR-0017).
+    """
+    paused = False
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if record.get("ticket") is None or str(record["ticket"]) != str(ticket):
+            continue
+        if record.get("event") == "launch":
+            paused = False
+        elif record.get("role") == CHILD:
+            paused = record.get("event") == PAUSED
+    return paused
 
 
 def project(records):
@@ -341,6 +401,12 @@ def project(records):
                 episode["witness"] = None
                 episode["fact_check_running"] = True
             episode["awaiting_ruling"] = False
+            episode["outstanding_nudge"] = False
+        elif event == PAUSED and record.get("role") == CHILD:
+            # The silence a standing nudge addressed is over: the turn it started ended on the
+            # vendor's limit rather than on nothing. So the child that comes back from the wait
+            # comes back to a fresh silence, and earns the one nudge that silence is owed rather
+            # than the failure the swallowed one had already spent.
             episode["outstanding_nudge"] = False
         elif event == "witness":
             pending = episode["unanswered_child_message"]
@@ -471,6 +537,7 @@ def project(records):
             awaiting_receipt=episode.get("awaiting_receipt", False),
             awaiting_ruling=episode.get("awaiting_ruling", False),
             outstanding_nudge=episode.get("outstanding_nudge", False),
+            paused=child_paused(events, ticket),
             merge_result=merge_result,
             merge_landed=merge_result in LANDED_MERGE_RESULTS,
             semantic_conflict_detail=semantic_conflict_detail,
@@ -743,6 +810,35 @@ def run_hook(args):
         return 0
 
 
+def run_pause(args):
+    """Record that this ticket's child is waiting on its vendor's usage limit; returns 0 always.
+
+    Like every hook this file backs, it has no channel a model reads: the turn it fires on has
+    already ended, and a log that could not be written is not a failure to report back into the
+    child's session. It writes nothing and exits 0 instead.
+    """
+    try:
+        append(args.log, entry(PAUSED, ticket=args.ticket, role=CHILD))
+    except OSError:
+        pass
+    return 0
+
+
+def run_resume(args):
+    """Record that this ticket's pause ended, when one was open; returns 0 always.
+
+    Fires at the end of every ordinary turn the child takes, so the condition is the whole of what
+    it does: with no pause open there is nothing to end, and a log of `resumed` records for turns
+    that followed no wait would say a child had been waiting when it had not.
+    """
+    try:
+        if child_paused(read_records(args.log), args.ticket):
+            append(args.log, entry(RESUMED, ticket=args.ticket, role=CHILD))
+    except OSError:
+        pass
+    return 0
+
+
 def run_guard(args):
     """Deny a stale Coordinator before SendMessage can deliver; returns zero for the hook."""
     coordinator_control = _coordinator_control()
@@ -816,6 +912,20 @@ def guard_command(script, log, scope):
         f"{shlex.quote(PYTHON)} {shlex.quote(absolute(script))}"
         f" --log {shlex.quote(absolute(log))} {GUARD_SUBCOMMAND}"
         f" --scope {shlex.quote(absolute(scope))}"
+    )
+
+
+def lifecycle_hook_command(script, log, subcommand, ticket):
+    """The command one end of a usage-limit pause is written by: this script, for that ticket.
+
+    It carries no `--scope`. The message hook needs one because a child's session loads the
+    enclosing checkout's settings too and both files register it; these two are registered in the
+    child's own settings alone, and a session that is not the child's never runs them.
+    """
+    return (
+        f"{shlex.quote(PYTHON)} {shlex.quote(absolute(script))}"
+        f" --log {shlex.quote(absolute(log))}"
+        f" {subcommand} --ticket {shlex.quote(ticket)}"
     )
 
 
@@ -896,6 +1006,7 @@ def settings_shape_is_sound(settings):
         (HOOK_EVENT, MESSAGE_TOOL),
         (PRE_TOOL_EVENT, BOUNDED_TOOLS),
         (PRE_TOOL_EVENT, MESSAGE_TOOL),
+        *((event, matcher) for event, matcher, _subcommand in LIFECYCLE_HOOKS),
     ):
         events = hooks.get(event, [])
         if not isinstance(events, list):
@@ -916,21 +1027,42 @@ def command_log(command):
     taken whole — rather than searched for a substring, because one log's path is a prefix of
     another's the moment a run directory is named after it and a hook nobody installed here must
     never be mistaken for one this script owns.
+
+    `pause` and `resume` are read strictly: in the subcommand slot — the word right after the
+    `--log` argument — and run by a file bearing this script's own name, which is what every copy
+    of it is installed under. Both are ordinary enough words that a stranger's command could carry
+    one in the same position, and claiming a stranger's entry means the next uninstall deletes it.
     """
     try:
         words = shlex.split(command)
     except ValueError:
         return None
-    if not (
-        (HOOK_SUBCOMMAND in words and "--role" in words)
-        or (GUARD_SUBCOMMAND in words and "--scope" in words)
-    ):
-        return None
+    log = None
+    script = None
+    subcommand = None
     for index, word in enumerate(words):
         if word == "--log" and index + 1 < len(words):
-            return absolute(words[index + 1])
-        if word.startswith("--log="):
-            return absolute(word[len("--log="):])
+            log, following = absolute(words[index + 1]), index + 2
+        elif word.startswith("--log="):
+            log, following = absolute(word[len("--log="):]), index + 1
+        else:
+            continue
+        script = words[index - 1] if index else None
+        subcommand = words[following] if following < len(words) else None
+        break
+    if log is None:
+        return None
+    if (HOOK_SUBCOMMAND in words and "--role" in words) or (
+        GUARD_SUBCOMMAND in words and "--scope" in words
+    ):
+        return log
+    if (
+        subcommand in LIFECYCLE_SUBCOMMANDS
+        and "--ticket" in words
+        and script is not None
+        and os.path.basename(script) == SCRIPT_NAME
+    ):
+        return log
     return None
 
 
@@ -972,6 +1104,21 @@ def guard_blocks(settings):
     return [
         block for block in events
         if isinstance(block, dict) and block.get("matcher") == MESSAGE_TOOL
+    ]
+
+
+def lifecycle_blocks(settings, event, matcher):
+    """Return every block of the settings document that claims one lifecycle event's matcher.
+
+    `matcher` is None for `Stop`, which takes none: a block written without the key is the one
+    that claims it, and `get` answers None for exactly those.
+    """
+    events = settings.get("hooks", {}).get(event, [])
+    if not isinstance(events, list):
+        return []
+    return [
+        block for block in events
+        if isinstance(block, dict) and block.get("matcher") == matcher
     ]
 
 
@@ -1053,6 +1200,52 @@ def install_guard_hook(settings, command, log):
     ]
     block["hooks"].append({"type": "command", "command": command})
     return settings
+
+
+def install_lifecycle_hook(settings, event, matcher, command, log):
+    """Return settings with one entry for `log` under that lifecycle event, others preserved.
+
+    Same idempotency as the message hook's install, on the same identity: the log an entry writes
+    is what makes it this run's, so a second install replaces it rather than doubling it. The
+    entry carries its own timeout, because it runs on the way out of a child's turn.
+    """
+    hooks = settings.setdefault("hooks", {})
+    events = hooks.setdefault(event, [])
+    blocks = lifecycle_blocks(settings, event, matcher)
+    if blocks:
+        block = blocks[0]
+    else:
+        block = {"hooks": []} if matcher is None else {"matcher": matcher, "hooks": []}
+        events.append(block)
+    block["hooks"] = [
+        hook for hook in block.get("hooks", []) if not registered_for(hook, log)
+    ]
+    block["hooks"].append({
+        "type": "command", "command": command, "timeout": LIFECYCLE_HOOK_TIMEOUT_SECONDS,
+    })
+    return settings
+
+
+def uninstall_lifecycle_hook(settings, event, matcher, log):
+    """Return whether this run's entry under that lifecycle event was removed.
+
+    A block this empties goes with its only occupant, and an event list this empties goes with its
+    only block: neither registered anything before the install, so neither may outlive it.
+    """
+    removed = False
+    events = settings.get("hooks", {}).get(event, [])
+    for block in lifecycle_blocks(settings, event, matcher):
+        registered = block.get("hooks", [])
+        kept = [hook for hook in registered if not registered_for(hook, log)]
+        if len(kept) == len(registered):
+            continue
+        removed = True
+        block["hooks"] = kept
+        if not kept:
+            events.remove(block)
+    if removed and not events:
+        del settings["hooks"][event]
+    return removed
 
 
 def uninstall_hook(settings, log):
@@ -1183,6 +1376,16 @@ def run_install(args):
     scope = args.scope if args.scope is not None else settings_scope(path)
     command = hook_command(script, args.log, args.role, args.ticket, scope)
     install_hook(settings, command, args.log)
+    if args.ticket is not None:
+        # The pause is a fact about one child, so it is registered only where a ticket names that
+        # child. The coordinator's own install serves every child at once and knows no ticket to
+        # attribute a wait to; its session is not the one that waits, either.
+        for event, matcher, subcommand in LIFECYCLE_HOOKS:
+            install_lifecycle_hook(
+                settings, event, matcher,
+                lifecycle_hook_command(script, args.log, subcommand, args.ticket),
+                args.log,
+            )
     if args.role == COORDINATOR:
         install_guard_hook(settings, guard_command(script, args.log, scope), args.log)
         crew_dir = args.crew_dir
@@ -1222,6 +1425,8 @@ def run_uninstall(args):
     removed = uninstall_hook(settings, args.log)
     removed = uninstall_bounded_hook(settings, args.log) or removed
     removed = uninstall_guard_hook(settings, args.log) or removed
+    for event, matcher, _subcommand in LIFECYCLE_HOOKS:
+        removed = uninstall_lifecycle_hook(settings, event, matcher, args.log) or removed
     if not removed:
         return 0
     return write_settings(path, settings)
@@ -1495,6 +1700,18 @@ def build_parser():
         "--scope",
         help="the directory whose sends this hook copies; anything else is another side's",
     )
+
+    pause = subcommands.add_parser(
+        PAUSE_SUBCOMMAND, help="record that a child is waiting on its vendor's usage limit"
+    )
+    pause.set_defaults(handler=run_pause)
+    pause.add_argument("--ticket", required=True, help="the ticket whose child is waiting")
+
+    resume = subcommands.add_parser(
+        RESUME_SUBCOMMAND, help="record the end of that wait, when one is open"
+    )
+    resume.set_defaults(handler=run_resume)
+    resume.add_argument("--ticket", required=True, help="the ticket whose child ended a turn")
 
     guard = subcommands.add_parser(
         "guard", help="deny a stale Coordinator before SendMessage delivery"
