@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-09-03
+
 ### Added
 - A finding a Run discovers is worked inside that Run instead of leaving it (ADR-0028). Scope no
   longer places a finding; the kind of work does. An *edit* — cause and change site already known
