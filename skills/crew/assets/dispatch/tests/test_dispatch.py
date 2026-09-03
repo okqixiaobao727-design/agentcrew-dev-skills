@@ -27,6 +27,7 @@ DISPATCH = TESTS_DIR.parent / "dispatch.py"
 CREW_SKILL_DIR = TESTS_DIR.parents[2]
 sys.path.insert(0, str(DISPATCH.parent))
 import dispatch as dispatch_module  # noqa: E402
+import run_plan  # noqa: E402
 
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_EFFORT = "medium"
@@ -1330,8 +1331,8 @@ DIAGNOSIS_STEP = (
     " the cause, and post the brief on the ticket, invoking <codebase-design skill> before you"
     " write its approach. Then send one `design` escalation — the brief's pointer, every question"
     " this triage would put to a maintainer, and your pick marked \"implement per brief\" — and"
-    " wait. The ruling arrives as the workflow's own opening line; the workflow below starts"
-    " there. A"
+    " wait. The ruling arrives as the workflow's own opening line, carrying the coordinator's own"
+    " words after it; the workflow below starts there, and those words are its direction. A"
     " cause an earlier ticket of this Run already fixed is still your deliverable: commit the test"
     " that proves it, and complete."
 )
@@ -1453,6 +1454,90 @@ class QueuedChildTests(DispatchTestCase):
         self.assertTrue(prompt.startswith(f"/implement {self.ticket_path()}\n"), prompt[:200])
         self.assertIn(ORDINARY_STEP_ONE, " ".join(prompt.split()))
         self.assertNotIn("triage", prompt)
+
+
+class WorkflowOpeningLineTests(DispatchTestCase):
+    """`workflow_opening_line`: the one line a ruling on a diagnosing child opens with (#195).
+
+    The Driver composes that ruling and asks the shapes library for the line, so what is pinned
+    here is that the library answers for the ticket's own workflow — not the `[queued]` triage
+    line the child opened on — in that child's executor spelling.
+    """
+
+    def planned(self, **overrides):
+        table = self.fixture.table([self.fixture.ticket("06", "queued-child", **overrides)])
+        return run_plan.load(pathlib.Path(table)).ticket("06")
+
+    def ticket_path(self):
+        return str(self.fixture.feature_dir / "06-queued-child.md")
+
+    def test_a_claude_ticket_answers_with_its_workflows_own_slash_form(self):
+        line = dispatch_module.workflow_opening_line(self.planned())
+
+        self.assertEqual(line, f"/implement {self.ticket_path()}")
+
+    def test_a_codex_ticket_answers_with_the_bare_mention_its_bridge_resolves(self):
+        ticket = self.planned(
+            executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
+
+        self.assertEqual(
+            dispatch_module.workflow_opening_line(ticket), f"$implement {self.ticket_path()}"
+        )
+
+    def test_the_queued_fact_does_not_change_the_answer(self):
+        """The child opened on `/triage`; the ruling is the workflow's line, queued or not."""
+        queued = self.planned(queued={"source": "#42 review finding", "open": "cause"})
+        ordinary = self.planned()
+
+        self.assertEqual(
+            dispatch_module.workflow_opening_line(queued),
+            dispatch_module.workflow_opening_line(ordinary),
+        )
+
+    def test_a_prose_opening_line_composes_with_no_case_of_its_own(self):
+        """`refactor`, `direct`, `spike`, `ops` and `acceptance` hold prose, not a slash command.
+
+        None carries a Codex spelling, so both executors read the same instruction — which is the
+        point: the Driver needs no branch for them.
+        """
+        # `refactor` runs a review lane and so keeps its review row; the other four do not.
+        expected = {
+            "refactor": "Refactor per", "direct": "Implement", "spike": "Investigate",
+            "ops": "Implement", "acceptance": "Prepare",
+        }
+        review = {"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT}
+        for workflow, opening in expected.items():
+            for executor, routing in (
+                ("claude", {}),
+                ("codex", {"model": CODEX_MODEL, "effort": CODEX_EFFORT}),
+            ):
+                with self.subTest(workflow=workflow, executor=executor):
+                    ticket = self.planned(
+                        workflow=workflow,
+                        review=review if workflow == "refactor" else None,
+                        executor=executor,
+                        **routing,
+                    )
+
+                    self.assertEqual(
+                        dispatch_module.workflow_opening_line(ticket),
+                        f"{opening} {self.ticket_path()}",
+                    )
+
+    def test_the_line_is_the_one_the_renderer_puts_at_the_head_of_a_first_turn(self):
+        """One reader, not two copies: an ordinary child's turn opens on exactly this string."""
+        table = self.fixture.table([self.fixture.ticket("06", "queued-child")])
+        result = self.fixture.run_dispatch("render", table)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ticket = run_plan.load(pathlib.Path(table)).ticket("06")
+
+        turn = self.fixture.turn("06")
+
+        self.assertTrue(
+            turn.startswith(dispatch_module.workflow_opening_line(ticket) + "\n"), turn[:200]
+        )
 
 
 class WrapUpClauseTests(DispatchTestCase):

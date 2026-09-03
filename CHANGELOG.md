@@ -8,6 +8,20 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- A ruling on a diagnosing child is one message the Driver composes, through the new
+  `driver.py rule` (ADR-0028). The coordinator supplies the ruling body alone; the command takes
+  the ticket's own workflow opening line from the shapes library the renderer composes first turns
+  from, substitutes the absolute ticket path, puts it at the head of the message in that child's
+  executor spelling, and delivers it on the child's existing channel. The two-message shape it
+  replaces sent the ruling body first as an ordinary answer, which reached a Claude child mid-turn
+  and made it busy, so the opening line typed four seconds later sat in Claude Code's queue behind
+  the work the body had started — five minutes on one observed ticket, thirty-eight on another,
+  both recorded as delivered. Both that delay and the silent downgrade of a ruling whose slash is
+  not the first characters of the message stop existing rather than being guarded against. A ruling
+  body that is empty delivers the opening line alone, a workflow whose opening line is prose
+  composes with no case of its own, and the command refuses a ticket the Run plan carries no
+  `queued` fact for. `answer` is unchanged and still serves permission-prompt keys and ordinary
+  answers (#195).
 - A finding queued into a running Run takes the Wave directly behind the one the Run is working
   instead of a Wave after every Wave still pending (ADR-0028). The Waves that were pending shift
   behind it and are renumbered, so they build on the code the diagnosis merged rather than on the

@@ -80,21 +80,21 @@ different comment. The report pairs any escalation ruling that lists placements,
 A queued ticket's child triages before it edits: it posts its agent brief on the ticket and sends
 one `design` escalation carrying the brief's pointer and every question the triage would put to a
 maintainer. Rule on it as you rule on any `design` — from the brief and its witness fact-check —
-and then deliver the ticket's own workflow opening line, so the child implements from the
+through one operation that carries your ruling and starts the child implementing from the
 diagnosis it just built rather than from a fresh reading:
 
 ```bash
-python3 <crew-skill-dir>/assets/driver/driver.py answer \
-  --run-dir <run-dir> --ticket <NN> --text "/implement <absolute ticket path>"
+python3 <crew-skill-dir>/assets/driver/driver.py rule \
+  --run-dir <run-dir> --ticket <NN> --text "<the ruling body>"
 ```
 
-A `tdd` ticket opens on `/implement <absolute ticket path>`, and `$implement <absolute ticket
-path>` where its child is Codex; every other workflow opens on a plain instruction naming the same
-path, which is an ordinary answer. The slash form is the **first characters** of `--text` or it
-does not open the skill at all: a Claude child given any preamble ahead of it reads the whole
-message as prose and starts nothing, with no error anywhere
-([`docs/research/second-turn-slash-command-expansion.md`](../../../docs/research/second-turn-slash-command-expansion.md)).
-Corrections to the brief are ordinary answers, sent before that line.
+`--text` is the ruling and nothing else — corrections to the brief included. The ticket's own
+workflow opening line is the Driver's to supply and goes ahead of your words, in that child's
+executor spelling, so there is no second message to send and no ticket path to spell. A ruling
+that has nothing to add to the brief omits `--text` and delivers that line alone.
+
+The command refuses a ticket this Run carries no `queued` fact for: an ordinary child was never
+told to diagnose first, and it is answered with `answer` as any child is.
 
 ## Open a ticket outside this Run
 

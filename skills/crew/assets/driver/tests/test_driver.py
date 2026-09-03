@@ -3972,8 +3972,9 @@ class DiagnosingChildChainTests(DriverTestCase):
 
     The variant itself is dispatch's; what these drive is the chain around it — that the queued
     child the Driver activates opens on `/triage`, that its one `design` escalation reaches the
-    coordinator carrying the brief's pointer, and that `driver.py answer` puts the ticket's own
-    opening line into the channel that child has, recorded in the run's log as it was delivered.
+    coordinator carrying the brief's pointer, and that `driver.py rule` composes the ticket's own
+    opening line and the ruling body into one message on the channel that child has, recorded in
+    the run's log as it was delivered.
     """
 
     BRIEF_POINTER = "https://github.example.invalid/issues/02#issuecomment-7"
@@ -4029,6 +4030,25 @@ class DiagnosingChildChainTests(DriverTestCase):
             capture_output=True, text=True, env=environment, cwd=str(self.fixture.repo),
         )
 
+    def rule(self, *arguments, ticket="02"):
+        """`driver.py rule`: the ruling body alone, or no `--text` at all."""
+        environment = self.fixture.environment()
+        environment["CLAUDE_CODE_MESSAGING_SOCKET"] = COORDINATOR_ADDRESS.removeprefix("uds:")
+        return subprocess.run(
+            [
+                sys.executable, str(DRIVER), "rule",
+                "--run-dir", str(self.fixture.run_dir), "--ticket", ticket, *arguments,
+            ],
+            capture_output=True, text=True, env=environment, cwd=str(self.fixture.repo),
+        )
+
+    def typed_sends(self):
+        """Every `send-keys` argv the stub tmux recorded, in order."""
+        return [
+            call["argv"] for call in self.fixture.tmux_calls()
+            if call["argv"][:1] == ["send-keys"]
+        ]
+
     def queued_turn(self, routing=ROUTING):
         """Run the chain to the queued child's launched first turn.
 
@@ -4056,7 +4076,14 @@ class DiagnosingChildChainTests(DriverTestCase):
             items = codex_bridge_module.turn_input("marker", message)
         return [item for item in items if item.get("type") != "text"]
 
-    def test_a_claude_queued_child_diagnoses_then_is_answered_with_its_own_opening_line(self):
+    def test_a_claude_queued_child_is_ruled_on_in_one_message_the_driver_composes(self):
+        """The ruling body alone goes in; the opening line and the body come out as one message.
+
+        The two-message shape this replaces could not deliver promptly: the body woke the child
+        mid-turn and made it busy, so the opening line typed four seconds later sat in Claude
+        Code's queue behind the work the body had started — five minutes on #218, thirty-eight on
+        #217 (#195).
+        """
         process, turn = self.queued_turn()
         path = self.ticket_path()
         self.assertTrue(turn.startswith(f"/mattpocock-skills:triage {path}\n"), turn[:200])
@@ -4068,7 +4095,8 @@ class DiagnosingChildChainTests(DriverTestCase):
 
         self.assertEqual(snapshot["ticket"], "02")
         self.assertIn(self.BRIEF_POINTER, snapshot["detail"])
-        ruling = f"/implement {path}"
+        body = "Implement per brief; keep the retention_audit table."
+        composed = f"/implement {path}\n{body}"
         window = self.fixture.launch_record("02")["window"]
         # What a real Claude child does with a slash command: the line stands in the composer for
         # a while after the `Enter` that submitted it, because the command is resolved and its
@@ -4076,22 +4104,142 @@ class DiagnosingChildChainTests(DriverTestCase):
         # loses this ruling from the log while the child goes on to act on it.
         (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
 
-        result = self.answer(ruling)
+        result = self.rule("--text", body)
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        sent = [
-            call["argv"] for call in self.fixture.tmux_calls()
-            if call["argv"][:1] == ["send-keys"]
-        ]
-        self.assertEqual(sent[-2:], [
-            ["send-keys", "-t", window, "-l", "--", ruling],
+        # One message, not two: the body follows the opening line over `S-Enter`, and the single
+        # `Enter` at the end is what submits both.
+        self.assertEqual(self.typed_sends()[-4:], [
+            ["send-keys", "-t", window, "-l", "--", f"/implement {path}"],
+            ["send-keys", "-t", window, "S-Enter"],
+            ["send-keys", "-t", window, "-l", "--", body],
             ["send-keys", "-t", window, "Enter"],
         ])
         recorded = self.events("ruling", ticket="02")[-1]
         self.assertEqual(recorded["role"], "coordinator")
-        self.assertEqual(recorded["message"], ruling)
+        self.assertEqual(recorded["message"], composed)
 
-    def test_a_codex_queued_child_is_answered_as_the_next_bridge_turn(self):
+    def test_an_empty_ruling_body_delivers_the_opening_line_alone(self):
+        process, _ = self.queued_turn()
+        path = self.ticket_path()
+        self.fixture.says("02", self.BRIEF_ASK)
+        self.woken(process, "judgment-needed")
+        window = self.fixture.launch_record("02")["window"]
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
+
+        result = self.rule()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.typed_sends()[-2:], [
+            ["send-keys", "-t", window, "-l", "--", f"/implement {path}"],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        self.assertEqual(self.events("ruling", ticket="02")[-1]["message"], f"/implement {path}")
+
+    def test_the_ruling_body_reaches_the_child_exactly_as_the_coordinator_wrote_it(self):
+        """A ruling sketching pseudocode is indented, and the indent is what makes it a block.
+
+        Composition decides where the body goes, never what it says: the Contract has the
+        coordinator sketch pseudocode as one of the three shapes a ruling takes, and a body that
+        arrived stripped would reach the child as prose.
+        """
+        process, _ = self.queued_turn()
+        path = self.ticket_path()
+        self.fixture.says("02", self.BRIEF_ASK)
+        self.woken(process, "judgment-needed")
+        body = "Implement per brief, in this shape:\n\n    for row in rows:\n        emit(row)\n"
+        window = self.fixture.launch_record("02")["window"]
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
+
+        result = self.rule("--text", body)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        typed = [call[-1] for call in self.typed_sends() if "-l" in call]
+        # Every line of the body, blank and indented ones included, and the trailing newline it
+        # was written with as the empty line that ends the list.
+        self.assertEqual(typed[-6:], [
+            f"/implement {path}",
+            "Implement per brief, in this shape:",
+            "",
+            "    for row in rows:",
+            "        emit(row)",
+            "",
+        ])
+        # `deliver` strips the line it writes into the log, as it does for every ruling; what is
+        # inside the block survives that, which is what the log is read for.
+        self.assertEqual(
+            self.events("ruling", ticket="02")[-1]["message"],
+            f"/implement {path}\n{body}".strip(),
+        )
+
+    def test_a_ruling_body_of_whitespace_alone_delivers_the_opening_line_alone(self):
+        """Nothing to say is nothing to say, however it was spelled on the command line."""
+        process, _ = self.queued_turn()
+        path = self.ticket_path()
+        self.fixture.says("02", self.BRIEF_ASK)
+        self.woken(process, "judgment-needed")
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
+
+        result = self.rule("--text", "   \n  ")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events("ruling", ticket="02")[-1]["message"], f"/implement {path}")
+
+    def test_a_prose_opening_line_composes_the_same_way_with_no_branch_of_its_own(self):
+        """`direct` opens on an instruction, not a slash command; nothing here treats it apart."""
+        process, _ = self.queued_turn(routing=DIRECT_ROUTING)
+        path = self.ticket_path()
+        self.fixture.says("02", self.BRIEF_ASK)
+        self.woken(process, "judgment-needed")
+        body = "Implement per brief."
+        window = self.fixture.launch_record("02")["window"]
+        (self.fixture.stub_dir / "tmux-linger-reads").write_text("2")
+
+        result = self.rule("--text", body)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.typed_sends()[-4:], [
+            ["send-keys", "-t", window, "-l", "--", f"Implement {path}"],
+            ["send-keys", "-t", window, "S-Enter"],
+            ["send-keys", "-t", window, "-l", "--", body],
+            ["send-keys", "-t", window, "Enter"],
+        ])
+        self.assertEqual(
+            self.events("ruling", ticket="02")[-1]["message"], f"Implement {path}\n{body}"
+        )
+
+    def test_a_ticket_the_plan_carries_no_queued_fact_for_is_refused(self):
+        """Only a child that diagnosed first is owed a composed ruling; 01 never did.
+
+        Nothing about 01's channel makes this wrong — it is a launched Claude child with a
+        pane — so what is refused is the composition, on the Run plan's own fact.
+        """
+        self.start()
+        before = self.typed_sends()
+
+        result = self.rule("--text", "Proceed.", ticket="01")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertEqual(snapshot["ticket"], "01")
+        self.assertIn("ticket 01 has state ordinary, not queued", snapshot["detail"])
+        # Refused before anything was said to the child, not after.
+        self.assertEqual(self.typed_sends(), before)
+        self.assertEqual(self.events("ruling", ticket="01"), [])
+
+    def test_a_ticket_outside_the_run_plan_is_refused_in_the_plans_own_words(self):
+        self.start()
+
+        result = self.rule("--text", "Proceed.", ticket="99")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        snapshot = self.snapshot(result)
+        self.assertEqual(snapshot["reason"], "driver-error")
+        self.assertEqual(snapshot["ticket"], "99")
+        self.assertIn("ticket 99 has state outside-run-plan", snapshot["detail"])
+
+    def test_a_codex_queued_child_is_ruled_on_as_one_next_bridge_turn(self):
         process, turn = self.queued_turn(routing=CODEX_ROUTING)
         path = self.ticket_path()
         self.assertTrue(turn.startswith(f"$triage {path}\n"), turn[:200])
@@ -4103,9 +4251,10 @@ class DiagnosingChildChainTests(DriverTestCase):
 
         self.assertEqual(snapshot["ticket"], "02")
         self.assertIn(self.BRIEF_POINTER, snapshot["detail"])
-        ruling = f"$implement {path}"
+        body = "Implement per brief; keep the retention_audit table."
+        ruling = f"$implement {path}\n{body}"
 
-        result = self.answer(ruling)
+        result = self.rule("--text", body)
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         sends = [

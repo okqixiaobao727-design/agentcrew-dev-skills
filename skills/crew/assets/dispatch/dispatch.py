@@ -386,6 +386,32 @@ def render_review_script(run, ticket, templates, log=None):
     ) + "\n"
 
 
+def opening_line(shape, ticket):
+    """The opening line one shape holds for this ticket's executor, its ticket path filled in.
+
+    One reader for both callers: the renderer, which puts it at the head of a first turn, and the
+    Driver, which puts it at the head of a ruling on a diagnosing child (ADR-0028). A shape that
+    holds no Codex spelling opens a Codex child on the Claude one — a prose opening line is the
+    same instruction whichever executor reads it.
+    """
+    template = (
+        shape.get("opening_line_codex", shape["opening_line"])
+        if ticket.executor == "codex"
+        else shape["opening_line"]
+    )
+    return fill(block(template), {"<absolute ticket path>": ticket.path})
+
+
+def workflow_opening_line(ticket):
+    """The opening line this ticket's own workflow opens on, whatever variant dispatched it.
+
+    A queued ticket's child opens on `[queued]`'s `/triage` line and receives this one as its
+    ruling, which is why the Driver asks for it here rather than holding a second copy: a workflow
+    added to the library needs no edit there.
+    """
+    return opening_line(load_templates()["workflows"][ticket.workflow], ticket)
+
+
 def skill_mention(ticket, name):
     """The way this child's executor is asked to invoke one mattpocock skill from a turn's body.
 
@@ -451,14 +477,9 @@ def render_turn(run, ticket, templates, review_script, log=None):
         coordinator = block(turn["coordinator_codex"])
 
     opening_template = shape if queued is None else queued
-    opening_line = (
-        opening_template.get("opening_line_codex", opening_template["opening_line"])
-        if ticket.executor == "codex"
-        else opening_template["opening_line"]
-    )
     step_one = turn["step_one"] if queued is None else queued["step"]
     text = block(turn["base"])
-    text = text.replace("<opening line>", block(opening_line))
+    text = text.replace("<opening line>", opening_line(opening_template, ticket))
     text = text.replace("<step one>", block(step_one))
     text = text.replace("<workflow block>", workflow_block)
     text = text.replace("<review step>", review_block)

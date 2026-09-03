@@ -53,7 +53,8 @@ this variant from a `queued` fact the Run plan carries on the ticket, never from
 ([ADR-0024](0024-driver-activates-every-wave-through-one-path.md)). The witness checks the brief's pointers as it checks any escalation. The coordinator's
 ruling is the **workflow's** own opening line (`/implement <ticket>` for a tdd ticket) — the
 ticket's own opening line is the triage skill, and the ruling replaces it — delivered through
-the Driver's `answer` command as any ruling is, and the child implements from the context its
+the Driver's `rule` command, which composes that line from the shapes library and carries the
+coordinator's ruling body after it as one message, and the child implements from the context its
 diagnosis built. That delivery is the same typed-into-the-composer path #127 already uses to type
 `/crew <feature-dir>` into the coordinator's pane, and the Codex bridge's next-turn path with
 `$implement`; a slash command typed into a composer is a user-typed invocation, which is what a
@@ -67,8 +68,19 @@ on Claude a preamble ahead of the slash downgrades the whole ruling to prose, wi
 nothing the delivery check can see; on Codex position is irrelevant but the name form is not — a
 bare `$implement` after a preamble injects nothing while the message still arrives, and the
 canonical `$mattpocock-skills:implement` is refused at the bridge before it is sent. So a ruling
-that starts a diagnosing child carries the opening line and nothing before it, and a correction
-travels as an ordinary answer ahead of it.
+that starts a diagnosing child carries the opening line and nothing before it — and the
+correction travels **inside** that same message, after the line, which #182 also showed is
+carried into the skill's own `<command-args>`.
+
+*Amended by #195.* The correction was first sent as an ordinary answer ahead of the opening line,
+which put the two on channels with different arrival semantics: an injected cross-session message
+reaches a Claude child mid-turn, a typed composer line only at a turn boundary. Sending the
+mid-turn one first is what made the child busy, so the line behind it sat in Claude Code's queue —
+five minutes on `crewtask/17` #218, thirty-eight on #217, both recorded as delivered because the
+line had left the composer. One message removes that failure rather than guarding against it, and
+removes the silent downgrade with it: `rule` puts the opening line first by construction, so
+nothing the coordinator writes can get ahead of the slash. The coordinator supplies the ruling
+body alone; the line, its executor spelling and the ticket path are the Driver's.
 
 **Three earlier decisions are amended, not replaced.** Tracker gains a `create` operation beside
 the read, edit, mark, comment and close that

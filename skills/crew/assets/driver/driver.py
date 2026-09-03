@@ -7,6 +7,8 @@
     clear   inventory one recorded run, ask the operator, and remove its recorded artefacts
     resume  put that loop back where a ruling stopped it
     answer  deliver and record one coordinator answer to a child, on its own channel
+    rule    compose one ruling on a diagnosing child — its workflow's opening line, then the
+            ruling body — and deliver it as `answer` delivers an answer
 
 The driver runs as a background task of the coordinator's own session, so it costs that session no
 turn while it works and its exit is what wakes it (ADR-0001). Two contracts follow from that and
@@ -36,8 +38,8 @@ The `clear` subcommand is an operator terminal command rather than a coordinator
 event: it prints a multi-line inventory, asks for confirmation, and reports errors directly instead
 of emitting a wake snapshot.
 
-The `answer` subcommand is also an operator terminal command, but its failures emit a `driver-error`
-wake snapshot so the coordinator can see why the child could not be answered.
+The `answer` and `rule` subcommands are also operator terminal commands, but their failures emit a
+`driver-error` wake snapshot so the coordinator can see why the child could not be reached.
 
 **A preflight failure never reaches the coordinator as diagnosis.** Its read-only phase checks the
 invoking checkout is clean, the selected local base branch resolves, every ticket has valid routing
@@ -4133,17 +4135,41 @@ def run_resume(args):
     return wave_loop(args, run_dir, table)
 
 
+def recorded_child_launch(loop, ticket):
+    """The launch record of the child something is about to be said to.
+
+    A ticket with no record has no channel, whatever the Run plan says of it, so both delivering
+    commands ask this before they compose anything.
+    """
+    launch = machine_log.project(loop.records()).ticket(ticket).launch
+    if launch is None:
+        raise DriverError(
+            f"{ticket} has no recorded child in {loop.log}", ticket=ticket, pointer=str(loop.log)
+        )
+    return launch
+
+
+def authorized_delivery(run_dir, loop, ticket, launch, text=None, keys=None):
+    """Deliver one message to a child under the coordinator's own authorization; returns its code.
+
+    The transaction every delivering command ends on, held once: what each of them owns is the
+    validation before it and the message it composes, not how a run says a thing to a child.
+    """
+    control = coordinator_control.CoordinatorControl(run_dir)
+    try:
+        return control.authorized_action(lambda: loop.deliver(ticket, launch, text, keys) or 0)
+    except coordinator_control.CoordinatorControlError as error:
+        print(str(error), flush=True)
+        return DRIVER_ERROR_EXIT
+
+
 def run_answer(args):
     """Deliver one coordinator answer on the recorded child's own channel; returns 0."""
     run_dir = resolved_run_dir(args.run_dir)
     table_path = run_dir / TABLE_NAME
     loop = Loop(args, run_dir, table_path)
     ticket = str(args.ticket)
-    launch = machine_log.project(loop.records()).ticket(ticket).launch
-    if launch is None:
-        raise DriverError(
-            f"{ticket} has no recorded child in {loop.log}", ticket=ticket, pointer=str(loop.log)
-        )
+    launch = recorded_child_launch(loop, ticket)
     # Text reaches either executor — `deliver` already carries it to a Codex child over the
     # bridge — so only the keys are guarded here: they answer a tmux permission prompt, and a
     # Codex child runs with approvals off and has no pane to type into.
@@ -4163,14 +4189,7 @@ def run_answer(args):
             f"unsupported answer key(s): {', '.join(unsupported)}",
             ticket=ticket, pointer=str(loop.log),
         )
-    control = coordinator_control.CoordinatorControl(run_dir)
-    try:
-        return control.authorized_action(
-            lambda: loop.deliver(ticket, launch, args.text, args.keys) or 0
-        )
-    except coordinator_control.CoordinatorControlError as error:
-        print(str(error), flush=True)
-        return DRIVER_ERROR_EXIT
+    return authorized_delivery(run_dir, loop, ticket, launch, args.text, args.keys)
 
 
 def plan_ticket(loop, reference):
@@ -4184,6 +4203,40 @@ def plan_ticket(loop, reference):
             ticket=reference,
             pointer=str(loop.table_path),
         ) from error
+
+
+def run_rule(args):
+    """Compose and deliver one ruling on a diagnosing child, opening line first; returns 0.
+
+    The coordinator supplies the ruling body alone. The opening line is this operation's own to
+    supply, so the two arrive as one message: a diagnosing child is idle when it is ruled on —
+    it escalated and is waiting — and nothing here makes it busy before the message that carries
+    the ruling. `answer` delivers exactly what the coordinator wrote and is unchanged; this
+    composes, which is why it is a second operation rather than a flag on the first (ADR-0028).
+    """
+    run_dir = resolved_run_dir(args.run_dir)
+    loop = Loop(args, run_dir, run_dir / TABLE_NAME)
+    row = plan_ticket(loop, args.ticket)
+    ticket = row.id
+    if row.queued is None:
+        raise DriverError(
+            f"ticket {ticket} has state ordinary, not queued: a ruling composes the workflow's"
+            " own opening line, which only a child that diagnosed first is owed — answer it"
+            " with `answer`",
+            ticket=ticket, pointer=str(loop.table_path),
+        )
+    launch = recorded_child_launch(loop, ticket)
+    # The opening line comes from the shapes library the renderer composes first turns from, in
+    # this ticket's own workflow and executor spelling, so a workflow added there needs no edit
+    # here. The body follows it on the next line: the slash form stays the first characters of the
+    # message, which is what makes it a skill invocation rather than prose.
+    opening = dispatch.workflow_opening_line(row)
+    # The body is carried exactly as the coordinator wrote it, as `defer` carries a finding: only
+    # whether there is one at all is decided here, so an indented code block in a ruling reaches
+    # the child and the log as the indented block it was.
+    body = args.text or ""
+    message = f"{opening}\n{body}" if body.strip() else opening
+    return authorized_delivery(run_dir, loop, ticket, launch, text=message)
 
 
 def run_defer(args):
@@ -4662,6 +4715,21 @@ def build_parser():
     answer.add_argument(
         "--key", dest="keys", action="append", default=[], metavar="KEY",
         help="a permission-prompt key name; repeat for a sequence (Claude children only)",
+    )
+    rule = commands.add_parser(
+        "rule",
+        help="compose and deliver a ruling on a diagnosing child: its workflow's opening line,"
+             " then the ruling body",
+    )
+    rule.set_defaults(handler=run_rule)
+    rule.add_argument("--run-dir", required=True, help="the recorded run directory")
+    rule.add_argument(
+        "--ticket", required=True, help="the queued ticket whose diagnosing child is being ruled on"
+    )
+    rule.add_argument(
+        "--text", default="",
+        help="the ruling body alone; the workflow's opening line is prepended. Omit it to deliver"
+             " that line by itself",
     )
     defer = commands.add_parser(
         "defer", help="comment a finding on a pending ticket, then deliver and record its placement"
