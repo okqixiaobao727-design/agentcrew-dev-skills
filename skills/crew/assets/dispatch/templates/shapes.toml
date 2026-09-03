@@ -136,11 +136,12 @@ CREW FAILED <reason> ts=<unix time>
 # the opening line and step 1 come from here. On a workflow that writes tests only where the
 # ticket names them, this step is that naming.
 #
-# The Codex mention is the bare skill name, not the canonical `plugin:skill` form: the bridge's
-# opening-skill regex is start-anchored over a colon-free character class, so a canonical mention
-# resolves to the plugin name and the send is refused before it leaves the bridge
-# (`../../codex/codex_bridge.py`, #182 fact 4b). Claude takes the canonical form, which is what its
-# composer rewrites a short name into anyway.
+# The Codex mention is the bare skill name. The bridge accepts either form on an opening line as
+# of #189 — a canonical `plugin:skill` mention resolves to the same skill — so this is no longer
+# the refusal it once worked around. The bare form is kept because it is the spelling the
+# end-to-end scenarios verified (`../../codex/codex_bridge.py`, #182 fact 4a), not because the
+# other is rejected. Claude takes the canonical form, which is what its composer rewrites a short
+# name into anyway.
 opening_line = "/mattpocock-skills:triage <absolute ticket path>"
 opening_line_codex = "$triage <absolute ticket path>"
 step = '''

@@ -1376,7 +1376,11 @@ class QueuedChildTests(DispatchTestCase):
         )
 
     def test_a_queued_codex_child_opens_on_the_bare_mention_its_bridge_resolves(self):
-        """`$mattpocock-skills:triage` is refused by the bridge before any send (#182 fact 4b)."""
+        """The bare form is what the end-to-end scenarios verified (#182 fact 4a).
+
+        Not a claim that the bridge refuses the canonical form: it accepts either on an opening
+        line as of #189. This pins the spelling the template actually emits.
+        """
         prompt = self.prompt_for(
             executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
             review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},

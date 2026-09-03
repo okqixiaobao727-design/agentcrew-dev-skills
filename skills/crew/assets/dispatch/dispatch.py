@@ -391,8 +391,8 @@ def skill_mention(ticket, name):
 
     Both executors take the canonical `plugin:skill` name here, because both resolve it from
     anywhere in the message: Claude's composer rewrites a short name into it, and Codex's core
-    text resolver matches it wherever it appears (#182 fact 3b). An opening line is the one place
-    this form is wrong on Codex, and it comes from the template, not from here.
+    text resolver matches it wherever it appears (#182 fact 3b). An opening line is no exception
+    — the Codex bridge accepts both the canonical and the bare form there (#189).
     """
     sigil = "$" if ticket.executor == "codex" else "/"
     return f"{sigil}mattpocock-skills:{name}"

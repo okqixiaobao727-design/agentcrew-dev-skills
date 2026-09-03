@@ -355,8 +355,19 @@ def read_prompt(args):
 
 
 def opening_skill_name(prompt):
-    """Return the skill named at the start of the prompt, if one is present."""
-    match = re.match(r"^\$([A-Za-z0-9][A-Za-z0-9_-]*)\b", prompt)
+    """Return the skill named at the start of the prompt, if one is present.
+
+    The character class follows Codex's own mention grammar, colon included, so the whole
+    mention the coordinator wrote comes back: the bare `$implement` and the canonical
+    `$mattpocock-skills:implement` alike. Returning the whole mention is what keeps the
+    remainder slice in `launch_prompt` aligned with the text that was written (#189).
+
+    The run is taken to its end rather than to a word boundary. `\\b` would stop before a
+    trailing `-` or `:`, which are grammar characters, and hand back a name one character short
+    of what was written — a name that can resolve to a *different* skill than the mention names,
+    and a remainder slice that then carries the dropped character into the message.
+    """
+    match = re.match(r"^\$([A-Za-z0-9][A-Za-z0-9_:-]*)", prompt)
     return match.group(1) if match else None
 
 
@@ -372,7 +383,25 @@ def launch_prompt(marker, message):
 
 
 def resolve_skill_path(skill_name):
-    """Return the installed mattpocock skill's unique existing SKILL.md path."""
+    """Return the installed mattpocock skill's unique existing SKILL.md path.
+
+    `skill_name` is the mention as written. A canonical `plugin:skill` mention is split at its
+    first colon: the plugin half must be this bridge's pinned plugin, and the skill half is what
+    the `skills/*/<skill>/SKILL.md` lookup uses. A bare mention is that lookup name directly.
+    """
+    mentioned_plugin, colon, skill_half = skill_name.partition(":")
+    if colon and mentioned_plugin != SKILL_PLUGIN_NAME:
+        raise BridgeError(
+            f"Skill mention names plugin {mentioned_plugin!r}, but this bridge resolves "
+            f"skills only from installed Codex plugin {SKILL_PLUGIN_NAME!r}"
+        )
+    if colon and not skill_half:
+        # Said here rather than left to the glob: an empty skill half would make the lookup
+        # pattern `skills/*//SKILL.md`, which matches nothing for a reason the message would
+        # not give.
+        raise BridgeError(f"Skill mention {skill_name!r} names no skill after its plugin")
+    bare_name = skill_half if colon else skill_name
+
     result = subprocess.run(
         ["codex", "plugin", "list", "--json"],
         text=True,
@@ -423,7 +452,7 @@ def resolve_skill_path(skill_name):
         plugin_roots.append(pathlib.Path(source_path).expanduser())
 
     for plugin_root in plugin_roots:
-        matches = list(plugin_root.glob(f"skills/*/{skill_name}/SKILL.md"))
+        matches = list(plugin_root.glob(f"skills/*/{bare_name}/SKILL.md"))
         if len(matches) == 1 and matches[0].is_file():
             return matches[0].resolve()
         if len(matches) > 1:

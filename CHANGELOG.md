@@ -41,6 +41,15 @@ and this project uses [Semantic Versioning](https://semver.org/).
   Rulings sentence names the queued form (#188).
 
 ### Fixed
+- The Codex bridge accepts a canonical `$mattpocock-skills:<skill>` mention at the start of a
+  prompt. Its mention grammar excluded the colon, so the canonical form was read as a mention of
+  a skill called `mattpocock-skills`, the resolver found no such skill, and `send` failed the
+  delivery before any request reached the app-server — a coordinator ruling that opened with the
+  form the Run's own turn body asks for could not be delivered. Both forms now resolve to the same
+  skill and carry the same structured input item, and a mention naming a different plugin is
+  refused by name rather than falling through to the bare-name lookup. The `send` path's opening
+  mention — canonical, bare, absent, and behind a preamble — is now covered by the bridge
+  contract suite, which is what would have caught this (#189).
 - A Wave-table write can no longer hand a reader a half-written run plan. Every reader of that
   table loads it without a lock, deliberately — the hold an edit takes is a separate lock file, so
   a reader is never held up by a writer — and the write truncated the table in place. A read

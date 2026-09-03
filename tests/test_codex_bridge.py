@@ -479,5 +479,87 @@ class LaunchFailureTests(unittest.IsolatedAsyncioTestCase):
             await self.launch_with_pane_observations([True, True], detail)
 
 
+class OpeningSkillNameTests(unittest.TestCase):
+    """The mention grammar itself, pinned where the end-to-end contract cannot afford a shard.
+
+    The contract suite proves what a mention *does* — the structured item, the linked mention,
+    the refusals — one tmux session at a time. What a mention *is* costs nothing to state, and
+    the shape that matters most here is the one the contract has no cheap way to reach: a
+    mention ending on a grammar character (#189).
+    """
+
+    def test_a_bare_mention_is_returned_whole(self):
+        self.assertEqual(bridge.opening_skill_name("$implement /a/b"), "implement")
+
+    def test_a_canonical_mention_keeps_its_plugin_half(self):
+        self.assertEqual(
+            bridge.opening_skill_name("$mattpocock-skills:implement /a/b"),
+            "mattpocock-skills:implement",
+        )
+
+    def test_a_mention_ending_on_a_grammar_character_is_not_truncated(self):
+        """A word boundary would stop before a trailing `-` or `:` and name a different skill."""
+        for prompt, expected in (
+            ("$implement- /a/b", "implement-"),
+            ("$mattpocock-skills:implement- /a/b", "mattpocock-skills:implement-"),
+            ("$mattpocock-skills: /a/b", "mattpocock-skills:"),
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(bridge.opening_skill_name(prompt), expected)
+
+    def test_the_run_stops_at_a_character_the_grammar_does_not_hold(self):
+        """Whitespace and `]` end a mention, so `launch_prompt`'s remainder stays aligned."""
+        for prompt, expected in (
+            ("$implement rest", "implement"),
+            ("$implement\trest", "implement"),
+            ("$implement\nrest", "implement"),
+            ("$implement] rest", "implement"),
+            ("$mattpocock-skills:implement] rest", "mattpocock-skills:implement"),
+            ("$implement/tmp/ticket.md", "implement"),
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(bridge.opening_skill_name(prompt), expected)
+
+    def test_the_remainder_after_the_mention_is_carried_through_untouched(self):
+        """What `launch_prompt` links is the mention; every byte after it is the message."""
+        path = pathlib.Path("/plugins/mattpocock-skills/skills/x/implement/SKILL.md")
+        for message, name in (
+            ("$implement /tmp/ticket.md", "implement"),
+            ("$mattpocock-skills:implement /tmp/ticket.md", "mattpocock-skills:implement"),
+            ("$mattpocock-skills:implement] /tmp/ticket.md", "mattpocock-skills:implement"),
+        ):
+            with self.subTest(message=message):
+                with mock.patch.object(bridge, "resolve_skill_path", return_value=path):
+                    prompt, linked = bridge.launch_prompt("[marker]", message)
+
+                self.assertEqual(linked, path)
+                remainder = message[len(name) + 1:]
+                self.assertEqual(prompt, f"[marker]\n[${name}]({path}){remainder}")
+
+    def test_the_match_is_anchored_at_the_start_of_the_prompt(self):
+        for prompt in (
+            "Ruling: proceed.\n$mattpocock-skills:implement /a/b",
+            "plain prompt",
+            " $implement /a/b",
+            "$_implement /a/b",
+            "$ implement /a/b",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(bridge.opening_skill_name(prompt))
+
+    def test_a_mention_naming_another_plugin_is_refused_by_name(self):
+        with self.assertRaises(bridge.BridgeError) as raised:
+            bridge.resolve_skill_path("other-plugin:implement")
+
+        self.assertIn("other-plugin", str(raised.exception))
+        self.assertIn(bridge.SKILL_PLUGIN_NAME, str(raised.exception))
+
+    def test_a_mention_with_no_skill_after_its_plugin_is_refused(self):
+        with self.assertRaises(bridge.BridgeError) as raised:
+            bridge.resolve_skill_path(f"{bridge.SKILL_PLUGIN_NAME}:")
+
+        self.assertIn("names no skill", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
