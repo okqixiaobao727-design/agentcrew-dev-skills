@@ -124,37 +124,6 @@ operator. A clean run costs it one turn to launch, one per ASK, and one to point
 > reads remain hunts. The former whole-Crew-directory exemption is narrowed to its skill document
 > and Markdown references.
 
-> **Amended (#194, 2026-09-03).** The witness brief was attached to an escalation *after* it was
-> sent, and the coordinator was woken twice for it. A child sends its `CREW ASK` straight to the
-> coordinator, which rules at once; the Driver then reads the same escalation out of the Machine
-> log, runs the witness, and wakes the coordinator with a snapshot whose `detail` is byte-identical
-> to the message it has already answered. Measured in one run: 8 of 8 escalations, 8 wasted
-> coordinator turns, and in 6 of them an empty brief — so the second wake carried nothing new. The
-> one wake that did carry value carried it *too late*: the brief contradicted a ruling already
-> made, because a directly-sent escalation gives the coordinator no way to know a brief is coming.
-> **A fact-check that arrives after the ruling is not a fact-check.** So the witness moves ahead of
-> the send: a child states its question and its kind to a Crew command, that command owns the
-> `CREW ASK` grammar, the stamp, the pointers and the witness run, and prints one message the child
-> sends unchanged. The child is not told the witness exists. Delivery stays with the child's own
-> message tool — composing and delivering are separate, and the command only composes — so the
-> authorization and message-copying hooks, and the Machine log's content-based classification of an
-> escalation, are untouched. A witness that fails or times out never blocks the send; the message
-> goes without a brief and says so. *The Driver's wake becomes a backstop.* Seeing a standing
-> escalation it now waits, and carries on the moment a ruling is recorded — the Run projection
-> already derives that fact and the Driver simply never consulted it. It raises today's wake only
-> after a grace period with no ruling recorded, measured from the escalation's own Machine-log
-> record so an adopted run does not restart the clock, and still records the hand-over line so the
-> backstop cannot repeat. The grace period is not optional: the escalation channel is fallible by
-> [ADR-0023](0023-the-coordinator-is-addressed-by-socket-not-by-name.md)'s own known risk — an
-> inbound peer message held for permission approval, where the approval expires — and today's
-> unconditional wake was silently the only thing covering it. Nothing else would find a lost ruling:
-> the whole-run stall timer resets on any Machine-log line anywhere in the run, and the idle rung
-> explicitly skips a child whose last word is still unsettled. Rejected: letting the command deliver
-> the message as well as compose it — there is no command-line way to send a cross-session message,
-> so it would mean reimplementing an undocumented socket protocol or typing into the coordinator's
-> pane, both of which bypass the two hooks and force a second, parallel way for escalations to enter
-> the Machine log, to save the child one tool call.
-
 ## Consequences
 
 - The crew skill document is the oracle's resident prefix, so it holds the reversibility contract,
