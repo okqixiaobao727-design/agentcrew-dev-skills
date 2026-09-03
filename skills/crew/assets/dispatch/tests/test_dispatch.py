@@ -1330,7 +1330,8 @@ DIAGNOSIS_STEP = (
     " the cause, and post the brief on the ticket, invoking <codebase-design skill> before you"
     " write its approach. Then send one `design` escalation — the brief's pointer, every question"
     " this triage would put to a maintainer, and your pick marked \"implement per brief\" — and"
-    " wait. The ruling arrives as this ticket's opening line; the workflow below starts there. A"
+    " wait. The ruling arrives as the workflow's own opening line; the workflow below starts"
+    " there. A"
     " cause an earlier ticket of this Run already fixed is still your deliverable: commit the test"
     " that proves it, and complete."
 )

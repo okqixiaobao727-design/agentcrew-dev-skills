@@ -24,22 +24,40 @@ then settles `failed` (ADR-0015).
 
 ## Place findings and leftovers
 
-A ruling that places findings or leftovers is ruled line by line. Every line gets one of the four
+A ruling that places findings or leftovers is ruled line by line. Every line gets one of the five
 placements the Contract names. Write it so the report can set each line beside its placement —
 repeat the child's own line, then the placement:
 
 ```
 <leftover line as the child wrote it> — this ticket
-<leftover line as the child wrote it> — opened <ticket reference>
+<leftover line as the child wrote it> — queued <ticket reference> (open: cause|approach|reach)
 <leftover line as the child wrote it> — deferred <ticket reference>
 <leftover line as the child wrote it> — dropped
+<leftover line as the child wrote it> — opened <ticket reference>
 ```
 
 A line ruled *this ticket* keeps the child running: it makes the edit and sends its receipt when
-done. A line ruled *opened* names the ticket you opened (below) before the ruling is sent, so the
-child's receipt and the report both carry the reference.
+done. A line ruled *dropped* ends there. A line ruled *opened* names the ticket you opened (below)
+before the ruling is sent, so the child's receipt and the report both carry the reference.
 
-A line ruled *deferred* names an existing pending ticket in this Run. The finding must be on the
+A line ruled *queued* goes through one operation, which opens the ticket, routes it, appends it
+to this Run as its next trailing Wave, and delivers the placement to the source child:
+
+```bash
+python3 <crew-skill-dir>/assets/driver/driver.py queue \
+  --run-dir <run-dir> --ticket <source NN> --open <cause|approach|reach> \
+  --title "<what the ticket is>" --text "<leftover line as the child wrote it>"
+```
+
+`--open` names what the ruling could not settle and is required: the command refuses a finding
+with nothing open, because that finding is an edit and belongs to this ticket. The command prints
+the Run's pending queued tickets on every call; a finding that shares a cause or an area with one
+of them is *deferred* to it with `driver.py defer`, not queued again. Routing comes from the crew
+config file's `[queued]` cell; `--workflow`, `--executor`, `--model`, `--effort` and `--account`
+override it for this ticket alone.
+
+A line ruled *deferred* names an existing pending ticket in this Run — a queued ticket not yet
+launched, or any other pending ticket that already owns the area. The finding must be on the
 target ticket before the ruling reaches the source child, so use this one operation for either a
 Claude or Codex source instead of sending an ordinary answer:
 
@@ -56,17 +74,38 @@ the comment locator exists. Its identical-comment retry is idempotent; a differe
 different comment. The report pairs any escalation ruling that lists placements, including
 `wrap-up` and `doc-conflict`.
 
-## Open a ticket
+## Rule on a diagnosing child's brief
 
-You open follow-up tickets yourself, during the run, through the tracker convention the repository
-names in `docs/agents/issue-tracker.md` — that document holds the command, and
+A queued ticket's child triages before it edits: it posts its agent brief on the ticket and sends
+one `design` escalation carrying the brief's pointer and every question the triage would put to a
+maintainer. Rule on it as you rule on any `design` — from the brief and its witness fact-check —
+and then deliver the ticket's own workflow opening line, so the child implements from the
+diagnosis it just built rather than from a fresh reading:
+
+```bash
+python3 <crew-skill-dir>/assets/driver/driver.py answer \
+  --run-dir <run-dir> --ticket <NN> --text "/implement <absolute ticket path>"
+```
+
+A `tdd` ticket opens on `/implement <absolute ticket path>`, and `$implement <absolute ticket
+path>` where its child is Codex; every other workflow opens on a plain instruction naming the same
+path, which is an ordinary answer. The slash form is the **first characters** of `--text` or it
+does not open the skill at all: a Claude child given any preamble ahead of it reads the whole
+message as prose and starts nothing, with no error anywhere
+([`docs/research/second-turn-slash-command-expansion.md`](../../../docs/research/second-turn-slash-command-expansion.md)).
+Corrections to the brief are ordinary answers, sent before that line.
+
+## Open a ticket outside this Run
+
+*Opened* is the exception the Contract makes to *queued*: work that belongs to no ticket of this
+feature, so this Run takes on nothing for it. You open such a ticket yourself, during the run,
+through the tracker convention the repository names in `docs/agents/issue-tracker.md` — that
+document holds the command, and
 [`references/trackers.md`](../../../references/trackers.md) names the operations both skills call
-on it. Seed the ticket from the wrap-up line: its body carries the leftover as the child stated it
+on it. Seed the ticket from the finding line: its body carries the leftover as the child stated it
 and every pointer the child cited, so the evidence travels with the ticket rather than with your
-memory of the run. Once the Tracker module lands
-([ADR-0019](../../../docs/adr/0019-tracker-owns-ticket-operations-callers-own-workflow.md), #123),
-creating a ticket goes through its create operation on either tracker; until then the convention
-document's command is the path.
+memory of the run. A queued ticket needs none of this — `driver.py queue` opens it for you
+([ADR-0028](../../../docs/adr/0028-a-finding-is-queued-into-the-run-and-diagnosed-by-the-child-that-implements-it.md)).
 
 ## Rule on an acceptance run
 

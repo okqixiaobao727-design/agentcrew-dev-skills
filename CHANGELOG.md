@@ -7,6 +7,39 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A finding a Run discovers is worked inside that Run instead of leaving it (ADR-0028). Scope no
+  longer places a finding; the kind of work does. An *edit* — cause and change site already known
+  — stays with the child in front of the coordinator, whatever the ticket's scope. A *diagnosis* —
+  cause, approach or reach still open — is *queued*: `driver.py queue` opens the ticket at the
+  Run's tracker, routes it from the crew config file's new `[queued]` cell or from the command
+  line, appends it to the Run plan as a trailing Wave blocked on the Wave before it, and delivers
+  `<line> — queued #<NN> (open: <word>)` to the source child. `--open` is required and closed to
+  `cause`, `approach` and `reach`, so a finding with nothing open is refused as the edit it is; an
+  identical finding is idempotent; and every call prints the Run's pending queued tickets, so a
+  finding that shares a cause with one of them is deferred to it rather than opening a second
+  diagnosis of the same thing. Tracker gained the `create` operation ADR-0019 planned, on both the
+  GitHub and the local adapter (#184, #185).
+- The Driver reloads the Run plan before it advances past a settled Wave and before it writes the
+  run's `complete` decision, and activates and adopts onto an appended Wave through the one
+  activation path every Wave uses — so a ticket queued while the last Wave was settling is
+  launched rather than lost. The dashboard and the report draw a queued Wave from the plan alone,
+  with no second rendering (#186).
+- A queued ticket's child diagnoses before it implements, in one session. Its opening line is the
+  triage skill on the ticket and its step 1 is a diagnosis step: verify the claim, find the cause,
+  post the agent brief on the ticket, and send one `design` escalation carrying the brief's pointer
+  and every question the triage would put to a maintainer. The coordinator's ruling on that
+  escalation is the workflow's own opening line, delivered by `driver.py answer` as any ruling is,
+  and the child implements from the diagnosis it just built. A cause an earlier Wave already fixed
+  is still a deliverable: the child commits the test that proves it and completes (#187).
+
+### Changed
+- The coordinator's own documents speak the placement grammar. The Contract's placement paragraph
+  is now the edit/diagnosis test rather than a list of destinations, the triage reference carries
+  the five-placement form and the `queue` operation beside `defer`, and `opened` is written as the
+  exception it now is — for work outside this feature altogether. ADR-0028 is accepted; ADR-0010's
+  Rulings sentence names the queued form (#188).
+
 ### Fixed
 - A Wave-table write can no longer hand a reader a half-written run plan. Every reader of that
   table loads it without a lock, deliberately — the hold an edit takes is a separate lock file, so

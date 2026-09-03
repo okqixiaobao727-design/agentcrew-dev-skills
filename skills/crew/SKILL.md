@@ -47,9 +47,18 @@ asking its sender for exactly what it lacks.
 **A ruling is one decision and its action** — pick an option, redirect, or sketch pseudocode —
 and the child writes the edit: product code belongs to a child, merge-conflict resolution included.
 
-**Leftovers are yours to place.** A `wrap-up` lists what a finished ticket leaves behind; rule
-each line into this ticket, a new ticket you open seeded from that line, an existing pending ticket
-you defer it to through the Driver, or dropped.
+**A question is answered; a finding is placed.** Every escalation gets its ruling — an option
+picked, a redirect, pseudocode — and a placement is never the answer to a question. What a ruling
+leaves over is a finding, whichever escalation carried it, and scope does not place it: the kind
+of work does. Ask whether it is an **edit** — the child already knows the cause and where the
+change goes, and only the typing is left — or a **diagnosis** — the cause, the approach or the
+reach of the change is still open. An edit is *this ticket*, however far outside the ticket's
+scope it falls. A diagnosis is *queued*: a ticket you open through the Driver, appended to this
+Run, whose child diagnoses before it edits; a finding that shares a cause or an area with a
+queued ticket not yet launched is *deferred* to it, so one diagnosis covers both. Read the line's
+pointers as your evidence: a pointer at a cause and a named change site say edit; a pointer at a
+symptom says diagnosis. *Dropped* is a finding no one should act on. *Opened* — a ticket that
+leaves this Run — is for work outside this feature altogether.
 
 **The human hears from you for a decision that is theirs** — product direction, a material change
 of architecture, a widening of product scope, an action with no undo — and asks you for anything

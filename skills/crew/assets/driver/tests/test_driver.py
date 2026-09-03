@@ -325,8 +325,8 @@ class ReportSelectionTests(unittest.TestCase):
         self.assertEqual(driver_module.report_rulings(records), [("45", message)])
 
 
-class DeferralDocumentationTests(unittest.TestCase):
-    def test_the_fourth_placement_and_tracker_comment_slice_are_documented(self):
+class PlacementDocumentationTests(unittest.TestCase):
+    def test_the_placement_grammar_and_tracker_comment_slice_are_documented(self):
         crew_skill = TRIAGE.parent.parent / "SKILL.md"
         repository = DRIVER.parents[4]
         glossary = repository / "docs" / "glossary.md"
@@ -340,9 +340,20 @@ class DeferralDocumentationTests(unittest.TestCase):
         self.assertIn(
             "<leftover line as the child wrote it> — deferred <ticket reference>", triage
         )
+        self.assertIn(
+            "<leftover line as the child wrote it>"
+            " — queued <ticket reference> (open: cause|approach|reach)",
+            triage,
+        )
         self.assertIn("driver.py defer", triage)
+        self.assertIn("driver.py queue", triage)
         self.assertIn("comment locator", triage)
-        self.assertIn("an existing pending ticket", crew_skill.read_text(encoding="utf-8"))
+        skill_text = " ".join(crew_skill.read_text(encoding="utf-8").split())
+        self.assertIn(
+            "a finding that shares a cause or an area with a queued ticket not yet launched is"
+            " *deferred* to it",
+            skill_text,
+        )
         glossary_text = " ".join(glossary.read_text(encoding="utf-8").split())
         self.assertIn("deferred to an existing pending ticket", glossary_text)
         adr = tracker_adr.read_text(encoding="utf-8")
