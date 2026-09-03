@@ -124,6 +124,39 @@ operator. A clean run costs it one turn to launch, one per ASK, and one to point
 > reads remain hunts. The former whole-Crew-directory exemption is narrowed to its skill document
 > and Markdown references.
 
+> **Amended (#194, 2026-09-04).** The witness brief was attached to an escalation *after* it was
+> sent, and the coordinator was woken twice for it. A Claude child sends its `CREW ASK` straight
+> to the coordinator, which rules at once; the Driver then reads the same escalation out of the
+> Machine log, runs the witness, and wakes the coordinator with a snapshot whose `detail` is
+> byte-identical to the message already answered. Measured in one run: 8 of 8 escalations, 8
+> wasted coordinator turns, 6 of them with an empty brief. The one brief that carried value arrived
+> after the ruling it contradicted. **The coordinator runs the witness itself, once, before it
+> rules.** An escalation carries one fixed command line — rendered into the child's first turn by
+> dispatch with the run directory and ticket filled in, copied by the child, copied by the
+> coordinator — and that Witness command finds the ticket's standing escalation in the Machine log,
+> checks its pointers, records its own Machine-log event with the brief in it, and prints the brief.
+> It runs in the coordinator's foreground with a fixed tool timeout the skill text supplies, so the
+> coordinator waits for it as it waits for any script; a fact-check that fails or times out prints
+> no brief and is not an error, and the coordinator rules without one. Run twice for the same
+> escalation it prints the brief it already recorded. The Driver no longer runs the witness at all.
+> It wakes the coordinator only for an escalation whose Machine-log record carries no sender
+> address — a Codex child's, transcribed by the bridge, which no message channel delivered — and
+> that wake carries the escalation and no brief, the coordinator fetching it by the same command.
+> An escalation with a sender address was delivered by the child's own message tool and the Driver
+> leaves it alone. *The Driver keeps no backstop for a delivered escalation.*
+> [ADR-0023](0023-the-coordinator-is-addressed-by-socket-not-by-name.md)'s known risk — an inbound
+> peer message held for permission approval until the approval expires — is accepted, not defended:
+> a lost escalation stands on the dashboard as an unanswered ASK until the operator resumes the
+> run. The reason is that no clock can defend it. The coordinator is blocked for the whole of a
+> fact-check (70–300s measured, #173), so with several children asking, the next escalation's
+> first sign of life is delayed by exactly that long; any window short enough to be a useful
+> backstop re-creates the double wake under the load that was measured, and any window long enough
+> to be safe is no better than the dashboard. Rejected on that ground: a grace period measured
+> from the escalation (the previous, reverted amendment); a Driver-run witness the coordinator
+> waits on, which adds a pickup event and two processes reasoning about each other through the
+> log; and a background fact-check, which lets the coordinator rule before the brief exists — the
+> late-brief case this amendment removes.
+
 ## Consequences
 
 - The crew skill document is the oracle's resident prefix, so it holds the reversibility contract,
