@@ -18,9 +18,17 @@ the natural reading of "outside the ticket's scope".
 **Scope does not place a finding; the kind of work does.** A finding that is an *edit* — cause and
 change site already known — stays with the child in front of the coordinator, whatever its scope.
 A finding that is a *diagnosis* — cause, approach or reach still open — is *queued*: the
-coordinator opens the ticket through one Driver command, and the Driver appends it to the current
-Run as a trailing Wave, one Wave per queued ticket in queue order. The Run plan remains the sole
-routing authority; it gains an append operation and is reloaded before each advance
+coordinator opens the ticket through one Driver command, and the Driver inserts it into the
+current Run as the **next Wave to launch** — one Wave per queued ticket, in queue order, directly
+behind the Wave the Run is working. The Waves that were still pending shift behind it and are
+renumbered, so they build on the code the diagnosis merged rather than on the shape the finding
+says is wrong; a finding queued when there is nothing pending is the trailing Wave this decision
+first described. The anchor is the last Wave the machine log says *launched*, never the source
+ticket's: Wave numbers are how `advance` records name their Wave and how the advance idempotence
+check decides whether a Wave already launched, so anchoring there renumbers only Waves that have
+never appeared in the log and no recorded number changes meaning. The Run plan remains the sole
+routing authority; it gains a placement operation that takes that anchor — which Wave launched
+last is log knowledge, not table knowledge — and is reloaded before each advance
 ([ADR-0018](0018-run-plan-owns-wave-table-meaning-callers-own-execution.md) made it reloadable
 for exactly this kind of change). *Opened* remains for work outside the feature altogether.
 
@@ -107,7 +115,9 @@ diagnosis that is always made against the current integration branch.
 - Receipt verification is unchanged: a branch must be ahead of its base, so a queued child whose
   cause is already fixed commits the regression test rather than an empty completion.
 - A Run's duration is no longer bounded by its approved Wave table; the dashboard and report show
-  queued Waves as they are appended.
+  queued Waves as they are inserted, and the Wave numbers of the Waves still pending shift as the
+  Run grows. Only Waves that have never launched are renumbered, so every `advance` record already
+  written still names the Wave it named.
 - A queued ticket names no account unless the queue command names one, so it runs on the
   coordinator's account exactly as any account-less ticket does; the `[queued]` cell never
   concludes an account, because which subscription pays is not a fact about the kind of work.

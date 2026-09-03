@@ -67,10 +67,10 @@ decision; a new one is appended before its Codex cursor advances and returns to 
 table. So re-typing the crew command is the whole of what an interruption, a driver crash or a
 coordinator restart costs, including one resumed child that spoke after settlement.
 
-**A run grows while it runs, and the plan on disk is the authority.** `queue` appends a Wave from
+**A run grows while it runs, and the plan on disk is the authority.** `queue` inserts a Wave from
 a process of its own, so a driver reads the plan back before it advances past a settled wave,
 again before the decision that ends the run is written, and before a coordinator handover writes
-the table. An appended wave is the following wave and is activated through the one path every wave
+the table. An inserted wave is the following wave and is activated through the one path every wave
 uses; a run whose log already holds a final decision is adopted onto a queued wave nobody launched
 into rather than reported over. A wave the run planned but never reached is not one of those: the
 halt that stopped short of it is the coordinator's to rule on.
@@ -1134,7 +1134,7 @@ def record_base_gate(log, gate):
 def outstanding_queued_wave(plan, projection):
     """The number of the first queued Wave of the plan the Run still owes work on, or None.
 
-    A Run grows while it runs: `driver.py queue` appends a Wave from a process of its own, so the
+    A Run grows while it runs: `driver.py queue` inserts a Wave from a process of its own, so the
     plan on disk is the authority and the copy a Driver loaded at start-up is a snapshot
     (ADR-0018). Such a Wave is read from the plan and the log alone — the `Queued` fact the plan
     persists, against the state the log settles its tickets into — because that is the whole of
@@ -1154,6 +1154,41 @@ def outstanding_queued_wave(plan, projection):
         ):
             return wave.number
     return None
+
+
+def queued_anchor_wave(plan, records):
+    """The Wave a queued ticket is placed behind (ADR-0028).
+
+    The last Wave the log says launched — the Wave the Run is working — walked forward past the
+    queued Waves earlier calls already inserted behind it. Placed there, the diagnosis is the next
+    Wave to launch and the Waves that were still pending build on the code it merged rather than
+    on the shape the finding says is wrong.
+
+    The anchor is the last **launched** Wave and not the source ticket's. The two coincide on the
+    ordinary path — a finding queued from the wrap-up of a child in the Wave being worked — and
+    diverge when a child that already settled sends later and the coordinator rules `queued` on it.
+    Anchoring on the source's Wave there would insert ahead of Waves that have already launched and
+    renumber them; Wave numbers are how the machine log's `advance` records name their Wave and how
+    the advance idempotence check decides whether a Wave already launched, so renumbering a
+    launched one can drive the Run into relaunching a Wave whose worktrees are already working.
+    Anchored here, only Waves that have never appeared in the log are renumbered, so no recorded
+    number ever changes meaning.
+
+    The walk forward is what orders several findings queued against one Wave. Every Wave past the
+    last launched one is by definition unlaunched, so a run of Waves carrying nothing but queued
+    tickets is exactly the ones earlier calls inserted here: each new finding lands behind them,
+    and queued Waves run in queue order, oldest first — the serial property ADR-0028 relies on.
+    """
+    anchor = machine_log.project(records).current_wave
+    while True:
+        # `following_wave` refuses a Wave this plan has not got, so a log and a table that have
+        # drifted are reported rather than placed around.
+        following = plan.following_wave(anchor)
+        if following is None or not following.tickets:
+            return anchor
+        if any(ticket.queued is None for ticket in following.tickets):
+            return anchor
+        anchor = following.number
 
 
 class PlanEdit:
@@ -1179,7 +1214,7 @@ def edit_plan(table_path):
     """Hold the wave table across one read-modify-write; yields the `PlanEdit` that carries it.
 
     Two processes edit this table: a Driver servicing a Coordinator handover, and `driver.py
-    queue` appending a Wave. Each writes the whole of it, so without one hold across the read and
+    queue` inserting a Wave. Each writes the whole of it, so without one hold across the read and
     the write, whichever writes second overwrites what the other put there — and what is lost is
     the run's sole routing authority (ADR-0003). The read is inside the hold because a lock over
     the write alone protects nothing: the stale plan was already in hand.
@@ -2131,12 +2166,12 @@ def adopt(args, run_dir, table_path):
     projection = machine_log.project(records)
     if projection.ended:
         projection = reconcile_terminal_codex_messages(plan, projection, log)
-    # A Run whose log says `complete` is over only while the plan agrees. A Wave appended after
+    # A Run whose log says `complete` is over only while the plan agrees. A Wave inserted after
     # that decision — a `queued` ruling on a message a settled child sent later — has never been
     # launched, and no other command reaches it, so the Run this start adopts is the one the plan
     # describes rather than the one the last advance decision left (ADR-0028).
-    appended = outstanding_queued_wave(plan, projection) if projection.ended else None
-    if projection.ended and appended is None:
+    inserted = outstanding_queued_wave(plan, projection) if projection.ended else None
+    if projection.ended and inserted is None:
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
         report = report_path(run_dir, plan.run)
@@ -2146,7 +2181,7 @@ def adopt(args, run_dir, table_path):
             crew_worktree=plan.run.crew_worktree,
         )
         return 0
-    resumed = projection.current_wave if appended is None else appended
+    resumed = projection.current_wave if inserted is None else inserted
     print(f"crew adopted wave {resumed}, run directory {run_dir}", flush=True)
     return wave_loop(args, run_dir, table_path, adopting=True)
 
@@ -2834,7 +2869,7 @@ class Loop:
         attend_coordinator(context.pane)
 
         # The handover writes the whole table, so it reads it back inside the same hold: the copy
-        # this Loop is carrying predates any Wave appended to the Run since it loaded one, and
+        # this Loop is carrying predates any Wave inserted into the Run since it loaded one, and
         # writing that copy would erase the Wave the handover exists to carry through.
         try:
             with edit_plan(self.table_path) as edit:
@@ -2867,7 +2902,7 @@ class Loop:
     def reload_plan(self):
         """Read the Run plan back from the wave table; returns the plan now in force.
 
-        The plan a Run runs on grows while it runs — `driver.py queue` appends a Wave from a
+        The plan a Run runs on grows while it runs — `driver.py queue` inserts a Wave from a
         process of its own — so the copy loaded at start-up is a snapshot and the table is the
         authority. The reload is the caller's to ask for rather than a query that quietly does IO,
         because the caller is what knows the moment its answer has to be current (ADR-0018).
@@ -2886,8 +2921,8 @@ class Loop:
         current wave names — is where the Loop starts, so it activates through the one path every
         Wave uses (ADR-0024).
         """
-        appended = outstanding_queued_wave(self.plan, projection) if projection.ended else None
-        return (projection.current_wave, False) if appended is None else (appended, True)
+        inserted = outstanding_queued_wave(self.plan, projection) if projection.ended else None
+        return (projection.current_wave, False) if inserted is None else (inserted, True)
 
     def records(self):
         return machine_log.read_records(self.log)
@@ -3402,7 +3437,7 @@ class Loop:
         activation succeeds.
 
         The plan is read back from the table on both sides of that classification, because a Wave
-        appended to the Run since this Loop loaded its plan is the following Wave and the Run may
+        inserted into the Run since this Loop loaded its plan is the following Wave and the Run may
         not call itself complete while one is unlaunched. The read before is what the settled
         Wave is classified against; the read after is what makes this Driver's answer at least as
         current as the one `advance.py` reached from the same table a moment later, which is the
@@ -4020,9 +4055,9 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
         if adopting:
             loop.adopt()
         projection = machine_log.project(loop.records())
-        wave, appended = loop.pending_wave(projection)
+        wave, inserted = loop.pending_wave(projection)
         loop.activation.activate(wave)
-        if appended:
+        if inserted:
             # The same commit point every other Wave's activation has: written only once the Wave
             # is up, and what takes the Run's `ended` fact back off the log it was left on, so the
             # next Driver to adopt this Run reads it as the running Run it now is.
@@ -4372,7 +4407,7 @@ def queued_staged_path(loop, feature_dir, identifier, locator):
 
 
 def run_queue(args):
-    """Open one diagnosis at the run's tracker, append it to the Run, and deliver its placement.
+    """Open one diagnosis at the run's tracker, insert it into the Run, and deliver its placement.
 
     The order is the one that makes a failure recoverable: every step after the tracker is
     idempotent against what the previous one put on disk, because a crash can land between any
@@ -4381,21 +4416,21 @@ def run_queue(args):
     1. **Refuse before the tracker.** The open word, the finding, the title, the source and the
        whole routing are judged first, the routing by exactly what an approved Wave table passes
        — a `--effort` the table rejects would otherwise open a real ticket and then fail at the
-       append, leaving it orphaned. A call matching a recorded queue under a *different* open
+       placement, leaving it orphaned. A call matching a recorded queue under a *different* open
        word is refused here too: the key is the source and the finding alone, while the word is
        in the ticket, the log, the plan and the line the child reads, so merging the two would
        leave them disagreeing with nothing to say which is the run's.
     2. **Open the ticket.** The tracker is the only writer here that cannot be rolled back, so it
        goes first, and a crash after it is caught by **create**'s title-and-body idempotency.
     3. **Record it.** The `queued` line is this command's idempotency key, so it lands before the
-       plan append: a retry resumes from the identifier and locator it carries rather than
+       plan is written: a retry resumes from the identifier and locator it carries rather than
        recomputing a body the source child's later escalations would have changed.
-    4. **Append, then place**, each guarded by its own read of disk rather than by the log line.
-       A retry appends only a ticket the plan does not carry and delivers only a placement no
+    4. **Insert, then place**, each guarded by its own read of disk rather than by the log line.
+       A retry inserts only a ticket the plan does not carry and delivers only a placement no
        `ruling` holds, so a delivery that failed after the log line was written is re-delivered
        rather than reported as a success nobody received. A resume resolves its routing here and
-       only where the append is owed — that question was settled when the ticket was opened, and
-       asking it again stranded a queue one append from complete under a `[queued]` cell the
+       only where the insert is owed — that question was settled when the ticket was opened, and
+       asking it again stranded a queue one insert from complete under a `[queued]` cell the
        project had changed in between.
 
     One window stays open and no ordering closes it: a crash between the create and the `queued`
@@ -4444,7 +4479,7 @@ def run_queue(args):
     # Resolved for the ticket this call opens, and only then: a resume's routing question was
     # settled when the ticket was opened, and a `[queued]` cell the project retargeted or broke in
     # between is no question this call has to answer. Asking it first stranded a queue that was
-    # one plan append away from complete.
+    # one plan write away from complete.
     routing = None
     binding = None
     if held is None:
@@ -4496,10 +4531,10 @@ def run_queue(args):
         )
 
     # Under the same hold the live Driver's handover takes, and over the read as well as the
-    # write: the plan appended to is the plan on disk at this moment, not the one this process
+    # write: the plan inserted into is the plan on disk at this moment, not the one this process
     # loaded when it started, so neither writer can lose the other's whole-table write. The read
-    # is also what makes the append idempotent — a plan that already carries this ticket is left
-    # exactly as it is, so a resumed queue cannot list it twice.
+    # is also what makes the placement idempotent — a plan that already carries this ticket is
+    # left exactly as it is, so a resumed queue cannot list it twice.
     try:
         with edit_plan(loop.table_path) as edit:
             if any(ticket.id == identifier for ticket in edit.plan.tickets):
@@ -4508,7 +4543,7 @@ def run_queue(args):
                 if routing is None:
                     routing = queued_ticket_routing(loop, args)
                     binding = queued_binding(loop, args.account)
-                plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
+                plan = edit.write(edit.plan.insert_after(run_plan.PlannedTicket(
                     id=identifier,
                     title=title,
                     path=str(path),
@@ -4519,7 +4554,7 @@ def run_queue(args):
                     binding=binding,
                     review=routing.review,
                     queued=run_plan.Queued(source, open_word),
-                )))
+                ), queued_anchor_wave(edit.plan, records)))
     except run_plan.RunPlanError as error:
         raise DriverError(
             str(error), ticket=identifier, pointer=str(loop.table_path)
@@ -4641,7 +4676,7 @@ def build_parser():
     )
     queue = commands.add_parser(
         "queue",
-        help="open a diagnosis at the run's tracker, append it to this run, and place it",
+        help="open a diagnosis at the run's tracker, insert it into this run, and place it",
     )
     queue.set_defaults(handler=run_queue)
     queue.add_argument("--run-dir", required=True, help="the recorded run directory")

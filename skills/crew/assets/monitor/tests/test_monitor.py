@@ -1176,7 +1176,7 @@ class DashboardTests(MonitorTestCase):
         """Append one queued Wave carrying `number`, through the plan contract `queue` uses.
 
         The routing is the first planned ticket's: nothing here is about routing, and what makes
-        the row a queued one is the `Queued` fact and the trailing Wave `append` puts it in.
+        the row a queued one is the `Queued` fact and the Wave the placement puts it in.
         """
         run_plan = MONITOR_MODULE.run_plan
         plan = run_plan.load(self.fixture.table_path)

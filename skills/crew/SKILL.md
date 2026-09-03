@@ -50,15 +50,15 @@ and the child writes the edit: product code belongs to a child, merge-conflict r
 **A question is answered; a finding is placed.** Every escalation gets its ruling — an option
 picked, a redirect, pseudocode — and a placement is never the answer to a question. What a ruling
 leaves over is a finding, whichever escalation carried it, and scope does not place it: the kind
-of work does. Ask whether it is an **edit** — the child already knows the cause and where the
-change goes, and only the typing is left — or a **diagnosis** — the cause, the approach or the
-reach of the change is still open. An edit is *this ticket*, however far outside the ticket's
-scope it falls. A diagnosis is *queued*: a ticket you open through the Driver, appended to this
-Run, whose child diagnoses before it edits; a finding that shares a cause or an area with a
-queued ticket not yet launched is *deferred* to it, so one diagnosis covers both. Read the line's
-pointers as your evidence: a pointer at a cause and a named change site say edit; a pointer at a
-symptom says diagnosis. *Dropped* is a finding no one should act on. *Opened* — a ticket that
-leaves this Run — is for work outside this feature altogether.
+of work does. Ask whether it is an **edit** — the child already knows the cause and where the change
+goes, and only the typing is left — or a **diagnosis** — the cause, the approach or the reach of the
+change is still open. An edit is *this ticket*, however far outside the ticket's scope it falls. A
+diagnosis is *queued*: a ticket you open through the Driver, placed into this Run as its next Wave,
+whose child diagnoses before it edits; a finding that shares a cause or an area with a queued ticket
+not yet launched is *deferred* to it, so one diagnosis covers both. Read the line's pointers as your
+evidence: a pointer at a cause and a named change site say edit; a pointer at a symptom says
+diagnosis. *Dropped* is a finding no one should act on. *Opened* — a ticket that leaves this Run —
+is for work outside this feature altogether.
 
 **The human hears from you for a decision that is theirs** — product direction, a material change
 of architecture, a widening of product scope, an action with no undo — and asks you for anything

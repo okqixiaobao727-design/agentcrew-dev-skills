@@ -165,11 +165,11 @@ fresh Reviewer session through Review-Switch rather than reusing the Implementer
 ### `[queued]` — the routing a ticket the run queues into itself is opened on
 
 A finding the coordinator rules a *diagnosis* — cause, approach or reach still open — becomes a
-ticket this run appends to itself as a trailing Wave, whose child diagnoses it before implementing
-it (ADR-0028). No classification session runs mid-run, so this cell is that classification's
-standing answer. It is one cell rather than a table because the case is always the same one, and it
-carries a `workflow` on top of the three fields every cell above carries, because nothing upstream
-chose one.
+ticket this run inserts into itself as the next Wave to launch, whose child diagnoses it before
+implementing it (ADR-0028). No classification session runs mid-run, so this cell is that
+classification's standing answer. It is one cell rather than a table because the case is always
+the same one, and it carries a `workflow` on top of the three fields every cell above carries,
+because nothing upstream chose one.
 
 | Field | What it answers | Shipped default |
 | --- | --- | --- |

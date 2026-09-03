@@ -762,7 +762,128 @@ class RunPlanTests(unittest.TestCase):
             **fields,
         )
 
-    def test_append_adds_one_trailing_wave_blocked_by_the_last_ticket_before_it(self):
+    def test_insert_after_places_the_queued_wave_behind_its_anchor_and_repoints_the_next(self):
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Consumer", blocked_by=("01",))
+        self.ticket("03", "Last", blocked_by=("02",))
+        plan = run_plan.build(self.feature, self.run)
+
+        inserted = plan.insert_after(self.queued_ticket("04", "Queued diagnosis"), 1)
+
+        self.assertEqual([wave.number for wave in inserted.waves], [1, 2, 3, 4])
+        self.assertEqual([ticket.id for ticket in inserted.wave(2).tickets], ["04"])
+        self.assertEqual([ticket.id for ticket in inserted.wave(3).tickets], ["02"])
+        self.assertEqual([ticket.id for ticket in inserted.wave(4).tickets], ["03"])
+        self.assertEqual(inserted.ticket("04").blocked_by, ("01",))
+        self.assertEqual(inserted.ticket("02").blocked_by, ("01", "04"))
+        self.assertEqual(inserted.ticket("03").blocked_by, ("02",))
+        self.assertEqual([wave.number for wave in plan.waves], [1, 2, 3])
+
+    def test_the_waves_at_or_before_the_anchor_are_untouched_by_the_insert(self):
+        """No `advance` record's Wave number changes meaning: a launched Wave is never
+        renumbered."""
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Consumer", blocked_by=("01",))
+        self.ticket("03", "Third", blocked_by=("02",))
+        self.ticket("04", "Fourth", blocked_by=("03",))
+        plan = run_plan.build(self.feature, self.run)
+
+        inserted = plan.insert_after(self.queued_ticket("05", "Queued diagnosis"), 2)
+
+        self.assertEqual(inserted.waves[:2], plan.waves[:2])
+        self.assertEqual([ticket.id for ticket in inserted.wave(3).tickets], ["05"])
+        self.assertEqual([ticket.id for ticket in inserted.wave(4).tickets], ["03"])
+        self.assertEqual([ticket.id for ticket in inserted.wave(5).tickets], ["04"])
+
+    def test_the_repointed_wave_keeps_every_blocker_it_already_had(self):
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Sibling")
+        self.ticket("03", "Consumer of both", blocked_by=("01", "02"))
+        plan = run_plan.build(self.feature, self.run)
+
+        inserted = plan.insert_after(self.queued_ticket("04", "Queued diagnosis"), 1)
+
+        self.assertEqual(inserted.ticket("04").blocked_by, ("02",))
+        self.assertEqual(inserted.ticket("03").blocked_by, ("01", "02", "04"))
+        self.assertEqual([ticket.id for ticket in inserted.wave(3).tickets], ["03"])
+
+    def test_two_findings_queued_behind_one_anchor_run_in_queue_order_ahead_of_the_pending(self):
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Consumer", blocked_by=("01",))
+        self.ticket("03", "Last", blocked_by=("02",))
+        plan = run_plan.build(self.feature, self.run)
+
+        once = plan.insert_after(self.queued_ticket("04", "First queued"), 1)
+        twice = once.insert_after(self.queued_ticket("05", "Second queued"), 2)
+
+        self.assertEqual([wave.number for wave in twice.waves], [1, 2, 3, 4, 5])
+        self.assertEqual([ticket.id for ticket in twice.wave(2).tickets], ["04"])
+        self.assertEqual([ticket.id for ticket in twice.wave(3).tickets], ["05"])
+        self.assertEqual([ticket.id for ticket in twice.wave(4).tickets], ["02"])
+        self.assertEqual([ticket.id for ticket in twice.wave(5).tickets], ["03"])
+        self.assertEqual(twice.ticket("05").blocked_by, ("04",))
+        self.assertEqual(twice.ticket("02").blocked_by, ("01", "04", "05"))
+
+    def test_inserting_behind_the_final_wave_is_exactly_what_appending_produces(self):
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Consumer", blocked_by=("01",))
+        plan = run_plan.build(self.feature, self.run)
+        queued = self.queued_ticket("03", "Queued diagnosis")
+
+        self.assertEqual(plan.insert_after(queued, 2), plan.append(queued))
+
+    def test_an_inserted_table_round_trips_and_following_wave_walks_it_first(self):
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Consumer", blocked_by=("01",))
+        plan = run_plan.build(self.feature, self.run).insert_after(
+            self.queued_ticket("03", "Queued diagnosis"), 1
+        )
+        table = self.root / "wave-table.json"
+
+        plan.write(table)
+        loaded = run_plan.load(table)
+
+        self.assertEqual(loaded, plan)
+        self.assertEqual(loaded.following_wave(1).number, 2)
+        self.assertEqual([ticket.id for ticket in loaded.following_wave(1).tickets], ["03"])
+        self.assertEqual([ticket.id for ticket in loaded.following_wave(2).tickets], ["02"])
+        self.assertIsNone(loaded.following_wave(3))
+
+    def test_insert_after_owns_blocked_by_and_refuses_a_ticket_that_names_its_own(self):
+        """Refused in the words appending has always used, wherever the Wave is placed."""
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Consumer", blocked_by=("01",))
+        plan = run_plan.build(self.feature, self.run)
+        named = dataclasses.replace(self.queued_ticket("03", "Queued"), blocked_by=("01",))
+        refusal = (
+            f"03 {self.feature / '03.md'}: names its own Blocked by #01"
+            " — appending owns that edge, so it is left unset"
+        )
+
+        with self.assertRaises(run_plan.RunPlanError) as inserted:
+            plan.insert_after(named, 1)
+        with self.assertRaises(run_plan.RunPlanError) as appended:
+            plan.append(named)
+
+        self.assertEqual(inserted.exception.problems, (refusal,))
+        self.assertEqual(appended.exception.problems, (refusal,))
+
+    def test_insert_after_refuses_a_ticket_the_plan_already_carries(self):
+        self.ticket("01", "Foundation")
+        self.ticket("02", "Consumer", blocked_by=("01",))
+        plan = run_plan.build(self.feature, self.run)
+
+        with self.assertRaisesRegex(run_plan.RunPlanError, "listed twice"):
+            plan.insert_after(self.queued_ticket("02", "Same number"), 1)
+
+    def test_insert_after_refuses_an_anchor_wave_the_plan_does_not_carry(self):
+        self.ticket("01", "Foundation")
+        plan = run_plan.build(self.feature, self.run)
+
+        with self.assertRaisesRegex(run_plan.RunPlanError, "holds no wave 4"):
+            plan.insert_after(self.queued_ticket("02", "Queued"), 4)
+
+    def test_append_adds_one_wave_behind_the_final_one_blocked_by_its_last_ticket(self):
         self.ticket("01", "Foundation")
         self.ticket("02", "Consumer", blocked_by=("01",))
         plan = run_plan.build(self.feature, self.run)

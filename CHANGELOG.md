@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- A finding queued into a running Run takes the Wave directly behind the one the Run is working
+  instead of a Wave after every Wave still pending (ADR-0028). The Waves that were pending shift
+  behind it and are renumbered, so they build on the code the diagnosis merged rather than on the
+  shape the finding says is wrong, and each of them keeps every blocker it already had. The anchor
+  is the last Wave the machine log says launched, never the source ticket's Wave: only Waves that
+  have never appeared in the log are renumbered, so no `advance` record's Wave number changes
+  meaning and no Wave is relaunched into worktrees that are already working. Several findings
+  queued against one Wave run in queue order, oldest first, and a finding queued when nothing is
+  pending produces exactly the trailing Wave it did before (#193).
+
 ## [0.9.18] - 2026-09-03
 
 ### Added

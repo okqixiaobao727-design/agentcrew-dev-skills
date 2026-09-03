@@ -329,11 +329,12 @@ queued ticket not yet launched is *deferred* to it, so one diagnosis covers them
 _Avoid_: follow-up, action item
 
 **Queued** — A ticket the coordinator opens during a Run that the Run itself takes on: it is
-appended as a trailing Wave, one Wave per queued ticket in queue order, so its child starts from
-the code the Waves before it merged. That child is a **diagnosing child**: it triages the ticket
-and writes its agent brief first, escalates the brief once for a ruling, then implements from the
-context its own diagnosis built. A queued ticket whose cause an earlier Wave already fixed lands the
-test that proves it and is merged, not failed
+inserted as the next Wave to launch, directly behind the Wave the Run is working, one Wave per
+queued ticket in queue order, so its child starts from the code the Waves before it merged and the
+Waves that were still pending build on the diagnosis rather than ahead of it. That child is a
+**diagnosing child**: it triages the ticket and writes its agent brief first, escalates the brief
+once for a ruling, then implements from the context its own diagnosis built. A queued ticket whose
+cause an earlier Wave already fixed lands the test that proves it and is merged, not failed
 ([ADR-0028](adr/0028-a-finding-is-queued-into-the-run-and-diagnosed-by-the-child-that-implements-it.md)).
 _Avoid_: follow-up ticket, re-run, second run
 

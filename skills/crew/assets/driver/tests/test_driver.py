@@ -148,6 +148,66 @@ class StrictLaunchReadTests(DriverTestCase):
             driver_module.launched_children(log)
 
 
+class QueuedAnchorTests(unittest.TestCase):
+    """Where a queued Wave is placed: the last Wave the log says launched, walked past the
+    queued Waves already inserted behind it."""
+
+    def planned(self, identifier, queued=False):
+        return run_plan.PlannedTicket(
+            id=identifier,
+            title=f"ticket {identifier}",
+            path=f"/feature/{identifier}.md",
+            workflow="tdd",
+            executor="claude",
+            model=CLAUDE_MODEL,
+            effort=CLAUDE_EFFORT,
+            binding=run_plan.accounts.inherited(pathlib.Path("/claude-config")),
+            queued=run_plan.Queued("01", "cause") if queued else None,
+        )
+
+    def plan(self, *waves):
+        """A plan of `(identifier, queued)` Waves; only Wave shape and the `Queued` fact matter."""
+        return run_plan.RunPlan(
+            None,
+            tuple(
+                run_plan.Wave(number, tuple(self.planned(*ticket) for ticket in wave))
+                for number, wave in enumerate(waves, start=1)
+            ),
+        )
+
+    def launched(self, wave):
+        return {"event": "advance", "decision": "launched", "wave": wave, "ts": f"0{wave}"}
+
+    def test_a_run_that_has_advanced_nowhere_anchors_on_its_first_wave(self):
+        plan = self.plan([("01",)], [("02",)], [("03",)])
+
+        self.assertEqual(driver_module.queued_anchor_wave(plan, ()), 1)
+
+    def test_the_anchor_is_the_wave_the_log_last_launched_not_the_final_one(self):
+        plan = self.plan([("01",)], [("02",)], [("03",)], [("04",)])
+        records = (self.launched(2), self.launched(3))
+
+        self.assertEqual(driver_module.queued_anchor_wave(plan, records), 3)
+
+    def test_the_anchor_walks_past_the_queued_waves_already_inserted_behind_it(self):
+        plan = self.plan(
+            [("01",)], [("05", True)], [("06", True)], [("02",)], [("03",)]
+        )
+
+        self.assertEqual(driver_module.queued_anchor_wave(plan, ()), 3)
+
+    def test_the_walk_stops_at_the_first_wave_the_run_planned_for_itself(self):
+        plan = self.plan([("01",)], [("05", True)], [("02",)], [("06", True)])
+
+        self.assertEqual(driver_module.queued_anchor_wave(plan, ()), 2)
+
+    def test_a_launched_wave_the_plan_no_longer_carries_is_refused_not_placed_around(self):
+        plan = self.plan([("01",)], [("02",)])
+
+        with self.assertRaisesRegex(run_plan.RunPlanError, "holds no wave 7"):
+            driver_module.queued_anchor_wave(plan, (self.launched(7),))
+
+
 class ReportSelectionTests(unittest.TestCase):
     """Report chronology remains distinct from the projection's non-empty settling fact."""
 
@@ -3162,7 +3222,7 @@ class AppendedWaveTests(DriverTestCase):
         """Append one queued Wave carrying `number` to the run's table; returns its ticket.
 
         The routing is the first planned ticket's, because none of these is about routing: what
-        makes this row a queued one is the `Queued` fact and the trailing Wave `append` puts it in.
+        makes this row a queued one is the `Queued` fact and the Wave the placement puts it in.
         """
         title = f"diagnosis {number}"
         self.fixture.ticket(number, title)
@@ -3908,7 +3968,7 @@ QUEUE_POINTERS = ("skills/example.py:12", "docs/glossary.md:8", "#45", "ADR-0028
 
 
 class DiagnosingChildChainTests(DriverTestCase):
-    """diagnose → ruling → implement, over one queued Wave the Run appended to itself (ADR-0028).
+    """diagnose → ruling → implement, over one queued Wave the Run placed in itself (ADR-0028).
 
     The variant itself is dispatch's; what these drive is the chain around it — that the queued
     child the Driver activates opens on `/triage`, that its one `design` escalation reaches the
@@ -3930,10 +3990,10 @@ class DiagnosingChildChainTests(DriverTestCase):
         )
 
     def append(self, number, source="01", open_word="cause"):
-        """Append one queued Wave carrying `number`, the way `driver.py queue` appends it.
+        """Place one queued Wave carrying `number`, the way `driver.py queue` places it.
 
         The routing is the planned ticket's, because none of this is about routing: what makes the
-        row a queued one is the `Queued` fact and the trailing Wave `append` puts it in.
+        row a queued one is the `Queued` fact and the Wave the placement puts it in.
         """
         self.fixture.ticket(number, f"diagnosis {number}")
         path = self.fixture.run_dir / "wave-table.json"
@@ -3949,7 +4009,7 @@ class DiagnosingChildChainTests(DriverTestCase):
         return number
 
     def start(self, routing=ROUTING):
-        """One planned ticket up and its loop running; the queued Wave is appended onto it."""
+        """One planned ticket up and its loop running; the queued Wave is placed behind it."""
         self.fixture.ticket("01", "thing 01", routing=routing)
         self.fixture.commit_feature()
         process = self.fixture.launch(
@@ -4077,11 +4137,15 @@ class DiagnosingChildChainTests(DriverTestCase):
 
 
 class QueueTests(DriverTestCase):
-    """`driver.py queue`: one finding opened, routed, appended to the Run and delivered back."""
+    """`driver.py queue`: one finding opened, routed, inserted into the Run and delivered back."""
 
-    def start(self, tracker="github", accounts=None):
+    def start(self, tracker="github", accounts=None, pending=()):
         self.fixture.configure(tracker=tracker, accounts=accounts)
         self.fixture.ticket("01", "reviewed ticket")
+        # Waves the Run planned for itself and has not reached: what a queued Wave is placed ahead
+        # of, each blocked on the one before it so the plan carries one ticket per Wave.
+        for number, blocked_by in pending:
+            self.fixture.ticket(number, f"pending ticket {number}", blocked_by=blocked_by)
         self.fixture.commit_feature()
         if tracker == "github":
             self.fixture.issues({"01": {"labels": [], "closed": False, "comments": []}})
@@ -4138,21 +4202,21 @@ class QueueTests(DriverTestCase):
             ticket for wave in self.fixture.table()["waves"] for ticket in wave["tickets"]
         ]
 
-    def drop_appended_wave(self):
-        """Take the last Wave back off the table, as a crash before the append leaves it."""
+    def drop_queued_wave(self):
+        """Take the last Wave back off the table, as a crash before the plan write leaves it."""
         path = self.fixture.run_dir / "wave-table.json"
         table = json.loads(path.read_text())
         table["waves"] = table["waves"][:-1]
         path.write_text(json.dumps(table, indent=2) + "\n")
 
-    def appended(self):
+    def placed(self):
         """The one ticket of the Wave the plan now ends on."""
         waves = self.fixture.table()["waves"]
         self.assertEqual(waves[-1]["wave"], len(waves))
         ticket, = waves[-1]["tickets"]
         return ticket
 
-    def test_a_github_queue_opens_routes_appends_records_and_delivers_the_placement(self):
+    def test_a_github_queue_opens_routes_places_records_and_delivers_the_placement(self):
         self.start()
         before_waves = len(self.fixture.table()["waves"])
 
@@ -4178,7 +4242,7 @@ class QueueTests(DriverTestCase):
         self.assertNotIn(QUEUE_FINDING, text)
 
         self.assertEqual(len(self.fixture.table()["waves"]), before_waves + 1)
-        ticket = self.appended()
+        ticket = self.placed()
         self.assertEqual(ticket["id"], number)
         self.assertEqual(ticket["queued"], {"source": "01", "open": "cause"})
         self.assertEqual(ticket["blocked_by"], ["01"])
@@ -4199,6 +4263,45 @@ class QueueTests(DriverTestCase):
         self.assertEqual(self.events("ruling", ticket="01")[-1]["message"], placement)
         self.assertIn(f"#{number}", result.stdout)
         self.assertIn(QUEUE_TITLE, result.stdout)
+
+    def test_a_finding_queued_from_the_current_wave_is_placed_ahead_of_the_pending(self):
+        self.start(pending=(("02", ("01",)), ("03", ("02",))))
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        number, _ = self.opened_issue()
+        waves = {wave["wave"]: wave["tickets"] for wave in self.fixture.table()["waves"]}
+        self.assertEqual(sorted(waves), [1, 2, 3, 4])
+        # Wave 1 has launched; its number and its ticket are what the log's advance records name.
+        self.assertEqual([ticket["id"] for ticket in waves[1]], ["01"])
+        self.assertEqual([ticket["id"] for ticket in waves[2]], [number])
+        self.assertEqual([ticket["id"] for ticket in waves[3]], ["02"])
+        self.assertEqual([ticket["id"] for ticket in waves[4]], ["03"])
+        self.assertEqual(waves[2][0]["blocked_by"], ["01"])
+        self.assertEqual(waves[2][0]["queued"], {"source": "01", "open": "cause"})
+        self.assertEqual(waves[3][0]["blocked_by"], ["01", number])
+        self.assertEqual(waves[4][0]["blocked_by"], ["02"])
+
+    def test_two_findings_queued_from_one_wave_run_in_queue_order_ahead_of_the_pending(self):
+        self.start(pending=(("02", ("01",)),))
+
+        first = self.queue_finding()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        first_number, _ = self.opened_issue()
+        second = self.queue_finding(
+            text="A second finding — skills/other.py:3", title="crew: the second diagnosis",
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        second_number, _ = self.opened_issue(title="crew: the second diagnosis")
+
+        waves = {wave["wave"]: wave["tickets"] for wave in self.fixture.table()["waves"]}
+        self.assertEqual(sorted(waves), [1, 2, 3, 4])
+        self.assertEqual([ticket["id"] for ticket in waves[2]], [first_number])
+        self.assertEqual([ticket["id"] for ticket in waves[3]], [second_number])
+        self.assertEqual([ticket["id"] for ticket in waves[4]], ["02"])
+        self.assertEqual(waves[3][0]["blocked_by"], [first_number])
+        self.assertEqual(waves[4][0]["blocked_by"], ["01", first_number, second_number])
 
     def test_the_printed_last_section_names_every_pending_queued_ticket_of_the_run(self):
         self.start()
@@ -4285,7 +4388,7 @@ class QueueTests(DriverTestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        ticket = self.appended()
+        ticket = self.placed()
         self.assertEqual(ticket["workflow"], "tdd")
         self.assertEqual(ticket["executor"], "codex")
         self.assertEqual(ticket["model"], CODEX_MODEL)
@@ -4309,7 +4412,7 @@ class QueueTests(DriverTestCase):
         result = self.queue_finding()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        ticket = self.appended()
+        ticket = self.placed()
         self.assertEqual(ticket["model"], CLAUDE_MODEL)
         self.assertEqual(ticket["effort"], "low")
         # The fields the project cell left alone are still the shipped cell's.
@@ -4355,7 +4458,7 @@ class QueueTests(DriverTestCase):
         result = self.queue_finding()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.appended()["account_mode"], "inherited")
+        self.assertEqual(self.placed()["account_mode"], "inherited")
 
     def test_a_local_queue_writes_the_run_directorys_own_ticket_file_and_calls_no_gh(self):
         self.start(tracker="local")
@@ -4370,7 +4473,7 @@ class QueueTests(DriverTestCase):
         self.assertIn(QUEUE_FINDING, text)
         self.assertIn("## Routing", text)
         self.assertIn("Status: ready-for-agent", text)
-        ticket = self.appended()
+        ticket = self.placed()
         self.assertEqual(ticket["id"], "02")
         self.assertEqual(ticket["path"], str(staged))
         self.assertEqual(ticket["queued"], {"source": "01", "open": "reach"})
@@ -4423,7 +4526,7 @@ class QueueTests(DriverTestCase):
         first = self.queue_finding()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         number, _ = self.opened_issue()
-        self.drop_appended_wave()
+        self.drop_queued_wave()
         self.assertNotIn(number, [ticket["id"] for ticket in self.planned_tickets()])
 
         second = self.queue_finding()
@@ -4431,7 +4534,7 @@ class QueueTests(DriverTestCase):
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(len(self.creates()), 1)
         self.assertEqual(len(self.events("queued", ticket=number)), 1)
-        ticket = self.appended()
+        ticket = self.placed()
         self.assertEqual(ticket["id"], number)
         self.assertEqual(ticket["queued"], {"source": "01", "open": "cause"})
         self.assertIn(f"#{number}", second.stdout)

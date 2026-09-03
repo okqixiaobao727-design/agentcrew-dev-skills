@@ -40,8 +40,9 @@ A line ruled *this ticket* keeps the child running: it makes the edit and sends 
 done. A line ruled *dropped* ends there. A line ruled *opened* names the ticket you opened (below)
 before the ruling is sent, so the child's receipt and the report both carry the reference.
 
-A line ruled *queued* goes through one operation, which opens the ticket, routes it, appends it
-to this Run as its next trailing Wave, and delivers the placement to the source child:
+A line ruled *queued* goes through one operation, which opens the ticket, routes it, inserts it
+into this Run as the next Wave to launch — behind the Wave being worked, ahead of the Waves still
+pending — and delivers the placement to the source child:
 
 ```bash
 python3 <crew-skill-dir>/assets/driver/driver.py queue \

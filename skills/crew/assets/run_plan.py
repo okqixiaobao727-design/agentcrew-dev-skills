@@ -187,14 +187,29 @@ class RunPlan:
                 return tuple(found)
             found.extend(frontier)
 
-    def append(self, ticket):
-        """This plan with one more trailing Wave carrying that one ticket (ADR-0028).
+    def insert_after(self, ticket, anchor):
+        """This plan with one more Wave carrying that one ticket, directly behind `anchor`.
 
-        The appended ticket is blocked by the last ticket, in table order, of the Wave that was
-        final before it: queued Waves run serially because they often share a root cause, so each
-        one starts from the code the Wave before it merged. `Blocked by` is this operation's to
-        set — a caller that names its own is refused rather than half-honoured — and the
-        result is validated exactly as an approved table is, so a routing the table refuses is
+        This is where a queued finding is placed (ADR-0028): behind the Wave the Run is working,
+        so it is the next Wave to launch and the Waves that were still pending build on the code
+        its diagnosis merged rather than on the shape it says is wrong.
+
+        The anchor is an argument because which Wave the Run has launched is log knowledge and
+        this table holds none of it (ADR-0018). The caller concludes it; this operation is the
+        pure structural half — given a Wave of this plan, it produces the table that follows.
+
+        The inserted ticket is blocked by the last ticket, in table order, of the anchor Wave:
+        queued Waves run serially because they often share a root cause, so each one starts from
+        the code the Wave before it merged. `Blocked by` is this operation's to set — a caller
+        that names its own is refused rather than half-honoured.
+
+        Every ticket of the Wave that followed the anchor gains the inserted one as an
+        **additional** blocker, never a replacement: a pending ticket may be blocked by tickets in
+        several earlier Waves, and rewriting its `Blocked by` wholesale would silently drop those
+        edges. One added blocker is enough to order it behind the insert, because the Wave layout
+        is derived topologically — the Waves after it renumber themselves and need no edit.
+
+        The result is validated exactly as an approved table is, so a routing the table refuses is
         refused here in the same words.
         """
         if not isinstance(ticket, PlannedTicket):
@@ -205,13 +220,38 @@ class RunPlan:
                 f" {', '.join('#' + blocker for blocker in ticket.blocked_by)} — appending owns"
                 " that edge, so it is left unset"
             ])
+        behind = self.wave(anchor)
+        if not behind.tickets:
+            raise RunPlanError([
+                f"run: wave {behind.number} carries no ticket to place behind"
+            ])
+        placed = replace(ticket, blocked_by=(behind.tickets[-1].id,))
+        waves = []
+        for wave in self.waves:
+            if wave.number < behind.number:
+                waves.append(wave)
+            elif wave.number == behind.number:
+                waves.append(wave)
+                waves.append(Wave(wave.number + 1, (placed,)))
+            else:
+                tickets = wave.tickets
+                if wave.number == behind.number + 1:
+                    tickets = tuple(
+                        replace(pending, blocked_by=pending.blocked_by + (placed.id,))
+                        for pending in tickets
+                    )
+                waves.append(Wave(wave.number + 1, tickets))
+        return _validate(RunPlan(self.run, tuple(waves)))
+
+    def append(self, ticket):
+        """This plan with one more Wave behind its final one, carrying that one ticket.
+
+        The insert whose anchor is the last Wave: there is no following Wave to re-point and no
+        number to shift, so this is the whole of `insert_after` when a Run's log has settled.
+        """
         if not self.waves or not self.waves[-1].tickets:
             raise RunPlanError(["run: the plan carries no wave to append behind"])
-        preceding = self.waves[-1].tickets[-1]
-        appended = Wave(
-            len(self.waves) + 1, (replace(ticket, blocked_by=(preceding.id,)),)
-        )
-        return _validate(RunPlan(self.run, self.waves + (appended,)))
+        return self.insert_after(ticket, self.waves[-1].number)
 
     def write(self, path):
         """Write the existing Wave-table JSON representation, replacing the table atomically.

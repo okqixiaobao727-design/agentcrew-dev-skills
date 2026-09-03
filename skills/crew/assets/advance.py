@@ -251,7 +251,7 @@ def advance_wave(plan, table_path, wave, options, interrupt):
     lines = land(table_path, wave, options)
 
     # The plan is read back after the merges, because the merges take time and the Run grows while
-    # it runs: `driver.py queue` appends a trailing Wave from a process of its own, and the
+    # it runs: `driver.py queue` inserts a Wave from a process of its own, and the
     # decision written below — `complete` above all — has to be the one the table says now rather
     # than the one it said before the landing (ADR-0018, ADR-0028).
     plan = run_plan.load(table_path)
