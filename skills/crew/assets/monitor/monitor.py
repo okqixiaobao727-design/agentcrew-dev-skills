@@ -112,6 +112,11 @@ WAITING = "waiting"
 # operator reads a run that lands in under a second as a hung one.
 REWORKING = "reworking"
 SETTLING = "settling"
+# The third interval the run had no word for: a child queued behind its account's usage limit.
+# Its lane reports it `idle`, which the operator reads as `waiting` — "go and look" — and
+# nobody needs to look: the harness resumes the session itself when the limit resets. The word is
+# its own so the row stays quiet and honest, and the Machine log is the only thing that says it.
+PAUSED = "paused"
 PARKED = "parked"
 LANDABLE = "landable"
 MERGED = "merged"
@@ -119,7 +124,8 @@ FAILED = "failed"
 VANISHED = "vanished"
 # The order the summary line counts them in: the way a ticket travels, start to finish.
 STATE_ORDER = (
-    PENDING, RUNNING, WAITING, REWORKING, PARKED, LANDABLE, SETTLING, MERGED, FAILED, VANISHED,
+    PENDING, RUNNING, PAUSED, WAITING, REWORKING, PARKED, LANDABLE, SETTLING, MERGED, FAILED,
+    VANISHED,
 )
 # The states that owe the operator an explanation; every other row stays quiet. `reworking` is one
 # of them: the word says the child is busy, and the annotation says what it was sent to do.
@@ -230,7 +236,7 @@ CLEAR_SCREEN = "\x1b[H\x1b[2J"
 # One SGR colour per state, and the reset that ends it. Applied to the state cell alone, and only
 # when a terminal is watching: `plain` is what a pipe, a redirect and every test sees.
 STATE_COLOURS = {
-    PENDING: "90", RUNNING: "36", WAITING: "33", REWORKING: "33", PARKED: "35",
+    PENDING: "90", RUNNING: "36", PAUSED: "90", WAITING: "33", REWORKING: "33", PARKED: "35",
     LANDABLE: "32", SETTLING: "32", MERGED: "32", FAILED: "31", VANISHED: "31",
 }
 COLOUR_RESET = "\x1b[0m"
@@ -964,6 +970,12 @@ def build_rows(plan, projection, moment, sources):
                 else:
                     state, anomaly, status = live_state(launch, sources, binding)
                     end = moment
+                    if facts.paused:
+                        # The one live word no lane can report: a session queued behind its
+                        # account's usage limit is `idle` in the agents list like any finished
+                        # turn, and only the child's own log records tell the two apart. The
+                        # anomaly is left standing — what a reading did is still worth saying.
+                        state = PAUSED
             escalation_count = sum(record.get("event") == ESCALATION_EVENT for record in events)
             rows.append({
                 "wave": number,

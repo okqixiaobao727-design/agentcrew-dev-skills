@@ -67,6 +67,7 @@ _Avoid_: raw source states (busy, idle) in human-facing output
 | --- | --- |
 | `pending` | is in the table and has not been launched yet |
 | `running` | has a live child working on it |
+| `paused` | has a child queued behind its account's usage limit, which nobody has to act on |
 | `waiting` | has a child or merge needing a human: a prompt, an idle/shell turn, a blocked merge |
 | `reworking` | has a live child resolving the semantic merge conflict the run sent it back to |
 | `parked` | needs an action only a human can take, so it is waiting for them |
@@ -256,6 +257,17 @@ kind, a semantic merge conflict a child has bounced back a second time, and any 
 has no row for (a driver crash, a timeout, an unknown status, a permission prompt, a failed
 monitor). Each arrives as one JSON **wake snapshot** the driver prints as it exits, carrying the
 reason, the ticket, a pointer for the ruling, and the command that resumes the loop.
+
+**Paused** — A child waiting on its vendor's usage limit, which is a wait rather than a silence:
+Claude Code queues the session and continues it by itself when the limit resets, and prints the
+reset time in the pane. Both ends are the child's own Machine-log records — its `StopFailure` hook
+writes `paused` when a turn ends on the limit, and its `Stop` hook writes `resumed` at the end of
+the next ordinary turn — so a ticket is paused exactly while its latest child-side record is a
+`paused` one, and nobody holds that fact anywhere else. The rule table's idle rung skips a paused
+ticket entirely, and the run's inactivity deadline is held while one is live: the lane reports a
+paused session as `idle`, so without the records the run reads the wait as the second silence and
+settles the ticket `failed` (#190).
+_Avoid_: idle, stuck, waiting (the words the lane's own status tempts)
 
 **Vanished** — A launched, unsettled child whose lane's live source was read successfully and
 does not list it: a tmux pane that is not in the pane list, a session that is not in the sessions

@@ -2429,6 +2429,247 @@ class UninstallTests(MachineLogTestCase):
         self.assertEqual(self.settings.read_text(encoding="utf-8"), '{"hooks": ')
 
 
+class PauseTests(MachineLogTestCase):
+    """The two ends of a vendor usage-limit wait, written by the child's own lifecycle hooks."""
+
+    def pause(self, ticket="07", log=None):
+        return run_cli("pause", "--ticket", ticket, log=log if log is not None else self.log)
+
+    def resume(self, ticket="07", log=None):
+        return run_cli("resume", "--ticket", ticket, log=log if log is not None else self.log)
+
+    def test_the_pause_command_appends_one_child_side_record_for_its_ticket(self):
+        result = self.pause()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.only_line()
+        self.assertEqual(record["event"], "paused")
+        self.assertEqual(record["ticket"], "07")
+        self.assertEqual(record["role"], "child")
+        self.assertUniformTimestamp(record)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_the_projection_reports_the_ticket_paused_once_the_record_is_in(self):
+        self.pause()
+
+        projection = machine_log.project(machine_log.read_records(self.log))
+
+        self.assertTrue(projection.ticket("07").paused)
+        self.assertFalse(projection.ticket("08").paused)
+
+    def test_the_resume_command_writes_only_while_the_ticket_is_paused(self):
+        self.assertEqual(self.resume().returncode, 0)
+        self.assertFalse(self.log.exists(), "a resume with no pause open writes nothing")
+
+        self.pause()
+        self.assertEqual(self.resume().returncode, 0)
+        self.assertEqual([record["event"] for record in self.lines()], ["paused", "resumed"])
+        self.assertFalse(machine_log.project(self.lines()).ticket("07").paused)
+
+        self.assertEqual(self.resume().returncode, 0)
+        self.assertEqual(len(self.lines()), 2, "a second resume has no pause left to end")
+
+    def test_a_pause_is_per_ticket(self):
+        self.pause(ticket="07")
+        self.resume(ticket="08")
+
+        self.assertEqual([record["event"] for record in self.lines()], ["paused"])
+        projection = machine_log.project(self.lines())
+        self.assertTrue(projection.ticket("07").paused)
+        self.assertFalse(projection.ticket("08").paused)
+
+    def test_both_commands_stay_silent_and_write_nothing_when_the_log_cannot_be_written(self):
+        blocked = pathlib.Path(self.work.name) / "blocked"
+        blocked.write_text("not a directory\n", encoding="utf-8")
+        unwritable = blocked / "log.jsonl"
+
+        for result in (self.pause(log=unwritable), self.resume(log=unwritable)):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
+        self.assertEqual(blocked.read_text(encoding="utf-8"), "not a directory\n")
+
+    def test_a_paused_ticket_is_re_projected_the_same_way_from_scratch(self):
+        records = [
+            {"event": "launch", "ticket": "07", "child": "crew-07"},
+            {"event": "paused", "ticket": "07", "role": "child"},
+        ]
+
+        self.assertTrue(machine_log.project(records).ticket("07").paused)
+        self.assertTrue(machine_log.project(list(records)).ticket("07").paused)
+
+    def test_the_child_speaking_again_ends_the_pause_as_surely_as_a_resume_record(self):
+        cases = (
+            ("nothing", [], False),
+            ("paused", [{"event": "paused", "ticket": "07", "role": "child"}], True),
+            ("paused then resumed", [
+                {"event": "paused", "ticket": "07", "role": "child"},
+                {"event": "resumed", "ticket": "07", "role": "child"},
+            ], False),
+            ("paused then a receipt claim", [
+                {"event": "paused", "ticket": "07", "role": "child"},
+                {"event": "message", "ticket": "07", "role": "child",
+                 "message": f"CREW COMPLETE {SHA}"},
+            ], False),
+            ("paused then an escalation", [
+                {"event": "paused", "ticket": "07", "role": "child"},
+                {"event": "escalation", "ticket": "07", "role": "child", "message": ESCALATION},
+            ], False),
+            ("a ruling does not end it", [
+                {"event": "paused", "ticket": "07", "role": "child"},
+                {"event": "ruling", "ticket": "07", "role": "coordinator", "message": RULING},
+            ], True),
+            ("a driver event does not end it", [
+                {"event": "paused", "ticket": "07", "role": "child"},
+                {"event": "review", "ticket": "07", "lane": REVIEW_LANE, "state": "running"},
+            ], True),
+            ("paused again after resuming", [
+                {"event": "paused", "ticket": "07", "role": "child"},
+                {"event": "resumed", "ticket": "07", "role": "child"},
+                {"event": "paused", "ticket": "07", "role": "child"},
+            ], True),
+            ("a relaunch ends a pause its own child never did", [
+                {"event": "paused", "ticket": "07", "role": "child"},
+                {"event": "launch", "ticket": "07", "child": "crew-07-again"},
+            ], False),
+        )
+        for name, records, expected in cases:
+            with self.subTest(name):
+                self.assertEqual(machine_log.project(records).ticket("07").paused, expected)
+
+    def test_a_pause_leaves_no_standing_nudge_for_the_silence_after_it_to_inherit(self):
+        """The nudge's own turn ended on the limit, so the silence it addressed is over.
+
+        A nudge left standing across the wait would settle the resumed child `failed` on the first
+        idle it reported, which is the failure this ticket exists to end one rung further down.
+        """
+        nudged = [
+            {"event": "launch", "ticket": "07", "child": "crew-07"},
+            {"event": "ruling", "ticket": "07", "role": "coordinator",
+             "message": f"{machine_log.NUDGE_MARKER} 07 — send your receipt"},
+        ]
+
+        self.assertTrue(machine_log.project(nudged).ticket("07").outstanding_nudge)
+
+        paused = machine_log.project(
+            nudged + [{"event": "paused", "ticket": "07", "role": "child"}]
+        ).ticket("07")
+        self.assertFalse(paused.outstanding_nudge)
+        self.assertTrue(paused.paused)
+
+        resumed = machine_log.project(
+            nudged
+            + [{"event": "paused", "ticket": "07", "role": "child"}]
+            + [{"event": "resumed", "ticket": "07", "role": "child"}]
+        ).ticket("07")
+        self.assertFalse(resumed.outstanding_nudge)
+        self.assertFalse(resumed.paused)
+
+    def test_a_strangers_command_carrying_the_word_pause_is_not_this_runs_hook(self):
+        """A claimed entry is a deleted entry: `uninstall` takes out everything it recognises."""
+        log = str(self.log)
+        cases = (
+            ("ours", f"python3 /run/machine_log.py --log {log} pause --ticket 07", True),
+            ("ours, joined", f"python3 /run/machine_log.py --log={log} resume --ticket 07", True),
+            ("a stranger in the subcommand slot",
+             f"python3 /foreign/tool.py --log {log} pause --ticket 07", False),
+            ("a stranger that pauses something else",
+             f"/foreign/tool.py --log {log} watch --mode pause --ticket 07", False),
+            ("a stranger named nearly ours",
+             f"python3 /notify/machine_log.py-watcher --log {log} pause --ticket 07", False),
+            ("a stranger with no ticket", f"python3 /run/machine_log.py --log {log} pause", False),
+            ("a stranger's own log", "python3 /run/machine_log.py --log /other pause --ticket 07",
+             False),
+        )
+        for name, command, ours in cases:
+            with self.subTest(name):
+                entry = {"type": "command", "command": command}
+                self.assertEqual(machine_log.registered_for(entry, self.log), ours)
+
+
+class PauseHookInstallTests(MachineLogTestCase):
+    """Where the two lifecycle hooks are registered, and that they leave with the message hook."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings = pathlib.Path(self.work.name) / ".claude" / "settings.local.json"
+        self.settings.parent.mkdir(parents=True)
+
+    def install(self, role="child", ticket="07"):
+        arguments = ["install", "--settings", str(self.settings), "--role", role]
+        if ticket is not None:
+            arguments += ["--ticket", ticket]
+        if role == "coordinator":
+            arguments += ["--run-dir", str(self.log.parent)]
+        return run_cli(*arguments, log=self.log)
+
+    def entries(self, event, matcher):
+        document = json.loads(self.settings.read_text(encoding="utf-8"))
+        blocks = [
+            block for block in document.get("hooks", {}).get(event, [])
+            if block.get("matcher") == matcher
+        ]
+        self.assertLessEqual(len(blocks), 1, f"one block claims {event}/{matcher}")
+        return blocks[0]["hooks"] if blocks else []
+
+    def paused_entries(self):
+        return self.entries("StopFailure", "rate_limit")
+
+    def resumed_entries(self):
+        return self.entries("Stop", None)
+
+    def test_a_child_install_registers_the_pause_and_resume_hooks(self):
+        result = self.install()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for entries, subcommand in (
+            (self.paused_entries(), "pause"), (self.resumed_entries(), "resume")
+        ):
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["type"], "command")
+            self.assertIn(f" {subcommand} --ticket 07", entries[0]["command"])
+            self.assertIn(str(self.log), entries[0]["command"])
+            self.assertEqual(entries[0]["timeout"], machine_log.LIFECYCLE_HOOK_TIMEOUT_SECONDS)
+
+    def test_the_registered_commands_run_and_do_what_they_say(self):
+        self.install()
+
+        for entries in (self.paused_entries(), self.resumed_entries()):
+            result = subprocess.run(
+                entries[0]["command"], shell=True, capture_output=True, text=True, input="{}"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([record["event"] for record in self.lines()], ["paused", "resumed"])
+
+    def test_installing_twice_registers_each_hook_once(self):
+        self.install()
+        self.install()
+
+        self.assertEqual(len(self.paused_entries()), 1)
+        self.assertEqual(len(self.resumed_entries()), 1)
+
+    def test_the_coordinator_side_registers_neither(self):
+        self.install(role="coordinator", ticket=None)
+
+        self.assertEqual(self.paused_entries(), [])
+        self.assertEqual(self.resumed_entries(), [])
+
+    def test_uninstalling_takes_both_out_and_leaves_a_stranger_where_it_is(self):
+        stranger = {"type": "command", "command": "/worktree/.claude/announce.sh"}
+        self.settings.write_text(
+            json.dumps({"hooks": {"Stop": [{"hooks": [stranger]}]}}), encoding="utf-8"
+        )
+        self.install()
+
+        result = run_cli("uninstall", "--settings", str(self.settings), log=self.log)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(self.settings.read_text(encoding="utf-8"))
+        self.assertNotIn("StopFailure", document["hooks"])
+        self.assertEqual(document["hooks"]["Stop"], [{"hooks": [stranger]}])
+
+
 class MachineParseabilityTests(MachineLogTestCase):
     """A later agent reconstructs the run from the file alone."""
 

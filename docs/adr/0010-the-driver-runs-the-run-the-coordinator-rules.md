@@ -70,7 +70,10 @@ Children's ASKs keep arriving by cross-session messaging, authenticated as befor
 predecessor skill document's settlement prose, not a new invention: verify on `CREW COMPLETE` and
 settle in silence; one re-ask on an invalid receipt and failed on the second; parked and failed
 receipts recorded by the driver; a parked ticket with no descendants does not gate its wave; one
-nudge for an idle child and failed on the second silence; vanished settles failed; a mechanical
+nudge for an idle child and failed on the second silence, except while the Machine log says that
+child is paused on its vendor's usage limit — a wait the harness ends by itself, which the idle
+rung neither nudges nor settles and which holds the run's inactivity deadline for as long as it
+lasts (#190); vanished settles failed; a mechanical
 conflict resolved in the merge driver itself, and only what it will not rewrite to the
 budget-capped repair rung; a templated first answer to a semantic conflict; tracker
 closes for merged tickets; wave advancement, monitor re-arming and the dashboard. The report — the

@@ -187,6 +187,7 @@ never reads an internal word:
 | --- | --- |
 | `pending` | the log carries no `launch` for that ticket, or an `outcome` of `blocked` |
 | `running` | its lane's source says `busy` |
+| `paused` | the log's latest child-side record for it is `paused`, whatever its lane says |
 | `waiting` | its lane says `waiting`, `idle` or `shell`; a `merge` of `conflict`/`escalated` |
 | `reworking` | an `escalated` merge, the rework instruction after it, and a `busy` lane |
 | `parked` | a `receipt` verdict or an `outcome` of `parked`, or its lane says so |
@@ -196,7 +197,14 @@ never reads an internal word:
 | `failed` | a `receipt` verdict or an `outcome` of `failed` |
 | `vanished` | a successful lane read has no live entry after launch and before settlement |
 
-Two of those words are the intervals the run used to have no vocabulary for, and both exist
+`paused` is the one live word no lane can report. A session queued behind its account's usage
+limit answers `idle`, exactly as a child that stopped without finishing does, so the frame takes
+this one from the Machine log's own records
+([the usage-limit hooks](machine-log.md#the-usage-limit-hooks)) rather than from the lane. It is
+not an abnormal state and it raises no toast: the harness continues the session itself when the
+limit resets, and there is nowhere for a toast to send the operator (#190).
+
+Two more of those words are the intervals the run used to have no vocabulary for, and both exist
 because a frozen-looking row is read as a hung run. A child sent the merge driver's rework
 instruction — the `ruling` the log carries opening `CREW MERGE`, after the `merge` that escalated
 — is working on the conflict rather than stuck at anything, so its row says `reworking` and
