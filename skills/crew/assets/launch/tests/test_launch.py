@@ -103,7 +103,13 @@ class Fixture:
         return self.run_dir / run_plan.CREW_STATE_DIR_NAME
 
     def recorded_driver(self):
-        """The pid the run directory names as its driver, or None where it names none."""
+        """The pid the run directory names as its driver, or None where it names none.
+
+        Deliberately strict where `monitor.recorded_driver` is forgiving: the product tolerates a
+        half-written record because a real one can be anything, but every writer in these tests
+        renames, so an unreadable record here means a writer stopped doing that. Softening this
+        to return None would let that regression through in silence.
+        """
         path = self.crew_dir / DRIVER_RECORD
         return int(path.read_text().strip()) if path.exists() else None
 
@@ -148,9 +154,16 @@ class Fixture:
         os.replace(temporary, self.crew_dir / WAKE_NAME)
 
     def record_driver(self, pid):
-        """Name a process as this run's driver, as a driver's loop names itself."""
+        """Name a process as this run's driver, as a driver's loop names itself.
+
+        By rename, as `wake` above and as `monitor.record_driver` itself: a plain write truncates
+        first, and a waiter polling the record would read it empty for a driver that is alive.
+        """
         self.crew_dir.mkdir(parents=True, exist_ok=True)
-        (self.crew_dir / DRIVER_RECORD).write_text(f"{pid}\n")
+        path = self.crew_dir / DRIVER_RECORD
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(f"{pid}\n")
+        os.replace(temporary, path)
 
     def dead_pid(self):
         """A pid that has certainly gone: a process this fixture started and then reaped."""
