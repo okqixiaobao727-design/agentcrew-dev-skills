@@ -18,8 +18,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
   `cause`, `approach` and `reach`, so a finding with nothing open is refused as the edit it is; an
   identical finding is idempotent; and every call prints the Run's pending queued tickets, so a
   finding that shares a cause with one of them is deferred to it rather than opening a second
-  diagnosis of the same thing. Tracker gained the `create` operation ADR-0019 planned, on both the
-  GitHub and the local adapter (#184, #185).
+  diagnosis of the same thing. Tracker gained a `create` operation on both the GitHub and the local
+  adapter — the addition ADR-0028 makes to ADR-0019's interface (#184, #185).
 - The Driver reloads the Run plan before it advances past a settled Wave and before it writes the
   run's `complete` decision, and activates and adopts onto an appended Wave through the one
   activation path every Wave uses — so a ticket queued while the last Wave was settling is

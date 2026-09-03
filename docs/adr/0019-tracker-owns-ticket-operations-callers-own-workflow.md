@@ -1,6 +1,6 @@
 ---
-status: partial — comment landed in #174; read, edit, mark and close remain deferred, as does the
-  ticket-locator-through-wave-table slice
+status: partial — comment landed in #174 and create in #184; read, edit, mark and close remain
+  deferred, as does the ticket-locator-through-wave-table slice
 ---
 
 # Tracker owns ticket operations; callers own workflow
@@ -20,8 +20,11 @@ live-synchronisation requirement.
 ## Decision
 
 One **Tracker module** owns the complete implementation of the tracker operations `read`, `edit`,
-`mark`, `comment` and `close`. Reading includes read-with-comments, author-association filtering,
-tracker-native child discovery and resolving the status of a referenced ticket. Stage decides
+`mark`, `comment` and `close`;
+[ADR-0028](0028-a-finding-is-queued-into-the-run-and-diagnosed-by-the-child-that-implements-it.md)
+adds `create` to that list, for the ticket a Run opens for itself. Reading includes
+read-with-comments, author-association filtering, tracker-native child discovery and resolving the
+status of a referenced ticket. Stage decides
 which reads and writes its staging workflow requires; the Driver decides when a merged ticket is
 closed. Neither caller knows how a tracker performs an operation.
 
@@ -51,6 +54,9 @@ distinct from the original ticket locator the deferred Run-plan slice above will
 Identical bodies return the existing locator; distinct local bodies remain as distinct `Crew:`
 comment blocks. A caller may name a `supersedes` body prefix when its workflow needs one matching
 comment replaced. Tracker owns that replacement operation but does not know what the prefix means.
+`create` landed the same way in #184, with the Driver's `queue` as its one caller;
+[`references/trackers.md`](../../references/trackers.md) states what both operations answer with on
+each tracker. `read`, `edit`, `mark` and `close` are still Stage's and the Driver's own.
 
 Only GitHub and local are supported now. `references/trackers.md` currently claims that GitLab,
 Jira, Linear and other trackers work from convention-document commands, while preflight rejects
