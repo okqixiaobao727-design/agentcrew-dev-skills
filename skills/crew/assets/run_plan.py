@@ -1,9 +1,12 @@
 """Build, validate, persist, and query the immutable meaning of a Wave table."""
 
-from dataclasses import dataclass
+import contextlib
+from dataclasses import dataclass, replace
 import json
+import os
 import pathlib
 import re
+import tempfile
 import tomllib
 
 import accounts
@@ -27,6 +30,19 @@ REVIEW_VENDORS = EXECUTORS
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ACCOUNT_MODES = accounts.ACCOUNT_MODES
 TRACKERS = ("github", "local")
+# The tracker whose Run-directory ticket file is a stub rather than the ticket itself.
+GITHUB_TRACKER = TRACKERS[0]
+# What a queued ticket's finding still leaves open, which is what its child diagnoses first
+# (ADR-0028). A finding whose cause and change site are both known is an edit, never a queued
+# ticket, so there is no fourth word.
+OPEN_WORDS = ("cause", "approach", "reach")
+# The routing a queued ticket is opened on: one cell of the crew config file, the operator's
+# standing approval. `account` is deliberately not one of these keys — which subscription pays is
+# not a fact about the kind of work, so the cell never concludes one.
+QUEUED_SECTION = "queued"
+QUEUED_FIELDS = ("workflow", "executor", "model", "effort")
+QUEUED_REVIEW = "review"
+QUEUED_ACCOUNT = "account"
 BARE_WORD = re.compile(r"^[A-Za-z]+$")
 CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]$")
 
@@ -85,6 +101,25 @@ class ReviewLane:
 
 
 @dataclass(frozen=True)
+class Queued:
+    """Why one ticket was queued into this Run: the finding's source, and what it leaves open."""
+
+    source: str
+    open: str
+
+
+@dataclass(frozen=True)
+class QueuedRouting:
+    """The routing a queued ticket is opened on, resolved from the `[queued]` config cell."""
+
+    workflow: str
+    executor: str
+    model: str
+    effort: str
+    review: ReviewLane | None = None
+
+
+@dataclass(frozen=True)
 class PlannedTicket:
     id: str
     title: str
@@ -98,6 +133,9 @@ class PlannedTicket:
     review: ReviewLane | None = None
     slug: str | None = None
     base_commit: str | None = None
+    # Absent on an ordinary ticket; present on one this Run queued into itself, which is what
+    # selects the diagnosing child at dispatch (ADR-0028).
+    queued: Queued | None = None
 
 
 @dataclass(frozen=True)
@@ -149,15 +187,69 @@ class RunPlan:
                 return tuple(found)
             found.extend(frontier)
 
+    def append(self, ticket):
+        """This plan with one more trailing Wave carrying that one ticket (ADR-0028).
+
+        The appended ticket is blocked by the last ticket, in table order, of the Wave that was
+        final before it: queued Waves run serially because they often share a root cause, so each
+        one starts from the code the Wave before it merged. `Blocked by` is this operation's to
+        set — a caller that names its own is refused rather than half-honoured — and the
+        result is validated exactly as an approved table is, so a routing the table refuses is
+        refused here in the same words.
+        """
+        if not isinstance(ticket, PlannedTicket):
+            raise RunPlanError([f"run: {ticket!r} is not a planned ticket"])
+        if ticket.blocked_by:
+            raise RunPlanError([
+                f"{ticket.id} {ticket.path}: names its own Blocked by"
+                f" {', '.join('#' + blocker for blocker in ticket.blocked_by)} — appending owns"
+                " that edge, so it is left unset"
+            ])
+        if not self.waves or not self.waves[-1].tickets:
+            raise RunPlanError(["run: the plan carries no wave to append behind"])
+        preceding = self.waves[-1].tickets[-1]
+        appended = Wave(
+            len(self.waves) + 1, (replace(ticket, blocked_by=(preceding.id,)),)
+        )
+        return _validate(RunPlan(self.run, self.waves + (appended,)))
+
     def write(self, path):
-        """Write the existing Wave-table JSON representation."""
+        """Write the existing Wave-table JSON representation, replacing the table atomically.
+
+        Written to a temporary file beside the table, flushed to disk, and renamed onto the name:
+        every reader of this table reads it without a lock, deliberately — the hold `edit_plan`
+        takes is a separate `wave-table.json.lock` file precisely so a reader is never held up by
+        a writer — so a truncating write would hand `advance.py`, `Loop.reload_plan` or `dispatch`
+        an empty or partial file, and a crash inside one would leave the run's sole routing
+        authority permanently unreadable. A rename gives them one whole table or the other.
+        """
         path = pathlib.Path(path)
+        text = json.dumps(_plan_object(_validate(self)), indent=2) + "\n"
+        handle = None
+        temporary = None
         try:
-            path.write_text(
-                json.dumps(_plan_object(_validate(self)), indent=2) + "\n", encoding="utf-8"
+            # In the table's own directory, because a rename is only atomic within one filesystem.
+            descriptor, temporary = tempfile.mkstemp(
+                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
             )
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            os.replace(temporary, path)
+            temporary = None
         except OSError as error:
             raise RunPlanError([f"run: {path} could not be written: {error}"]) from error
+        finally:
+            if handle is not None:
+                handle.close()
+            if temporary is not None:
+                # The name was never taken, so the table on disk is the one that was already
+                # there; what must not be left behind is this attempt's half of a file.
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
 
 
 def _wave_number(value):
@@ -202,6 +294,43 @@ def ticket_title(text, identifier):
     return identifier
 
 
+def ticket_section(text, wanted):
+    """One Markdown section, including its heading, exactly as the source carries it."""
+    lines = text.splitlines(keepends=True)
+    start = None
+    for index, line in enumerate(lines):
+        heading = SECTION.match(line.rstrip("\n"))
+        if heading and start is not None:
+            return "".join(lines[start:index]).rstrip("\n")
+        if heading and heading.group(1).lower() == wanted:
+            start = index
+    return "" if start is None else "".join(lines[start:]).rstrip("\n")
+
+
+def ticket_pointer(url):
+    """The tracker-authority line shared by ticket and parent stubs."""
+    return f"Ticket: {url} — the issue body and every comment are this ticket; read all of it."
+
+
+def staged_text(kind, title, body, url=None):
+    """That ticket as a Run directory holds it, pointing at its tracker authority.
+
+    The Run directory's own form of a ticket, which is the Run plan's to say (ADR-0018): a github
+    ticket is a stub carrying the pointer and the two machine sections the plan reads, and a local
+    ticket is the file itself. Staging writes one at `/route` time and the Driver writes one for a
+    ticket the Run queues into itself (ADR-0028); both render it from here, so a run directory
+    holds one shape however the ticket got there.
+    """
+    if kind == GITHUB_TRACKER:
+        machine_sections = [
+            held for name in (ROUTING_SECTION, BLOCKED_BY_SECTION)
+            if (held := ticket_section(body, name))
+        ]
+        suffix = "".join(f"\n\n{held}" for held in machine_sections)
+        return f"# {title}\n\n{ticket_pointer(url)}{suffix}\n"
+    return body
+
+
 def ticket_dependencies(text):
     """The ordered ticket identifiers in one ticket's `Blocked by` section."""
     return tuple(BLOCKER.findall(_sections(text).get(BLOCKED_BY_SECTION, "")))
@@ -236,6 +365,54 @@ def _routing_vocabulary():
     return templates["workflows"], {
         str(alias).lower() for alias in templates["models"]["aliases"]
     }
+
+
+def routing_faults(workflow, executor, model, effort, vocabulary=None):
+    """Every fault in one ticket's four routing fields, in the Wave table's own words.
+
+    The single place those four are judged, so a routing resolved anywhere else — the `[queued]`
+    cell a coordinator queues a diagnosis on (ADR-0028) — is held to exactly what an approved
+    table passes, and is refused in the same words. `vocabulary` is the `_routing_vocabulary`
+    pair, passed in by a caller validating a whole table so the templates are read once.
+    """
+    workflows, aliases = vocabulary if vocabulary is not None else _routing_vocabulary()
+    faults = []
+    if workflow not in workflows:
+        faults.append(f"Workflow `{workflow}` is outside {', '.join(sorted(workflows))}")
+    if executor not in EXECUTORS:
+        faults.append(f"Executor `{executor}` is outside {', '.join(EXECUTORS)}")
+    if effort not in EFFORTS:
+        faults.append(f"Effort `{effort}` is outside {', '.join(EFFORTS)}")
+    fault = _alias_problem("Model", model, aliases)
+    if fault:
+        faults.append(fault)
+    return faults
+
+
+def review_faults(workflow, review, vocabulary=None):
+    """Every fault in one ticket's review lane against its workflow, in the same words."""
+    workflows, aliases = vocabulary if vocabulary is not None else _routing_vocabulary()
+    wants_lane = bool(workflow in workflows and workflows[workflow]["review_lane"])
+    if wants_lane and review is None:
+        return ["lacks Review, which its workflow requires"]
+    if review is None:
+        return []
+    if not wants_lane:
+        return [f"carries a Review, which workflow `{workflow}` takes none of"]
+    if not isinstance(review, ReviewLane):
+        return ["Review is not a review lane"]
+    faults = []
+    if review.vendor not in REVIEW_VENDORS:
+        faults.append(f"Review vendor `{review.vendor}` is outside {', '.join(REVIEW_VENDORS)}")
+    if not review.model:
+        faults.append("Review lacks model")
+    else:
+        fault = _alias_problem("Review model", review.model, aliases)
+        if fault:
+            faults.append(fault)
+    if review.effort not in EFFORTS:
+        faults.append(f"Review effort `{review.effort}` is outside {', '.join(EFFORTS)}")
+    return faults
 
 
 def model_problem(label, value):
@@ -292,7 +469,7 @@ def _validation_problems(plan, check_wave_layout=True):
         plan.run.witness_budget_usd,
         plan.run.tracker,
     )
-    workflows, aliases = _routing_vocabulary()
+    vocabulary = _routing_vocabulary()
     numbers = [wave.number for wave in plan.waves]
     expected_numbers = list(range(1, len(plan.waves) + 1))
     if numbers != expected_numbers:
@@ -317,24 +494,17 @@ def _validation_problems(plan, check_wave_layout=True):
             "effort": "Effort",
         }
         for key, label in required.items():
-            if not getattr(ticket, key):
+            value = getattr(ticket, key)
+            if not isinstance(value, str) or not value:
                 faults.append(f"lacks {label}")
-        if not ticket.id.isdigit():
+        if isinstance(ticket.id, str) and not ticket.id.isdigit():
             faults.append(f"Ticket id `{ticket.id}` is not numeric")
         if ticket.id in seen:
             faults.append("is listed twice")
         seen.add(ticket.id)
-        if ticket.workflow not in workflows:
-            faults.append(
-                f"Workflow `{ticket.workflow}` is outside {', '.join(sorted(workflows))}"
-            )
-        if ticket.executor not in EXECUTORS:
-            faults.append(f"Executor `{ticket.executor}` is outside {', '.join(EXECUTORS)}")
-        if ticket.effort not in EFFORTS:
-            faults.append(f"Effort `{ticket.effort}` is outside {', '.join(EFFORTS)}")
-        fault = _alias_problem("Model", ticket.model, aliases)
-        if fault:
-            faults.append(fault)
+        faults.extend(routing_faults(
+            ticket.workflow, ticket.executor, ticket.model, ticket.effort, vocabulary
+        ))
         binding = ticket.binding
         if not isinstance(binding, accounts.Binding):
             faults.append("lacks Account binding")
@@ -349,29 +519,26 @@ def _validation_problems(plan, check_wave_layout=True):
                 faults.append(
                     f"Account mode `{binding.mode}` is outside {', '.join(ACCOUNT_MODES)}"
                 )
-        wants_lane = bool(
-            ticket.workflow in workflows and workflows[ticket.workflow]["review_lane"]
-        )
-        if wants_lane and ticket.review is None:
-            faults.append("lacks Review, which its workflow requires")
-        elif ticket.review is not None and not wants_lane:
-            faults.append(f"carries a Review, which workflow `{ticket.workflow}` takes none of")
-        elif ticket.review is not None:
-            review = ticket.review
-            if review.vendor not in REVIEW_VENDORS:
-                faults.append(
-                    f"Review vendor `{review.vendor}` is outside {', '.join(REVIEW_VENDORS)}"
-                )
-            if not review.model:
-                faults.append("Review lacks model")
+        faults.extend(review_faults(ticket.workflow, ticket.review, vocabulary))
+        if ticket.queued is not None:
+            if not isinstance(ticket.queued, Queued):
+                faults.append("Queued is not a queued fact")
             else:
-                fault = _alias_problem("Review model", review.model, aliases)
-                if fault:
-                    faults.append(fault)
-            if review.effort not in EFFORTS:
-                faults.append(
-                    f"Review effort `{review.effort}` is outside {', '.join(EFFORTS)}"
-                )
+                if not isinstance(ticket.queued.source, str):
+                    faults.append("Queued source is not a string")
+                elif not ticket.queued.source.strip():
+                    faults.append("Queued lacks source, the finding's own ticket")
+                if ticket.queued.open not in OPEN_WORDS:
+                    faults.append(
+                        f"Queued open `{ticket.queued.open}` is outside"
+                        f" {', '.join(OPEN_WORDS)}"
+                    )
+        # The optional strings, held to what a load of the written table would accept, so nothing
+        # this validates can be written and then refused on the way back in.
+        for key, label in (("slug", "Slug"), ("base_commit", "Base commit")):
+            value = getattr(ticket, key)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                faults.append(f"{label} is not a non-empty string")
         if ticket.executor == "codex" and plan.run.codex is None:
             faults.append("needs the run's codex bridge and state_dir")
         if faults:
@@ -454,6 +621,111 @@ def witness_routing(model, budget_usd):
         if budget_usd is None:
             budget_usd = defaults["budget_usd"]
     return WITNESS_EXECUTOR, model, budget_usd
+
+
+def queued_defaults():
+    """The shipped `[queued]` cell: the routing every queued ticket is opened on."""
+    try:
+        with DEFAULT_CONFIG.open("rb") as handle:
+            queued = tomllib.load(handle).get(QUEUED_SECTION)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RunPlanError([
+            f"run: shipped queued defaults {DEFAULT_CONFIG} are unreadable: {error}"
+        ]) from error
+    if not isinstance(queued, dict):
+        raise RunPlanError([
+            f"run: shipped defaults {DEFAULT_CONFIG} carry no [{QUEUED_SECTION}] table"
+        ])
+    return queued
+
+
+def _queued_problems(faults):
+    """The validator's own fault text, said of the `[queued]` cell that resolved to it."""
+    return [f"queued: [{QUEUED_SECTION}] {fault}" for fault in faults]
+
+
+def _queued_field(cell, key, label):
+    value = cell.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise RunPlanError([f"queued: [{label}] {key} is not a non-empty string"])
+    return value
+
+
+def queued_routing(project_cell):
+    """Resolve the `[queued]` cell, a project's own overriding the shipped one field by field.
+
+    The operator's standing approval for a routing the coordinator applies in their stead
+    (ADR-0028), read the way every other cell of the config file is read: a project file names
+    only the fields it retargets and inherits the rest. The review lane is resolved for the
+    workflows that take one and dropped for the workflows that take none, so the resolved value is
+    a routing the wave table already accepts.
+    """
+    shipped = queued_defaults()
+    if project_cell is None:
+        project_cell = {}
+    if not isinstance(project_cell, dict):
+        raise RunPlanError([
+            f"queued: [{QUEUED_SECTION}] is not a table of routing fields"
+        ])
+    if QUEUED_ACCOUNT in project_cell or QUEUED_ACCOUNT in shipped:
+        raise RunPlanError([
+            f"queued: [{QUEUED_SECTION}] names an `{QUEUED_ACCOUNT}` — which subscription pays is"
+            " not a fact about the kind of work, so a queued ticket names none and runs on the"
+            " coordinator's own account; name it on the queue command instead"
+        ])
+    known = set(QUEUED_FIELDS) | {QUEUED_REVIEW}
+    unknown = sorted(set(project_cell) - known) + sorted(set(shipped) - known)
+    if unknown:
+        raise RunPlanError([
+            f"queued: [{QUEUED_SECTION}] carries an unknown field `{field}` — it is one of"
+            f" {', '.join(sorted(known))}"
+            for field in unknown
+        ])
+    cell = {**shipped, **project_cell}
+    resolved = {
+        key: _queued_field(cell, key, QUEUED_SECTION) for key in QUEUED_FIELDS
+    }
+    vocabulary = _routing_vocabulary()
+    workflows, _ = vocabulary
+    # Held to exactly what an approved Wave table passes, in the table's own words, and held here
+    # rather than at the append: the coordinator's `--effort`, `--executor` and `--model`
+    # overrides reach this cell, and everything refusable must be refused before `queue` opens a
+    # tracker ticket that no failure afterwards can take back.
+    faults = routing_faults(
+        resolved["workflow"], resolved["executor"], resolved["model"], resolved["effort"],
+        vocabulary,
+    )
+    shape = workflows.get(resolved["workflow"])
+    if shape is None:
+        # Without a shape there is no saying whether a lane is owed, so this is as far as one
+        # resolution goes; the workflow fault is already in hand.
+        raise RunPlanError(_queued_problems(faults))
+    review = None
+    if shape["review_lane"]:
+        lanes = []
+        for source in (shipped, project_cell):
+            held = source.get(QUEUED_REVIEW)
+            if held is not None and not isinstance(held, dict):
+                raise RunPlanError([
+                    f"queued: [{QUEUED_SECTION}.{QUEUED_REVIEW}] is not a table of lane fields"
+                ])
+            lanes.append(held or {})
+        lane = {**lanes[0], **lanes[1]}
+        if not lane:
+            raise RunPlanError([
+                f"queued: [{QUEUED_SECTION}.{QUEUED_REVIEW}] is missing, and workflow"
+                f" `{resolved['workflow']}` takes a review lane"
+            ])
+        label = f"{QUEUED_SECTION}.{QUEUED_REVIEW}"
+        review = ReviewLane(
+            _queued_field(lane, "executor", label),
+            _queued_field(lane, "model", label),
+            _queued_field(lane, "effort", label),
+        )
+    faults += review_faults(resolved["workflow"], review, vocabulary)
+    if faults:
+        raise RunPlanError(_queued_problems(faults))
+    return QueuedRouting(review=review, **resolved)
 
 
 def configuration_problems(
@@ -681,6 +953,11 @@ def _ticket_object(ticket):
             "model": ticket.review.model,
             "effort": ticket.review.effort,
         }
+    if ticket.queued is not None:
+        document["queued"] = {
+            "source": ticket.queued.source,
+            "open": ticket.queued.open,
+        }
     if ticket.slug is not None:
         document["slug"] = ticket.slug
     if ticket.base_commit is not None:
@@ -730,6 +1007,16 @@ def _loaded_ticket(value):
             _ticket_string(review, "model", "Review model"),
             _ticket_string(review, "effort", "Review effort"),
         )
+    queued = value.get("queued")
+    queued_value = None
+    if queued is not None:
+        where = f"{identifier or '(no id)'} {value.get('path', '')}"
+        if not isinstance(queued, dict):
+            raise RunPlanError([f"{where}: Queued is not a queued fact"])
+        for key, label in (("source", "Queued source"), ("open", "Queued open")):
+            if not isinstance(queued.get(key), str):
+                raise RunPlanError([f"{where}: {label} is not a string"])
+        queued_value = Queued(queued["source"], queued["open"])
     blocked_by = value.get("blocked_by", [])
     if not isinstance(blocked_by, list):
         raise RunPlanError([
@@ -752,6 +1039,7 @@ def _loaded_ticket(value):
         review=review_value,
         slug=_ticket_string(value, "slug", "Slug", optional=True),
         base_commit=_ticket_string(value, "base_commit", "Base commit", optional=True),
+        queued=queued_value,
     )
 
 

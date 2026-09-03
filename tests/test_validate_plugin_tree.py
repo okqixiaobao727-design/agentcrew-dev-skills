@@ -617,6 +617,20 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.edit_config("budget_usd = 2.0\n", "")
         self.assert_rejects("budget_usd")
 
+    def test_shipped_defaults_without_the_queued_cell_are_rejected(self):
+        """Nothing else answers the routing a queued ticket is opened on (ADR-0028)."""
+        self.tree.drop_config_block("queued")
+        self.tree.drop_config_block("queued.review")
+        self.assert_rejects("[queued]")
+
+    def test_shipped_defaults_without_the_queued_review_lane_are_rejected(self):
+        self.tree.drop_config_block("queued.review")
+        self.assert_rejects("[queued.review]")
+
+    def test_a_shipped_queued_cell_naming_an_account_is_rejected(self):
+        self.tree.edit_config('[queued]\nworkflow', '[queued]\naccount = "second"\nworkflow')
+        self.assert_rejects("account")
+
     def test_shipped_defaults_without_a_tracker_are_rejected(self):
         self.tree.edit_config('[tracker]\nkind = "local"\n', "")
         self.assert_rejects("tracker")
@@ -785,6 +799,28 @@ class ProjectConfigTests(unittest.TestCase):
             '[witness]\nmodel = "sonnet"\nbudget_usd = 2.0\n', "alias"
         )
 
+    def test_a_project_overriding_one_queued_field_is_accepted(self):
+        """The cell is inherited field by field, exactly as an implementer cell is."""
+        self.assert_accepts_with_required('[queued]\neffort = "high"\n')
+
+    def test_a_project_overriding_only_the_queued_review_effort_is_accepted(self):
+        self.assert_accepts_with_required('[queued.review]\neffort = "xhigh"\n')
+
+    def test_a_project_queued_cell_naming_an_account_is_rejected(self):
+        self.assert_rejects_with_required('[queued]\naccount = "second"\n', "account")
+
+    def test_a_project_queued_cell_with_an_alias_model_is_rejected(self):
+        self.assert_rejects_with_required('[queued]\nmodel = "opus"\n', "alias")
+
+    def test_a_project_queued_cell_with_an_unknown_workflow_is_rejected(self):
+        self.assert_rejects_with_required('[queued]\nworkflow = "diagnose"\n', "diagnose")
+
+    def test_a_project_queued_review_lane_with_an_unknown_executor_is_rejected(self):
+        self.assert_rejects_with_required('[queued.review]\nexecutor = "gemini"\n', "gemini")
+
+    def test_an_unknown_queued_field_is_rejected(self):
+        self.assert_rejects_with_required('[queued]\nbudget_usd = 2.0\n', "budget_usd")
+
     def test_a_project_naming_a_tracker_that_is_not_exercised_is_rejected(self):
         self.assert_rejects('[repair]\nmodel = "claude-sonnet-5"\n[tracker]\nkind = "jira"\n', "jira")
 
@@ -808,6 +844,55 @@ class ProjectConfigTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("missing", result.stdout + result.stderr)
+
+
+class WorkflowVocabularyTests(unittest.TestCase):
+    """The workflows this checker accepts are the workflows the renderer can render.
+
+    The `[queued]` cell names a workflow no upstream classification chose, so this checker is the
+    only thing between a typo there and a run that cannot render its child's first turn. It reads
+    the renderer's own templates rather than restating them, and these cases hold it to that.
+    """
+
+    REQUIRED = '[repair]\nmodel = "claude-sonnet-5"\n[tracker]\nkind = "local"\n'
+
+    @staticmethod
+    def rendered_workflows():
+        with (PLUGIN_ROOT / VALIDATOR.SHAPES).open("rb") as handle:
+            return tomllib.load(handle)["workflows"]
+
+    def check(self, text):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / "agentcrew.toml"
+        path.write_text(text)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--config", str(path)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_every_workflow_the_renderer_renders_is_accepted_in_the_queued_cell(self):
+        for workflow in sorted(self.rendered_workflows()):
+            with self.subTest(workflow=workflow):
+                result = self.check(f'[queued]\nworkflow = "{workflow}"\n' + self.REQUIRED)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_an_unreadable_template_file_is_a_problem_rather_than_an_empty_vocabulary(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        problems = []
+
+        workflows = VALIDATOR.template_workflows(pathlib.Path(directory.name), problems)
+
+        self.assertEqual(workflows, frozenset())
+        self.assertTrue(any(VALIDATOR.SHAPES in problem for problem in problems), problems)
+
+    def test_the_shipped_queued_workflow_is_one_the_renderer_gives_a_review_lane(self):
+        with (PLUGIN_ROOT / CONFIG).open("rb") as handle:
+            queued = tomllib.load(handle)["queued"]
+
+        self.assertTrue(self.rendered_workflows()[queued["workflow"]]["review_lane"])
 
 
 class AliasVerdictParityTests(unittest.TestCase):

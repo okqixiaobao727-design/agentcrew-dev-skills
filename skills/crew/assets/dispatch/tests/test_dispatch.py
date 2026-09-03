@@ -1321,6 +1321,159 @@ class WorkflowShapeTests(DispatchTestCase):
         )
 
 
+# The diagnosis step a queued ticket's child receives in place of the skeleton's step 1
+# (ADR-0028), as #183 pinned it. Held here as the child reads it, so a reflow in the template
+# cannot pass unnoticed.
+DIAGNOSIS_STEP = (
+    "1. Diagnose before your first edit. This triage's maintainer is the coordinator, and"
+    " verifying the claim and writing the agent brief are approved in advance: reproduce it, find"
+    " the cause, and post the brief on the ticket, invoking <codebase-design skill> before you"
+    " write its approach. Then send one `design` escalation — the brief's pointer, every question"
+    " this triage would put to a maintainer, and your pick marked \"implement per brief\" — and"
+    " wait. The ruling arrives as the workflow's own opening line; the workflow below starts"
+    " there. A"
+    " cause an earlier ticket of this Run already fixed is still your deliverable: commit the test"
+    " that proves it, and complete."
+)
+
+# The wrap-up bullet every child and every manual developer prompt renders (#183).
+WRAP_UP_BULLET = (
+    "- wrap-up: the ticket is complete and leftovers remain. One line per leftover — what it is"
+    " and its pointer, at the cause where you know it and at the symptom where you do not — and"
+    " no recommendation: placing them is the ruling."
+)
+
+# The ordinary child's step 1, which a queued ticket's child does not receive.
+ORDINARY_STEP_ONE = (
+    "1. Before your first edit: send this phase's decision points as one `design` escalation and"
+    " wait for the ruling."
+)
+
+
+class QueuedChildTests(DispatchTestCase):
+    """The diagnosing child a queued ticket launches: triage first, then the ticket's workflow."""
+
+    QUEUED = {"source": "#42 review finding", "open": "cause"}
+
+    def prompt_for(self, **overrides):
+        overrides.setdefault("queued", self.QUEUED)
+        table = self.fixture.table([self.fixture.ticket("06", "queued-child", **overrides)])
+        result = self.fixture.run_dispatch("render", table)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.fixture.turn("06")
+
+    def ticket_path(self):
+        return str(self.fixture.feature_dir / "06-queued-child.md")
+
+    def test_a_queued_claude_child_opens_on_the_triage_skill(self):
+        prompt = self.prompt_for()
+
+        self.assertTrue(
+            prompt.startswith(
+                f"/mattpocock-skills:triage {self.ticket_path()}\n"
+            ),
+            prompt[:200],
+        )
+
+    def test_a_queued_codex_child_opens_on_the_bare_mention_its_bridge_resolves(self):
+        """The bare form is what the end-to-end scenarios verified (#182 fact 4a).
+
+        Not a claim that the bridge refuses the canonical form: it accepts either on an opening
+        line as of #189. This pins the spelling the template actually emits.
+        """
+        prompt = self.prompt_for(
+            executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
+
+        self.assertTrue(prompt.startswith(f"$triage {self.ticket_path()}\n"), prompt[:200])
+        self.assertNotIn("$mattpocock-skills:triage", prompt)
+
+    def test_the_diagnosis_step_replaces_step_one_verbatim(self):
+        prompt = self.prompt_for()
+
+        flattened = " ".join(prompt.split())
+        self.assertIn(
+            DIAGNOSIS_STEP.replace(
+                "<codebase-design skill>", "/mattpocock-skills:codebase-design"
+            ),
+            flattened,
+        )
+        self.assertNotIn(ORDINARY_STEP_ONE, flattened)
+        self.assertNotIn("A seam or public interface /tdd would have you confirm", flattened)
+
+    def test_the_codebase_design_skill_resolves_the_way_the_writing_skill_does(self):
+        claude = self.prompt_for()
+        codex = self.prompt_for(
+            executor="codex", model=CODEX_MODEL, effort=CODEX_EFFORT,
+            review={"vendor": "claude", "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT},
+        )
+
+        self.assertIn("/mattpocock-skills:codebase-design", claude)
+        self.assertIn("$mattpocock-skills:codebase-design", codex)
+        self.assertNotIn("<codebase-design skill>", claude + codex)
+
+    def test_every_other_block_of_the_turn_is_the_workflow_the_ticket_names(self):
+        prompt = self.prompt_for()
+
+        self.assertEqual(
+            re.findall(r"^([1-5])\. ", prompt, flags=re.MULTILINE), ["1", "2", "3", "4", "5"]
+        )
+        flattened = " ".join(prompt.split())
+        self.assertIn("2. Workflow: tdd. Base commit:", flattened)
+        self.assertIn("3. Before committing, run `bash", flattened)
+        self.assertIn("4. Commit.", flattened)
+        self.assertIn("5. If leftovers remain", flattened)
+        self.assertIn("CREW ASK 06 <design|scope|doc-conflict|stuck|wrap-up>", flattened)
+        self.assertIn(f"Spec: {self.fixture.spec_path}.", flattened)
+
+    def test_a_queued_ticket_on_a_testless_workflow_still_names_its_regression_test(self):
+        """`direct` and `ops` write tests only where the ticket names them; this step is that."""
+        for workflow in ("direct", "ops"):
+            with self.subTest(workflow=workflow):
+                prompt = self.prompt_for(workflow=workflow, review=None)
+                flattened = " ".join(prompt.split())
+                self.assertIn(
+                    DIAGNOSIS_STEP.replace(
+                        "<codebase-design skill>", "/mattpocock-skills:codebase-design"
+                    ),
+                    flattened,
+                )
+                self.assertIn(f"2. Workflow: {workflow}.", flattened)
+                self.assertEqual(
+                    re.findall(r"^([1-4])\. ", prompt, flags=re.MULTILINE), ["1", "2", "3", "4"]
+                )
+
+    def test_a_ticket_without_the_queued_fact_keeps_the_ordinary_step_one(self):
+        table = self.fixture.table([self.fixture.ticket("06", "queued-child")])
+        result = self.fixture.run_dispatch("render", table)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = self.fixture.turn("06")
+        self.assertTrue(prompt.startswith(f"/implement {self.ticket_path()}\n"), prompt[:200])
+        self.assertIn(ORDINARY_STEP_ONE, " ".join(prompt.split()))
+        self.assertNotIn("triage", prompt)
+
+
+class WrapUpClauseTests(DispatchTestCase):
+    """The wrap-up bullet is one text, rendered into both the first turn and the manual prompt."""
+
+    def test_the_first_turn_carries_the_placement_wrap_up_bullet(self):
+        ticket = self.fixture.ticket("06", "wrap-up")
+        result = self.fixture.run_dispatch("render", self.fixture.table([ticket]))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(WRAP_UP_BULLET, " ".join(self.fixture.turn("06").split()))
+
+    def test_the_manual_developer_prompt_renders_the_same_clause(self):
+        ticket = self.fixture.ticket("06", "wrap-up")
+
+        result = self.fixture.run_roles(ticket["path"])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(WRAP_UP_BULLET, " ".join(result.stdout.split()))
+
+
 class WorkflowMatrixTests(DispatchTestCase):
     EXPECTED_STEPS = {
         "tdd": ["1", "2", "3", "4", "5"],

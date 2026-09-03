@@ -7,6 +7,74 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A finding a Run discovers is worked inside that Run instead of leaving it (ADR-0028). Scope no
+  longer places a finding; the kind of work does. An *edit* — cause and change site already known
+  — stays with the child in front of the coordinator, whatever the ticket's scope. A *diagnosis* —
+  cause, approach or reach still open — is *queued*: `driver.py queue` opens the ticket at the
+  Run's tracker, routes it from the crew config file's new `[queued]` cell or from the command
+  line, appends it to the Run plan as a trailing Wave blocked on the Wave before it, and delivers
+  `<line> — queued #<NN> (open: <word>)` to the source child. `--open` is required and closed to
+  `cause`, `approach` and `reach`, so a finding with nothing open is refused as the edit it is; an
+  identical finding is idempotent; and every call prints the Run's pending queued tickets, so a
+  finding that shares a cause with one of them is deferred to it rather than opening a second
+  diagnosis of the same thing. Tracker gained a `create` operation on both the GitHub and the local
+  adapter — the addition ADR-0028 makes to ADR-0019's interface (#184, #185).
+- The Driver reloads the Run plan before it advances past a settled Wave and before it writes the
+  run's `complete` decision, and activates and adopts onto an appended Wave through the one
+  activation path every Wave uses — so a ticket queued while the last Wave was settling is
+  launched rather than lost. The dashboard and the report draw a queued Wave from the plan alone,
+  with no second rendering (#186).
+- A queued ticket's child diagnoses before it implements, in one session. Its opening line is the
+  triage skill on the ticket and its step 1 is a diagnosis step: verify the claim, find the cause,
+  post the agent brief on the ticket, and send one `design` escalation carrying the brief's pointer
+  and every question the triage would put to a maintainer. The coordinator's ruling on that
+  escalation is the workflow's own opening line, delivered by `driver.py answer` as any ruling is,
+  and the child implements from the diagnosis it just built. A cause an earlier Wave already fixed
+  is still a deliverable: the child commits the test that proves it and completes (#187).
+
+### Changed
+- The coordinator's own documents speak the placement grammar. The Contract's placement paragraph
+  is now the edit/diagnosis test rather than a list of destinations, the triage reference carries
+  the five-placement form and the `queue` operation beside `defer`, and `opened` is written as the
+  exception it now is — for work outside this feature altogether. ADR-0028 is accepted; ADR-0010's
+  Rulings sentence names the queued form (#188).
+
+### Fixed
+- The Codex bridge accepts a canonical `$mattpocock-skills:<skill>` mention at the start of a
+  prompt. Its mention grammar excluded the colon, so the canonical form was read as a mention of
+  a skill called `mattpocock-skills`, the resolver found no such skill, and `send` failed the
+  delivery before any request reached the app-server — a coordinator ruling that opened with the
+  form the Run's own turn body asks for could not be delivered. Both forms now resolve to the same
+  skill and carry the same structured input item, and a mention naming a different plugin is
+  refused by name rather than falling through to the bare-name lookup. The `send` path's opening
+  mention — canonical, bare, absent, and behind a preamble — is now covered by the bridge
+  contract suite, which is what would have caught this (#189).
+- A Wave-table write can no longer hand a reader a half-written run plan. Every reader of that
+  table loads it without a lock, deliberately — the hold an edit takes is a separate lock file, so
+  a reader is never held up by a writer — and the write truncated the table in place. A read
+  landing inside the truncate raised and escalated a healthy run; a crash inside one left the
+  run's sole routing authority unreadable for good. The table is now replaced atomically, so a
+  reader sees one whole table or the other, and a write that cannot be placed leaves the table
+  that was already there (#191).
+- `driver.py queue` can no longer leave the tracker, the Run plan and the machine log disagreeing
+  after a crash. Each step is now recoverable from what the previous one put on disk: a queue that
+  crashed before its plan append finishes it on the retry instead of failing `is listed twice`,
+  and one whose delivery failed re-delivers instead of reporting a success the source child never
+  received. A retry that contradicts the queue already recorded — the same finding under a
+  different `--open` — is refused rather than merged. The whole routing, not the workflow alone,
+  is held to exactly what an approved Wave table passes before the tracker is touched, so a
+  mistyped `--effort` no longer opens an issue it then orphans (#191).
+- A slash-command ruling delivered to a Claude child is recorded in the machine log again.
+  `driver.py answer` read the child's composer once, immediately after the `Enter` that submitted
+  the instruction, and a Claude composer takes up to about 100ms to clear a slash command — the
+  command is resolved and its skill body loaded before the input clears — against about 20ms for
+  prose. Both reads landed inside that lag, so a ruling the child had received and expanded was
+  called a failed delivery and never recorded, leaving the run's log and report holding the
+  hand-over placeholder. The driver now waits for the composer to clear, and settles on a stable
+  reading rather than one frame of a repaint. A composer that genuinely never clears still ends
+  the delivery as unreachable, and a dropped `Enter` is still rescued by the one retry (#191).
+
 ## [0.9.17] - 2026-09-01
 
 ### Added

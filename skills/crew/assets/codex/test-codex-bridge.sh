@@ -4,6 +4,18 @@
 
 set -uo pipefail
 
+# The group column is the only place a scenario's membership is declared: `--list-scenario-groups`
+# derives the groups from this table, so the root suite picks a new one up without a list to keep
+# in step. The groups run as parallel shards under one shared deadline, so the gate costs the
+# slowest of them — which is why `skills` is its own group rather than more of `inputs`.
+#
+#   observation  what a watch sees in a pane and reports
+#   telemetry    what reaches the machine log, and when
+#   resume       what a relaunch inherits from prior state
+#   skills       the opening skill mention: how it is spelled, what it resolves to, and what a
+#                turn carries because of it, on both `launch` and `send`
+#   inputs       the rest of what a turn is launched with — model and effort pins — and the
+#                launch failures and lifecycle commands reported alongside them
 SCENARIO_TABLE='observation|receipt|test_receipt
 observation|escalation_logging|test_escalation_logging
 telemetry|ruling_logging|test_ruling_logging
@@ -19,15 +31,20 @@ resume|resume_keeps_pinned_model_effort|test_resume_keeps_pinned_model_effort
 resume|model_only_pin_and_resume|test_model_only_pin_and_resume
 resume|unusable_resume_state|test_unusable_resume_state
 resume|question_send|test_question_send
-inputs|send_skill_input|test_send_skill_input
-inputs|launch_skill_input|test_launch_skill_input
-inputs|plain_prompt_has_no_skill_input|test_plain_prompt_has_no_skill_input
-inputs|missing_skill_path_is_reported|test_missing_skill_path_is_reported
+skills|send_skill_input|test_send_skill_input
+skills|launch_skill_input|test_launch_skill_input
+skills|send_canonical_skill_input|test_send_canonical_skill_input
+skills|launch_canonical_skill_input|test_launch_canonical_skill_input
+skills|foreign_plugin_mention_is_reported|test_foreign_plugin_mention_is_reported
+skills|send_preamble_has_no_skill_input|test_send_preamble_has_no_skill_input
+skills|send_plain_prompt_has_no_skill_input|test_send_plain_prompt_has_no_skill_input
+skills|plain_prompt_has_no_skill_input|test_plain_prompt_has_no_skill_input
+skills|missing_skill_path_is_reported|test_missing_skill_path_is_reported
 inputs|launch_unresolved_skill_is_reported|test_launch_unresolved_skill_is_reported
 inputs|relaunch_late_skill_failure_is_reported|test_relaunch_late_skill_failure_is_reported
 inputs|relaunch_early_skill_failure_is_reported|test_relaunch_early_skill_failure_is_reported
-inputs|skill_source_fallback|test_skill_source_fallback
-inputs|skill_path_alias|test_skill_path_alias
+skills|skill_source_fallback|test_skill_source_fallback
+skills|skill_path_alias|test_skill_path_alias
 observation|wave_wakeup|test_wave_wakeup
 observation|vanished|test_vanished
 observation|transient_pane_read_failures|test_transient_pane_read_failures
@@ -839,6 +856,135 @@ assert re.fullmatch(r"\[agentcrew:[^]]+\]", marker), prompt
 path = pathlib.Path(sys.argv[2]).resolve()
 assert message == f"[$implement]({path}) /tmp/ticket.md", prompt
 PY
+}
+
+# --- Test 34: a send opening with the canonical plugin:skill name resolves the same skill ---
+test_send_canonical_skill_input() {
+  local dir; dir=$(make_child t34 question)
+  local sf="$WORK/t34.state.json" out="$WORK/t34.launch.json"
+  launch "$dir" "$sf" 35 "$out" || { fail "send-canonical: launch exited $?"; return; }
+  watch "$WORK/t34.watch.json" "$sf" || { fail "send-canonical: watch exited $?"; return; }
+  "$PYTHON" "$BRIDGE" send --state-file "$sf" \
+    --prompt '$mattpocock-skills:implement /tmp/ticket.md' > "$WORK/t34.send.json" 2>&1 \
+    || { fail "send-canonical: send exited $?"; return; }
+  "$PYTHON" - "$dir/stub-requests.jsonl" \
+      "$CACHE_SKILL_PATH" <<'PY' \
+    && ok "send-canonical: canonical mention posted the installed skill input" \
+    || fail "send-canonical: canonical mention did not post the installed skill input"
+import json
+import pathlib
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+turn = [request for request in requests if request["method"] == "turn/start"][-1]
+skill = turn["params"]["input"][1]
+assert skill["type"] == "skill", turn
+assert skill["name"] == "mattpocock-skills:implement", turn
+assert pathlib.Path(skill["path"]).samefile(sys.argv[2]), turn
+PY
+}
+
+# --- Test 35: a launch opening with the canonical name links that name unchanged ---
+test_launch_canonical_skill_input() {
+  local dir; dir=$(make_child t35 receipt)
+  local sf="$WORK/t35.state.json" out="$WORK/t35.launch.json"
+  "$PYTHON" "$BRIDGE" launch --cwd "$dir" --tmux-session 'bt:' \
+    --window-name 36 --state-file "$sf" --startup-timeout 15 \
+    --prompt '$mattpocock-skills:implement /tmp/ticket.md' > "$out" 2> "$out.err" \
+    || { fail "launch-canonical: launch exited $? ($(cat "$out.err"))"; return; }
+  wait_for_stub_argv "$dir" 2 \
+    || { fail "launch-canonical: TUI invocation was not recorded"; return; }
+  "$PYTHON" - "$dir/stub-argv.jsonl" "$CACHE_SKILL_PATH" <<'PY' \
+    && ok "launch-canonical: canonical linked mention passed in the TUI prompt" \
+    || fail "launch-canonical: canonical linked mention missing from the TUI prompt"
+import json
+import pathlib
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    invocations = [json.loads(line) for line in stream if line.strip()]
+prompt = invocations[-1][-1]
+marker, message = prompt.split("\n", 1)
+assert re.fullmatch(r"\[agentcrew:[^]]+\]", marker), prompt
+path = pathlib.Path(sys.argv[2]).resolve()
+assert message == f"[$mattpocock-skills:implement]({path}) /tmp/ticket.md", prompt
+PY
+}
+
+# --- Test 36: a canonical mention naming another plugin is refused before the turn ---
+test_foreign_plugin_mention_is_reported() {
+  local dir; dir=$(make_child t36 question)
+  local sf="$WORK/t36.state.json" out="$WORK/t36.launch.json"
+  launch "$dir" "$sf" 37 "$out" || { fail "foreign-plugin: launch exited $?"; return; }
+  watch "$WORK/t36.watch.json" "$sf" || { fail "foreign-plugin: watch exited $?"; return; }
+  if "$PYTHON" "$BRIDGE" send --state-file "$sf" \
+      --prompt '$other-plugin:implement /tmp/ticket.md' \
+      > "$WORK/t36.send.json" 2> "$WORK/t36.send.err"; then
+    fail "foreign-plugin: send unexpectedly succeeded"
+    return
+  fi
+  grep -q "other-plugin" "$WORK/t36.send.err" \
+    && grep -q "mattpocock-skills" "$WORK/t36.send.err" \
+    || { fail "foreign-plugin: error does not name both plugins"; return; }
+  # A plugin mismatch is its own report, not the missing-SKILL.md fall-through the bare-name
+  # lookup would raise for a skill called `other-plugin`.
+  if grep -q "SKILL.md" "$WORK/t36.send.err"; then
+    fail "foreign-plugin: mismatch fell through to the bare-name lookup"
+    return
+  fi
+  "$PYTHON" - "$dir/stub-requests.jsonl" <<'PY' \
+    && ok "foreign-plugin: plugin mismatch reported and no turn started" \
+    || fail "foreign-plugin: a turn was started despite the plugin mismatch"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+assert not [request for request in requests if request["method"] == "turn/start"], requests
+PY
+}
+
+# A `send` whose prompt carries no *opening* mention: the turn is one text item, the message
+# arrives as written, and no skill is looked up. Shared, because "no mention at all" and "a
+# mention the preamble pushed off the opening" are the same delivery with different prompts.
+assert_send_is_plain_text() { # <name> <window-name> <prompt> <expected-message>
+  local name="$1" window_name="$2" prompt="$3" expected="$4"
+  local dir; dir=$(make_child "$name" question)
+  local sf="$WORK/$name.state.json" out="$WORK/$name.launch.json"
+  launch "$dir" "$sf" "$window_name" "$out" || { fail "$name: launch exited $?"; return; }
+  watch "$WORK/$name.watch.json" "$sf" || { fail "$name: watch exited $?"; return; }
+  "$PYTHON" "$BRIDGE" send --state-file "$sf" \
+    --prompt "$prompt" > "$WORK/$name.send.json" 2>&1 \
+    || { fail "$name: send exited $?"; return; }
+  "$PYTHON" - "$dir/stub-requests.jsonl" "$expected" <<'PY' \
+    && ok "$name: sent as one text item, with no skill looked up" \
+    || fail "$name: did not stay one text item"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    requests = [json.loads(line) for line in stream if line.strip()]
+turn = [request for request in requests if request["method"] == "turn/start"][-1]
+inputs = turn["params"]["input"]
+assert len(inputs) == 1, turn
+assert inputs[0]["type"] == "text", turn
+_marker, message = inputs[0]["text"].split("\n", 1)
+assert message == sys.argv[2], turn
+assert not [request for request in requests if request["method"] == "skills/list"], requests
+PY
+}
+
+# --- Test 37: a send whose mention follows a preamble line stays plain text ---
+test_send_preamble_has_no_skill_input() {
+  local prompt=$'Ruling: proceed.\n$mattpocock-skills:implement /tmp/ticket.md'
+  assert_send_is_plain_text send-preamble 38 "$prompt" "$prompt"
+}
+
+# --- Test 38: a send without any mention carries one text item and asks for no skills ---
+test_send_plain_prompt_has_no_skill_input() {
+  assert_send_is_plain_text send-plain 39 'plain prompt' 'plain prompt'
 }
 
 # --- Test 27: an absent versioned cache links the plugin source path in the TUI prompt ---

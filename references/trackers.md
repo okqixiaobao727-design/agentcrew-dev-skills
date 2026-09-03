@@ -17,6 +17,7 @@ user with the rest of what that step reports.
 
 | Operation | github | local |
 | --- | --- | --- |
+| **create** — open a ticket and declare who may pick it up | `gh issue create` with the role as its label; the issue URL | a new `<number>.md` file under the tracker's ticket directory, its `Status:` line carrying the role |
 | **read** | Read the tracker content below. | Read the tracker file below. |
 | **edit** — replace a ticket's body with new text | `gh issue edit <n> --body-file -` with the complete new text, so the edit is one atomic replacement | rewrite the whole file |
 | **mark** — declare who may pick the ticket up | the triage labels `ready-for-agent` and `ready-for-human` | the same two role strings on the ticket's `Status:` line |
@@ -34,6 +35,16 @@ user with the rest of what that step reports.
 **A local run stays in the working tree.** Every operation above is a file read or a file write
 inside the repo, so a local-mode run reaches no remote and calls no tracker CLI at all — a step that
 finds itself reaching for `gh` on this tracker has misread which tracker it is on.
+
+**Create is how a Run opens a ticket it takes on itself** — a queued finding (ADR-0028),
+never a spec being cut, which stays `to-tickets`' alone. It answers with the ticket and the same
+kind of opaque locator comment returns: the issue URL on github, the ticket file's path on local.
+An identical title and body opens nothing a second time — the ticket already there comes back
+instead, so a caller that retries after a crash cannot open two. On github that takes two looks:
+the newest open issues, which the list API answers the instant one is opened, and then a
+title-scoped search read to GitHub's own search cap, which reaches an issue old enough to have
+scrolled out of the first. On local the new file is numbered one past the highest `<number>.md`
+the tracker's directory already holds.
 
 **Comment returns an opaque locator.** It is the comment URL on github and the ticket fact's
 `path:line` on local; a Driver deferral passes the staged ticket fact, so that locator names the

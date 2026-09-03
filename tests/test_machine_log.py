@@ -33,6 +33,7 @@ COORDINATOR_SOCKET = "/private/tmp/cc-socks-501/1504.sock"
 sys.path.insert(0, str(SCRIPT.parent))
 import coordinator_control  # noqa: E402
 import machine_log  # noqa: E402
+import run_plan  # noqa: E402
 
 # The run's one timestamp format: `date -u +%Y-%m-%dT%H:%M:%SZ`, as the crew skill reads it.
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -625,6 +626,21 @@ class RunProjectionTests(unittest.TestCase):
         self.assertFalse(resumed.ended)
         self.assertFalse(resumed.halted)
 
+    def test_a_wave_launched_after_a_final_decision_reopens_the_run_until_it_ends_again(self):
+        """A Wave queued into a Run after it ended is a Run that has not ended after all."""
+        complete = {"event": "advance", "decision": "complete", "wave": 1}
+        launched = {"event": "advance", "decision": "launched", "wave": 2}
+
+        self.assertTrue(machine_log.project([complete]).ended)
+        reopened = machine_log.project([complete, launched])
+        self.assertFalse(reopened.ended)
+        self.assertEqual(reopened.current_wave, 2)
+        self.assertTrue(machine_log.project([
+            complete,
+            launched,
+            {"event": "advance", "decision": "complete", "wave": 2},
+        ]).ended)
+
     def test_a_late_actionable_message_reopens_a_stopped_run_until_it_ends_again(self):
         stopped = {"event": "advance", "decision": "stopped", "wave": 1}
         completion = {
@@ -937,6 +953,38 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["ticket"], "11")
         self.assertEqual(entry["outcome"], "blocked")
         self.assertEqual(entry["detail"], "blocked by 07")
+
+    def test_the_open_words_this_log_accepts_are_the_run_plans_own(self):
+        self.assertEqual(machine_log.OPEN_WORDS, run_plan.OPEN_WORDS)
+
+    def test_a_queued_event_records_the_ticket_a_finding_opened_and_what_it_leaves_open(self):
+        result = run_cli(
+            "queued", "--ticket", "42", "--source", "07", "--open", "cause",
+            "--locator", "https://github.example.invalid/issues/42",
+            "--finding", "The cause is upstream — skills/example.py:12", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertUniformTimestamp(entry)
+        self.assertEqual(entry["event"], "queued")
+        self.assertEqual(entry["finding"], "The cause is upstream — skills/example.py:12")
+        self.assertEqual(entry["ticket"], "42")
+        self.assertEqual(entry["source"], "07")
+        self.assertEqual(entry["open"], "cause")
+        self.assertEqual(entry["locator"], "https://github.example.invalid/issues/42")
+
+    def test_a_queued_event_takes_only_the_three_words_a_finding_can_leave_open(self):
+        result = run_cli(
+            "queued", "--ticket", "42", "--source", "07", "--open", "scope",
+            "--locator", "https://github.example.invalid/issues/42",
+            "--finding", "The cause is upstream — skills/example.py:12", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(self.log.exists(), self.log.read_text() if self.log.exists() else "")
+        for word in ("cause", "approach", "reach"):
+            self.assertIn(word, result.stderr)
 
     def test_a_review_records_the_lane_it_ran_in_and_which_end_of_it_this_is(self):
         result = run_cli(

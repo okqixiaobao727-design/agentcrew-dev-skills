@@ -67,6 +67,14 @@ decision; a new one is appended before its Codex cursor advances and returns to 
 table. So re-typing the crew command is the whole of what an interruption, a driver crash or a
 coordinator restart costs, including one resumed child that spoke after settlement.
 
+**A run grows while it runs, and the plan on disk is the authority.** `queue` appends a Wave from
+a process of its own, so a driver reads the plan back before it advances past a settled wave,
+again before the decision that ends the run is written, and before a coordinator handover writes
+the table. An appended wave is the following wave and is activated through the one path every wave
+uses; a run whose log already holds a final decision is adopted onto a queued wave nobody launched
+into rather than reported over. A wave the run planned but never reached is not one of those: the
+halt that stopped short of it is the coordinator's to rule on.
+
 **The wave loop is a rule table, and the rule table is exhaustive.** Between the launch and the
 report the driver settles everything a written rule already decides: a `CREW COMPLETE` is verified
 and, where it holds, settled in silence; an invalid receipt earns one re-ask and settles failed on
@@ -113,6 +121,7 @@ import argparse
 import contextlib
 from dataclasses import dataclass, replace
 import datetime
+import fcntl
 import json
 import os
 import pathlib
@@ -167,6 +176,9 @@ COORDINATOR_PANE_HELP = (
     " types nothing"
 )
 TABLE_NAME = "wave-table.json"
+# What one process holds while it reads, edits and writes that table back, beside the table
+# itself so that no way of writing the table can drop the hold and no plain reader waits on it.
+LOCK_SUFFIX = ".lock"
 LAUNCH_DIR_NAME = "launch"
 CODEX_DIR_NAME = "codex"
 PARKED_PATHS_NAME = "parked-paths"
@@ -217,6 +229,9 @@ STATUS_FINISHED = "done"
 # The labels a github ticket carries to say who may pick it up; a close takes the one it has off,
 # and the undo puts it back (`references/trackers.md`).
 PICKUP_LABELS = ("ready-for-agent", "ready-for-human")
+# The one workflow whose ticket a human picks up (`skills/route/references/classify.md`); every
+# other ticket is an agent's. Staging marks a routed ticket from here, and so does a queued one.
+HUMAN_WORKFLOW = "acceptance"
 GH = "gh"
 # The installed Review-Switch command a reviewed ticket's child runs. This repository ships no
 # review implementation and calls it across a process boundary (ADR-0020), so on a machine where
@@ -265,12 +280,23 @@ NUDGE_MARKER = machine_log.NUDGE_MARKER
 MERGE_MARKER = machine_log.MERGE_MARKER
 ANCHOR_MARKER = machine_log.ANCHOR_MARKER
 HANDED_OVER_MARKER = machine_log.HANDED_OVER_MARKER
-PLACEMENT_MARKERS = (
+# The two shapes a placement marker takes: one that is the whole end of the line, and one that
+# opens what the placement names. `queued` is the second kind with a closed tail — a queued line
+# that does not say what it leaves open is not a placement at all, and the report leaves the whole
+# ruling standing rather than rendering half a placement (ADR-0028).
+EXACT_PLACEMENT_MARKERS = (
     " — this ticket",
     " — dropped",
+)
+OPENING_PLACEMENT_MARKERS = (
     " — opened ",
     " — deferred ",
 )
+QUEUED_MARKER = " — queued "
+QUEUED_PLACEMENT = re.compile(
+    rf"{re.escape(QUEUED_MARKER)}#\d+ \(open: (?:{'|'.join(run_plan.OPEN_WORDS)})\)$"
+)
+PLACEMENT_MARKERS = EXACT_PLACEMENT_MARKERS + OPENING_PLACEMENT_MARKERS + (QUEUED_MARKER,)
 
 # The tmux key names the permission-prompt command accepts, kept narrow so an answer cannot
 # accidentally become an unsupported tmux key sequence.
@@ -343,6 +369,19 @@ DEFAULT_TIMEOUT_SECONDS = 7200.0
 GATE_OUTPUT_LINE_LIMIT = 20
 # How long a monitor asked to stop is given before it is killed.
 MONITOR_STOP_SECONDS = 5.0
+# How long an instruction typed into a child's composer is given to leave it after `Enter`, and
+# how often that is re-read. A Claude composer clears prose in about 20ms but a slash command in
+# up to about 100ms, because the command is resolved and its skill body loaded before the input is
+# cleared; the deadline is a second so a child with a larger context than the probe's still fits
+# inside it (#191).
+COMPOSER_CLEAR_SECONDS = 1.0
+COMPOSER_POLL_SECONDS = 0.03
+# How many consecutive reads must find the composer clear before the line counts as submitted.
+# Claude Code repaints that row while the child works, so a capture served between the clear and
+# the rewrite reads clear for one frame; polling samples the row tens of times where the old check
+# sampled it once, and a single frame is no longer evidence. Two consecutive reads cost one poll
+# interval and keep a dropped Enter from being recorded as a delivery.
+COMPOSER_CLEAR_READS = 2
 
 ADVANCE_ESCALATED_EXIT = 1
 ADVANCE_INTERRUPTED_EXIT = 130
@@ -722,6 +761,13 @@ def type_into_pane(window, text, unreachable, stuck):
     with S-Enter between lines so a multi-line instruction stays one message, and Enter at the
     end. One Enter is retried, because the composer sometimes still holds the line after the
     first; a second that also leaves it standing is `stuck` rather than a message anyone received.
+
+    Each Enter is given `COMPOSER_CLEAR_SECONDS` to empty the composer before it counts as
+    dropped, because a submit is not instantaneous: a slash command stands in the composer for
+    roughly five times as long as prose, since Claude Code resolves the command and loads the
+    skill body before clearing the input. Deciding on a single immediate read lost the whole
+    ruling — the child had received and expanded it, but the driver called the delivery failed and
+    never recorded it (#191).
     """
     lines = text.split("\n")
     for index, line in enumerate(lines):
@@ -730,9 +776,43 @@ def type_into_pane(window, text, unreachable, stuck):
             tmux(["send-keys", "-t", window, "S-Enter"], unreachable)
     for _attempt in range(2):
         tmux(["send-keys", "-t", window, "Enter"], unreachable)
-        if not composer_holds(window, text):
+        if composer_clears(window, text):
             return
     raise DriverError(stuck)
+
+
+def composer_clears(window, text):
+    """Whether the typed line leaves the composer within `COMPOSER_CLEAR_SECONDS`.
+
+    Polled rather than read once, and settled on `COMPOSER_CLEAR_READS` consecutive clear reads
+    rather than the first: the wait is what stops a slow submit being called a failure, and the
+    consecutive reads are what stop the repaint frame between a clear and a rewrite being called a
+    success. Only a line still standing at the deadline is a delivery to retry.
+    """
+    if typed_tail(text) is None:
+        # Nothing was typed that a composer check can look for, so `composer_holds` answers the
+        # same on every read: polling could only spend the deadline to reach the decision the
+        # first read already made.
+        return False
+    deadline = time.monotonic() + COMPOSER_CLEAR_SECONDS
+    cleared = 0
+    while True:
+        cleared = 0 if composer_holds(window, text) else cleared + 1
+        if cleared >= COMPOSER_CLEAR_READS:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(COMPOSER_POLL_SECONDS)
+
+
+def typed_tail(text):
+    """The last non-blank line of what was typed — the one a composer check looks for, or None.
+
+    None is text that gives a composer check nothing to find: every read of the pane answers it
+    the same way, whatever the composer is holding.
+    """
+    typed = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return typed[-1] if typed else None
 
 
 def composer_holds(window, text):
@@ -749,11 +829,11 @@ def composer_holds(window, text):
         ["capture-pane", "-p", "-J", "-t", window, "-S", "0", "-E", cursor_y],
         f"the composer in {window} could not be read",
     )
-    typed_lines = [typed.rstrip() for typed in text.splitlines() if typed.strip()]
-    if not typed_lines:
+    tail = typed_tail(text)
+    if tail is None:
         return True
     cursor_line = line.splitlines()[-1] if line.splitlines() else ""
-    return typed_lines[-1] in cursor_line
+    return tail in cursor_line
 
 
 def notice_windows(session):
@@ -1049,6 +1129,80 @@ def record_base_gate(log, gate):
     for value in gate or ():
         arguments.append(f"--argument={value}")
     run_command(arguments, "the base-gate result could not be recorded", pointer=str(log))
+
+
+def outstanding_queued_wave(plan, projection):
+    """The number of the first queued Wave of the plan the Run still owes work on, or None.
+
+    A Run grows while it runs: `driver.py queue` appends a Wave from a process of its own, so the
+    plan on disk is the authority and the copy a Driver loaded at start-up is a snapshot
+    (ADR-0018). Such a Wave is read from the plan and the log alone — the `Queued` fact the plan
+    persists, against the state the log settles its tickets into — because that is the whole of
+    the state a Driver keeps about one; there is no queued-ticket register beside it.
+
+    Two Waves are deliberately not one of these. A Wave the Run planned but never reached: its
+    tickets were in the table the run was approved on, and a halt that stopped short of them is
+    the coordinator's to rule on rather than this Driver's to launch past. And a queued Wave the
+    log has already settled or blocked — blocked is what a halt marks a queued descendant, and
+    relaunching it would drive the Run straight past the halt that marked it.
+    """
+    for wave in plan.waves:
+        if wave.tickets and all(
+            ticket.queued is not None
+            and projection.ticket(ticket.id).settlement_state == machine_log.LIVE
+            for ticket in wave.tickets
+        ):
+            return wave.number
+    return None
+
+
+class PlanEdit:
+    """One held read-modify-write of the wave table: the plan as loaded, and the plan to write."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.written = None
+
+    def write(self, plan):
+        """Hand back the plan to write when the hold ends; returns it."""
+        self.written = plan
+        return plan
+
+
+def table_lock_path(table_path):
+    """The file one process holds while it reads, edits and writes that wave table back."""
+    return table_path.parent / (table_path.name + LOCK_SUFFIX)
+
+
+@contextlib.contextmanager
+def edit_plan(table_path):
+    """Hold the wave table across one read-modify-write; yields the `PlanEdit` that carries it.
+
+    Two processes edit this table: a Driver servicing a Coordinator handover, and `driver.py
+    queue` appending a Wave. Each writes the whole of it, so without one hold across the read and
+    the write, whichever writes second overwrites what the other put there — and what is lost is
+    the run's sole routing authority (ADR-0003). The read is inside the hold because a lock over
+    the write alone protects nothing: the stale plan was already in hand.
+
+    The lock is a file beside the table rather than the table itself, so it survives however the
+    table comes to be written, and so a process that only reads the plan is never held up by it.
+    """
+    lock_path = table_lock_path(table_path)
+    try:
+        handle = lock_path.open("a+")
+    except OSError as error:
+        raise DriverError(
+            f"the wave table could not be held for editing: {error}", pointer=str(lock_path)
+        ) from error
+    with handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            edit = PlanEdit(run_plan.load(table_path))
+            yield edit
+            if edit.written is not None:
+                edit.written.write(table_path)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def launched_children(log):
@@ -1977,7 +2131,12 @@ def adopt(args, run_dir, table_path):
     projection = machine_log.project(records)
     if projection.ended:
         projection = reconcile_terminal_codex_messages(plan, projection, log)
-    if projection.ended:
+    # A Run whose log says `complete` is over only while the plan agrees. A Wave appended after
+    # that decision — a `queued` ruling on a message a settled child sent later — has never been
+    # launched, and no other command reaches it, so the Run this start adopts is the one the plan
+    # describes rather than the one the last advance decision left (ADR-0028).
+    appended = outstanding_queued_wave(plan, projection) if projection.ended else None
+    if projection.ended and appended is None:
         # The same snapshot the run's own ending emitted, because a coordinator reading it has no
         # way to tell — and no reason to care — whether this run finished a moment ago or last week.
         report = report_path(run_dir, plan.run)
@@ -1987,7 +2146,8 @@ def adopt(args, run_dir, table_path):
             crew_worktree=plan.run.crew_worktree,
         )
         return 0
-    print(f"crew adopted wave {projection.current_wave}, run directory {run_dir}", flush=True)
+    resumed = projection.current_wave if appended is None else appended
+    print(f"crew adopted wave {resumed}, run directory {run_dir}", flush=True)
     return wave_loop(args, run_dir, table_path, adopting=True)
 
 
@@ -2178,20 +2338,25 @@ def report_rulings(records):
 
 
 def placement_line(line):
-    """Whether one ruling line names one of the placement grammar's four outcomes."""
-    return any(
-        line.endswith(marker) if marker in PLACEMENT_MARKERS[:2] else marker in line
-        for marker in PLACEMENT_MARKERS
+    """Whether one ruling line names one of the placement grammar's five outcomes."""
+    if QUEUED_MARKER in line:
+        return QUEUED_PLACEMENT.search(line) is not None
+    return (
+        any(line.endswith(marker) for marker in EXACT_PLACEMENT_MARKERS)
+        or any(marker in line for marker in OPENING_PLACEMENT_MARKERS)
     )
 
 
 def placement_belongs_to(line, leftover):
     """Whether one placement line rules the named wrap-up leftover."""
-    return any(
-        line == f"{leftover}{marker}"
-        if marker in PLACEMENT_MARKERS[:2]
-        else line.startswith(f"{leftover}{marker}")
-        for marker in PLACEMENT_MARKERS
+    if not placement_line(line):
+        return False
+    return (
+        any(line == f"{leftover}{marker}" for marker in EXACT_PLACEMENT_MARKERS)
+        or any(
+            line.startswith(f"{leftover}{marker}")
+            for marker in OPENING_PLACEMENT_MARKERS + (QUEUED_MARKER,)
+        )
     )
 
 
@@ -2622,6 +2787,16 @@ class Loop:
         self.run_dir = run_dir
         self.log = run_dir / LOG_NAME
         self.table_path = table_path
+        # The hold's own file exists from the moment a Run is taken up rather than from its first
+        # edit, so the run directory holds one layout however the Run went — the two locks already
+        # there are made the same way.
+        try:
+            table_lock_path(table_path).touch()
+        except OSError as error:
+            raise DriverError(
+                f"the wave table's hold could not be opened: {error}",
+                pointer=str(table_lock_path(table_path)),
+            ) from error
         try:
             self.plan = run_plan.load(table_path)
         except run_plan.RunPlanError as error:
@@ -2658,17 +2833,20 @@ class Loop:
         self.coordinator = context
         attend_coordinator(context.pane)
 
-        run = replace(
-            self.run,
-            coordinator_name=context.name,
-            coordinator_pid=context.pid,
-            coordinator_session=context.harness_session,
-            coordinator_address=context.address,
-            permission_mode=context.permission_mode,
-        )
-        plan = replace(self.plan, run=run)
+        # The handover writes the whole table, so it reads it back inside the same hold: the copy
+        # this Loop is carrying predates any Wave appended to the Run since it loaded one, and
+        # writing that copy would erase the Wave the handover exists to carry through.
         try:
-            plan.write(self.table_path)
+            with edit_plan(self.table_path) as edit:
+                run = replace(
+                    edit.plan.run,
+                    coordinator_name=context.name,
+                    coordinator_pid=context.pid,
+                    coordinator_session=context.harness_session,
+                    coordinator_address=context.address,
+                    permission_mode=context.permission_mode,
+                )
+                plan = edit.write(replace(edit.plan, run=run))
         except run_plan.RunPlanError as error:
             raise DriverError(str(error), pointer=str(self.table_path)) from error
         self.run = run
@@ -2685,6 +2863,31 @@ class Loop:
         start_dashboard(context, self.crew_worktree, self.run_dir)
 
     # --- what it reads --------------------------------------------------------------------
+
+    def reload_plan(self):
+        """Read the Run plan back from the wave table; returns the plan now in force.
+
+        The plan a Run runs on grows while it runs — `driver.py queue` appends a Wave from a
+        process of its own — so the copy loaded at start-up is a snapshot and the table is the
+        authority. The reload is the caller's to ask for rather than a query that quietly does IO,
+        because the caller is what knows the moment its answer has to be current (ADR-0018).
+        """
+        try:
+            self.plan = run_plan.load(self.table_path)
+        except run_plan.RunPlanError as error:
+            raise DriverError(str(error), pointer=str(self.table_path)) from error
+        return self.plan
+
+    def pending_wave(self, projection):
+        """The Wave this Loop takes the Run up on, and whether the plan rather than the log named it.
+
+        A Run whose log holds a final decision still has a Wave to work when the plan holds a
+        queued one the Run still owes work on, and that Wave — not the settled one the log's
+        current wave names — is where the Loop starts, so it activates through the one path every
+        Wave uses (ADR-0024).
+        """
+        appended = outstanding_queued_wave(self.plan, projection) if projection.ended else None
+        return (projection.current_wave, False) if appended is None else (appended, True)
 
     def records(self):
         return machine_log.read_records(self.log)
@@ -3197,7 +3400,15 @@ class Loop:
         Advance classifies and lands the current Wave, then this Driver activates the following
         Wave. The existing `launched` decision is the commit point: it is written only after
         activation succeeds.
+
+        The plan is read back from the table on both sides of that classification, because a Wave
+        appended to the Run since this Loop loaded its plan is the following Wave and the Run may
+        not call itself complete while one is unlaunched. The read before is what the settled
+        Wave is classified against; the read after is what makes this Driver's answer at least as
+        current as the one `advance.py` reached from the same table a moment later, which is the
+        answer the run's final `complete` decision is written from.
         """
+        self.reload_plan()
         result = subprocess.run(
             [
                 sys.executable, str(ADVANCE), "advance",
@@ -3219,7 +3430,7 @@ class Loop:
                 f" {(result.stderr or result.stdout).strip()}",
                 pointer=str(self.log),
             )
-        following_wave = self.plan.following_wave(wave)
+        following_wave = self.reload_plan().following_wave(wave)
         if following_wave is None:
             self.close_merged()
             return None
@@ -3565,10 +3776,8 @@ class Loop:
         self.arm(wave, projection)
         return wave
 
-    def run_until_woken(self):
-        """Apply the rule table until it is done or something outside it needs judgment."""
-        projection = machine_log.project(self.records())
-        wave = projection.current_wave
+    def run_until_woken(self, wave):
+        """Apply the rule table to `wave` onward until it is done or judgment is needed."""
         deadline = time.monotonic() + self.args.timeout
         seen = None
         while True:
@@ -3811,11 +4020,18 @@ def wave_loop(args, run_dir, table_path, adopting=False, starting=False):
         if adopting:
             loop.adopt()
         projection = machine_log.project(loop.records())
-        loop.activation.activate(projection.current_wave)
+        wave, appended = loop.pending_wave(projection)
+        loop.activation.activate(wave)
+        if appended:
+            # The same commit point every other Wave's activation has: written only once the Wave
+            # is up, and what takes the Run's `ended` fact back off the log it was left on, so the
+            # next Driver to adopt this Run reads it as the running Run it now is.
+            children = ", ".join(ticket.id for ticket in loop.tickets_of(wave))
+            loop.record_advance(wave, LAUNCHED, f"queued into the run: {children}")
         loop.open_wave()
         if starting:
             print(f"crew wave 1 launched, run directory {run_dir}", flush=True)
-        return loop.run_until_woken()
+        return loop.run_until_woken(wave)
     except Wake as wake:
         landed = snapshot(
             wake.reason,
@@ -3959,6 +4175,8 @@ def run_defer(args):
             ticket=target,
             pointer=str(loop.log),
         )
+    # The finding is carried exactly as it was given: the ticket body, the log line and the
+    # placement the source child receives are all the child's own words, unedited.
     finding = args.text
     if not isinstance(finding, str) or not finding.strip():
         raise DriverError(
@@ -3973,6 +4191,343 @@ def run_defer(args):
         raise DriverError(str(error), ticket=target, pointer=str(loop.table_path)) from error
     ruling = f"{finding} — deferred #{target} (comment: {locator})"
     loop.deliver(source, launch, ruling)
+    return 0
+
+
+def pickup_label(workflow):
+    """Which role label a ticket on that workflow is marked with when it is opened."""
+    agent, human = PICKUP_LABELS
+    return human if str(workflow).strip().lower() == HUMAN_WORKFLOW else agent
+
+
+# --- queueing one diagnosis into the run -------------------------------------------------------
+
+
+QUEUED_CELL = (run_plan.QUEUED_SECTION,)
+POINTERS_HEADING = "## Pointers"
+ROUTING_HEADING = f"## {run_plan.ROUTING_SECTION.title()}"
+
+
+def queued_ticket_routing(loop, args):
+    """The routing this ticket is opened on: the `[queued]` cell, under this call's overrides.
+
+    The overrides go into the cell rather than onto the resolved value, so a workflow named here
+    resolves its own review lane: a queued ticket routed onto a workflow that takes none carries
+    none, and one routed onto a workflow that takes a lane is refused where the cell holds no lane
+    to give it (ADR-0028).
+    """
+    cell = config_value(project_config(loop.repo_root), QUEUED_CELL)
+    if cell is None:
+        cell = {}
+    if isinstance(cell, dict):
+        cell = dict(cell)
+        for field in run_plan.QUEUED_FIELDS:
+            override = getattr(args, field, None)
+            if override is not None:
+                cell[field] = override
+    # A cell that is not a table of routing fields is handed on exactly as the project wrote it,
+    # so the resolver refuses it in its own words rather than this command reading past it.
+    try:
+        return run_plan.queued_routing(cell)
+    except run_plan.RunPlanError as error:
+        raise DriverError(str(error), pointer=str(loop.repo_root / CONFIG_NAME)) from error
+
+
+def queued_binding(loop, name):
+    """The account binding a queued ticket runs under: the one named, or the coordinator's own.
+
+    A queued ticket names no account unless this command names one, so the default is the run's
+    own configuration home — exactly what an account-less ticket of the approved table binds
+    (ADR-0014, ADR-0028).
+    """
+    if not name:
+        return accounts.inherited(loop.run.coordinator_config_home)
+    declared = loop.run.declared_accounts
+    config = pathlib.Path(loop.run.repo_root) / CONFIG_NAME
+    if declared and name not in declared:
+        raise DriverError(
+            f"the account `{name}` is not declared by {config} — it declares"
+            f" {', '.join(declared)}",
+            pointer=str(config),
+        )
+    try:
+        registry = accounts.registry_path()
+        directory = accounts.profile_directory(name, accounts.load_registry(registry))
+    except accounts.AccountsError as error:
+        raise DriverError(f"account: {error}", pointer=str(config)) from error
+    if not pathlib.Path(directory).is_dir():
+        raise DriverError(
+            f"the account `{name}` has no profile directory at {directory}, which the registry"
+            f" {registry} names",
+            pointer=str(registry),
+        )
+    return accounts.explicit(directory)
+
+
+def queued_routing_section(routing, account, source, open_word):
+    """The `## Routing` section a queued ticket is opened with, in the order staging writes one."""
+    lines = [
+        f"Workflow: {routing.workflow}",
+        f"Executor: {routing.executor}",
+        f"Model: {routing.model}",
+        f"Effort: {routing.effort}",
+    ]
+    if account:
+        lines.append(f"Account: {account}")
+    if routing.review is not None:
+        lines.append(
+            f"Review: {routing.review.vendor} {routing.review.model} {routing.review.effort}"
+        )
+    lines.append(
+        f"Reasons: queued from #{source} by a coordinator ruling; its {open_word} is what this"
+        " ticket's own child diagnoses first (ADR-0028)."
+    )
+    return f"{ROUTING_HEADING}\n\n" + "\n".join(lines)
+
+
+def queued_pointers(records, source, finding, worktree):
+    """Every pointer the source child cited, and every one this finding carries, once each."""
+    escalations = [
+        record for record in records
+        if record.get("event") == "escalation" and str(record.get("ticket") or "") == source
+    ]
+    cited = str(escalations[-1].get("message") or "") if escalations else ""
+    return [str(pointer) for pointer in witness_runner.pointers(f"{cited}\n{finding}", worktree)]
+
+
+def queued_body(source, finding, cited, section):
+    """The ticket body a queued finding is opened with, evidence and routing included."""
+    parts = [f"Queued from #{source}", finding]
+    if cited:
+        parts.append(POINTERS_HEADING + "\n\n" + "\n".join(f"- {pointer}" for pointer in cited))
+    parts.append(section)
+    return "\n\n".join(parts) + "\n"
+
+
+def queued_already(records, source, finding):
+    """The `queued` line this run already holds for that finding from that source, or None."""
+    for record in records:
+        if (
+            record.get("event") == "queued"
+            and str(record.get("source") or "") == source
+            and str(record.get("finding") or "") == finding
+        ):
+            return record
+    return None
+
+
+def queued_summary(loop, identifier):
+    """What the coordinator needs in front of it for its next ruling.
+
+    The reference this call placed, and every queued ticket of the Run no child has picked up yet:
+    a finding that shares a cause with one of those is deferred to it rather than queued again
+    (ADR-0028).
+    """
+    projection = machine_log.project(loop.records())
+    placed = loop.plan.ticket(identifier)
+    pending = [
+        f"- #{ticket.id} — {ticket.title}"
+        for ticket in loop.plan.tickets
+        if ticket.queued is not None and projection.ticket(ticket.id).launch is None
+    ]
+    return "\n".join([
+        f"queued #{placed.id} (open: {placed.queued.open}) — {placed.title}",
+        "",
+        "pending queued tickets of this run:",
+        *(pending or ["- none"]),
+    ])
+
+
+def queued_placement(finding, identifier, open_word):
+    """The placement line the source child is given for one queued ticket."""
+    return f"{finding}{QUEUED_MARKER}#{identifier} (open: {open_word})"
+
+
+def queued_placed_already(records, source, identifier, open_word):
+    """Whether this run's log already holds the ruling that placed that queued ticket.
+
+    The `queued` line says a ticket was opened; only a `ruling` says the child that raised the
+    finding was told where it went. `deliver` trims the line it composes, so the tail is what is
+    matched rather than the whole message.
+    """
+    tail = f"{QUEUED_MARKER}#{identifier} (open: {open_word})"
+    return any(
+        record.get("event") == "ruling"
+        and str(record.get("ticket") or "") == source
+        and str(record.get("message") or "").rstrip().endswith(tail)
+        for record in records
+    )
+
+
+def queued_staged_path(loop, feature_dir, identifier, locator):
+    """Where the queued ticket's own file is: the local tracker's ticket, or the staged github one.
+
+    Reconstructed rather than remembered, so a retry that skips the tracker still knows the path
+    the first attempt wrote. The local tracker's locator *is* that path; on github the ticket is
+    staged beside the run's other tickets under the issue number.
+    """
+    if loop.run.tracker == TRACKER_LOCAL and locator:
+        return pathlib.Path(locator)
+    return feature_dir / f"{identifier}.md"
+
+
+def run_queue(args):
+    """Open one diagnosis at the run's tracker, append it to the Run, and deliver its placement.
+
+    The order is the one that makes a failure recoverable: every step after the tracker is
+    idempotent against what the previous one put on disk, because a crash can land between any
+    two of them.
+
+    1. **Refuse before the tracker.** The open word, the finding, the title, the source and the
+       whole routing are judged first, the routing by exactly what an approved Wave table passes
+       — a `--effort` the table rejects would otherwise open a real ticket and then fail at the
+       append, leaving it orphaned. A call matching a recorded queue under a *different* open
+       word is refused here too: the key is the source and the finding alone, while the word is
+       in the ticket, the log, the plan and the line the child reads, so merging the two would
+       leave them disagreeing with nothing to say which is the run's.
+    2. **Open the ticket.** The tracker is the only writer here that cannot be rolled back, so it
+       goes first, and a crash after it is caught by **create**'s title-and-body idempotency.
+    3. **Record it.** The `queued` line is this command's idempotency key, so it lands before the
+       plan append: a retry resumes from the identifier and locator it carries rather than
+       recomputing a body the source child's later escalations would have changed.
+    4. **Append, then place**, each guarded by its own read of disk rather than by the log line.
+       A retry appends only a ticket the plan does not carry and delivers only a placement no
+       `ruling` holds, so a delivery that failed after the log line was written is re-delivered
+       rather than reported as a success nobody received. A resume resolves its routing here and
+       only where the append is owed — that question was settled when the ticket was opened, and
+       asking it again stranded a queue one append from complete under a `[queued]` cell the
+       project had changed in between.
+
+    One window stays open and no ordering closes it: a crash between the create and the `queued`
+    line leaves an issue this run has no record of. **create**'s idempotency covers every retry
+    the source child did not escalate inside.
+    """
+    open_word = args.open
+    if open_word not in run_plan.OPEN_WORDS:
+        raise DriverError(
+            "a queued finding says what it leaves open: --open is one of "
+            + ", ".join(run_plan.OPEN_WORDS)
+        )
+    finding = args.text
+    if not isinstance(finding, str) or not finding.strip():
+        raise DriverError("a queued finding needs --text naming the finding and its pointers")
+    if not isinstance(args.title, str) or not args.title.strip():
+        raise DriverError("a queued ticket needs --title naming what is to be diagnosed")
+    title = args.title.strip()
+
+    run_dir = resolved_run_dir(args.run_dir)
+    loop = Loop(args, run_dir, run_dir / TABLE_NAME)
+    source = plan_ticket(loop, args.ticket).id
+    records = loop.records()
+    launch = machine_log.project(records).ticket(source).launch
+    if launch is None:
+        raise DriverError(
+            f"{source} has no recorded child in {loop.log}", ticket=source, pointer=str(loop.log)
+        )
+
+    feature_dir = run_dir.parent
+    held = queued_already(records, source, finding)
+    if held is not None:
+        recorded_open = str(held.get("open") or "")
+        identifier = str(held.get("ticket") or "")
+        if recorded_open != open_word:
+            raise DriverError(
+                f"this finding from {source} is already queued as #{identifier} with open:"
+                f" {recorded_open}, and this call says open: {open_word}. The open word is in the"
+                " ticket that was opened, in this run's log, in the plan and in the line the"
+                f" child reads, so resuming under {open_word} would leave them disagreeing with"
+                " nothing to say which is the run's. Re-run it with --open"
+                f" {recorded_open}, or queue this as a finding of its own.",
+                ticket=source, pointer=str(loop.log),
+            )
+
+    # Resolved for the ticket this call opens, and only then: a resume's routing question was
+    # settled when the ticket was opened, and a `[queued]` cell the project retargeted or broke in
+    # between is no question this call has to answer. Asking it first stranded a queue that was
+    # one plan append away from complete.
+    routing = None
+    binding = None
+    if held is None:
+        routing = queued_ticket_routing(loop, args)
+        binding = queued_binding(loop, args.account)
+        body = queued_body(
+            source, finding,
+            queued_pointers(records, source, finding, launch.get("worktree") or loop.run.repo_root),
+            queued_routing_section(routing, args.account, source, open_word),
+        )
+        try:
+            created, locator = tracker.create(
+                loop.run.tracker, title, body,
+                role_label=pickup_label(routing.workflow),
+                # Where the ticket is placed: the run directory itself on the local tracker, whose
+                # ticket file is the file a run reads, and the repository on github, which is the
+                # whole of how `gh` knows which repository it is talking to.
+                directory=feature_dir if loop.run.tracker == TRACKER_LOCAL else loop.repo_root,
+            )
+        except tracker.TrackerError as error:
+            raise DriverError(str(error), ticket=source, pointer=str(loop.table_path)) from error
+        identifier = str(created["id"])
+        path = (
+            pathlib.Path(created["path"]) if created.get("path")
+            else feature_dir / f"{identifier}.md"
+        )
+        if not created.get("path"):
+            staged = run_plan.staged_text(loop.run.tracker, title, body, created.get("url"))
+            try:
+                path.write_text(staged, encoding="utf-8")
+            except OSError as error:
+                raise DriverError(
+                    f"the queued ticket {identifier} could not be written to {path}: {error}",
+                    ticket=identifier, pointer=str(path),
+                ) from error
+        run_command(
+            [
+                sys.executable, MACHINE_LOG, "--log", loop.log, "queued",
+                "--ticket", identifier, "--source", source, "--open", open_word,
+                "--locator", locator, "--finding", finding,
+            ],
+            f"the queued ticket {identifier} could not be recorded",
+            ticket=identifier, pointer=str(loop.log),
+        )
+        records = loop.records()
+    else:
+        path = queued_staged_path(
+            loop, feature_dir, identifier, str(held.get("locator") or "")
+        )
+
+    # Under the same hold the live Driver's handover takes, and over the read as well as the
+    # write: the plan appended to is the plan on disk at this moment, not the one this process
+    # loaded when it started, so neither writer can lose the other's whole-table write. The read
+    # is also what makes the append idempotent — a plan that already carries this ticket is left
+    # exactly as it is, so a resumed queue cannot list it twice.
+    try:
+        with edit_plan(loop.table_path) as edit:
+            if any(ticket.id == identifier for ticket in edit.plan.tickets):
+                plan = edit.plan
+            else:
+                if routing is None:
+                    routing = queued_ticket_routing(loop, args)
+                    binding = queued_binding(loop, args.account)
+                plan = edit.write(edit.plan.append(run_plan.PlannedTicket(
+                    id=identifier,
+                    title=title,
+                    path=str(path),
+                    workflow=routing.workflow,
+                    executor=routing.executor,
+                    model=routing.model,
+                    effort=routing.effort,
+                    binding=binding,
+                    review=routing.review,
+                    queued=run_plan.Queued(source, open_word),
+                )))
+    except run_plan.RunPlanError as error:
+        raise DriverError(
+            str(error), ticket=identifier, pointer=str(loop.table_path)
+        ) from error
+    loop.plan = plan
+    if not queued_placed_already(records, source, identifier, open_word):
+        loop.deliver(source, launch, queued_placement(finding, identifier, open_word))
+    print(queued_summary(loop, identifier), flush=True)
     return 0
 
 
@@ -4083,6 +4638,32 @@ def build_parser():
     defer.add_argument(
         "--text", required=True,
         help="the finding exactly as the child stated it, with pointers",
+    )
+    queue = commands.add_parser(
+        "queue",
+        help="open a diagnosis at the run's tracker, append it to this run, and place it",
+    )
+    queue.set_defaults(handler=run_queue)
+    queue.add_argument("--run-dir", required=True, help="the recorded run directory")
+    queue.add_argument("--ticket", required=True, help="the ticket whose child stated the finding")
+    queue.add_argument(
+        "--open",
+        help="what the finding leaves open, which is what the queued child diagnoses first: one"
+             f" of {', '.join(run_plan.OPEN_WORDS)}",
+    )
+    queue.add_argument("--title", required=True, help="the title the new ticket is opened under")
+    queue.add_argument(
+        "--text", required=True,
+        help="the finding exactly as the child stated it, with pointers",
+    )
+    for field in run_plan.QUEUED_FIELDS:
+        queue.add_argument(
+            f"--{field}",
+            help=f"the {field} this one ticket is routed on, overriding the `[queued]` cell",
+        )
+    queue.add_argument(
+        "--account",
+        help="the account this one ticket runs on; naming none runs it on the coordinator's own",
     )
     return parser
 

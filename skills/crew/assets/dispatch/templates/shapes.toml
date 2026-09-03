@@ -10,8 +10,9 @@
 # meant to read literally — `<sha>`, `<unix time>`, `<reason>`,
 # `<design|scope|doc-conflict|stuck|wrap-up>`, `<path:line>`, `#<ticket>`, `ADR-<nnnn>` — are
 # never substituted; the renderer fills a fixed, named set and nothing else.
-# Numbering coupling: steps 1-3 are literal in `[turn].base`, workflow blocks, and `[review].block`;
-# `render_turn` computes steps 4-5, and `WorkflowMatrixTests.EXPECTED_STEPS` pins every lane.
+# Numbering coupling: step 1 is `[turn].step_one` — or `[queued].step` on a queued ticket — steps
+# 2-3 are literal in the workflow blocks and `[review].block`; `render_turn` computes steps 4-5,
+# and `WorkflowMatrixTests.EXPECTED_STEPS` pins every lane.
 
 [ticket]
 comment_rule = '''
@@ -29,8 +30,7 @@ Spec: <absolute spec path>. Scope: this worktree and branch only.
 
 <ticket comment rule>
 
-1. Before your first edit: send this phase's decision points as one `design` escalation and wait
-for the ruling.<design bridge>
+<step one>
 
 <workflow block><review step>
 
@@ -41,6 +41,14 @@ for the ruling.<design bridge>
 <coordinator paragraph>
 
 <escalation paragraph>
+'''
+
+# The ordinary child's step 1: decide first, edit after. A queued ticket's child receives
+# `[queued].step` in its place, the design bridge included — the diagnosis step names the same
+# escalation in its own words, so rendering both would say it twice.
+step_one = '''
+1. Before your first edit: send this phase's decision points as one `design` escalation and wait
+for the ruling.<design bridge>
 '''
 
 # The escalation paragraph, one body per kind. A manual run's developer prompt renders this same
@@ -58,9 +66,9 @@ holds:
   your pick marked.
 - stuck: the same obstacle has survived two attempts. State the question in one paragraph and give
   2-3 options with your pick marked.<review caller budget>
-- wrap-up: the ticket is complete and leftovers remain. One line per leftover — what, its
-  pointer, and whether it touches only this ticket, another ticket, or a public interface —
-  and no recommendation: placing them is the ruling.
+- wrap-up: the ticket is complete and leftovers remain. One line per leftover — what it is and
+  its pointer, at the cause where you know it and at the symptom where you do not — and no
+  recommendation: placing them is the ruling.
 Everything else is yours to settle: code shape, naming, tests, a root-caused bug, a refactor
 that changes no behaviour, what a document already answers.
 One message per escalation, distilled to about 250 words, then wait — the ruling wakes you:
@@ -119,6 +127,31 @@ python3 <machine log script> --log <machine log path> message \
 
 If you cannot complete the ticket, record the same way with:
 CREW FAILED <reason> ts=<unix time>
+'''
+
+[queued]
+# The diagnosing child (ADR-0028). Dispatch selects this variant from the Run plan's `queued` fact
+# and from nothing else, on whatever workflow the ticket carries: the ticket's workflow block,
+# review step, commit step, completion and escalation paragraphs are rendered unchanged, and only
+# the opening line and step 1 come from here. On a workflow that writes tests only where the
+# ticket names them, this step is that naming.
+#
+# The Codex mention is the bare skill name. The bridge accepts either form on an opening line as
+# of #189 — a canonical `plugin:skill` mention resolves to the same skill — so this is no longer
+# the refusal it once worked around. The bare form is kept because it is the spelling the
+# end-to-end scenarios verified (`../../codex/codex_bridge.py`, #182 fact 4a), not because the
+# other is rejected. Claude takes the canonical form, which is what its composer rewrites a short
+# name into anyway.
+opening_line = "/mattpocock-skills:triage <absolute ticket path>"
+opening_line_codex = "$triage <absolute ticket path>"
+step = '''
+1. Diagnose before your first edit. This triage's maintainer is the coordinator, and verifying
+the claim and writing the agent brief are approved in advance: reproduce it, find the cause, and
+post the brief on the ticket, invoking <codebase-design skill> before you write its approach.
+Then send one `design` escalation — the brief's pointer, every question this triage would put
+to a maintainer, and your pick marked "implement per brief" — and wait. The ruling arrives as
+the workflow's own opening line; the workflow below starts there. A cause an earlier ticket of this
+Run already fixed is still your deliverable: commit the test that proves it, and complete.
 '''
 
 [witness]

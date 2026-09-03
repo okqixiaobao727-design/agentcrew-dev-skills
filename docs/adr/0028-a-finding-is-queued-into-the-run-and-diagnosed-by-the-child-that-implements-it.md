@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A finding is queued into the Run and diagnosed by the child that implements it
@@ -43,14 +43,24 @@ pick "implement per brief" — the skill's "wait for direction" and "grill if ne
 every question the triage would put to a maintainer, travel in that one message. Dispatch chooses
 this variant from a `queued` fact the Run plan carries on the ticket, never from the machine log
 ([ADR-0024](0024-driver-activates-every-wave-through-one-path.md)). The witness checks the brief's pointers as it checks any escalation. The coordinator's
-ruling is the ticket's own opening line (`/implement <ticket>` for a tdd ticket), delivered through
+ruling is the **workflow's** own opening line (`/implement <ticket>` for a tdd ticket) — the
+ticket's own opening line is the triage skill, and the ruling replaces it — delivered through
 the Driver's `answer` command as any ruling is, and the child implements from the context its
 diagnosis built. That delivery is the same typed-into-the-composer path #127 already uses to type
 `/crew <feature-dir>` into the coordinator's pane, and the Codex bridge's next-turn path with
 `$implement`; a slash command typed into a composer is a user-typed invocation, which is what a
-`disable-model-invocation` skill accepts. Verifying it on both executors is the first acceptance
-criterion of the implementing ticket. Routing for queued tickets comes from one `[queued]` cell in the crew config file,
-overridable on the queue command; no classification session runs.
+`disable-model-invocation` skill accepts. Routing for queued tickets comes from one `[queued]`
+cell in the crew config file, overridable on the queue command; no classification session runs.
+
+**The mention is the first characters of the message, and each executor fails silently in its own
+shape past that edge.** #182 ran both live
+([`docs/research/second-turn-slash-command-expansion.md`](../research/second-turn-slash-command-expansion.md)):
+on Claude a preamble ahead of the slash downgrades the whole ruling to prose, with no error and
+nothing the delivery check can see; on Codex position is irrelevant but the name form is not — a
+bare `$implement` after a preamble injects nothing while the message still arrives, and the
+canonical `$mattpocock-skills:implement` is refused at the bridge before it is sent. So a ruling
+that starts a diagnosing child carries the opening line and nothing before it, and a correction
+travels as an ordinary answer ahead of it.
 
 **Three earlier decisions are amended, not replaced.** Tracker gains a `create` operation beside
 the read, edit, mark, comment and close that

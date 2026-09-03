@@ -162,6 +162,36 @@ fresh Reviewer session through Review-Switch rather than reusing the Implementer
 | `reviewer.non-core-complex` | `codex` / `gpt-5.6-luna` / `max` |
 | `reviewer.non-core-routine` | `claude` / `claude-opus-5` / `medium` |
 
+### `[queued]` — the routing a ticket the run queues into itself is opened on
+
+A finding the coordinator rules a *diagnosis* — cause, approach or reach still open — becomes a
+ticket this run appends to itself as a trailing Wave, whose child diagnoses it before implementing
+it (ADR-0028). No classification session runs mid-run, so this cell is that classification's
+standing answer. It is one cell rather than a table because the case is always the same one, and it
+carries a `workflow` on top of the three fields every cell above carries, because nothing upstream
+chose one.
+
+| Field | What it answers | Shipped default |
+| --- | --- | --- |
+| `workflow` | which of the six workflows the ticket is worked under | `tdd` |
+| `executor` | the vendor that runs it | `claude` |
+| `model` | its full model ID, never an alias | `claude-opus-5` |
+| `effort` | the reasoning effort it is launched at | `medium` |
+| `review` | its Review lane's own `executor`, `model` and `effort`, read on the two workflows that carry a Review line and ignored on the four that carry none | `codex` / `gpt-5.6-luna` / `max` |
+
+This cell is inherited field by field rather than whole: name only the fields you retarget, and the
+rest stay as shipped. There is deliberately no `account` key — which subscription pays is not a
+fact about the kind of work, so a queued ticket names none and runs on the coordinator's own
+account. A file that puts an `account` here stops the run in preflight rather than binding one.
+
+```toml
+[queued]
+effort = "high"
+
+[queued.review]
+effort = "xhigh"
+```
+
 ### `[hooks.on-child-launch]` — the one extension point
 
 Both fields are empty by default, and both empty means a child launches exactly as it would with no

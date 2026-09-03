@@ -89,6 +89,20 @@ def record_handover(state_dir, context):
         }) + "\n")
 
 
+def record_self(directory):
+    """Name this process the run's driver, by rename, as `monitor.record_driver` does.
+
+    A plain write truncates first, so a launcher polling the record can read it empty while a
+    driver that is very much alive is halfway through naming itself — the exact read the real
+    writer uses a rename to make impossible. A stand-in that leaves that window open does not
+    merely fail to test the race; it manufactures one the product does not have.
+    """
+    path = directory / "driver.pid"
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(f"{os.getpid()}\n")
+    os.replace(temporary, path)
+
+
 def main():
     """Run the Driver stand-in and return the configured process exit status."""
     argv = sys.argv[1:]
@@ -103,7 +117,7 @@ def main():
 
     if directory is None or not directory.is_dir():
         return int(os.environ.get("AGENTCREW_STUB_DRIVER_EXIT") or 0)
-    (directory / "driver.pid").write_text(f"{os.getpid()}\n")
+    record_self(directory)
     hold = float(os.environ.get("AGENTCREW_STUB_DRIVER_HOLD") or 0)
     if os.environ.get("AGENTCREW_STUB_DRIVER_SERVICE"):
         coordinator_control, context = coordinator_context(argv)
