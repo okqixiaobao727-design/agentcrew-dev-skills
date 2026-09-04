@@ -307,7 +307,10 @@ out of the brief, while extra cited pointers become uncited findings. `failed` c
 Driver launches `check` automatically, or a child launches
 it before sending in a run without a driver. An `ask` is coordinator-initiated and returns
 independently stated factual claims, each with at least one pointer. Both operations carry no
-recommendation or ruling.
+recommendation or ruling, and both record their own Machine-log `witness` event with the brief in
+it, so a later reader takes the finding from the log rather than paying for a second session. The
+session is bounded by the run's `[witness] timeout_seconds`, and a change made to the worktree it
+reads — by the child still working in it — is never that session's failure.
 _Avoid_: research, verification
 
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers

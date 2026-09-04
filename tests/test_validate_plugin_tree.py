@@ -617,6 +617,36 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.tree.edit_config("budget_usd = 2.0\n", "")
         self.assert_rejects("budget_usd")
 
+    def test_a_witness_without_its_own_session_timeout_is_rejected(self):
+        self.tree.edit_config("timeout_seconds = 300\n", "")
+        self.assert_rejects("timeout_seconds")
+
+    def test_a_shipped_witness_timeout_above_the_ceiling_is_rejected(self):
+        self.tree.edit_config("timeout_seconds = 300", "timeout_seconds = 541")
+        self.assert_rejects("ceiling")
+
+    def test_a_witness_timeout_that_is_not_a_number_at_all_is_rejected(self):
+        """`nan` compares false against every bound, so it is refused as a non-positive value."""
+        self.tree.edit_config("timeout_seconds = 300", "timeout_seconds = nan")
+        self.assert_rejects("positive")
+
+    def test_the_validator_and_the_run_plan_hold_the_same_timeout_ceiling(self):
+        """The ceiling is spelled twice — this script runs with no crew module beside it."""
+        spec = importlib.util.spec_from_file_location(
+            "run_plan", PLUGIN_ROOT / "skills" / "crew" / "assets" / "run_plan.py"
+        )
+        run_plan = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "crew" / "assets"))
+        try:
+            spec.loader.exec_module(run_plan)
+        finally:
+            sys.path.pop(0)
+
+        self.assertEqual(
+            VALIDATOR.WITNESS_TIMEOUT_CEILING_SECONDS,
+            run_plan.WITNESS_TIMEOUT_CEILING_SECONDS,
+        )
+
     def test_shipped_defaults_without_the_queued_cell_are_rejected(self):
         """Nothing else answers the routing a queued ticket is opened on (ADR-0028)."""
         self.tree.drop_config_block("queued")
@@ -792,6 +822,12 @@ class ProjectConfigTests(unittest.TestCase):
     def test_a_project_can_override_the_inherited_witness_defaults(self):
         self.assert_accepts_with_required(
             '[witness]\nmodel = "claude-sonnet-5"\nbudget_usd = 2.0\n'
+            "timeout_seconds = 540\n"
+        )
+
+    def test_a_project_witness_timeout_above_the_ceiling_is_rejected(self):
+        self.assert_rejects_with_required(
+            '[witness]\ntimeout_seconds = 600\n', "ceiling"
         )
 
     def test_a_project_witness_alias_is_rejected(self):

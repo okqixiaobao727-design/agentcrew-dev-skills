@@ -3844,15 +3844,17 @@ class CostTests(MonitorTestCase):
         self.fixture.launch("06")
         self.fixture.claude_transcript("06")
         self.fixture.append(
-            LAUNCH_TS, "witness", ticket="06", executor="claude",
+            LAUNCH_TS, "witness", ticket="06", operation="check", executor="claude",
             model="claude-sonnet-5", outcome="checked", reason="",
+            brief="README.md:1 — held — the fixture file exists",
             duration_seconds=1.25, input_tokens=11, output_tokens=22,
             cache_read_tokens=33, cache_creation_tokens=44, total_tokens=110,
         )
         self.fixture.append(
-            LAUNCH_TS, "witness", ticket="06", executor="codex",
+            # The same ticket's second operation: one row each, both `witness-06` (#196).
+            LAUNCH_TS, "witness", ticket="06", operation="ask", executor="codex",
             model="gpt-5.6-luna", outcome="partial", reason="uncovered pointer",
-            covered_count=10, uncovered_count=2,
+            brief="the ticket is open — #6", covered_count=10, uncovered_count=2,
             duration_seconds=2.5, input_tokens=1, output_tokens=2,
             cache_read_tokens=3, cache_creation_tokens=4, total_tokens=10,
         )

@@ -92,8 +92,12 @@ re-derive a named projection fact from them.
   It is false without a launch, and a newer launch clears it.
 - `escalation` and `witness` are the latest checked pair. A later escalation replaces the first
   and clears the second until its own witness event arrives, so an older fact-check cannot be
-  paired with a newer escalation. The handed-over ruling consumes the pending message but retains
-  this factual pair for audit and report readers.
+  paired with a newer escalation. A `witness` event whose `operation` is `ask` is never that
+  second half: an `ask` answers a coordinator question against the same ticket, and pairing it
+  here would let an unrelated answer stand where the escalation's fact-check belongs. The rule is
+  written as "every operation but `ask`", so an operation added later is a fact-check by default.
+  The handed-over ruling consumes the pending message but retains this factual pair for audit and
+  report readers.
 - `fact_check_running` is true from the newest escalation until its later
   `CREW RULED <NN> — handed to the coordinator` line. A `witness` event of any outcome does not
   clear it: that event says the check process ended, not that the wake snapshot reached disk. A
@@ -355,24 +359,36 @@ that reaches `review-start` writes one pair; a preparation failure opens no revi
 another pair for the same ticket. The caller's run-again budget changes only how many pairs may be
 written; the event shape and the rule that the last line holds are unchanged.
 
-### `witness` — one fact-check of a child escalation
+### `witness` — one Witness operation, recorded by the Witness itself
 
-`ticket`, `executor`, `model`, `outcome` (`checked`, `partial`, or `failed`), `reason`,
-`duration_seconds`, `covered_count`, `uncovered_count`, `input_tokens`, `output_tokens`,
-`cache_read_tokens`, `cache_creation_tokens`, `total_tokens`.
-The Driver writes one line after the child escalation and before its handed-over ruling. `model`
-and the budget that bounded the run come from the run's `[witness]` configuration; `executor` and
-`model` are the resolved witness route, while the hard budget remains in the Wave table. `reason`
-is empty for `checked` and non-empty for `partial` and `failed`. Both coverage counts are required
-non-negative integers: `checked` leaves none uncovered (and can have no expected pointers when its
-brief consists of uncited findings), `partial` has covered pointers and may have zero uncovered
-pointers when its only structural rejection is an extra cited pointer, and `failed` covers none.
+`ticket`, `operation` (`check` or `ask`), `executor`, `model`, `outcome` (`checked`, `partial`, or
+`failed`), `reason`, `brief`, `duration_seconds`, `covered_count`, `uncovered_count`,
+`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`.
+
+The Witness writes this line itself, on completion of every operation it offers, and no caller
+transcribes those fields: it is the one process that holds them, and the coordinator-initiated
+`ask` has no caller to write them down at all. A `check` line falls after the child escalation and
+before its handed-over ruling. `model` and the budget that bounded the run come from the run's
+`[witness]` configuration; `executor` and `model` are the resolved witness route, while the hard
+budget remains in the Wave table.
+
+`reason` is empty for `checked` and non-empty for `partial` and `failed`. `brief` is what the
+operation found, verbatim — the fact-check's findings for a `check`, the answer for an `ask` —
+so a later reader takes the finding from the log rather than paying for a second session. It is
+non-empty for `checked` and `partial` and empty for `failed`.
+
+Both coverage counts are required non-negative integers: `checked` leaves none uncovered (and can
+have no expected pointers when its brief consists of uncited findings), `partial` has covered
+pointers and may have zero uncovered pointers when its only structural rejection is an extra cited
+pointer, and `failed` covers none. An `ask` has no pointers to cover and records both as zero.
 
 The four token counters and `total_tokens` use the same meanings as `session-cost`, and total is
 their sum. They are absent together when the Witness returned no usage; the outcome, reason,
-coverage, and duration still record the attempted fact-check. The Driver writes this event for both
-Claude and Codex children: the witness itself is driver-side, runs in the escalating child's
-worktree, and uses that ticket's named Claude account where it has one.
+brief, coverage, and duration still record the attempted operation. The event is written for both
+Claude and Codex children: the witness session runs in the escalating child's worktree and uses
+that ticket's named Claude account where it has one. A Witness invoked with no run to record
+against — the manual, driver-less flow — records nothing and returns its document as usual, and
+a log it could not write leaves the document standing with the failure named in it.
 
 ### `base-gate` — whether a fresh run checked its integration base
 
@@ -512,9 +528,10 @@ machine_log.py --log <path> outcome --ticket NN --outcome completed|failed|parke
                                     [--detail TEXT]
 machine_log.py --log <path> review  --ticket NN --lane "VENDOR MODEL" --state running|returned \
                                     [--detail TEXT]
-machine_log.py --log <path> witness --ticket NN --model ID --outcome checked|partial|failed \
+machine_log.py --log <path> witness --ticket NN --operation check|ask --model ID \
+                                    --outcome checked|partial|failed \
                                     --executor claude|codex \
-                                    --reason TEXT --duration-seconds N \
+                                    --reason TEXT --brief TEXT --duration-seconds N \
                                     --covered-count N --uncovered-count N \
                                     [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \

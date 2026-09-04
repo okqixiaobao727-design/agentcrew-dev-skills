@@ -8,6 +8,28 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- The Witness no longer compares the worktree's working state before and after its session. The
+  guard defended against a Witness write, which its plan permission mode and single read-only
+  allowed Bash form already make impossible; what it caught instead was the escalating child, still
+  editing and committing its own worktree while the Witness read it — 5 of 8 escalation witnesses
+  in one measured run failed as `witness session changed the worktree` for a change the Witness did
+  not make. A Witness operation now fails only for its own failure, and a process that failed or
+  timed out keeps its own reason rather than having it replaced (#196).
+- The Witness session timeout is a project-configurable routing value, `[witness] timeout_seconds`,
+  shipped at 300 seconds — above the 70–200s measured range and below the 600-second ceiling any
+  shell-tool caller is subject to. It resolves through the same witness routing the model and the
+  budget already take, stays overridable per invocation, and a configured or explicit value above
+  540 seconds is a routing error in the same resolution path that validates the model and the
+  budget. The 900-second module constant it replaces was a promise no child could keep (#196).
+- Every Witness operation records its own Machine-log `witness` event, and no caller transcribes
+  those fields any more. The event gains the operation name and the brief text itself, so the log
+  is the record of what the fact-check found and a later reader takes it from there without a
+  second run. The coordinator-initiated `ask`, which had no caller doing that transcription, now
+  reaches the Machine log and the run's cost rollup for the first time. A Witness invoked with no
+  run to record against records nothing and returns normally; a log it could not write leaves its
+  result standing and names the failure in the document and on stderr. The projection pairs an
+  escalation with every operation but `ask`, so an answer to a coordinator's question never stands
+  in for the fact-check a standing escalation waits on (#196).
 - A ruling on a diagnosing child is one message the Driver composes, through the new
   `driver.py rule` (ADR-0028). The coordinator supplies the ruling body alone; the command takes
   the ticket's own workflow opening line from the shapes library the renderer composes first turns

@@ -207,10 +207,17 @@ model = "claude-sonnet-5"
 #
 # `budget_usd` is that witness session's own hard cap. It is independent of the merge repair
 # command's default even while both ship the same numeric value.
+#
+# `timeout_seconds` is how long that session may run. The measured range is 70-200 seconds (#173),
+# and the value below leaves margin above it. Its ceiling is 540 seconds: a caller that reaches the
+# witness through a shell tool is capped at that tool's 600 seconds, less a minute for session
+# start-up and the bounded wait around it. A larger value here is a routing error that stops the
+# run in preflight rather than a promise the caller is cut off inside.
 
 [witness]
 model = "claude-sonnet-5"
 budget_usd = 2.0
+timeout_seconds = 300
 
 # --- Issue tracker ----------------------------------------------------------
 # Which tracker a run closes its merged tickets in, and so which close operation and which undo it

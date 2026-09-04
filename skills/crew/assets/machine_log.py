@@ -177,6 +177,12 @@ HALTED_DECISIONS = ("escalated", "interrupted")
 # it, so an executor this log does not know is an executor whose figures nobody can check.
 EXECUTORS = ("claude", "codex")
 WITNESS_OUTCOMES = ("checked", "partial", "failed")
+# The operations the Witness offers, each of which records its own event. `check` fact-checks an
+# escalation's pointers; `ask` answers one factual coordinator question and has no pointers to
+# cover. A projection reading an episode's fact-check takes every operation but `ask`, so an
+# answer to an unrelated question can never stand in for the check of a standing escalation.
+WITNESS_OPERATIONS = ("check", "ask")
+WITNESS_ASK = "ask"
 BASE_GATE_STATUSES = ("passed", "not-configured")
 # What a queued ticket's finding still leaves open (ADR-0028). The Run plan decides this
 # vocabulary; it is spelled again here because this file is installed as a hook and runs with no
@@ -193,6 +199,10 @@ COST_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_cr
 COST_TOTAL = "total_tokens"
 
 LOG_FILE_MODE = 0o644
+# The Machine log's file name inside a run's state directory. Spelled here because every writer
+# reaches it from the run directory alone: the driver holds one, and the witness derives its own
+# from the run it was pointed at.
+LOG_NAME = "log.jsonl"
 
 
 @dataclass(frozen=True)
@@ -409,8 +419,15 @@ def project(records):
             # than the failure the swallowed one had already spent.
             episode["outstanding_nudge"] = False
         elif event == "witness":
+            # Every operation but `ask`: a coordinator's factual question is recorded against the
+            # same ticket, and taking the latest event of any kind would let that answer displace
+            # the fact-check the standing escalation is waiting on. Written as "not `ask`" so an
+            # operation added later is a fact-check here by default, not by an edit to this line.
             pending = episode["unanswered_child_message"]
-            if (pending or {}).get("event") == "escalation":
+            if (
+                record.get("operation") != WITNESS_ASK
+                and (pending or {}).get("event") == "escalation"
+            ):
                 episode["witness"] = record
         elif event in ("receipt", "ruling", "outcome"):
             pending = episode["unanswered_child_message"]
@@ -1498,24 +1515,37 @@ def run_session_cost(args):
     return run_event(args)
 
 
-def witness_problem(args):
-    """Why a witness event contradicts itself, or None when its shape is complete."""
-    if args.duration_seconds < 0:
+def witness_problem(fields):
+    """Why a witness event contradicts itself, or None when its shape is complete.
+
+    Takes the record's own fields, so the one contradiction check answers to the Witness writing
+    its event in process and to the command line writing the same event from outside.
+    """
+    outcome = fields["outcome"]
+    reason = fields["reason"]
+    brief = fields["brief"]
+    if fields["operation"] not in WITNESS_OPERATIONS:
+        return f"witness operation is one of {', '.join(WITNESS_OPERATIONS)}"
+    if fields["duration_seconds"] < 0:
         return "duration_seconds is never negative"
-    if args.covered_count < 0 or args.uncovered_count < 0:
+    if fields["covered_count"] < 0 or fields["uncovered_count"] < 0:
         return "witness coverage counts are never negative"
-    if args.outcome == "checked" and args.reason:
+    if outcome == "checked" and reason:
         return "a checked witness carries an empty reason"
-    if args.outcome in ("partial", "failed") and not args.reason.strip():
-        return f"a {args.outcome} witness carries its reason"
-    if args.outcome == "checked" and args.uncovered_count:
+    if outcome in ("partial", "failed") and not reason.strip():
+        return f"a {outcome} witness carries its reason"
+    if outcome in ("checked", "partial") and not brief.strip():
+        return f"a {outcome} witness carries the brief it found"
+    if outcome == "failed" and brief.strip():
+        return "a failed witness carries no brief"
+    if outcome == "checked" and fields["uncovered_count"]:
         return "a checked witness leaves no pointers uncovered"
-    if args.outcome == "partial" and not args.covered_count:
+    if outcome == "partial" and not fields["covered_count"]:
         return "a partial witness has one or more covered pointers"
-    if args.outcome == "failed" and args.covered_count:
+    if outcome == "failed" and fields["covered_count"]:
         return "a failed witness covers no pointers"
-    counters = [getattr(args, name) for name in COST_COUNTERS]
-    total = getattr(args, COST_TOTAL)
+    counters = [fields[name] for name in COST_COUNTERS]
+    total = fields[COST_TOTAL]
     figures = [value for value in counters + [total] if value is not None]
     if not figures:
         return None
@@ -1528,13 +1558,68 @@ def witness_problem(args):
     return None
 
 
-def run_witness(args):
-    """Append one witness event; returns 0, or 2 for a contradictory result."""
-    problem = witness_problem(args)
+def witness_fields(
+    ticket, operation, executor, model, outcome, reason, brief, duration_seconds,
+    covered_count, uncovered_count, counters=None,
+):
+    """The witness event's fields, in the order the record writes them."""
+    counters = counters or {}
+    fields = {
+        "ticket": ticket,
+        "operation": operation,
+        "executor": executor,
+        "model": model,
+        "outcome": outcome,
+        "reason": reason,
+        "brief": brief,
+        "duration_seconds": duration_seconds,
+        "covered_count": covered_count,
+        "uncovered_count": uncovered_count,
+    }
+    for name in COST_COUNTERS + (COST_TOTAL,):
+        fields[name] = counters.get(name)
+    return fields
+
+
+def record_witness(log, **values):
+    """Append one witness event through the log's own append discipline; returns nothing.
+
+    Raises ValueError for a result that contradicts itself and OSError for a log it could not
+    write, so a caller can tell the two apart: the first is its own document being wrong, the
+    second is the record failing around a document that stands.
+    """
+    fields = witness_fields(**values)
+    problem = witness_problem(fields)
     if problem is not None:
-        print(f"machine log: witness: {problem}", file=sys.stderr)
+        raise ValueError(problem)
+    append(log, entry("witness", **fields))
+
+
+def run_witness(args):
+    """Append one witness event; returns 0, 1 for an unwritable log, or 2 for a contradiction."""
+    counters = {name: getattr(args, name) for name in COST_COUNTERS + (COST_TOTAL,)}
+    try:
+        record_witness(
+            args.log,
+            ticket=args.ticket,
+            operation=args.operation,
+            executor=args.executor,
+            model=args.model,
+            outcome=args.outcome,
+            reason=args.reason,
+            brief=args.brief,
+            duration_seconds=args.duration_seconds,
+            covered_count=args.covered_count,
+            uncovered_count=args.uncovered_count,
+            counters=counters,
+        )
+    except ValueError as error:
+        print(f"machine log: witness: {error}", file=sys.stderr)
         return 2
-    return run_event(args)
+    except OSError as error:
+        print(f"machine log: {args.log}: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def run_base_gate(args):
@@ -1625,10 +1710,12 @@ def build_parser():
 
     witness = event_command("witness", "one witness fact-check of an escalation")
     witness.set_defaults(handler=run_witness)
+    witness.add_argument("--operation", required=True, choices=WITNESS_OPERATIONS)
     witness.add_argument("--executor", required=True, choices=EXECUTORS)
     witness.add_argument("--model", required=True, help="the full model ID, never an alias")
     witness.add_argument("--outcome", required=True, choices=WITNESS_OUTCOMES)
     witness.add_argument("--reason", required=True)
+    witness.add_argument("--brief", required=True, help="what the operation found, as recorded")
     witness.add_argument("--duration-seconds", required=True, type=float)
     witness.add_argument("--covered-count", required=True, type=int)
     witness.add_argument("--uncovered-count", required=True, type=int)

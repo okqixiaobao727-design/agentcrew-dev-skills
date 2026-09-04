@@ -45,6 +45,7 @@ REVIEW_LANE_MATRIX = (
 )
 WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_BUDGET_USD = 2.5
+WITNESS_TIMEOUT_SECONDS = 420
 COORDINATOR_NAME = "crew-coordinator-1f"
 COORDINATOR_PID = 1504
 # The whole address a child sends to, exactly as the harness spelled the socket it bound: not
@@ -114,6 +115,7 @@ class Fixture:
         self.config_path = self.repo / "agentcrew.toml"
         self.config_path.write_text(
             f'[witness]\nmodel = "{WITNESS_MODEL}"\nbudget_usd = {WITNESS_BUDGET_USD}\n'
+            f"timeout_seconds = {WITNESS_TIMEOUT_SECONDS}\n"
         )
 
         self.stub_dir = self.root / "stub"
@@ -371,12 +373,28 @@ class ManualRolesTests(DispatchTestCase):
             "check", "--escalation", "-", "--worktree", ".",
             "--model", WITNESS_MODEL,
             "--budget-usd", f"{WITNESS_BUDGET_USD:g}",
+            "--timeout-seconds", f"{WITNESS_TIMEOUT_SECONDS:g}",
         ])
 
         result = self.fixture.run_roles(ticket["path"])
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(expected, result.stdout)
+
+    def test_a_configured_witness_timeout_above_the_ceiling_is_an_error(self):
+        # The manual command line is the whole of this flow's routing, so a timeout it cannot
+        # honour is refused where it is read rather than at the session that would be cut off.
+        ticket = self.fixture.ticket("136", "manual-roles")
+        self.fixture.config_path.write_text(
+            f'[witness]\nmodel = "{WITNESS_MODEL}"\nbudget_usd = {WITNESS_BUDGET_USD}\n'
+            "timeout_seconds = 541\n"
+        )
+
+        result = self.fixture.run_roles(ticket["path"])
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(self.fixture.config_path), result.stderr)
+        self.assertIn("ceiling", result.stderr)
 
     def test_an_aliased_configured_witness_model_is_an_error(self):
         ticket = self.fixture.ticket("136", "manual-roles")

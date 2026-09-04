@@ -3,6 +3,7 @@
 import contextlib
 from dataclasses import dataclass, replace
 import json
+import math
 import os
 import pathlib
 import re
@@ -26,6 +27,10 @@ EXECUTORS = ("claude", "codex")
 # The witness launcher is the Claude CLI; exposing that here makes its complete route available to
 # every consumer without making presentation code infer a vendor from a model name.
 WITNESS_EXECUTOR = "claude"
+# A caller that reaches the witness through a shell tool is capped at that tool's 600 seconds. The
+# ceiling here is that less a minute for session start-up and the bounded wait around it, so every
+# timeout this resolution accepts is one any caller can honour rather than be cut off inside (#196).
+WITNESS_TIMEOUT_CEILING_SECONDS = 540.0
 REVIEW_VENDORS = EXECUTORS
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ACCOUNT_MODES = accounts.ACCOUNT_MODES
@@ -87,6 +92,7 @@ class RunMetadata:
     repair_model: str | None = None
     witness_model: str | None = None
     witness_budget_usd: float | None = None
+    witness_timeout_seconds: float | None = None
     tracker: str | None = None
     declared_accounts: tuple[str, ...] = ()
     codex: CodexConfig | None = None
@@ -507,6 +513,7 @@ def _validation_problems(plan, check_wave_layout=True):
         plan.run.repair_model,
         plan.run.witness_model,
         plan.run.witness_budget_usd,
+        plan.run.witness_timeout_seconds,
         plan.run.tracker,
     )
     vocabulary = _routing_vocabulary()
@@ -634,7 +641,7 @@ def _absolute(values, key, label=None, optional=False):
 
 
 def witness_defaults():
-    """The witness's independently shipped model and budget defaults."""
+    """The witness's independently shipped model, budget and session timeout defaults."""
     try:
         with DEFAULT_CONFIG.open("rb") as handle:
             witness = tomllib.load(handle).get("witness")
@@ -649,18 +656,47 @@ def witness_defaults():
     return {
         "model": witness.get("model"),
         "budget_usd": witness.get("budget_usd"),
+        "timeout_seconds": witness.get("timeout_seconds"),
     }
 
 
-def witness_routing(model, budget_usd):
-    """Resolve the witness executor, model and budget without consulting `[repair]`."""
-    if model is None or budget_usd is None:
+def witness_routing(model, budget_usd, timeout_seconds=None):
+    """Resolve the witness executor, model, budget and timeout without consulting `[repair]`.
+
+    The timeout resolves here rather than at the witness's own command line so that the value a
+    caller is held to is the value this project configured, checked against the same ceiling and
+    in the same place as the model and the budget beside it.
+    """
+    if model is None or budget_usd is None or timeout_seconds is None:
         defaults = witness_defaults()
         if model is None:
             model = defaults["model"]
         if budget_usd is None:
             budget_usd = defaults["budget_usd"]
-    return WITNESS_EXECUTOR, model, budget_usd
+        if timeout_seconds is None:
+            timeout_seconds = defaults["timeout_seconds"]
+    return WITNESS_EXECUTOR, model, budget_usd, timeout_seconds
+
+
+def witness_timeout_problem(label, timeout_seconds):
+    """Why this witness timeout is unusable, or None where it is a value every caller can honour.
+
+    `NaN` is refused by the positivity test rather than the ceiling, because every comparison
+    against it is false: a bound it passed would be no bound at all.
+    """
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        return f"{label} is not a positive number of seconds"
+    if timeout_seconds > WITNESS_TIMEOUT_CEILING_SECONDS:
+        return (
+            f"{label} {timeout_seconds:g} is above the {WITNESS_TIMEOUT_CEILING_SECONDS:g}-second"
+            " ceiling a shell-tool caller can honour"
+        )
+    return None
 
 
 def queued_defaults():
@@ -769,7 +805,7 @@ def queued_routing(project_cell):
 
 
 def configuration_problems(
-    repo_root, repair_model, witness_model, witness_budget_usd, tracker
+    repo_root, repair_model, witness_model, witness_budget_usd, witness_timeout_seconds, tracker
 ):
     """Problems in the configured run decisions, in the Run plan's vocabulary."""
     config = pathlib.Path(repo_root) / PROJECT_CONFIG_NAME
@@ -784,8 +820,8 @@ def configuration_problems(
         if fault:
             problems.append(f"repair model: {fault}")
     try:
-        _, witness_model, witness_budget_usd = witness_routing(
-            witness_model, witness_budget_usd
+        _, witness_model, witness_budget_usd, witness_timeout_seconds = witness_routing(
+            witness_model, witness_budget_usd, witness_timeout_seconds
         )
     except RunPlanError as error:
         problems.extend(error.problems)
@@ -808,6 +844,12 @@ def configuration_problems(
                 f"witness budget: {config} and the shipped defaults do not name a positive"
                 " [witness] budget_usd"
             )
+        fault = witness_timeout_problem(
+            f"{config} and the shipped defaults' `[witness] timeout_seconds`",
+            witness_timeout_seconds,
+        )
+        if fault:
+            problems.append(f"witness timeout: {fault}")
     if not isinstance(tracker, str) or not tracker.strip():
         problems.append(
             f"tracker: {config} names no [tracker] kind — a merged ticket has nowhere to be"
@@ -864,8 +906,10 @@ def _metadata(values, persisted=False):
         key: _string(values, key, optional=True)
         for key in ("base_branch", "repair_model", "tracker")
     }
-    _, witness_model, witness_budget_usd = witness_routing(
-        values.get("witness_model"), values.get("witness_budget_usd")
+    _, witness_model, witness_budget_usd, witness_timeout_seconds = witness_routing(
+        values.get("witness_model"),
+        values.get("witness_budget_usd"),
+        values.get("witness_timeout_seconds"),
     )
     if not isinstance(witness_model, str) or not witness_model.strip():
         raise RunPlanError(["run: witness_model is not a non-empty string"])
@@ -934,6 +978,7 @@ def _metadata(values, persisted=False):
         repair_model=optional["repair_model"],
         witness_model=witness_model,
         witness_budget_usd=witness_budget_usd,
+        witness_timeout_seconds=witness_timeout_seconds,
         tracker=optional["tracker"],
         declared_accounts=tuple(declared_accounts),
         codex=codex_value,
@@ -960,7 +1005,7 @@ def _metadata_object(run):
     }
     for key in (
         "base_branch", "feature_dir", "repair_model", "witness_model",
-        "witness_budget_usd", "tracker",
+        "witness_budget_usd", "witness_timeout_seconds", "tracker",
     ):
         value = getattr(run, key)
         if value is not None:

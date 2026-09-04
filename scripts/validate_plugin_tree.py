@@ -11,6 +11,7 @@ Exits 0 when what was checked is sound, 1 when it is not, printing one line per 
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import re
@@ -123,10 +124,14 @@ SURFACES = ("window", "pin", "both")
 # so it is refused on the same alias rule.
 REPAIR = "repair"
 REPAIR_MODEL = "model"
-# The escalation fact-checker's independently inheritable model and hard budget cap.
+# The escalation fact-checker's independently inheritable model, hard budget cap and session
+# timeout. The timeout's ceiling is the one `run_plan.witness_routing` resolves against: the
+# 600 seconds a shell-tool caller is capped at, less a minute for start-up and the wait around it.
 WITNESS = "witness"
 WITNESS_MODEL = "model"
 WITNESS_BUDGET = "budget_usd"
+WITNESS_TIMEOUT = "timeout_seconds"
+WITNESS_TIMEOUT_CEILING_SECONDS = 540
 # The tracker a run closes its merged tickets in. Two are exercised end to end
 # (`references/trackers.md`), and a run on any other would reach a CLI nobody named.
 # The account names a repository declares, and nothing else: the name-to-profile mapping is a
@@ -446,7 +451,7 @@ def check_queued(config, label, complete, aliases, workflows, problems):
 
 
 def check_witness(config, label, complete, aliases, problems):
-    """The independently inheritable witness model and its positive hard budget cap."""
+    """The inheritable witness model, its positive hard budget cap and its honourable timeout."""
     witness = config.get(WITNESS)
     if witness is None:
         if complete:
@@ -457,6 +462,7 @@ def check_witness(config, label, complete, aliases, problems):
         return
     model = witness.get(WITNESS_MODEL)
     budget = witness.get(WITNESS_BUDGET)
+    timeout = witness.get(WITNESS_TIMEOUT)
     if model is not None or complete:
         if not isinstance(model, str) or not model.strip():
             problems.append(f"{label}: [{WITNESS}] needs a non-empty {WITNESS_MODEL}")
@@ -471,7 +477,22 @@ def check_witness(config, label, complete, aliases, problems):
             or budget <= 0
         ):
             problems.append(f"{label}: [{WITNESS}] needs a positive {WITNESS_BUDGET}")
-    for field in sorted(set(witness) - {WITNESS_MODEL, WITNESS_BUDGET}):
+    if timeout is not None or complete:
+        # `NaN` fails here rather than at the ceiling below, where every comparison against it is
+        # false: a value that passed the ceiling test without being bounded by it is no timeout.
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            problems.append(f"{label}: [{WITNESS}] needs a positive {WITNESS_TIMEOUT}")
+        elif timeout > WITNESS_TIMEOUT_CEILING_SECONDS:
+            problems.append(
+                f"{label}: [{WITNESS}] {WITNESS_TIMEOUT} {timeout:g} is above the"
+                f" {WITNESS_TIMEOUT_CEILING_SECONDS}-second ceiling a shell-tool caller can honour"
+            )
+    for field in sorted(set(witness) - {WITNESS_MODEL, WITNESS_BUDGET, WITNESS_TIMEOUT}):
         problems.append(f"{label}: [{WITNESS}] carries an unknown field {field!r}")
 
 

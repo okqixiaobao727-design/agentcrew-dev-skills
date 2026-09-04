@@ -187,7 +187,7 @@ def contract_text():
 
 
 def project_witness_routing(ticket):
-    """Return the ticket repository's configured witness model and budget."""
+    """Return the ticket repository's configured witness model, budget and session timeout."""
     ticket = pathlib.Path(ticket).resolve()
     result = subprocess.run(
         ["git", "-C", str(ticket.parent), "rev-parse", "--show-toplevel"],
@@ -210,8 +210,8 @@ def project_witness_routing(ticket):
     witness = config.get("witness") if isinstance(config, dict) else None
     witness = witness if isinstance(witness, dict) else {}
     try:
-        _, model, budget = run_plan.witness_routing(
-            witness.get("model"), witness.get("budget_usd")
+        _, model, budget, timeout = run_plan.witness_routing(
+            witness.get("model"), witness.get("budget_usd"), witness.get("timeout_seconds")
         )
     except run_plan.RunPlanError as error:
         raise RoleRenderError("; ".join(error.problems)) from error
@@ -225,12 +225,18 @@ def project_witness_routing(ticket):
         raise RoleRenderError(
             f"{sources} name no positive [witness] budget_usd"
         )
-    return model, budget
+    # Checked here for the same reason the model and the budget are: this command line is the
+    # whole of the manual flow's routing, so a timeout the project configured above the ceiling
+    # has to be refused where it is read rather than reached at the session it cannot honour.
+    fault = run_plan.witness_timeout_problem("`[witness] timeout_seconds`", timeout)
+    if fault:
+        raise RoleRenderError(f"{sources}: {fault}")
+    return model, budget, timeout
 
 
 def render_roles(spec, ticket, coordinator_name, coordinator_address, templates):
     """Return the manual advisor and developer prompts rendered from their shared blocks."""
-    witness_model, witness_budget = project_witness_routing(ticket)
+    witness_model, witness_budget, witness_timeout = project_witness_routing(ticket)
     caller_budget = f"\n  {block(templates['review']['caller_budget'])}"
     advisor = block(templates["manual"]["advisor"])
     advisor = fill(
@@ -263,6 +269,10 @@ def render_roles(spec, ticket, coordinator_name, coordinator_address, templates)
                 "check", "--escalation", "-", "--worktree", ".",
                 "--model", witness_model,
                 "--budget-usd", f"{witness_budget:g}",
+                # Carried on the command line beside the model and the budget: the manual flow
+                # has no run to resolve routing from, so what this line omits is not configured
+                # at all — it is the shipped default (#196).
+                "--timeout-seconds", f"{witness_timeout:g}",
             ]),
         },
     )

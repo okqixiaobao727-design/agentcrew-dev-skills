@@ -221,7 +221,7 @@ class WitnessTests(unittest.TestCase):
 
     def run_witness(
         self, behaviour="witness", *extra, stdin=None, brief=BRIEF, operation="check",
-        structured_output=STRUCTURED_FROM_BRIEF, prose=None, issue=None,
+        structured_output=STRUCTURED_FROM_BRIEF, prose=None, issue=None, worktree=None,
     ):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
@@ -243,7 +243,7 @@ class WitnessTests(unittest.TestCase):
             "--escalation",
             "-" if stdin is not None else str(self.escalation),
             "--worktree",
-            str(self.worktree),
+            str(worktree or self.worktree),
             "--model",
             MODEL,
             "--budget-usd",
@@ -566,25 +566,34 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "failed")
         self.assertIn("time", document["reason"].lower())
 
-    def test_a_session_that_changes_the_tree_returns_an_empty_failed_brief(self):
+    def test_a_worktree_changed_during_the_session_returns_the_session_result(self):
+        # The escalating child keeps working while its worktree is read: a file appearing here is
+        # that child's, never this read-only session's, and it is not this operation's failure.
         result = self.run_witness("witness-write")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
-        self.assertEqual(document["brief"], "")
-        self.assertEqual(document["outcome"], "failed")
-        self.assertTrue(document["reason"])
+        self.assertEqual(document["outcome"], "checked")
+        self.assertEqual(document["brief"], BRIEF)
 
-    def test_tree_changes_fail_closed_after_process_failure_and_timeout(self):
+    def test_a_worktree_change_never_displaces_the_real_failure_reason(self):
         # One second leaves process-startup margin for the stub to write the stray file before its
         # 30-second sleep reaches the timeout; the timeout path itself is still exercised.
-        for behaviour, extra in (
-            ("witness-fail-write", ()),
-            ("witness-timeout-write", ("--timeout-seconds", "1")),
+        for behaviour, extra, expected in (
+            # Whatever the process itself said is kept as the reason, rather than replaced.
+            ("witness-fail-write", (), "session failed after writing"),
+            ("witness-timeout-write", ("--timeout-seconds", "1"), "timed out"),
         ):
             with self.subTest(behaviour=behaviour):
                 document = self.assert_failed_result(self.run_witness(behaviour, *extra))
-                self.assertIn("changed the worktree", document["reason"])
+                self.assertIn(expected, document["reason"])
+                self.assertNotIn("changed the worktree", document["reason"])
+
+    def test_an_unreadable_worktree_is_still_a_failure(self):
+        result = self.run_witness(worktree=self.root / "no-such-worktree")
+
+        document = self.assert_failed_result(result)
+        self.assertTrue(document["reason"])
 
     def test_partial_and_absent_usage_do_not_discard_a_checked_result(self):
         partial = self.run_witness("witness-partial-usage")
@@ -602,7 +611,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(json.loads(absent.stdout)["outcome"], "checked")
         self.assertNotIn("usage", json.loads(absent.stdout))
 
-    def test_rewriting_an_already_dirty_file_is_still_a_tree_change(self):
+    def test_a_file_the_child_was_already_editing_is_not_this_session_failure(self):
         (self.worktree / "src" / "check.py").write_text(
             "the child already changed it\n", encoding="utf-8"
         )
@@ -611,9 +620,8 @@ class WitnessTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
-        self.assertEqual(document["brief"], "")
-        self.assertEqual(document["outcome"], "failed")
-        self.assertTrue(document["reason"])
+        self.assertEqual(document["outcome"], "checked")
+        self.assertEqual(document["brief"], BRIEF)
 
     def test_an_uncited_pointer_uses_the_fixed_uncited_line_shape(self):
         brief = BRIEF + "\nuncited docs/context.md:7 — held — this fact also needs context"
@@ -768,6 +776,145 @@ class WitnessTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["brief"], brief)
+
+    # --- what the operation records of itself ------------------------------------------------
+
+    def events(self, log):
+        if not pathlib.Path(log).exists():
+            return []
+        return [json.loads(line) for line in pathlib.Path(log).read_text().splitlines()]
+
+    def test_a_check_records_one_witness_event_carrying_its_brief(self):
+        log = self.root / "log.jsonl"
+
+        result = self.run_witness("witness", "--log", str(log), "--ticket", "154")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked")
+        self.assertNotIn("record_error", document)
+        events = self.events(log)
+        self.assertEqual(len(events), 1, events)
+        event = events[0]
+        self.assertEqual(event["event"], "witness")
+        self.assertEqual(event["operation"], "check")
+        self.assertEqual(event["ticket"], "154")
+        self.assertEqual(event["executor"], "claude")
+        self.assertEqual(event["model"], MODEL)
+        self.assertEqual(event["outcome"], "checked")
+        self.assertEqual(event["reason"], "")
+        self.assertEqual(event["brief"], BRIEF)
+        self.assertEqual(event["covered_count"], 3)
+        self.assertEqual(event["uncovered_count"], 0)
+        self.assertGreaterEqual(event["duration_seconds"], 0)
+        self.assertEqual(event["total_tokens"], sum(
+            event[name] for name in
+            ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens")
+        ))
+
+    def test_a_failed_check_records_its_failure_too(self):
+        log = self.root / "log.jsonl"
+
+        result = self.run_witness(
+            "witness-error", "--log", str(log), "--ticket", "154"
+        )
+
+        document = self.assert_failed_result(result)
+        events = self.events(log)
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["outcome"], "failed")
+        self.assertEqual(events[0]["operation"], "check")
+        self.assertEqual(events[0]["brief"], "")
+        self.assertEqual(events[0]["reason"], document["reason"])
+
+    def test_a_check_with_no_run_to_record_against_records_nothing(self):
+        result = self.run_witness()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["outcome"], "checked")
+        self.assertEqual(self.events(self.root / "log.jsonl"), [])
+
+    def test_a_log_and_a_ticket_are_given_together_or_not_at_all(self):
+        for extra in (("--log", str(self.root / "log.jsonl")), ("--ticket", "154")):
+            with self.subTest(extra=extra):
+                result = self.run_witness("witness", *extra)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--log", result.stderr)
+
+    def test_an_unwritable_log_leaves_the_checked_result_standing_and_visible(self):
+        unwritable = self.root / "log-directory"
+        unwritable.mkdir()
+
+        result = self.run_witness("witness", "--log", str(unwritable), "--ticket", "154")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked")
+        self.assertEqual(document["brief"], BRIEF)
+        self.assertIn("not recorded", document["record_error"])
+        self.assertIn("not recorded", result.stderr)
+
+    def test_an_ask_records_its_own_event_in_the_run_it_names(self):
+        result = self.run_ask()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events(self.state_dir / "log.jsonl")
+        self.assertEqual(len(events), 1, events)
+        event = events[0]
+        self.assertEqual(event["event"], "witness")
+        self.assertEqual(event["operation"], "ask")
+        self.assertEqual(event["ticket"], "154")
+        self.assertEqual(event["model"], MODEL)
+        self.assertEqual(event["outcome"], "checked")
+        self.assertEqual(event["brief"], ASK_BRIEF)
+        self.assertEqual(event["covered_count"], 0)
+        self.assertEqual(event["uncovered_count"], 0)
+
+    def test_a_failed_ask_records_its_failure_against_the_run(self):
+        result = self.run_ask(question="   ")
+
+        self.assert_failed_result(result)
+        events = self.events(self.state_dir / "log.jsonl")
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["operation"], "ask")
+        self.assertEqual(events[0]["outcome"], "failed")
+
+    def test_an_ask_with_no_run_records_nothing(self):
+        result = self.run_ask(run_dir=self.root / "missing-run")
+
+        self.assert_failed_result(result)
+        self.assertEqual(self.events(self.state_dir / "log.jsonl"), [])
+
+    # --- the session timeout every caller can honour ------------------------------------------
+
+    def test_a_timeout_at_the_ceiling_is_accepted_and_one_above_it_is_refused(self):
+        accepted = self.run_witness("witness", "--timeout-seconds", "540")
+
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(json.loads(accepted.stdout)["outcome"], "checked")
+
+        launched = len(self.calls())
+        for value in ("541", "600"):
+            with self.subTest(value=value):
+                document = self.assert_failed_result(
+                    self.run_witness("witness", "--timeout-seconds", value)
+                )
+
+                self.assertIn("540", document["reason"])
+                self.assertIn("ceiling", document["reason"])
+                # Refused at the routing boundary: no session was ever started on it.
+                self.assertEqual(len(self.calls()), launched)
+
+    def test_an_absent_timeout_takes_the_configured_default(self):
+        self.assertEqual(
+            witness_module.run_plan.witness_routing(MODEL, 2.0, None)[3], 300
+        )
+
+        result = self.run_witness()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["outcome"], "checked")
 
 
 if __name__ == "__main__":

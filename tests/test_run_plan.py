@@ -23,6 +23,7 @@ import driver  # noqa: E402
 
 WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_BUDGET_USD = 2.0
+WITNESS_TIMEOUT_SECONDS = 300
 IMPLEMENTER_ROUTING = {
     "claude": {"model": "claude-opus-5", "effort": "max"},
     "codex": {"model": "gpt-5.6-luna", "effort": "max"},
@@ -68,6 +69,7 @@ class RunPlanTests(unittest.TestCase):
             "repair_model": "claude-sonnet-5",
             "witness_model": WITNESS_MODEL,
             "witness_budget_usd": WITNESS_BUDGET_USD,
+            "witness_timeout_seconds": WITNESS_TIMEOUT_SECONDS,
             "tracker": "local",
             "declared_accounts": [],
             "codex": {
@@ -121,7 +123,11 @@ class RunPlanTests(unittest.TestCase):
         """Build, persist, and reload the Run plan through the Driver's config seam."""
         config = {
             "repair": {"model": "claude-sonnet-5"},
-            "witness": {"model": WITNESS_MODEL, "budget_usd": WITNESS_BUDGET_USD},
+            "witness": {
+                "model": WITNESS_MODEL,
+                "budget_usd": WITNESS_BUDGET_USD,
+                "timeout_seconds": WITNESS_TIMEOUT_SECONDS,
+            },
             "tracker": {"kind": "local"},
         }
         if hook is not ...:
@@ -271,10 +277,12 @@ class RunPlanTests(unittest.TestCase):
         metadata = copy.deepcopy(self.run)
         metadata.pop("witness_model")
         metadata.pop("witness_budget_usd")
+        metadata.pop("witness_timeout_seconds")
         independent = self.root / "defaults.toml"
         independent.write_text(
             "[repair]\nmodel = \"claude-opus-5\"\n"
-            "[witness]\nmodel = \"claude-sonnet-5\"\nbudget_usd = 2.0\n",
+            "[witness]\nmodel = \"claude-sonnet-5\"\nbudget_usd = 2.0\n"
+            "timeout_seconds = 300\n",
             encoding="utf-8",
         )
         path = self.root / "wave-table.json"
@@ -286,6 +294,9 @@ class RunPlanTests(unittest.TestCase):
         document = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(document["run"]["witness_model"], WITNESS_MODEL)
         self.assertEqual(document["run"]["witness_budget_usd"], WITNESS_BUDGET_USD)
+        self.assertEqual(
+            document["run"]["witness_timeout_seconds"], WITNESS_TIMEOUT_SECONDS
+        )
 
     def test_an_aliased_witness_model_is_rejected(self):
         self.ticket("01", "Foundation")
@@ -301,15 +312,57 @@ class RunPlanTests(unittest.TestCase):
 
         self.assertEqual(witness["model"], WITNESS_MODEL)
         self.assertEqual(witness["budget_usd"], WITNESS_BUDGET_USD)
+        # Above the 70-200s measured range and below the ceiling every caller is held to, so the
+        # value a caller is promised is one it can keep.
+        self.assertEqual(witness["timeout_seconds"], WITNESS_TIMEOUT_SECONDS)
+        self.assertLessEqual(
+            witness["timeout_seconds"], run_plan.WITNESS_TIMEOUT_CEILING_SECONDS
+        )
 
     def test_witness_routing_names_the_executor_that_launches_the_session(self):
-        executor, model, budget_usd = run_plan.witness_routing(
-            WITNESS_MODEL, WITNESS_BUDGET_USD
+        executor, model, budget_usd, timeout_seconds = run_plan.witness_routing(
+            WITNESS_MODEL, WITNESS_BUDGET_USD, WITNESS_TIMEOUT_SECONDS
         )
 
         self.assertEqual(executor, "claude")
         self.assertEqual(model, WITNESS_MODEL)
         self.assertEqual(budget_usd, WITNESS_BUDGET_USD)
+        self.assertEqual(timeout_seconds, WITNESS_TIMEOUT_SECONDS)
+
+    def test_an_unset_witness_timeout_inherits_the_shipped_default(self):
+        _, _, _, timeout_seconds = run_plan.witness_routing(
+            WITNESS_MODEL, WITNESS_BUDGET_USD, None
+        )
+
+        self.assertEqual(timeout_seconds, WITNESS_TIMEOUT_SECONDS)
+
+    def test_a_witness_timeout_above_the_ceiling_is_a_routing_problem(self):
+        # `nan` and `inf` among them: every comparison against `nan` is false, so a ceiling it
+        # passed would be no ceiling, and the session would run to the caller's own cut-off.
+        for value in (541, 600, 0, -1, "300", True, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                problems = run_plan.configuration_problems(
+                    self.feature, "claude-sonnet-5", WITNESS_MODEL, WITNESS_BUDGET_USD,
+                    value, "local",
+                )
+
+                self.assertTrue(
+                    any(problem.startswith("witness timeout:") for problem in problems),
+                    problems,
+                )
+
+    def test_a_witness_timeout_at_or_below_the_ceiling_is_accepted(self):
+        for value in (540, 300, 0.5):
+            with self.subTest(value=value):
+                problems = run_plan.configuration_problems(
+                    self.feature, "claude-sonnet-5", WITNESS_MODEL, WITNESS_BUDGET_USD,
+                    value, "local",
+                )
+
+                self.assertEqual(
+                    [problem for problem in problems if problem.startswith("witness timeout:")],
+                    [],
+                )
 
     def test_build_resolves_a_named_account_once_and_rejects_duplicate_ticket_ids(self):
         profile = self.root / "second-profile"

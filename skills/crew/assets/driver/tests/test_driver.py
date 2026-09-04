@@ -67,6 +67,7 @@ from harness import (
     WITNESS_FAILURE,
     WITNESS_MODEL,
     WITNESS_OVERRUN,
+    WITNESS_TIMEOUT_SECONDS,
     git,
     run_plan,
     routing_naming,
@@ -1338,6 +1339,7 @@ class LaunchTests(DriverTestCase):
         self.assertEqual(run["repair_model"], REPAIR_MODEL)
         self.assertEqual(run["witness_model"], WITNESS_MODEL)
         self.assertEqual(run["witness_budget_usd"], WITNESS_BUDGET_USD)
+        self.assertEqual(run["witness_timeout_seconds"], WITNESS_TIMEOUT_SECONDS)
         self.assertEqual(run["tracker"], TRACKER)
         self.assertEqual(
             len({run["repo_root"], run["feature_dir"], run["crew_worktree"]}),
@@ -2709,6 +2711,13 @@ class LoopTests(DriverTestCase):
         self.assertEqual(snapshot["detail"], message)
         self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
         self.assertNotIn("witness_reason", snapshot)
+        # Recorded once, by the witness itself: the driver transcribes none of these fields, and
+        # the brief the coordinator was woken with is in the log without a second run (#196).
+        witness = self.events("witness", ticket="01")
+        self.assertEqual(len(witness), 1, witness)
+        self.assertEqual(witness[0]["operation"], "check")
+        self.assertEqual(witness[0]["brief"], WITNESS_BRIEF)
+        self.assertEqual(witness[0]["outcome"], "checked")
 
     def test_a_failed_witness_still_wakes_with_an_empty_brief_and_its_reason(self):
         process = self.start(("01", ()), env_overrides={
@@ -2911,6 +2920,13 @@ class LoopTests(DriverTestCase):
         self.assertEqual(witness[0]["cache_read_tokens"], 33)
         self.assertEqual(witness[0]["cache_creation_tokens"], 44)
         self.assertEqual(witness[0]["total_tokens"], 110)
+
+    def test_a_configured_witness_timeout_reaches_the_run_the_driver_holds_it_to(self):
+        self.fixture.configure(witness_timeout_seconds=420)
+
+        self.start(("01", ()))
+
+        self.assertEqual(self.fixture.table()["run"]["witness_timeout_seconds"], 420)
 
     def test_a_codex_childs_escalation_carries_the_same_witness_brief(self):
         process = self.start(

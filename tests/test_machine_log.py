@@ -502,6 +502,42 @@ class RunProjectionTests(unittest.TestCase):
         self.assertEqual(checked_second.ticket("7").escalation, second)
         self.assertEqual(checked_second.ticket("7").witness, second_witness)
 
+    def test_an_ask_never_displaces_the_fact_check_a_standing_escalation_waits_on(self):
+        escalation = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — check src/check.py:12",
+        }
+        check = {
+            "event": "witness", "ticket": "7", "operation": "check", "outcome": "checked",
+            "reason": "", "brief": "src/check.py:12 — held — the guard is present",
+            "duration_seconds": 1,
+        }
+        ask = {
+            "event": "witness", "ticket": "7", "operation": "ask", "outcome": "checked",
+            "reason": "", "brief": "the ticket is open — #7", "duration_seconds": 2,
+        }
+
+        projection = machine_log.project([escalation, check, ask])
+
+        self.assertEqual(projection.ticket("7").witness, check)
+
+    def test_an_operation_this_projection_has_not_heard_of_is_a_fact_check(self):
+        # Written as "not `ask`", so an operation added later reaches the escalation's slot
+        # without an edit here; an event from before the field existed does too.
+        escalation = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — check src/check.py:12",
+        }
+        later = {
+            "event": "witness", "ticket": "7", "operation": "brief", "outcome": "checked",
+            "reason": "", "brief": "src/check.py:12 — held — the guard is present",
+            "duration_seconds": 1,
+        }
+
+        projection = machine_log.project([escalation, later])
+
+        self.assertEqual(projection.ticket("7").witness, later)
+
     def test_fact_check_runs_from_each_escalation_until_its_hand_over_ruling(self):
         escalation = {
             "event": "escalation", "ticket": "7", "role": "child",
@@ -1018,10 +1054,10 @@ class EventTests(MachineLogTestCase):
 
     def test_a_witness_records_the_fact_check_and_its_session_cost(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--executor", "claude",
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
             "--outcome", "failed", "--reason", "witness session timed out",
-            "--duration-seconds", "900.125",
+            "--brief", "", "--duration-seconds", "900.125",
             "--covered-count", "0", "--uncovered-count", "3",
             "--input-tokens", "11", "--output-tokens", "22",
             "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
@@ -1037,6 +1073,8 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["model"], "claude-sonnet-5")
         self.assertEqual(entry["outcome"], "failed")
         self.assertEqual(entry["reason"], "witness session timed out")
+        self.assertEqual(entry["operation"], "check")
+        self.assertEqual(entry["brief"], "")
         self.assertEqual(entry["duration_seconds"], 900.125)
         self.assertEqual(entry["covered_count"], 0)
         self.assertEqual(entry["uncovered_count"], 3)
@@ -1048,9 +1086,10 @@ class EventTests(MachineLogTestCase):
 
     def test_a_partial_witness_records_its_required_coverage_counts(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--executor", "claude",
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
             "--outcome", "partial", "--reason", "uncovered pointers: c.py:11, c.py:12",
+            "--brief", "c.py:10 — held — the cited guard is present",
             "--duration-seconds", "12.5",
             "--covered-count", "10", "--uncovered-count", "2", log=self.log,
         )
@@ -1063,10 +1102,11 @@ class EventTests(MachineLogTestCase):
 
     def test_a_structural_partial_can_cover_every_expected_pointer(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--executor", "claude",
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
             "--outcome", "partial",
             "--reason", "structural rejection (extra cited): docs/context.md:7",
+            "--brief", "c.py:10 — held — the cited guard is present",
             "--duration-seconds", "12.5",
             "--covered-count", "3", "--uncovered-count", "0", log=self.log,
         )
@@ -1079,9 +1119,11 @@ class EventTests(MachineLogTestCase):
 
     def test_a_pointer_free_checked_witness_records_zero_coverage(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--executor", "claude",
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
-            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--outcome", "checked", "--reason", "",
+            "--brief", "the escalation cited no pointer",
+            "--duration-seconds", "1",
             "--covered-count", "0", "--uncovered-count", "0", log=self.log,
         )
 
@@ -1090,6 +1132,36 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["outcome"], "checked")
         self.assertEqual(entry["covered_count"], 0)
         self.assertEqual(entry["uncovered_count"], 0)
+
+    def test_an_ask_records_the_answer_it_found_with_no_pointers_to_cover(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--operation", "ask", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "",
+            "--brief", "Issue 154 requires the tracker body — #154",
+            "--duration-seconds", "1",
+            "--covered-count", "0", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.only_line()
+        self.assertEqual(entry["event"], "witness")
+        self.assertEqual(entry["operation"], "ask")
+        self.assertEqual(entry["brief"], "Issue 154 requires the tracker body — #154")
+        self.assertEqual(entry["covered_count"], 0)
+        self.assertEqual(entry["uncovered_count"], 0)
+
+    def test_a_witness_operation_outside_the_closed_grammar_is_refused(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--operation", "guess", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "", "--brief", "a fact — #154",
+            "--duration-seconds", "1",
+            "--covered-count", "1", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
 
     def test_a_passing_base_gate_records_its_argv_without_a_ticket(self):
         result = run_cli(
@@ -1132,9 +1204,9 @@ class EventTests(MachineLogTestCase):
 
     def test_a_witness_outcome_outside_the_closed_grammar_is_refused(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--executor", "claude",
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
-            "--outcome", "unknown", "--reason", "why", "--duration-seconds", "1",
+            "--outcome", "unknown", "--reason", "why", "--brief", "", "--duration-seconds", "1",
             "--covered-count", "0", "--uncovered-count", "0",
             log=self.log,
         )
@@ -1144,8 +1216,9 @@ class EventTests(MachineLogTestCase):
 
     def test_a_witness_without_an_executor_is_refused_and_appends_nothing(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--model", "claude-sonnet-5",
-            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "witness", "--ticket", "07", "--operation", "check", "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "", "--brief", "a fact — #154",
+            "--duration-seconds", "1",
             "--covered-count", "1", "--uncovered-count", "0",
             log=self.log,
         )
@@ -1155,9 +1228,10 @@ class EventTests(MachineLogTestCase):
 
     def test_a_witness_without_both_coverage_counts_is_refused(self):
         result = run_cli(
-            "witness", "--ticket", "07", "--executor", "claude",
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
-            "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+            "--outcome", "checked", "--reason", "", "--brief", "a fact — #154",
+            "--duration-seconds", "1",
             "--covered-count", "1", log=self.log,
         )
 
@@ -1167,40 +1241,59 @@ class EventTests(MachineLogTestCase):
     def test_a_witness_refuses_a_contradictory_result_or_cost(self):
         cases = (
             ("checked with a failure reason", [
-                "--outcome", "checked", "--reason", "failed", "--duration-seconds", "1",
+                "--outcome", "checked", "--reason", "failed", "--brief", "a fact — #154",
+                "--duration-seconds", "1",
                 "--covered-count", "1", "--uncovered-count", "0",
             ]),
             ("failed without a reason", [
-                "--outcome", "failed", "--reason", "", "--duration-seconds", "1",
+                "--outcome", "failed", "--reason", "", "--brief", "",
+                "--duration-seconds", "1",
                 "--covered-count", "0", "--uncovered-count", "1",
             ]),
             ("partial without a reason", [
-                "--outcome", "partial", "--reason", "", "--duration-seconds", "1",
+                "--outcome", "partial", "--reason", "", "--brief", "a fact — #154",
+                "--duration-seconds", "1",
                 "--covered-count", "10", "--uncovered-count", "2",
             ]),
             ("partial without covered pointers", [
-                "--outcome", "partial", "--reason", "uncovered", "--duration-seconds", "1",
+                "--outcome", "partial", "--reason", "uncovered", "--brief", "a fact — #154",
+                "--duration-seconds", "1",
                 "--covered-count", "0", "--uncovered-count", "2",
             ]),
             ("failed with a covered pointer", [
-                "--outcome", "failed", "--reason", "failed", "--duration-seconds", "1",
+                "--outcome", "failed", "--reason", "failed", "--brief", "",
+                "--duration-seconds", "1",
                 "--covered-count", "1", "--uncovered-count", "0",
             ]),
+            ("checked without the brief it found", [
+                "--outcome", "checked", "--reason", "", "--brief", "   ",
+                "--duration-seconds", "1",
+                "--covered-count", "1", "--uncovered-count", "0",
+            ]),
+            ("failed carrying a brief", [
+                "--outcome", "failed", "--reason", "timed out", "--brief", "a fact — #154",
+                "--duration-seconds", "1",
+                "--covered-count", "0", "--uncovered-count", "1",
+            ]),
             ("negative duration", [
-                "--outcome", "checked", "--reason", "", "--duration-seconds", "-1",
+                "--outcome", "checked", "--reason", "", "--brief", "a fact — #154",
+                "--duration-seconds", "-1",
                 "--covered-count", "1", "--uncovered-count", "0",
             ]),
             ("negative coverage", [
-                "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--outcome", "checked", "--reason", "", "--brief", "a fact — #154",
+                "--duration-seconds", "1",
                 "--covered-count", "-1", "--uncovered-count", "0",
             ]),
             ("partial cost", [
-                "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--outcome", "checked", "--reason", "", "--brief", "a fact — #154",
+                "--duration-seconds", "1",
                 "--covered-count", "1", "--uncovered-count", "0",
                 "--input-tokens", "11",
             ]),
             ("wrong total", [
-                "--outcome", "checked", "--reason", "", "--duration-seconds", "1",
+                "--outcome", "checked", "--reason", "", "--brief", "a fact — #154",
+                "--duration-seconds", "1",
                 "--covered-count", "1", "--uncovered-count", "0",
                 "--input-tokens", "11", "--output-tokens", "22",
                 "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
@@ -1210,7 +1303,8 @@ class EventTests(MachineLogTestCase):
         for label, fields in cases:
             with self.subTest(label=label):
                 result = run_cli(
-                    "witness", "--ticket", "07", "--executor", "claude",
+                    "witness", "--ticket", "07", "--operation", "check",
+                    "--executor", "claude",
                     "--model", "claude-sonnet-5",
                     *fields, log=self.log,
                 )

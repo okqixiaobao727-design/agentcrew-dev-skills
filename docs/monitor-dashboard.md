@@ -357,9 +357,10 @@ hole in the history, and takes the row to `--` like any other.
 Without the flag the rollup ends at `TOTAL`, as it always did.
 
 Every `witness` event contributes its own `witness-<NN>` row using the executor, model, token
-counters and duration the event records. Its tokens are included in `TOTAL`; its duration is shown
-as `<duration_seconds>s`. Child, total and coordinator rows show `--` for duration. A run with no
-`witness` event has no witness row.
+counters and duration the event records — one row per operation, so a ticket whose escalation was
+checked and whose coordinator later asked a factual question renders two. Its tokens are included
+in `TOTAL`; its duration is shown as `<duration_seconds>s`. Child, total and coordinator rows show
+`--` for duration. A run with no `witness` event has no witness row.
 
 Transcripts are found by the worktree they ran in, compared by realpath and path-component
 containment: a cwd at or below the launch event's worktree is that worktree, while a parent,

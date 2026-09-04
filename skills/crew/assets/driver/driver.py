@@ -162,8 +162,9 @@ import witness as witness_runner  # noqa: E402
 sys.path.insert(0, str(MONITOR.parent))
 import monitor  # noqa: E402
 
-# The run's own directory, inside the feature it runs: `docs/` publishes what it holds.
-LOG_NAME = "log.jsonl"
+# The run's own directory, inside the feature it runs: `docs/` publishes what it holds. The log's
+# name belongs to the log itself now that the witness derives its own from the run directory.
+LOG_NAME = machine_log.LOG_NAME
 # The channel a woken coordinator reads. The driver runs detached in its own tmux window now, so
 # its stdout belongs to that pane and to the log beside it — the one JSON object the coordinator
 # rules on is left here instead, where the waiter `/crew` leaves behind blocks on it (#103).
@@ -213,6 +214,7 @@ PREFLIGHT_GATE_KEYS = ("preflight", "gate")
 # defaults where the project leaves either cell out.
 WITNESS_MODEL_KEYS = ("witness", "model")
 WITNESS_BUDGET_KEYS = ("witness", "budget_usd")
+WITNESS_TIMEOUT_KEYS = ("witness", "timeout_seconds")
 # The account *names* this repository expects, declared in its committed config and never a path
 # (ADR-0013). Declaring none is the ordinary case and checks nothing; declaring some makes a
 # ticket naming an account outside them a problem stated in the config's own terms, which is a
@@ -969,6 +971,7 @@ def run_section(args, repo, feature_dir, run_dir, base_branch, base_commit, conf
         # shipped for the two rungs happen to match.
         "witness_model": config_value(config, WITNESS_MODEL_KEYS),
         "witness_budget_usd": config_value(config, WITNESS_BUDGET_KEYS),
+        "witness_timeout_seconds": config_value(config, WITNESS_TIMEOUT_KEYS),
         "tracker": config_value(config, TRACKER_KIND_KEYS),
         # The account names this repository declares, and the coordinator's own configuration
         # home — which is the account a ticket naming none runs on, written down here so the
@@ -3061,13 +3064,15 @@ class Loop:
     # --- the rule table, row by row ---------------------------------------------------------
 
     def run_witness(self, ticket, launch, message):
-        """Run and record one escalation witness.
+        """Run one escalation witness; returns its checked, partial or failed document.
 
-        Returns its checked, partial or failed document.
+        The witness records its own Machine-log event, with the brief in it, so nothing is
+        transcribed here (#196). What is still read from the document is the wake snapshot this
+        escalation is handed to the coordinator with.
         """
         started = time.monotonic()
-        witness_executor, witness_model, witness_budget_usd = run_plan.witness_routing(
-            self.run.witness_model, self.run.witness_budget_usd
+        _, witness_model, witness_budget_usd, witness_timeout = run_plan.witness_routing(
+            self.run.witness_model, self.run.witness_budget_usd, self.run.witness_timeout_seconds
         )
 
         def failed(reason):
@@ -3087,6 +3092,9 @@ class Loop:
                     "--worktree", launch["worktree"],
                     "--model", witness_model,
                     "--budget-usd", f"{witness_budget_usd:g}",
+                    "--timeout-seconds", f"{witness_timeout:g}",
+                    "--log", str(self.log),
+                    "--ticket", ticket,
                 ],
                 input=message,
                 capture_output=True,
@@ -3094,7 +3102,7 @@ class Loop:
                 env=accounts.process_environment(self.plan.ticket(ticket).binding),
                 # The witness owns the session timeout. One poll interval lets it shape and print
                 # that failure before this outer guard treats the whole process as the overrun.
-                timeout=witness_runner.DEFAULT_TIMEOUT_SECONDS + self.args.poll_seconds,
+                timeout=witness_timeout + self.args.poll_seconds,
             )
         except subprocess.TimeoutExpired:
             document = failed("witness process timed out")
@@ -3151,38 +3159,11 @@ class Loop:
         if not sound:
             document = failed("witness process returned a contradictory result")
 
-        usage = document.get("usage")
-        if not isinstance(usage, dict):
-            usage = {}
-        witness_event = [
-            sys.executable, MACHINE_LOG, "--log", self.log, "witness",
-            "--ticket", ticket,
-            "--executor", witness_executor,
-            "--model", witness_model,
-            "--outcome", document["outcome"],
-            "--reason", document["reason"],
-            "--duration-seconds", str(document["duration_seconds"]),
-            "--covered-count", str(document["covered_count"]),
-            "--uncovered-count", str(document["uncovered_count"]),
-        ]
-        counters = {
-            "input": usage.get("input_tokens"),
-            "output": usage.get("output_tokens"),
-            "cache-read": usage.get("cache_read_input_tokens"),
-            "cache-creation": usage.get("cache_creation_input_tokens"),
-        }
-        if all(
-            isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            for value in counters.values()
-        ):
-            for name, value in counters.items():
-                witness_event.extend([f"--{name}-tokens", str(value)])
-            witness_event.extend(["--total-tokens", str(sum(counters.values()))])
-        run_command(
-            witness_event,
-            f"the witness run for {ticket} could not be recorded",
-            ticket=ticket, pointer=str(self.log),
-        )
+        # The witness records itself; a record that failed is the witness's own account of the
+        # failure, printed here so it is visible in this pane rather than only in the document.
+        record_error = document.get("record_error")
+        if isinstance(record_error, str) and record_error.strip():
+            print(f"{ticket}: {record_error.strip()}", flush=True)
         return document
 
     def hand_over(self, ticket, launch, message):

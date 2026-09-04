@@ -2,7 +2,6 @@
 """Run one fresh, read-only, budget-capped Witness operation."""
 
 import argparse
-import hashlib
 import json
 import os
 import pathlib
@@ -12,6 +11,7 @@ import sys
 import time
 
 import accounts
+import machine_log
 import run_plan
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "dispatch"))
@@ -23,7 +23,6 @@ HEADLESS_FLAG = "--print"
 BUDGET_FLAG = "--max-budget-usd"
 READ_ONLY_PERMISSION_MODE = "plan"
 TRACKER_READ_TOOL = "Bash(gh issue view:*)"
-DEFAULT_TIMEOUT_SECONDS = 900.0
 # A path part starts with a letter, underscore, dot, tilde, or slash; contains at
 # least one ASCII letter; and is not a bare version/number token matching
 # v?[0-9]+([.-][0-9]+)*. ASCII boundary classes deliberately let a pointer touch CJK prose.
@@ -360,30 +359,6 @@ def structured_ask_brief(value):
     return "\n".join(lines)
 
 
-def working_state(worktree):
-    listed = subprocess.run(
-        [
-            "git", "-C", str(worktree), "status", "--porcelain=v1", "-z",
-            "--untracked-files=all", "--no-renames",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    state = {}
-    for record in listed.split("\0"):
-        if not record:
-            continue
-        relative = record[3:]
-        path = worktree / relative
-        try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            digest = None
-        state[relative] = (record[:2], digest)
-    return state
-
-
 def command(prompt, model, budget, schema):
     return [
         CLAUDE,
@@ -415,7 +390,10 @@ def execute(
     prompt, worktree, model, budget, timeout, session_environment, schema, render, started,
     failure_coverage=None,
 ):
-    before = working_state(worktree)
+    # The session is read-only by construction — a plan permission mode with one allowed Bash
+    # form, which reads the tracker — so there is no worktree change of its own to guard against.
+    # The worktree it reads is the escalating child's, live and still being worked in, and a
+    # comparison here would report that child's ordinary edit as this session's failure (#196).
     result = None
     failure = None
     try:
@@ -431,14 +409,6 @@ def execute(
         failure = "witness session timed out"
     except OSError as error:
         failure = error
-    try:
-        after = working_state(worktree)
-    except (OSError, subprocess.CalledProcessError) as error:
-        return failed(error, started, coverage=failure_coverage)
-    if after != before:
-        return failed(
-            "witness session changed the worktree", started, coverage=failure_coverage
-        )
     if failure is not None:
         return failed(failure, started, coverage=failure_coverage)
     if result.returncode:
@@ -485,62 +455,136 @@ def checked_context(worktree, model, budget, timeout):
         raise ValueError(fault)
     if budget <= 0:
         raise ValueError("budget-usd must be positive")
-    if timeout <= 0:
-        raise ValueError("timeout-seconds must be positive")
+    fault = run_plan.witness_timeout_problem("timeout-seconds", timeout)
+    if fault:
+        raise ValueError(fault)
     return worktree
+
+
+def usage_counters(document):
+    """The document's token counters under the log's own names, or None where it counted none."""
+    usage = document.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    counted = {
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cache_read_tokens": usage.get("cache_read_input_tokens"),
+        "cache_creation_tokens": usage.get("cache_creation_input_tokens"),
+    }
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in counted.values()
+    ):
+        return None
+    return {**counted, "total_tokens": sum(counted.values())}
+
+
+def record(document, log, ticket, operation, model):
+    """Record this operation's own Machine-log event; returns the document either way.
+
+    The Witness holds the outcome, the reason, the duration, the brief and the token counters, so
+    it writes them down itself rather than handing them out for a caller to transcribe — which is
+    what left the coordinator-initiated `ask` out of the log and out of the run's cost rollup
+    entirely (#196). An invocation with no run to record against records nothing and returns
+    normally. A log that could not be written is a failure of the record and not of the operation:
+    the document stands, and carries `record_error` so the failure is visible to a caller reading
+    the document, whether that is the Driver or the coordinator itself.
+    """
+    if log is None or not ticket or not model:
+        return document
+    try:
+        machine_log.record_witness(
+            log,
+            ticket=str(ticket),
+            operation=operation,
+            executor=run_plan.WITNESS_EXECUTOR,
+            model=model,
+            outcome=document["outcome"],
+            reason=document.get("reason", ""),
+            brief=document.get("brief", ""),
+            duration_seconds=document["duration_seconds"],
+            covered_count=document.get("covered_count", 0),
+            uncovered_count=document.get("uncovered_count", 0),
+            counters=usage_counters(document),
+        )
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        document["record_error"] = f"the witness event was not recorded: {error}"
+        print(f"witness: {document['record_error']}", file=sys.stderr)
+    return document
 
 
 def check(args):
     started = time.monotonic()
     expected = []
     try:
+        _, _, _, timeout = run_plan.witness_routing(
+            args.model, args.budget_usd, args.timeout_seconds
+        )
         escalation = read_escalation(args.escalation)
         if not escalation.strip():
-            return failed("escalation is empty", started, coverage=(0, 0))
+            document = failed("escalation is empty", started, coverage=(0, 0))
+            return record(document, args.log, args.ticket, "check", args.model)
         expected = pointers(escalation, args.worktree)
-        worktree = checked_context(
-            args.worktree, args.model, args.budget_usd, args.timeout_seconds
-        )
-        return execute(
+        worktree = checked_context(args.worktree, args.model, args.budget_usd, timeout)
+        document = execute(
             dispatch.render_witness_prompt(
                 escalation, operation="check", check_pointers=expected
             ),
             worktree,
             args.model,
             args.budget_usd,
-            args.timeout_seconds,
+            timeout,
             environment(args.account),
             CHECK_SCHEMA,
             lambda value: check_result(value, expected),
             started,
             failure_coverage=(0, len(expected)),
         )
-    except (OSError, subprocess.CalledProcessError, accounts.AccountsError, ValueError) as error:
-        return failed(error, started, coverage=(0, len(expected)))
+    except (
+        OSError, subprocess.CalledProcessError, accounts.AccountsError, run_plan.RunPlanError,
+        ValueError,
+    ) as error:
+        document = failed(error, started, coverage=(0, len(expected)))
+    return record(document, args.log, args.ticket, "check", args.model)
 
 
 def ask(args):
     started = time.monotonic()
+    log = None
+    identifier = args.ticket
+    model = None
     try:
-        if not args.question.strip():
-            return failed("question is empty", started)
         run_dir = run_plan.resolve_run_dir(args.run)
+        # Derived rather than asked for: `ask` already names the run it belongs to, and a Machine
+        # log passed beside it could name a different one.
+        log = run_dir / machine_log.LOG_NAME
         plan = run_plan.load(run_dir / WAVE_TABLE)
         ticket = plan.ticket(args.ticket)
+        identifier = ticket.id
+        model = plan.run.witness_model
+        # After the run is resolved rather than before it, so that the refusal is an event this
+        # run recorded against its ticket, on the model it would have spent.
+        if not args.question.strip():
+            document = failed("question is empty", started)
+            return record(document, log, identifier, "ask", model)
+        _, _, _, timeout = run_plan.witness_routing(
+            plan.run.witness_model, plan.run.witness_budget_usd, args.timeout_seconds
+        )
         worktree = checked_context(
             dispatch.worktree_path(plan.run, ticket),
             plan.run.witness_model,
             plan.run.witness_budget_usd,
-            args.timeout_seconds,
+            timeout,
         )
-        return execute(
+        document = execute(
             dispatch.render_witness_prompt(
                 f"Ticket: #{ticket.id}\nQuestion: {args.question.strip()}", operation="ask"
             ),
             worktree,
             plan.run.witness_model,
             plan.run.witness_budget_usd,
-            args.timeout_seconds,
+            timeout,
             accounts.process_environment(ticket.binding),
             ASK_SCHEMA,
             lambda value: {
@@ -552,7 +596,8 @@ def ask(args):
         OSError, subprocess.CalledProcessError, accounts.AccountsError, run_plan.RunPlanError,
         TypeError, ValueError,
     ) as error:
-        return failed(error, started)
+        document = failed(error, started)
+    return record(document, log, identifier, "ask", model)
 
 
 def parse_args(argv):
@@ -564,23 +609,29 @@ def parse_args(argv):
     check.add_argument("--model", required=True, help="the full Claude model ID")
     check.add_argument("--budget-usd", required=True, type=float, help="the hard session budget")
     check.add_argument(
-        "--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS,
-        help="how long the fresh session may run",
+        "--timeout-seconds", type=float,
+        help="how long the fresh session may run, over the configured `[witness] timeout_seconds`",
     )
     check.add_argument("--account", help="the named Claude account to spend on")
+    # A check with no run behind it — the manual, driver-less flow — has nothing to record
+    # against, and records nothing rather than failing.
+    check.add_argument("--log", help="the run's Machine log, to record this check in")
+    check.add_argument("--ticket", help="the ticket this check is recorded against")
     ask_parser = operations.add_parser("ask", help="answer one factual coordinator question")
     ask_parser.add_argument("--run", required=True, help="the active run directory")
     ask_parser.add_argument("--ticket", required=True, help="the ticket number in the Run plan")
     ask_parser.add_argument("--question", required=True, help="the factual question to answer")
     ask_parser.add_argument(
-        "--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS,
-        help="how long the fresh session may run",
+        "--timeout-seconds", type=float,
+        help="how long the fresh session may run, over the configured `[witness] timeout_seconds`",
     )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.operation == "check" and bool(args.log) != bool(args.ticket):
+        raise SystemExit("witness: check records against a --log and a --ticket, or neither")
     operation = {"check": check, "ask": ask}[args.operation]
     print(json.dumps(operation(args)))
     return 0
