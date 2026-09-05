@@ -157,6 +157,22 @@ operator. A clean run costs it one turn to launch, one per ASK, and one to point
 > log; and a background fact-check, which lets the coordinator rule before the brief exists — the
 > late-brief case this amendment removes.
 
+> **Amended (#194, 2026-09-05).** Two consequences of the above, ruled on while it was built and
+> recorded here because the amendment they follow from does not imply them. *The run's inactivity
+> deadline is held by a ticket owed a ruling*, as it is already held by a child paused on its
+> vendor's usage limit (#190). The Driver no longer exits on a delivered escalation, so the
+> coordinator's whole ruling turn — a 70–300s fact-check plus the turn around it, and several
+> children asking queue behind each other — now happens while the loop polls, and a deadline that
+> fired over it would stop the run for the coordinator doing the one job it has.
+> This is a rule about a stall the Driver can recognise, not a backstop: nothing here answers a
+> lost escalation, which still stands on the dashboard until the operator resumes the run.
+> *The dashboard's `⏳ fact-check running` marker is retired*, and `⚠ awaiting your ruling` covers
+> the whole of the wait. The marker named the Driver's own witness subprocess, which no longer
+> exists; under this flow nothing the Machine log holds tells a coordinator reading an ASK from
+> one running the Witness, so the marker would assert what it does not know. The projection fact
+> behind it and the row annotation that drew its elapsed go with it, and `awaiting_ruling` starts
+> at a delivered escalation and, for an undelivered one, at the Driver's hand-over line.
+
 ## Consequences
 
 - The crew skill document is the oracle's resident prefix, so it holds the reversibility contract,
