@@ -1724,10 +1724,24 @@ def clear_worktrees_and_branches(repo, rows):
 
 
 def clear_actions(run_dir, run, log_path, plan):
-    """Apply the clearing steps using only the paths and ids in the inventory."""
+    """Apply the clearing steps using only the paths and ids in the inventory.
+
+    The run directory is checked to be intact before anything is removed. It used to be checked
+    just before the hooks came out, because that step ran the durable copy of the writer and a
+    missing copy was a command that could not start; the uninstall is now a call into the module
+    this process already imports (ADR-0030), so the check has to earn its place at the front
+    instead. It does: a run that is missing the writer it installed its hooks with is one this
+    inventory cannot vouch for, and refusing after the worktrees and branches are gone would leave
+    that run half cleared and its hooks still registered, with nothing left to inventory on a
+    second attempt.
+    """
     repo = pathlib.Path(run.repo_root)
     integration_branch = run.integration_branch
     crew_worktree = pathlib.Path(run.crew_worktree)
+
+    durable_writer = run_dir / MACHINE_LOG.name
+    if not durable_writer.exists():
+        raise ClearError(f"the run carries no durable machine log at {durable_writer}")
 
     state_dir = pathlib.Path(run.codex.state_dir) if run.codex else None
     clear_stop_codex_sessions(run, plan.launches)
@@ -1745,9 +1759,6 @@ def clear_actions(run_dir, run, log_path, plan):
         else:
             shutil.rmtree(state_dir)
 
-    durable_writer = run_dir / MACHINE_LOG.name
-    if not durable_writer.exists():
-        raise ClearError(f"the run carries no durable machine log at {durable_writer}")
     settings = repo / SETTINGS_PATH
     try:
         machine_log.uninstall_settings(str(log_path), str(settings))

@@ -52,8 +52,10 @@ functions. A hook, a child, and a shell script can only run a command, so the re
 into a child, the `hook`, `guard`, `pause` and `resume` commands registered in settings, the
 lifecycle hook commands the dispatch renderer hands Review-Switch, `monitor-wave.sh` and
 `codex_bridge.py` all go on running the CLI. `driver.py clear` keeps its check that the run carries
-a durable copy of the writer beside its log, because that copy is what a registered hook command
-names across a plugin upgrade (#37) — it just no longer starts it to uninstall.
+a durable copy of the writer beside its log, and moves it to the front. That check used to sit just
+before the uninstall, where the step it guarded ran the copy as a command; with the uninstall a
+call, a refusal landing there would leave a run half cleared — worktrees and branches gone, hooks
+still registered, and nothing left to inventory on a second attempt.
 
 **The record is the contract, and it does not move.** A line written by a function is byte for byte
 the line the subcommand writes for the same inputs; `docs/machine-log.md` keeps publishing the
