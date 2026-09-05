@@ -443,6 +443,23 @@ def read_log(path):
         return ()
 
 
+def fold_status(states, cwd, status):
+    """Add one live session's reading to a worktree-keyed map, in place.
+
+    A worktree's reading is taken from its status-bearing rows alone. The run puts headless
+    sessions of its own into a ticket's worktree — the Witness on an escalation, a Claude reviewer
+    on the Review lane — and both sources list each of those without a status, while an
+    interactive child always carries one. A status-less row is a helper by construction, so it is
+    neither the reading nor the second session the duplicate anomaly is there to name (#197): a
+    worktree holding nothing else stays out of the map, which is the `vanished` every caller
+    already reads an absent key as.
+    """
+    if status is None:
+        return
+    key = worktree_key(cwd)
+    states[key] = DUPLICATE if key in states else str(status)
+
+
 def agent_states(claude_bin, timeout=None, binding=None):
     """Each live session's status by its `cwd`, or None when the agents list cannot be read.
 
@@ -450,8 +467,9 @@ def agent_states(claude_bin, timeout=None, binding=None):
     why the source a tick reaches for first is `session_states` and why what this answers is
     shared machine-wide rather than fetched again by the next pane.
 
-    A worktree the list carries twice has no single status, so it is reported as the duplicate the
-    wake monitor calls an error — the dashboard draws it and leaves the stopping to the wake-up.
+    A worktree the list carries twice with a status has no single reading, so it is reported as
+    the duplicate the wake monitor calls an error — the dashboard draws it and leaves the stopping
+    to the wake-up. `fold_status` has which rows count.
 
     A list that does not answer within `timeout` is one that could not be read: a caller drawing
     into a statusline cannot wait on it, and a row drawn `unknown` says more than no frame at all.
@@ -480,8 +498,7 @@ def agent_states(claude_bin, timeout=None, binding=None):
     for agent in snapshot:
         if not isinstance(agent, dict) or "cwd" not in agent:
             continue
-        cwd = worktree_key(agent["cwd"])
-        states[cwd] = DUPLICATE if cwd in states else str(agent.get("status", UNKNOWN))
+        fold_status(states, agent["cwd"], agent.get("status"))
     return states
 
 
@@ -571,8 +588,7 @@ def session_states(timeout=None, account=None):
             continue
         if not isinstance(session, dict) or not session.get(SESSION_CWD):
             continue
-        cwd = worktree_key(session[SESSION_CWD])
-        states[cwd] = DUPLICATE if cwd in states else str(session.get(SESSION_STATUS, UNKNOWN))
+        fold_status(states, session[SESSION_CWD], session.get(SESSION_STATUS))
     return states
 
 

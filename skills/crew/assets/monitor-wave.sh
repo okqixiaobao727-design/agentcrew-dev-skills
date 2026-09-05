@@ -151,13 +151,20 @@ while true; do
     resolve "$path"
   done <"$parked_file" | jq -R 'select(length > 0)' | jq -s .)
 
+  # A worktree's reading is taken from its status-bearing rows alone. The run puts headless
+  # sessions of its own into a ticket's worktree — the Witness on an escalation, a Claude reviewer
+  # on the Review lane — and each is listed with a null status while an interactive child always
+  # carries one, so a status-less row is a helper by construction and never the second implementer
+  # the duplicate rule is there to catch (#197). Two status-bearing rows is still that rule.
   if ! current=$(jq -r --argjson expected "$expected" --argjson real "$real" \
     --argjson parked_paths "$parked_resolved" '
     $expected[] as $cwd
     | if ($parked_paths | index($cwd)) != null then
         [$cwd, "parked"]
       else
-        ([.[] | select((.cwd // "") as $listed | ($real[$listed] // $listed) == $cwd)]) as $agents
+        ([.[]
+          | select((.cwd // "") as $listed | ($real[$listed] // $listed) == $cwd)
+          | select(.status != null)]) as $agents
         | if ($agents | length) == 0 then
             [$cwd, "vanished"]
           elif ($agents | length) > 1 then

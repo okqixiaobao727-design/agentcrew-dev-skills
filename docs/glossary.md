@@ -78,8 +78,12 @@ _Avoid_: raw source states (busy, idle) in human-facing output
 | `vanished` | was launched and its child is no longer there |
 
 Two more words describe what a *reading* did rather than where a ticket got to, so they are drawn
-as annotations beneath a row and are never a state of their own: `duplicate`, where two sessions
-are running in one worktree, and `unknown`, where the agents list could not be read at all.
+as annotations beneath a row and are never a state of their own: `duplicate`, where two
+status-bearing sessions — two implementers — are running in one ticket worktree, and `unknown`,
+where the agents list could not be read at all. A Witness, a Review lane's Reviewer or an
+Exception handler running in that worktree is not one of the two: the run launches each headless,
+the live sources list a headless session without a status, and a reading is taken from the
+status-bearing rows alone.
 
 ## Routing
 

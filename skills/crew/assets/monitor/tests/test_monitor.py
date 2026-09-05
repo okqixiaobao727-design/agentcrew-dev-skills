@@ -567,6 +567,13 @@ class Fixture:
             for index, (ticket, status) in enumerate(entries.items())
         ]))
 
+    def command_agents_at(self, entries, home=None):
+        """The same list, each row's `cwd` and status spelled as the caller wants them."""
+        (self.stub_dir / f"agents-{(home or self.claude_home).name}.json").write_text(json.dumps([
+            dict(self.session_record(ticket, cwd, status), pid=4000 + index)
+            for index, (ticket, cwd, status) in enumerate(entries)
+        ]))
+
     def agents_cache(self, home=None):
         """One account's shared fallback answer, as it stands on disk right now."""
         path = self.agents_cache_path(home)
@@ -1717,6 +1724,60 @@ class DashboardTests(MonitorTestCase):
             f"  ↳ anomaly: duplicate · more than one session in {self.fixture.worktrees['06']}\n",
             result.stdout,
         )
+
+    def test_a_status_less_session_beside_a_child_is_not_a_duplicate(self):
+        # The run puts headless sessions of its own into a ticket's worktree — the Witness on an
+        # escalation, a Claude reviewer on the Review lane — and the CLI lists each without a
+        # status. Neither is a second implementer, so the row keeps the child's own reading (#197).
+        self.fixture.columns = 200
+        self.launch_wave_one()
+        self.fixture.agents_at([
+            ("06", self.fixture.worktrees["06"], "busy"),
+            ("06", self.fixture.worktrees["06"], None),
+        ])
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
+        self.assertNotIn("anomaly: duplicate", result.stdout)
+
+    def test_a_worktree_holding_only_a_status_less_session_is_vanished(self):
+        # Nothing status-bearing is left in the worktree: the child is gone whatever helper of the
+        # run's own outlived it.
+        self.launch_wave_one()
+        self.fixture.agents_at([("06", self.fixture.worktrees["06"], None)])
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "vanished", LIVE_ELAPSED, width=8),
+            result.stdout,
+        )
+        self.assertNotIn("anomaly: duplicate", result.stdout)
+
+    def test_the_fallback_lane_reads_past_a_status_less_session_too(self):
+        # The same rule on the lane reached when the sessions directory cannot be read: one
+        # `claude agents --json` row without a status is a helper there as well.
+        self.fixture.columns = 200
+        self.launch_wave_one()
+        self.fixture.command_agents_at([
+            ("06", self.fixture.worktrees["06"], "busy"),
+            ("06", self.fixture.worktrees["06"], None),
+        ])
+        self.fixture.codex_state("07")
+
+        result = self.fixture.dashboard()
+
+        self.assertIn(
+            row("1", "06", TITLES["06"], CLAUDE_LANE, "running", LIVE_ELAPSED),
+            result.stdout,
+        )
+        self.assertNotIn("anomaly: duplicate", result.stdout)
 
     def test_an_unreadable_agents_list_is_an_anomaly_and_the_frame_still_draws(self):
         self.launch_wave_one()

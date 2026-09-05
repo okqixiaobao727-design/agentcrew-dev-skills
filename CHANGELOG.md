@@ -92,6 +92,22 @@ and this project uses [Semantic Versioning](https://semver.org/).
   queued against one Wave run in queue order, oldest first, and a finding queued when nothing is
   pending produces exactly the trailing Wave it did before (#193).
 
+### Fixed
+- A worktree's live reading is taken from its status-bearing sessions alone, so a headless session
+  the run puts in a ticket's worktree is no longer read as a second implementer. The Witness the
+  coordinator runs on an escalation and the Claude Reviewer `review-bridge` starts both run with
+  the ticket's worktree as their cwd, and the wave monitor identified a child by that path alone:
+  two rows for one worktree was `duplicate`, a fatal exit 4 that the Driver surfaces as
+  `driver-error` and stops on. Every reviewed ticket of a run therefore took the Driver down at its
+  review round, and every escalation did the same, so a run could not complete unattended. A live
+  source lists a headless session with a null status while an interactive child always carries one,
+  which is the whole test: a status-less row is neither the reading nor one of the two sessions
+  `duplicate` names, a worktree holding nothing else is `vanished`, and two status-bearing rows is
+  still the fatal duplicate it was. The statusline dashboard applied the same count and flashed the
+  same annotation non-fatally; it reads the same way now. The root cause is that the monitor uses
+  cwd as session identity, and the durable fix — arming the monitor with each worktree's recorded
+  child session name and reading that row alone — is the follow-up, not this change (#197).
+
 ## [0.9.18] - 2026-09-03
 
 ### Added

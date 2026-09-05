@@ -235,7 +235,7 @@ has to grow a column:
 | Annotation | Drawn when |
 | --- | --- |
 | `↳ review: <lane> <state> · <elapsed>` | the log's last `review` line says a review is `running` |
-| `↳ anomaly: duplicate · more than one session in <worktree>` | one worktree, two sessions |
+| `↳ anomaly: duplicate · more than one session in <worktree>` | one worktree, two status-bearing sessions |
 | `↳ anomaly: unknown · <source> could not be read` | the lane's source failed or is unknown |
 | `↳ last event: <event> <word> — <detail> · <stamp>` | the row's state is an abnormal one |
 
@@ -244,10 +244,12 @@ of them owes the operator that last line, and every other row stays quiet unless
 above applies.
 
 `duplicate` and `unknown` are annotations rather than states: both say what a reading did, not
-where the ticket got to, so the row keeps the state its own log lines justify. For a Codex child,
-an absent bridge state file or one that says `stopped` is a successful `vanished` observation; a
-bridge state file that exists but cannot be read keeps the row `running` with the `unknown`
-annotation and emits no vanished toast.
+where the ticket got to, so the row keeps the state its own log lines justify. A worktree's
+reading comes from its status-bearing rows alone, so the headless sessions the run puts in a
+ticket's worktree — the Witness, a Claude Reviewer — are neither the reading nor a `duplicate`.
+For a Codex child, an absent bridge state file or one that says `stopped` is a successful
+`vanished` observation; a bridge state file that exists but cannot be read keeps the row `running`
+with the `unknown` annotation and emits no vanished toast.
 
 The `review` event is written by the Lifecycle Hook commands the reviewed child passes to
 Review-Switch — `running` at review start and `returned` on every exit path it controls — so the

@@ -42,6 +42,24 @@ if [ "${1:-}" = "agents" ] && [ "${2:-}" = "--json" ]; then
     unknown)
       printf '[{"cwd":"/wave/01","status":"paused"},{"cwd":"/wave/02","status":"busy"}]\n'
       ;;
+    helper-beside-busy)
+      # A run-launched headless session — the Witness, or a Claude reviewer — shares the child's
+      # worktree and is listed without a status. Neither spelling of statuslessness is a second
+      # implementer, so the wave stays armed on the child's own `busy` (#197).
+      printf '[{"cwd":"/wave/01","status":"busy"},{"cwd":"/wave/01","status":null},%s,%s]\n' \
+        '{"cwd":"/wave/01"}' '{"cwd":"/wave/02","status":"busy"}'
+      ;;
+    helper-only)
+      # The child is gone and only the helper it left behind is listed: nothing status-bearing is
+      # in that worktree, which is what `vanished` means.
+      printf '[{"cwd":"/wave/01","status":null},{"cwd":"/wave/02","status":"busy"}]\n'
+      ;;
+    duplicate-beside-helper)
+      # Two implementers is still fatal however many status-less rows sit beside them.
+      printf '[%s,%s,%s,%s]\n' \
+        '{"cwd":"/wave/01","status":"busy"}' '{"cwd":"/wave/01","status":null}' \
+        '{"cwd":"/wave/01","status":"busy"}' '{"cwd":"/wave/02","status":"busy"}'
+      ;;
     invalid-json)
       printf '{invalid\n'
       ;;
@@ -181,7 +199,9 @@ assert_actionable busy-to-waiting waiting
 assert_actionable idle-busy idle
 assert_actionable vanished-busy vanished
 assert_actionable parked-busy parked
+assert_actionable helper-only vanished
 assert_error duplicate 'MONITOR ERROR duplicate session'
+assert_error duplicate-beside-helper 'MONITOR ERROR duplicate session'
 assert_error unknown 'MONITOR ERROR unknown status'
 assert_error invalid-json 'MONITOR ERROR invalid claude agents JSON'
 assert_error cli-failure 'MONITOR ERROR claude agents --json failed'
@@ -190,6 +210,18 @@ assert_error_records_log invalid-json 'invalid claude agents JSON'
 assert_error_records_log duplicate 'duplicate session for /wave/01'
 assert_error_records_log unknown "unknown status 'paused' for /wave/01"
 assert_error_records_log cli-failure 'claude agents --json failed' default
+
+# A status-less helper beside a live child leaves the wave armed: no wake-up, no error.
+helper_parked="$test_dir/helper-beside-busy.parked"
+helper_output="$test_dir/helper-beside-busy.output"
+helper_exit="$test_dir/helper-beside-busy.exit"
+: >"$helper_parked"
+run_monitor helper-beside-busy "$helper_parked" "$helper_output" "$helper_exit"
+if [ "$(cat "$helper_exit")" -lt 128 ] || grep -q '^MONITOR ACTIONABLE$' "$helper_output"; then
+  printf 'FAIL helper-beside-busy monitor did not remain armed\n' >&2
+  sed -n '1,20p' "$helper_output" >&2
+  exit 1
+fi
 
 busy_parked="$test_dir/all-busy.parked"
 busy_output="$test_dir/all-busy.output"
