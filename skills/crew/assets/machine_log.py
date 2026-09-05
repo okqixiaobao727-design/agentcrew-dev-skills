@@ -856,30 +856,16 @@ def run_hook(args):
         return 0
 
 
-def run_pause(args):
-    """Record that this ticket's child is waiting on its vendor's usage limit; returns 0 always.
+def run_lifecycle(args):
+    """Record one end of a child's wait on its vendor's usage limit; returns 0 always.
 
     Like every hook this file backs, it has no channel a model reads: the turn it fires on has
     already ended, and a log that could not be written is not a failure to report back into the
-    child's session. It writes nothing and exits 0 instead.
+    child's session. It writes nothing and exits 0 instead — which is also why this is the one
+    adapter that swallows the OSError its writer raises rather than reporting it.
     """
     try:
-        append(args.log, entry(PAUSED, ticket=args.ticket, role=CHILD))
-    except OSError:
-        pass
-    return 0
-
-
-def run_resume(args):
-    """Record that this ticket's pause ended, when one was open; returns 0 always.
-
-    Fires at the end of every ordinary turn the child takes, so the condition is the whole of what
-    it does: with no pause open there is nothing to end, and a log of `resumed` records for turns
-    that followed no wait would say a child had been waiting when it had not.
-    """
-    try:
-        if child_paused(read_records(args.log), args.ticket):
-            append(args.log, entry(RESUMED, ticket=args.ticket, role=CHILD))
+        args.writer(args.log, ticket=args.ticket)
     except OSError:
         pass
     return 0
@@ -1365,168 +1351,316 @@ def read_settings(path):
     return settings, None
 
 
+class SettingsError(Exception):
+    """A settings file cannot carry this run's hooks, and that file was not changed.
+
+    Carries the line the command line prints on stderr, so the registration seam has two adapters
+    for the same reason the write seam does (ADR-0030): the Driver installs a child's hooks in
+    process and turns this into its own error, while a manual advisor runs the subcommand and
+    reads the same sentence.
+    """
+
+
 def write_settings(path, settings):
-    """Write the settings document back; returns 0, or 1 when it cannot be written."""
+    """Write the settings document back; raises SettingsError when it cannot be written."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     except OSError as error:
-        print(f"machine log: {path}: {error}", file=sys.stderr)
-        return 1
-    print(path)
-    return 0
+        raise SettingsError(f"machine log: {path}: {error}") from error
 
 
-def run_install(args):
-    """Register the hook in a settings file; returns 0, or 1 when that file cannot be read.
+def install_settings(log, settings, role, ticket=None, hook_script=None, scope=None,
+                     crew_dir=None, run_dir=None, session_id=None):
+    """Register this run's hooks in one settings file; returns the file written.
 
     By default the command registered runs the run's own copy of this script rather than the one
     installing, because the plugin is installed one directory per version: an entry naming the
     plugin's copy stops working at the next upgrade, while the run directory outlives every one of
     them (#37). The copy is refreshed from the script that is installing, so an upgraded plugin's
     log writer is the one a resumed run's hooks go on running. A caller that keeps its own copy
-    names it with `--hook-script` and that path is registered as it was given.
+    names it with `hook_script` and that path is registered as it was given.
+
+    Raises SettingsError for a settings file this must not touch and for one it could not write.
+    The settings file itself is never half written — it is read whole, amended in memory and
+    replaced — but the run's own script copies are not covered by that: `materialise_script` has
+    already refreshed them by the time a coordinator install refuses for a missing crew directory,
+    so that refusal leaves those copies behind. They are the same bytes the next install writes,
+    which is why the refusal is safe to retry rather than something to unwind.
     """
-    if args.role == COORDINATOR and args.run_dir is None:
-        print("machine log: coordinator install requires --run-dir", file=sys.stderr)
-        return 1
-    path = pathlib.Path(args.settings)
-    settings, problem = read_settings(path)
+    if role == COORDINATOR and run_dir is None:
+        raise SettingsError("machine log: coordinator install requires --run-dir")
+    path = pathlib.Path(settings)
+    document, problem = read_settings(path)
     if problem is not None:
-        print(problem, file=sys.stderr)
-        return 1
+        raise SettingsError(problem)
     try:
         source = pathlib.Path(__file__).resolve()
         script = (
-            absolute(args.hook_script) if args.hook_script is not None
-            else str(materialise_script(source, run_script(args.log)))
+            absolute(hook_script) if hook_script is not None
+            else str(materialise_script(source, run_script(log)))
         )
         bounded_script = None
-        if args.role == COORDINATOR:
+        if role == COORDINATOR:
             control_source = source.with_name(COORDINATOR_CONTROL_SCRIPT_NAME)
-            if not control_source.exists() and args.crew_dir is not None:
+            if not control_source.exists() and crew_dir is not None:
                 control_source = (
-                    pathlib.Path(args.crew_dir) / "assets" / COORDINATOR_CONTROL_SCRIPT_NAME
+                    pathlib.Path(crew_dir) / "assets" / COORDINATOR_CONTROL_SCRIPT_NAME
                 )
             materialise_script(
-                control_source,
-                pathlib.Path(args.log).parent / COORDINATOR_CONTROL_SCRIPT_NAME,
+                control_source, pathlib.Path(log).parent / COORDINATOR_CONTROL_SCRIPT_NAME,
             )
             bounded_script = materialise_script(
-                source.with_name(BOUNDED_SCRIPT_NAME),
-                bounded_run_script(args.log),
+                source.with_name(BOUNDED_SCRIPT_NAME), bounded_run_script(log),
             )
     except OSError as error:
-        print(f"machine log: {error}", file=sys.stderr)
-        return 1
-    scope = args.scope if args.scope is not None else settings_scope(path)
-    command = hook_command(script, args.log, args.role, args.ticket, scope)
-    install_hook(settings, command, args.log)
-    if args.ticket is not None:
+        raise SettingsError(f"machine log: {error}") from error
+    if scope is None:
+        scope = settings_scope(path)
+    install_hook(document, hook_command(script, log, role, ticket, scope), log)
+    if ticket is not None:
         # The pause is a fact about one child, so it is registered only where a ticket names that
         # child. The coordinator's own install serves every child at once and knows no ticket to
         # attribute a wait to; its session is not the one that waits, either.
         for event, matcher, subcommand in LIFECYCLE_HOOKS:
             install_lifecycle_hook(
-                settings, event, matcher,
-                lifecycle_hook_command(script, args.log, subcommand, args.ticket),
-                args.log,
+                document, event, matcher,
+                lifecycle_hook_command(script, log, subcommand, ticket), log,
             )
-    if args.role == COORDINATOR:
-        install_guard_hook(settings, guard_command(script, args.log, scope), args.log)
-        crew_dir = args.crew_dir
+    if role == COORDINATOR:
+        install_guard_hook(document, guard_command(script, log, scope), log)
         if crew_dir is None and source.parent.name == "assets":
             crew_dir = source.parent.parent
         if crew_dir is None:
-            print(
-                "machine log: coordinator install from a copied script requires --crew-dir",
-                file=sys.stderr,
+            raise SettingsError(
+                "machine log: coordinator install from a copied script requires --crew-dir"
             )
-            return 1
-        session_id = args.session_id
         if session_id is None:
             session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
-        bounded = bounded_hook_command(
-            bounded_script, args.log, crew_dir, args.run_dir, session_id
+        install_bounded_hook(
+            document, bounded_hook_command(bounded_script, log, crew_dir, run_dir, session_id), log
         )
-        install_bounded_hook(settings, bounded, args.log)
-    return write_settings(path, settings)
+    write_settings(path, document)
+    return path
 
 
-def run_uninstall(args):
-    """Take this run's hooks out of a settings file; returns 0, or 1 on a file it must not touch.
+def uninstall_settings(log, settings):
+    """Take this run's hooks out of one settings file; returns the file rewritten, or None.
 
     What it removes is every message, authorization and bounded-read entry owned by this Run's
     log, whichever version of this script installed it, and nothing else. Idempotent by
     construction: a file that carries none of ours is left exactly as it was found and a second
     call has nothing left to do. Another Run's entry and unrelated hooks stay where they are.
+
+    Raises SettingsError for a file this must not touch and for one it could not write.
     """
-    path = pathlib.Path(args.settings)
+    path = pathlib.Path(settings)
     if not path.exists():
-        return 0
-    settings, problem = read_settings(path)
+        return None
+    document, problem = read_settings(path)
     if problem is not None:
-        print(problem, file=sys.stderr)
-        return 1
-    removed = uninstall_hook(settings, args.log)
-    removed = uninstall_bounded_hook(settings, args.log) or removed
-    removed = uninstall_guard_hook(settings, args.log) or removed
+        raise SettingsError(problem)
+    removed = uninstall_hook(document, log)
+    removed = uninstall_bounded_hook(document, log) or removed
+    removed = uninstall_guard_hook(document, log) or removed
     for event, matcher, _subcommand in LIFECYCLE_HOOKS:
-        removed = uninstall_lifecycle_hook(settings, event, matcher, args.log) or removed
+        removed = uninstall_lifecycle_hook(document, event, matcher, log) or removed
     if not removed:
-        return 0
-    return write_settings(path, settings)
+        return None
+    write_settings(path, document)
+    return path
 
 
-def run_event(args):
-    """Append one script event, named by the subcommand called; returns 0, or 1 on an OSError."""
-    fields = {
-        name: value
-        for name, value in vars(args).items()
-        if name not in ("log", "event", "handler")
-    }
+def run_install(args):
+    """Register the hook in a settings file; returns 0, or 1 when that file cannot be read."""
     try:
-        append(args.log, entry(args.event, **fields))
-    except OSError as error:
-        print(f"machine log: {args.log}: {error}", file=sys.stderr)
+        print(install_settings(
+            args.log, args.settings, args.role, ticket=args.ticket,
+            hook_script=args.hook_script, scope=args.scope, crew_dir=args.crew_dir,
+            run_dir=args.run_dir, session_id=args.session_id,
+        ))
+    except SettingsError as error:
+        print(str(error), file=sys.stderr)
         return 1
     return 0
 
 
-def run_message(args):
-    """Append one outgoing message; returns 0, or 1 on an OSError."""
-    record = entry(
-        message_event(args.message, args.role),
-        ticket=args.ticket,
-        role=args.role,
-        to=args.to,
-        message=args.message,
-    )
+def run_uninstall(args):
+    """Take this run's hooks out of a settings file; returns 0, or 1 on a file it refuses."""
     try:
-        append(args.log, record)
-    except OSError as error:
-        print(f"machine log: {args.log}: {error}", file=sys.stderr)
+        written = uninstall_settings(args.log, args.settings)
+        if written is not None:
+            print(written)
+    except SettingsError as error:
+        print(str(error), file=sys.stderr)
         return 1
     return 0
 
 
-def cost_problem(args):
+# --- the writers: one in-process function per event ---------------------------------------------
+#
+# The field table of an event lives here, in the signature of the function that writes it: what is
+# required is a parameter with no default, what is optional defaults to None and is left out of the
+# record by `entry`, and the order the parameters are assembled in is the order the keys appear on
+# the line. That is what makes two adapters onto one write seam possible — the CLI below, for a
+# hook or a child that can only run a command, and these functions, for the Driver and its scripts
+# that already import this module (ADR-0030). A writer raises `ValueError` where the values
+# contradict each other and `OSError` where the log could not be written, so a caller can tell its
+# own document being wrong from the record failing around a document that stands.
+
+
+def record_launch(log, *, ticket, child, workflow, executor, model, effort,
+                  branch=None, worktree=None, window=None, account=None):
+    """Append the `launch` event that makes one child part of the run; returns nothing.
+
+    `account` is the Claude Code profile directory the child launched under, which is what makes a
+    run's spend attributable after the fact; a Codex child runs on its own vendor's credentials and
+    carries none.
+    """
+    append(log, entry(
+        "launch", ticket=ticket, child=child, workflow=workflow, executor=executor, model=model,
+        effort=effort, branch=branch, worktree=worktree, window=window, account=account,
+    ))
+
+
+def record_launch_failed(log, *, ticket, detail):
+    """Append the `launch-failed` event a live child failed post-launch verification with."""
+    append(log, entry("launch-failed", ticket=ticket, detail=detail))
+
+
+def record_receipt(log, *, ticket, verdict, sha=None, detail=None):
+    """Append one `receipt`: a child's final word, as the verifying script found it."""
+    if verdict not in VERDICTS:
+        raise ValueError(f"verdict is one of {', '.join(VERDICTS)}")
+    append(log, entry("receipt", ticket=ticket, verdict=verdict, sha=sha, detail=detail))
+
+
+def record_merge(log, *, ticket, result, branch=None, into=None, sha=None, detail=None):
+    """Append one `merge`: one ticket branch's trip into the integration branch."""
+    if result not in MERGE_RESULTS:
+        raise ValueError(f"merge result is one of {', '.join(MERGE_RESULTS)}")
+    append(log, entry(
+        "merge", ticket=ticket, result=result, branch=branch, into=into, sha=sha, detail=detail,
+    ))
+
+
+def record_outcome(log, *, ticket, outcome, detail=None):
+    """Append one `outcome`: the ticket's one report outcome."""
+    if outcome not in OUTCOMES:
+        raise ValueError(f"outcome is one of {', '.join(OUTCOMES)}")
+    append(log, entry("outcome", ticket=ticket, outcome=outcome, detail=detail))
+
+
+def record_queued(log, *, ticket, source, open, locator, finding):  # noqa: A002
+    """Append one `queued`: a finding this run opened a ticket for and queued into itself.
+
+    `open` is the log's own field name for what the finding leaves open (ADR-0028), so the
+    parameter carries it rather than a synonym a caller would have to translate.
+    """
+    if open not in OPEN_WORDS:
+        raise ValueError(f"a queued finding leaves open one of {', '.join(OPEN_WORDS)}")
+    append(log, entry(
+        "queued", ticket=ticket, source=source, open=open, locator=locator, finding=finding,
+    ))
+
+
+def record_review(log, *, ticket, lane, state, detail=None):
+    """Append one `review`: one end of a ticket's trip through its review lane."""
+    if state not in REVIEW_STATES:
+        raise ValueError(f"review state is one of {', '.join(REVIEW_STATES)}")
+    append(log, entry("review", ticket=ticket, lane=lane, state=state, detail=detail))
+
+
+def record_advance(log, *, wave, decision, detail=None):
+    """Append one `advance`: what the run decided after a wave settled.
+
+    The one event that carries no ticket — a decision is about a wave.
+    """
+    if decision not in DECISIONS:
+        raise ValueError(f"advance decision is one of {', '.join(DECISIONS)}")
+    append(log, entry("advance", wave=str(wave), decision=decision, detail=detail))
+
+
+def record_live_source(log, *, lane, source, reason):
+    """Append one `live-source`: which source a lane's live children were read from."""
+    if source not in LIVE_SOURCES:
+        raise ValueError(f"live source is one of {', '.join(LIVE_SOURCES)}")
+    append(log, entry("live-source", lane=lane, source=source, reason=reason))
+
+
+def record_monitor_error(log, *, monitor, reason):
+    """Append one `monitor-error`: a monitor that exited with an error."""
+    append(log, entry("monitor-error", monitor=monitor, reason=reason))
+
+
+def record_message(log, *, role, message, ticket=None, to=None):
+    """Append one outgoing message, under the event name the role and the body give it.
+
+    The event is `ruling` for anything the coordinator sends, `escalation` for a child body ending
+    on the escalation verb, and `message` otherwise — read through `message_event`, so a message
+    written here and one copied in by the `SendMessage` hook can never disagree about what was
+    said.
+    """
+    append(log, entry(
+        message_event(message, role), ticket=ticket, role=role, to=to, message=message,
+    ))
+
+
+def record_pause(log, *, ticket):
+    """Append the `paused` event that opens this child's wait on its vendor's usage limit."""
+    append(log, entry(PAUSED, ticket=ticket, role=CHILD))
+
+
+def record_resume(log, *, ticket):
+    """Append the `resumed` event that closes such a wait, when one is open; returns nothing.
+
+    The condition is the whole of what it does: with no pause open there is nothing to end, and a
+    `resumed` record for a turn that followed no wait would say a child had been waiting when it
+    had not.
+    """
+    if child_paused(read_records(log), ticket):
+        append(log, entry(RESUMED, ticket=ticket, role=CHILD))
+
+
+def base_gate_problem(status, argv):
+    """Why this base-gate decision contradicts its argv, or None when the two agree."""
+    if status not in BASE_GATE_STATUSES:
+        return f"base-gate status is one of {', '.join(BASE_GATE_STATUSES)}"
+    if status == "passed" and not argv:
+        return "a passed gate carries its argv"
+    if status == "not-configured" and argv:
+        return "an unconfigured gate carries no argv"
+    return None
+
+
+def record_base_gate(log, *, status, argv=None):
+    """Append one `base-gate`: whether the integration base passed its configured project gate."""
+    problem = base_gate_problem(status, argv)
+    if problem is not None:
+        raise ValueError(problem)
+    append(log, entry("base-gate", status=status, argv=list(argv) if argv else None))
+
+
+def cost_problem(fields):
     """Why this session cost contradicts itself, or None when it holds together.
 
     A session cost answers one of two questions and never both: what the child spent, in all five
     figures, or why nobody could tell. Anything between the two is a line whose reader cannot know
-    which of the two it is holding.
+    which of the two it is holding. Takes the record's own fields, so the one contradiction check
+    answers to a caller writing the event in process and to the command line writing it from
+    outside.
     """
-    counters = [getattr(args, name) for name in COST_COUNTERS]
-    total = getattr(args, COST_TOTAL)
+    counters = [fields[name] for name in COST_COUNTERS]
+    total = fields[COST_TOTAL]
+    detail = fields["detail"]
     figures = [value for value in counters + [total] if value is not None]
     if not figures:
-        if args.detail is None:
+        if detail is None:
             return "a session cost with no figures carries the diagnosis that says why"
         return None
     if len(figures) < len(COST_COUNTERS) + 1:
         return f"a session cost carries all of {', '.join(COST_COUNTERS)} and {COST_TOTAL}, or none"
-    if args.detail is not None:
+    if detail is not None:
         return "a session cost carries its figures or a diagnosis, never both"
     if any(value < 0 for value in figures):
         return "a token count is never negative"
@@ -1535,13 +1669,31 @@ def cost_problem(args):
     return None
 
 
-def run_session_cost(args):
-    """Append one session cost; returns 0, or 2 for a record that contradicts itself."""
-    problem = cost_problem(args)
+def record_session_cost(log, *, ticket, executor, model, lane=None, session=None,
+                        input_tokens=None, output_tokens=None, cache_read_tokens=None,
+                        cache_creation_tokens=None, total_tokens=None, detail=None):
+    """Append one `session-cost`: what one session spent, in tokens.
+
+    `lane` carries the same spelling the `review` event's does, so a review's spend is filterable
+    by the lane that spent it; an absent lane says the session was the ticket's own work.
+    """
+    fields = {
+        "ticket": ticket,
+        "executor": executor,
+        "lane": lane,
+        "model": model,
+        "session": session,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+        "total_tokens": total_tokens,
+        "detail": detail,
+    }
+    problem = cost_problem(fields)
     if problem is not None:
-        print(f"machine log: session-cost: {problem}", file=sys.stderr)
-        return 2
-    return run_event(args)
+        raise ValueError(problem)
+    append(log, entry("session-cost", **fields))
 
 
 def witness_problem(fields):
@@ -1610,40 +1762,50 @@ def witness_fields(
     return fields
 
 
-def record_witness(log, **values):
-    """Append one witness event through the log's own append discipline; returns nothing.
+def record_witness(log, *, ticket, operation, executor, model, outcome, reason, brief,
+                   duration_seconds, covered_count, uncovered_count,
+                   input_tokens=None, output_tokens=None, cache_read_tokens=None,
+                   cache_creation_tokens=None, total_tokens=None):
+    """Append one `witness`: one fact-check of an escalation; returns nothing.
 
     Raises ValueError for a result that contradicts itself and OSError for a log it could not
     write, so a caller can tell the two apart: the first is its own document being wrong, the
     second is the record failing around a document that stands.
     """
-    fields = witness_fields(**values)
+    fields = witness_fields(
+        ticket, operation, executor, model, outcome, reason, brief, duration_seconds,
+        covered_count, uncovered_count,
+        counters={
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "total_tokens": total_tokens,
+        },
+    )
     problem = witness_problem(fields)
     if problem is not None:
         raise ValueError(problem)
     append(log, entry("witness", **fields))
 
 
-def run_witness(args):
-    """Append one witness event; returns 0, 1 for an unwritable log, or 2 for a contradiction."""
-    counters = {name: getattr(args, name) for name in COST_COUNTERS + (COST_TOTAL,)}
+def run_event(args):
+    """Append one event through its own in-process writer; returns the exit code the CLI owes.
+
+    The one adapter every appending subcommand goes through: argparse has already checked what it
+    can check — that a required flag was given, that a value is in a closed set — and what is left
+    is the record's own arithmetic, which the writer owns. A contradiction is exit 2 and an
+    unwritable log is exit 1, each on the message the caller of a command reads on stderr.
+    """
+    fields = {
+        name: value
+        for name, value in vars(args).items()
+        if name not in ("log", "event", "handler", "writer")
+    }
     try:
-        record_witness(
-            args.log,
-            ticket=args.ticket,
-            operation=args.operation,
-            executor=args.executor,
-            model=args.model,
-            outcome=args.outcome,
-            reason=args.reason,
-            brief=args.brief,
-            duration_seconds=args.duration_seconds,
-            covered_count=args.covered_count,
-            uncovered_count=args.uncovered_count,
-            counters=counters,
-        )
+        args.writer(args.log, **fields)
     except ValueError as error:
-        print(f"machine log: witness: {error}", file=sys.stderr)
+        print(f"machine log: {args.event}: {error}", file=sys.stderr)
         return 2
     except OSError as error:
         print(f"machine log: {args.log}: {error}", file=sys.stderr)
@@ -1651,29 +1813,23 @@ def run_witness(args):
     return 0
 
 
-def run_base_gate(args):
-    """Append one base-gate decision, or refuse a status that contradicts its argv."""
-    if args.status == "passed" and not args.argv:
-        print("machine log: base-gate: a passed gate carries its argv", file=sys.stderr)
-        return 2
-    if args.status == "not-configured" and args.argv:
-        print("machine log: base-gate: an unconfigured gate carries no argv", file=sys.stderr)
-        return 2
-    return run_event(args)
-
-
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--log", required=True, help="the run's machine log")
     subcommands = parser.add_subparsers(dest="event", required=True)
 
-    def event_command(name, help_text):
+    def event_command(name, help_text, writer):
+        """One subcommand over one writer: argparse parses, `run_event` hands the fields on."""
         command = subcommands.add_parser(name, help=help_text)
-        command.set_defaults(handler=run_event)
+        command.set_defaults(handler=run_event, writer=writer)
+        return command
+
+    def ticket_command(name, help_text, writer):
+        command = event_command(name, help_text, writer)
         command.add_argument("--ticket", required=True, help="the ticket number, as written")
         return command
 
-    launch = event_command("launch", "a child started on a ticket")
+    launch = ticket_command("launch", "a child started on a ticket", record_launch)
     launch.add_argument("--child", required=True)
     launch.add_argument("--workflow", required=True)
     launch.add_argument("--executor", required=True)
@@ -1688,29 +1844,33 @@ def build_parser():
                           " child's alone, a Codex child running on its own vendor's credentials",
     )
 
-    launch_failed = event_command(
-        "launch-failed", "a live child failed post-launch verification"
+    launch_failed = ticket_command(
+        "launch-failed", "a live child failed post-launch verification", record_launch_failed
     )
     launch_failed.add_argument("--detail", required=True)
 
-    receipt = event_command("receipt", "a child's final word, as verified by script")
+    receipt = ticket_command(
+        "receipt", "a child's final word, as verified by script", record_receipt
+    )
     receipt.add_argument("--verdict", required=True, choices=VERDICTS)
     receipt.add_argument("--sha")
     receipt.add_argument("--detail")
 
-    merge = event_command("merge", "one ticket branch's trip into the integration branch")
+    merge = ticket_command(
+        "merge", "one ticket branch's trip into the integration branch", record_merge
+    )
     merge.add_argument("--result", required=True, choices=MERGE_RESULTS)
     merge.add_argument("--branch")
     merge.add_argument("--into")
     merge.add_argument("--sha")
     merge.add_argument("--detail")
 
-    outcome = event_command("outcome", "a ticket's one report outcome")
+    outcome = ticket_command("outcome", "a ticket's one report outcome", record_outcome)
     outcome.add_argument("--outcome", required=True, choices=OUTCOMES)
     outcome.add_argument("--detail")
 
-    queued = event_command(
-        "queued", "a finding this run opened a ticket for and queued into itself"
+    queued = ticket_command(
+        "queued", "a finding this run opened a ticket for and queued into itself", record_queued
     )
     queued.add_argument(
         "--source", required=True, help="the ticket whose child stated the finding"
@@ -1729,7 +1889,9 @@ def build_parser():
              " repeated queue of the same finding find its own line here",
     )
 
-    review = event_command("review", "one end of a ticket's trip through its review lane")
+    review = ticket_command(
+        "review", "one end of a ticket's trip through its review lane", record_review
+    )
     review.add_argument(
         "--lane", required=True,
         help="the reviewing vendor and its model, as the wave table approved them",
@@ -1737,8 +1899,9 @@ def build_parser():
     review.add_argument("--state", required=True, choices=REVIEW_STATES)
     review.add_argument("--detail")
 
-    witness = event_command("witness", "one witness fact-check of an escalation")
-    witness.set_defaults(handler=run_witness)
+    witness = ticket_command(
+        "witness", "one witness fact-check of an escalation", record_witness
+    )
     witness.add_argument("--operation", required=True, choices=WITNESS_OPERATIONS)
     witness.add_argument("--executor", required=True, choices=EXECUTORS)
     witness.add_argument("--model", required=True, help="the full model ID, never an alias")
@@ -1751,18 +1914,19 @@ def build_parser():
     for tokens in ("input", "output", "cache-read", "cache-creation", "total"):
         witness.add_argument(f"--{tokens}-tokens", type=int, help=f"{tokens} tokens, as counted")
 
-    base_gate = subcommands.add_parser(
-        "base-gate", help="whether the integration base passed its configured project gate"
+    base_gate = event_command(
+        "base-gate", "whether the integration base passed its configured project gate",
+        record_base_gate,
     )
-    base_gate.set_defaults(handler=run_base_gate)
     base_gate.add_argument("--status", required=True, choices=BASE_GATE_STATUSES)
     base_gate.add_argument(
         "--argument", action="append", dest="argv",
         help="one argv element, repeated in order; absent when no gate was configured",
     )
 
-    cost = event_command("session-cost", "what one session spent, in tokens")
-    cost.set_defaults(handler=run_session_cost)
+    cost = ticket_command(
+        "session-cost", "what one session spent, in tokens", record_session_cost
+    )
     cost.add_argument("--executor", required=True, choices=EXECUTORS)
     # The same spelling the `review` event's lane carries, so a review's spend is filterable by
     # the lane that spent it. Left unset by the cost pass, whose rows are implementing children:
@@ -1780,29 +1944,28 @@ def build_parser():
     # rather than a note: a line with no figures and no detail would be a silent gap.
     cost.add_argument("--detail", help="why the figures are missing, when they are")
 
-    advance = subcommands.add_parser("advance", help="what the run decided after a wave settled")
-    advance.set_defaults(handler=run_event)
+    advance = event_command(
+        "advance", "what the run decided after a wave settled", record_advance
+    )
     advance.add_argument("--wave", required=True, help="the wave the decision is about")
     advance.add_argument("--decision", required=True, choices=DECISIONS)
     advance.add_argument("--detail")
 
-    live_source = subcommands.add_parser(
-        "live-source", help="record which source a lane's live children were read from"
+    live_source = event_command(
+        "live-source", "record which source a lane's live children were read from",
+        record_live_source,
     )
-    live_source.set_defaults(handler=run_event)
     live_source.add_argument("--lane", required=True, choices=EXECUTORS)
     live_source.add_argument("--source", required=True, choices=LIVE_SOURCES)
     live_source.add_argument("--reason", required=True, help="why that source and not the first")
 
-    monitor_error = subcommands.add_parser(
-        "monitor-error", help="record a monitor that exited with an error"
+    monitor_error = event_command(
+        "monitor-error", "record a monitor that exited with an error", record_monitor_error
     )
-    monitor_error.set_defaults(handler=run_event)
     monitor_error.add_argument("--monitor", required=True, help="the monitor that failed")
     monitor_error.add_argument("--reason", required=True, help="why the monitor failed")
 
-    message = subcommands.add_parser("message", help="record an outgoing message")
-    message.set_defaults(handler=run_message)
+    message = event_command("message", "record an outgoing message", record_message)
     message.add_argument("--role", required=True, choices=(COORDINATOR, CHILD))
     message.add_argument("--ticket")
     message.add_argument("--to")
@@ -1820,13 +1983,13 @@ def build_parser():
     pause = subcommands.add_parser(
         PAUSE_SUBCOMMAND, help="record that a child is waiting on its vendor's usage limit"
     )
-    pause.set_defaults(handler=run_pause)
+    pause.set_defaults(handler=run_lifecycle, writer=record_pause)
     pause.add_argument("--ticket", required=True, help="the ticket whose child is waiting")
 
     resume = subcommands.add_parser(
         RESUME_SUBCOMMAND, help="record the end of that wait, when one is open"
     )
-    resume.set_defaults(handler=run_resume)
+    resume.set_defaults(handler=run_lifecycle, writer=record_resume)
     resume.add_argument("--ticket", required=True, help="the ticket whose child ended a turn")
 
     guard = subcommands.add_parser(

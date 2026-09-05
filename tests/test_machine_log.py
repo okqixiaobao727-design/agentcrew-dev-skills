@@ -7,6 +7,7 @@ one of them, and outgoing messages copied in byte for byte. The shape they asser
 `docs/machine-log.md` publishes.
 """
 
+import ast
 import datetime
 import json
 import os
@@ -1691,6 +1692,452 @@ class EventTests(MachineLogTestCase):
             self.assertEqual(entry["role"], role)
             self.assertEqual(entry["ticket"], "07")
             self.assertEqual(entry["message"], message)
+
+
+# Every subcommand that appends a line, with the argv that writes it and the exact line it
+# writes. `ts` is the one field a caller cannot predict, so it is the one field these rows leave
+# out; everything else — which keys are present, in which order, carrying which values — is the
+# record the schema publishes and the byte-for-byte contract two adapters onto one write seam have
+# to keep. A row's argv is the CLI's; the same table is read back in `WriterFunctionParityTests`
+# to assert the in-process writer answers it identically.
+WRITTEN_LINES = (
+    (
+        "a launch carrying every optional field",
+        ("launch", "--ticket", "07", "--child", "agentcrew-machine-log", "--workflow", "tdd",
+         "--executor", "claude", "--model", "claude-opus-4-6-20260401", "--effort", "medium",
+         "--branch", "worktree-07-machine-log", "--worktree", "/repo/.claude/worktrees/07",
+         "--window", "crew:07", "--account", "/home/simon/.claude-a"),
+        '{"event": "launch", "ticket": "07", "child": "agentcrew-machine-log",'
+        ' "workflow": "tdd", "executor": "claude", "model": "claude-opus-4-6-20260401",'
+        ' "effort": "medium", "branch": "worktree-07-machine-log",'
+        ' "worktree": "/repo/.claude/worktrees/07", "window": "crew:07",'
+        ' "account": "/home/simon/.claude-a"}',
+    ),
+    (
+        "a launch carrying none of them",
+        ("launch", "--ticket", "07", "--child", "c", "--workflow", "tdd",
+         "--executor", "codex", "--model", "gpt-5.6-luna", "--effort", "high"),
+        '{"event": "launch", "ticket": "07", "child": "c", "workflow": "tdd",'
+        ' "executor": "codex", "model": "gpt-5.6-luna", "effort": "high"}',
+    ),
+    (
+        "a launch failure",
+        ("launch-failed", "--ticket", "07", "--detail", "no entry for this child"),
+        '{"event": "launch-failed", "ticket": "07", "detail": "no entry for this child"}',
+    ),
+    (
+        "a receipt with its sha and detail",
+        ("receipt", "--ticket", "07", "--verdict", "landable", "--sha", SHA,
+         "--detail", "verified at the tip"),
+        '{"event": "receipt", "ticket": "07", "verdict": "landable", "sha": "%s",'
+        ' "detail": "verified at the tip"}' % SHA,
+    ),
+    (
+        "a receipt with neither",
+        ("receipt", "--ticket", "07", "--verdict", "parked"),
+        '{"event": "receipt", "ticket": "07", "verdict": "parked"}',
+    ),
+    (
+        "a merge carrying every optional field",
+        ("merge", "--ticket", "07", "--result", "clean", "--branch", "worktree-07",
+         "--into", "crew/73", "--sha", SHA, "--detail", "fast-forward"),
+        '{"event": "merge", "ticket": "07", "result": "clean", "branch": "worktree-07",'
+        ' "into": "crew/73", "sha": "%s", "detail": "fast-forward"}' % SHA,
+    ),
+    (
+        "a merge carrying none of them",
+        ("merge", "--ticket", "07", "--result", "escalated"),
+        '{"event": "merge", "ticket": "07", "result": "escalated"}',
+    ),
+    (
+        "an outcome with its detail",
+        ("outcome", "--ticket", "07", "--outcome", "completed", "--detail", "closed in github"),
+        '{"event": "outcome", "ticket": "07", "outcome": "completed",'
+        ' "detail": "closed in github"}',
+    ),
+    (
+        "an outcome without one",
+        ("outcome", "--ticket", "07", "--outcome", "blocked"),
+        '{"event": "outcome", "ticket": "07", "outcome": "blocked"}',
+    ),
+    (
+        "a queued finding",
+        ("queued", "--ticket", "31", "--source", "07", "--open", "cause",
+         "--locator", "okqixiaobao727-design/agentcrew-dev-skills#31",
+         "--finding", "the writer spawns a process per line"),
+        '{"event": "queued", "ticket": "31", "source": "07", "open": "cause",'
+        ' "locator": "okqixiaobao727-design/agentcrew-dev-skills#31",'
+        ' "finding": "the writer spawns a process per line"}',
+    ),
+    (
+        "a review that started",
+        ("review", "--ticket", "07", "--lane", REVIEW_LANE, "--state", "running"),
+        '{"event": "review", "ticket": "07", "lane": "%s", "state": "running"}' % REVIEW_LANE,
+    ),
+    (
+        "a review that came back with a detail",
+        ("review", "--ticket", "07", "--lane", REVIEW_LANE, "--state", "returned",
+         "--detail", "next: fix"),
+        '{"event": "review", "ticket": "07", "lane": "%s", "state": "returned",'
+        ' "detail": "next: fix"}' % REVIEW_LANE,
+    ),
+    (
+        "a witness check with its cost",
+        ("witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
+         "--model", "claude-opus-4-6-20260401", "--outcome", "checked", "--reason", "",
+         "--brief", "all nine pointers held", "--duration-seconds", "12.5",
+         "--covered-count", "9", "--uncovered-count", "0",
+         "--input-tokens", "1", "--output-tokens", "2", "--cache-read-tokens", "3",
+         "--cache-creation-tokens", "4", "--total-tokens", "10"),
+        '{"event": "witness", "ticket": "07", "operation": "check", "executor": "claude",'
+        ' "model": "claude-opus-4-6-20260401", "outcome": "checked", "reason": "",'
+        ' "brief": "all nine pointers held", "duration_seconds": 12.5, "covered_count": 9,'
+        ' "uncovered_count": 0, "input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 3,'
+        ' "cache_creation_tokens": 4, "total_tokens": 10}',
+    ),
+    (
+        "a witness check with no cost read",
+        ("witness", "--ticket", "07", "--operation", "ask", "--executor", "codex",
+         "--model", "gpt-5.6-luna", "--outcome", "failed", "--reason", "the brief was unreadable",
+         "--brief", "", "--duration-seconds", "0.0",
+         "--covered-count", "0", "--uncovered-count", "2"),
+        '{"event": "witness", "ticket": "07", "operation": "ask", "executor": "codex",'
+        ' "model": "gpt-5.6-luna", "outcome": "failed", "reason": "the brief was unreadable",'
+        ' "brief": "", "duration_seconds": 0.0, "covered_count": 0, "uncovered_count": 2}',
+    ),
+    (
+        "a base gate that passed, carrying the argv it ran",
+        ("base-gate", "--status", "passed", "--argument=python3", "--argument=scripts/test.py"),
+        '{"event": "base-gate", "status": "passed",'
+        ' "argv": ["python3", "scripts/test.py"]}',
+    ),
+    (
+        "a base gate nobody configured",
+        ("base-gate", "--status", "not-configured"),
+        '{"event": "base-gate", "status": "not-configured"}',
+    ),
+    (
+        "a session cost in all five figures",
+        ("session-cost", "--ticket", "07", "--executor", "claude",
+         "--model", "claude-opus-4-6-20260401", "--session", "abc,def",
+         "--input-tokens", "10", "--output-tokens", "20", "--cache-read-tokens", "30",
+         "--cache-creation-tokens", "40", "--total-tokens", "100"),
+        '{"event": "session-cost", "ticket": "07", "executor": "claude",'
+        ' "model": "claude-opus-4-6-20260401", "session": "abc,def", "input_tokens": 10,'
+        ' "output_tokens": 20, "cache_read_tokens": 30, "cache_creation_tokens": 40,'
+        ' "total_tokens": 100}',
+    ),
+    (
+        "a review lane's session cost, which carries the lane that spent it",
+        ("session-cost", "--ticket", "07", "--executor", "codex", "--lane", REVIEW_LANE,
+         "--model", "gpt-5.6-luna",
+         "--input-tokens", "0", "--output-tokens", "0", "--cache-read-tokens", "0",
+         "--cache-creation-tokens", "0", "--total-tokens", "0"),
+        '{"event": "session-cost", "ticket": "07", "executor": "codex", "lane": "%s",'
+        ' "model": "gpt-5.6-luna", "input_tokens": 0, "output_tokens": 0,'
+        ' "cache_read_tokens": 0, "cache_creation_tokens": 0, "total_tokens": 0}' % REVIEW_LANE,
+    ),
+    (
+        "a session cost nobody could read, which carries the diagnosis instead",
+        ("session-cost", "--ticket", "07", "--executor", "claude", "--model", "m",
+         "--detail", "no transcript for this child"),
+        '{"event": "session-cost", "ticket": "07", "executor": "claude", "model": "m",'
+        ' "detail": "no transcript for this child"}',
+    ),
+    (
+        "an advance decision with its detail",
+        ("advance", "--wave", "2", "--decision", "launched", "--detail", "advanced from wave 1"),
+        '{"event": "advance", "wave": "2", "decision": "launched",'
+        ' "detail": "advanced from wave 1"}',
+    ),
+    (
+        "an advance decision without one",
+        ("advance", "--wave", "1", "--decision", "complete"),
+        '{"event": "advance", "wave": "1", "decision": "complete"}',
+    ),
+    (
+        "a live source a dashboard fell back to",
+        ("live-source", "--lane", "claude", "--source", "command",
+         "--reason", "sessions unreadable in /home/simon/.claude-a/projects"),
+        '{"event": "live-source", "lane": "claude", "source": "command",'
+        ' "reason": "sessions unreadable in /home/simon/.claude-a/projects"}',
+    ),
+    (
+        "a monitor that failed",
+        ("monitor-error", "--monitor", "wave", "--reason", "tmux is not running"),
+        '{"event": "monitor-error", "monitor": "wave", "reason": "tmux is not running"}',
+    ),
+    (
+        "a child's ordinary message",
+        ("message", "--role", "child", "--ticket", "07", "--to", "crew-coordinator",
+         "--message", "on it"),
+        '{"event": "message", "ticket": "07", "role": "child", "to": "crew-coordinator",'
+        ' "message": "on it"}',
+    ),
+    (
+        "a child's escalation, named by the verb its body ends on",
+        ("message", "--role", "child", "--ticket", "07", "--message", ESCALATION),
+        '{"event": "escalation", "ticket": "07", "role": "child", "message": %s}'
+        % json.dumps(ESCALATION, ensure_ascii=False),
+    ),
+    (
+        "a coordinator's ruling, which is a ruling whatever it opens with",
+        ("message", "--role", "coordinator", "--ticket", "07", "--to", "crew-07",
+         "--message", RULING),
+        '{"event": "ruling", "ticket": "07", "role": "coordinator", "to": "crew-07",'
+        ' "message": %s}' % json.dumps(RULING, ensure_ascii=False),
+    ),
+    (
+        "a child's wait on its vendor's usage limit",
+        ("pause", "--ticket", "07"),
+        '{"event": "paused", "ticket": "07", "role": "child"}',
+    ),
+)
+
+
+class WriteSeamAdapterTests(unittest.TestCase):
+    """No caller that imports this module reaches it by starting it instead (ADR-0030).
+
+    Read off the sources rather than off a run, because the thing being pinned is a decision about
+    which seam a caller uses, and a run only ever exercises the paths that run happened to take. A
+    caller in this list that needs a command has one it can name — the copy the run keeps beside
+    its log, for a hook or a child — and that is a string, never an argv this test could mistake
+    for an append.
+    """
+
+    IN_PROCESS_CALLERS = (
+        "skills/crew/assets/driver/driver.py",
+        "skills/crew/assets/dispatch/dispatch.py",
+        "skills/crew/assets/advance.py",
+        "skills/crew/assets/merge_driver.py",
+        "skills/crew/assets/monitor/monitor.py",
+    )
+
+    def spawns(self, source, text):
+        """Every process this module starts whose argv names the machine-log script."""
+        found = []
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in ("run", "Popen", "check_output", "call"):
+                continue
+            for argument in list(node.args) + [keyword.value for keyword in node.keywords]:
+                segment = ast.get_source_segment(text, argument) or ""
+                if "MACHINE_LOG" in segment or "machine_log.py" in segment:
+                    found.append(f"{source}:{node.lineno}")
+        return found
+
+    def test_no_caller_that_imports_the_module_starts_it_as_a_command(self):
+        for source in self.IN_PROCESS_CALLERS:
+            path = PLUGIN_ROOT / source
+            with self.subTest(source):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("import machine_log", text, "this caller imports the module")
+                self.assertEqual(self.spawns(source, text), [])
+
+
+class SettingsSeamTests(MachineLogTestCase):
+    """The registration seam is split the same way the write seam is, and for the same reason.
+
+    The Driver installs and uninstalls a run's hooks in the interpreter it already runs the log
+    module in, so it needs the failure as an exception; a manual advisor runs the subcommand and
+    needs the same sentence on stderr behind an exit code.
+    """
+
+    def settings_path(self):
+        return pathlib.Path(self.work.name) / ".claude" / "settings.local.json"
+
+    def test_installing_returns_the_file_it_wrote_and_registers_the_hook(self):
+        path = self.settings_path()
+
+        written = machine_log.install_settings(str(self.log), str(path), "child", ticket="07")
+
+        self.assertEqual(written, path)
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        self.assertTrue(machine_log.message_blocks(settings))
+
+    def test_a_file_this_must_not_touch_raises_and_changes_nothing(self):
+        path = self.settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"hooks": ', encoding="utf-8")
+
+        with self.assertRaises(machine_log.SettingsError) as raised:
+            machine_log.install_settings(str(self.log), str(path), "child", ticket="07")
+
+        self.assertIn(str(path), str(raised.exception))
+        self.assertEqual(path.read_text(encoding="utf-8"), '{"hooks": ')
+
+        result = run_cli("install", "--settings", str(path), "--role", "child", "--ticket", "07",
+                         log=self.log)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.strip(), str(raised.exception))
+
+    def test_a_coordinator_install_with_no_run_directory_raises_the_same_sentence(self):
+        path = self.settings_path()
+
+        with self.assertRaises(machine_log.SettingsError) as raised:
+            machine_log.install_settings(str(self.log), str(path), "coordinator")
+
+        result = run_cli("install", "--settings", str(path), "--role", "coordinator", log=self.log)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.strip(), str(raised.exception))
+        self.assertFalse(path.exists(), "a refused install writes no settings file")
+
+    def test_uninstalling_answers_with_the_file_only_where_it_removed_something(self):
+        path = self.settings_path()
+
+        self.assertIsNone(machine_log.uninstall_settings(str(self.log), str(path)))
+
+        machine_log.install_settings(str(self.log), str(path), "child", ticket="07")
+
+        self.assertEqual(machine_log.uninstall_settings(str(self.log), str(path)), path)
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(machine_log.message_blocks(settings), [])
+        self.assertIsNone(
+            machine_log.uninstall_settings(str(self.log), str(path)),
+            "a file this run's hooks have already left is left exactly as it was found",
+        )
+
+
+class WrittenRecordShapeTests(MachineLogTestCase):
+    """What every appending subcommand puts on disk, byte for byte but for the stamp.
+
+    The log is the contract `docs/machine-log.md` publishes and a later auditing agent reads, so
+    the thing worth pinning is the line itself — its keys, their order, their types — not a
+    handful of fields read back through `json.loads`. These rows are what any second adapter onto
+    the same write seam has to reproduce exactly.
+    """
+
+    def raw_lines(self):
+        if not self.log.exists():
+            return []
+        text = self.log.read_text(encoding="utf-8")
+        self.assertTrue(text.endswith("\n"), "every record ends its own line")
+        return text[:-1].split("\n")
+
+    def written_line(self, argv):
+        """The one line `argv` appends, with its unpredictable stamp checked and then removed."""
+        before = len(self.raw_lines())
+        result = run_cli(*argv, log=self.log)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.raw_lines()
+        self.assertEqual(len(after), before + 1, "one call appends one line")
+        line = after[-1]
+        self.assertUniformTimestamp(json.loads(line))
+        stamp = json.loads(line)["ts"]
+        prefix = '{"ts": "%s", ' % stamp
+        self.assertTrue(line.startswith(prefix), line)
+        return "{" + line[len(prefix):]
+
+    def test_every_appending_subcommand_writes_its_published_line(self):
+        for description, argv, expected in WRITTEN_LINES:
+            with self.subTest(description):
+                self.log.unlink(missing_ok=True)
+                self.assertEqual(self.written_line(argv), expected)
+
+    def test_a_resume_writes_its_line_only_where_a_pause_is_open(self):
+        """The one appending subcommand whose line depends on what the log already holds."""
+        result = run_cli("resume", "--ticket", "07", log=self.log)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.log.exists(), "a resume with no pause open writes nothing")
+
+        self.log.write_text(
+            '{"ts": "2026-08-13T09:00:00Z", "event": "paused", "ticket": "07",'
+            ' "role": "child"}\n',
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            self.written_line(("resume", "--ticket", "07")),
+            '{"event": "resumed", "ticket": "07", "role": "child"}',
+        )
+
+
+class WriterFunctionParityTests(MachineLogTestCase):
+    """The second adapter onto the same write seam writes the same line as the first.
+
+    The Driver and its scripts import this module and call its writers in process; hooks and
+    children can only run a command and go on calling the CLI (ADR-0030). The two must be
+    indistinguishable in the file, so every row the CLI is pinned against above is replayed
+    through the writer the subcommand delegates to, with the values argparse read off that very
+    argv.
+    """
+
+    def parsed(self, argv):
+        """The writer one argv delegates to, and the fields it hands over."""
+        args = machine_log.build_parser().parse_args(["--log", str(self.log), *argv])
+        fields = {
+            name: value
+            for name, value in vars(args).items()
+            if name not in ("log", "event", "handler", "writer")
+        }
+        return args.writer, fields
+
+    def test_every_writer_writes_the_line_its_subcommand_writes(self):
+        for description, argv, expected in WRITTEN_LINES:
+            with self.subTest(description):
+                self.log.unlink(missing_ok=True)
+                writer, fields = self.parsed(argv)
+                self.assertIsNone(writer(self.log, **fields))
+                line = self.log.read_text(encoding="utf-8")[:-1]
+                entry = json.loads(line)
+                self.assertUniformTimestamp(entry)
+                prefix = '{"ts": "%s", ' % entry["ts"]
+                self.assertEqual("{" + line[len(prefix):], expected)
+
+    def test_a_writer_raises_where_the_subcommand_exits_two(self):
+        """A contradiction is the caller's own document being wrong, so it is an exception."""
+        contradictions = (
+            (
+                ("session-cost", "--ticket", "07", "--executor", "claude", "--model", "m",
+                 "--input-tokens", "1"),
+                "a session cost carries all of",
+            ),
+            (
+                ("session-cost", "--ticket", "07", "--executor", "claude", "--model", "m"),
+                "a session cost with no figures carries the diagnosis",
+            ),
+            (
+                ("base-gate", "--status", "passed"),
+                "a passed gate carries its argv",
+            ),
+            (
+                ("base-gate", "--status", "not-configured", "--argument=python3"),
+                "an unconfigured gate carries no argv",
+            ),
+            (
+                ("witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
+                 "--model", "m", "--outcome", "checked", "--reason", "why", "--brief", "b",
+                 "--duration-seconds", "1.0", "--covered-count", "1", "--uncovered-count", "0"),
+                "a checked witness carries an empty reason",
+            ),
+        )
+        for argv, expected in contradictions:
+            with self.subTest(argv[0], reason=expected):
+                writer, fields = self.parsed(argv)
+                with self.assertRaises(ValueError) as raised:
+                    writer(self.log, **fields)
+                self.assertIn(expected, str(raised.exception))
+                self.assertFalse(self.log.exists(), "a refused record writes nothing")
+
+                result = run_cli(*argv, log=self.log)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected, result.stderr)
+
+    def test_a_writer_raises_the_oserror_the_subcommand_exits_one_on(self):
+        """An unwritable log is the record failing around a document that stands."""
+        unwritable = pathlib.Path(self.work.name) / "occupied"
+        unwritable.mkdir()
+
+        with self.assertRaises(OSError) as raised:
+            machine_log.record_outcome(unwritable, ticket="07", outcome="completed")
+
+        self.assertIn(str(unwritable), str(raised.exception), "the path stays in the message")
+
+        result = run_cli("outcome", "--ticket", "07", "--outcome", "completed", log=unwritable)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(str(unwritable), result.stderr)
 
 
 class AppendOnlyTests(MachineLogTestCase):

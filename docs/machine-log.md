@@ -5,7 +5,22 @@ future auditing agent, not a human: it exists so a run can be reconstructed with
 memory, and so bookkeeping costs the coordinator zero turns
 ([ADR-0001](adr/0001-coordinator-spends-tokens-only-on-judgment.md)).
 
-The writer is [`skills/crew/assets/machine_log.py`](../skills/crew/assets/machine_log.py).
+The writer is [`skills/crew/assets/machine_log.py`](../skills/crew/assets/machine_log.py), and it
+is reached two ways over one seam
+([ADR-0030](adr/0030-the-machine-log-has-one-write-seam-with-two-adapters.md)):
+
+- **In process**, by the callers that import the module — the Driver, dispatch, advance, the merge
+  driver and the monitor. Each event has one writer function, `record_<event>`, whose keyword-only
+  parameters *are* that event's field table: a required field has no default, an optional one
+  defaults to `None` and is left out of the record rather than written empty. A function raises
+  `ValueError` where the values contradict each other and `OSError` where the log could not be
+  written.
+- **As a command**, by the callers that can only run one — a hook, a child, a shell script. Every
+  [subcommand below](#script-entry-points) parses its arguments and hands them to that event's
+  writer function, so the line it appends is byte for byte the line the function appends for the
+  same inputs.
+
+Which of the two a caller uses follows from what that caller can do, never from preference.
 
 ## Accepted Run projection design
 
@@ -530,6 +545,10 @@ record the hook did not write, and on one written by a session the harness expor
 reformatting, no summary. A structured message is recorded as the object it was.
 
 ## Script entry points
+
+Each of these subcommands is an adapter over the writer function of the same event, so this table
+is also the field table of the in-process seam: what is required here is a parameter with no
+default there, and the order the flags are listed in is the order the keys appear on the line.
 
 ```sh
 machine_log.py --log <path> launch  --ticket NN --child NAME --workflow W --executor E \

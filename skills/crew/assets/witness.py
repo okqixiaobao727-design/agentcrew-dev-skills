@@ -506,7 +506,7 @@ def record(document, log, ticket, operation, model):
             duration_seconds=document["duration_seconds"],
             covered_count=document.get("covered_count", 0),
             uncovered_count=document.get("uncovered_count", 0),
-            counters=usage_counters(document),
+            **(usage_counters(document) or {}),
         )
     except (OSError, ValueError, KeyError, TypeError) as error:
         document["record_error"] = f"the witness event was not recorded: {error}"

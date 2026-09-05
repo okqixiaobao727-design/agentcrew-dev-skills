@@ -395,6 +395,36 @@ class ClearTests(unittest.TestCase):
         self.assertIn("not a readable Git worktree", result.stderr)
         self.assertTrue(marker.exists())
 
+    def test_a_run_missing_its_durable_writer_is_refused_before_anything_is_removed(self):
+        """The refusal is a precondition, not an afterthought: nothing is half cleared by it.
+
+        The copy beside the log is what the run installed its hooks with, so a run without one is
+        a run this inventory cannot vouch for. The check used to sit just before the uninstall,
+        where it ran that copy as a command; the uninstall is a call now (ADR-0030), and a refusal
+        landing there would have left the worktrees and branches gone with the hooks still
+        registered and nothing left to inventory on a second attempt.
+        """
+        (self.run_dir / "machine_log.py").unlink()
+        before_branches = git(
+            self.fixture.repo, "branch", "--format=%(refname:short)"
+        ).stdout
+        before_worktrees = git(self.fixture.repo, "worktree", "list", "--porcelain").stdout
+        before_settings = (self.fixture.repo / ".claude" / "settings.local.json").read_bytes()
+
+        result = self.run_clear("y")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("no durable machine log", result.stderr)
+        self.assertEqual(
+            git(self.fixture.repo, "branch", "--format=%(refname:short)").stdout, before_branches
+        )
+        self.assertEqual(
+            git(self.fixture.repo, "worktree", "list", "--porcelain").stdout, before_worktrees
+        )
+        self.assertEqual(
+            (self.fixture.repo / ".claude" / "settings.local.json").read_bytes(), before_settings
+        )
+
     def test_confirmation_tolerates_a_tmux_server_already_gone(self):
         (self.fixture.stub_dir / "tmux-server-gone").write_text("yes\n")
 
