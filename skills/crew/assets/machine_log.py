@@ -1352,7 +1352,7 @@ def read_settings(path):
 
 
 class SettingsError(Exception):
-    """A settings file cannot carry this run's hooks, and nothing in it was changed.
+    """A settings file cannot carry this run's hooks, and that file was not changed.
 
     Carries the line the command line prints on stderr, so the registration seam has two adapters
     for the same reason the write seam does (ADR-0030): the Driver installs a child's hooks in
@@ -1381,8 +1381,12 @@ def install_settings(log, settings, role, ticket=None, hook_script=None, scope=N
     log writer is the one a resumed run's hooks go on running. A caller that keeps its own copy
     names it with `hook_script` and that path is registered as it was given.
 
-    Raises SettingsError for a file this must not touch and for one it could not write; nothing on
-    disk is changed in either case.
+    Raises SettingsError for a settings file this must not touch and for one it could not write.
+    The settings file itself is never half written — it is read whole, amended in memory and
+    replaced — but the run's own script copies are not covered by that: `materialise_script` has
+    already refreshed them by the time a coordinator install refuses for a missing crew directory,
+    so that refusal leaves those copies behind. They are the same bytes the next install writes,
+    which is why the refusal is safe to retry rather than something to unwind.
     """
     if role == COORDINATOR and run_dir is None:
         raise SettingsError("machine log: coordinator install requires --run-dir")
