@@ -8,6 +8,24 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- The Machine log has one write seam, and the CLI is one of two adapters over it (ADR-0030). Every
+  writer in the same process tree as the module used to append by starting `machine_log.py <event>
+  …`: about 40ms of interpreter start for a write whose `append(entry(...))` costs 0.025ms. The
+  module now offers one in-process writer per event, and a writer's signature is that event's field
+  table — a required field is a parameter with no default, an optional one defaults to None and is
+  left off the line rather than written empty, and the parameter order is the order the keys appear
+  in. A writer raises `ValueError` where the values contradict each other and `OSError` where the
+  log could not be written. The Driver, dispatch, advance, the merge driver and the monitor call the
+  functions; the CLI remains for the callers that can only run a command — the receipt command typed
+  into a child, the hook, guard, pause and resume commands registered in settings, the lifecycle
+  hooks the dispatch renderer hands Review-Switch, `monitor-wave.sh` and `codex_bridge.py` — with
+  all 26 of its subcommand rows pinned byte for byte and its exit codes unchanged. The settings
+  seam splits the same way: `install_settings`/`uninstall_settings` raise `SettingsError` and
+  `run_install`/`run_uninstall` catch it, print and return an exit code, so `driver.py clear`
+  uninstalls in process while settings-mutation stderr stays off the Driver's captured channel. The
+  driver shard went from 329 tests in 154.9s to 329 in 115.6s. One error detail changed with it: a
+  write failure now reads `…could not be recorded: [Errno 21] Is a directory: '/path'`, without the
+  `machine log: /path:` prefix that only named an executable which no longer runs (#198).
 - Each test fixture puts its stub commands on `PATH` as the stub's own source under a `#!` naming
   the interpreter the tests run under, where it used to write a `/bin/sh` script that `exec`ed
   that interpreter. Every stub call started two processes where one would do, and a heavy driver
@@ -38,6 +56,19 @@ and this project uses [Semantic Versioning](https://semver.org/).
   non-interactive shell inherits, and which stops Python from installing a `KeyboardInterrupt`
   handler at all — passed the test twenty seconds later without the driver ever receiving the
   signal (#192).
+- `driver.py clear` refuses a run whose durable `machine_log.py` copy is gone before it removes
+  anything, where the check used to sit after the destructive steps. Such a run had its windows
+  killed, its worktrees and branches removed and its Codex state deleted and only then hit the
+  refusal — hooks still registered, no inventory left for a second attempt, and the refusal firing
+  again on every retry. The check keeps its condition and its message and moves to the front of
+  `clear_actions`, where it is a precondition. This is the one disclosed departure from the frozen
+  behaviour #198 otherwise held to (#198).
+- `install_settings` no longer documents more than it does. Its docstring claimed "nothing on disk
+  is changed in either case", but the coordinator refusal that names a missing crew directory is
+  raised after `materialise_script` has already refreshed the run's own `machine_log.py`, the
+  coordinator control script and the bounded script. The behaviour is pre-existing and correct —
+  those copies are the same bytes the next install writes, which is what makes the refusal safe to
+  retry — so only the claim changed, in it and in `SettingsError`'s own docstring (#198).
 
 ## [0.9.19] - 2026-09-05
 
