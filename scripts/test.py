@@ -24,7 +24,13 @@ A machine may hand the run to a command of its own: a `[test] runner` in `agentc
 the uncommitted `agentcrew.local.toml` laid over it (ADR-0029), is started with this script's
 arguments verbatim and its exit status is this script's. Every caller keeps naming this script —
 the gate, CI, the agent following AGENTS.md — and the machine decides what runs it. The runner
-gets back here with `--no-delegate`, which runs the suites where it is invoked.
+gets back here with `--no-delegate`, which runs the suites where it is invoked; a local runner
+that forgets it is stopped after one hand-over rather than left to fork forever.
+
+The overlay is read from the repository's *main* working tree rather than from beside the
+checkout under test, because it is a fact about the machine and untracked: the worktrees a Crew
+run gates its base in and works its tickets in never receive it from `git worktree add`, and it
+is precisely those runs that a machine configures a runner for.
 """
 
 import argparse
@@ -49,7 +55,9 @@ ROOT_REQUIREMENT = "aiohttp"
 TEST_REQUIREMENTS_FILE = "requirements-test.txt"
 CONFIG_NAME = "agentcrew.toml"
 LOCAL_CONFIG_NAME = "agentcrew.local.toml"
-RUNNER_KEYS = ("test", "runner")
+TEST_SECTION = "test"
+RUNNER_KEY = "runner"
+DELEGATED_ENV = "AGENTCREW_TEST_DELEGATED"
 
 
 def suites(root):
@@ -272,40 +280,90 @@ def merged_config(base, overlay):
     return merged
 
 
+def overlay_root(root):
+    """The working tree this machine's overlay sits in: for a worktree, the repository's main one.
+
+    `agentcrew.local.toml` states a fact about the *machine*, and it is untracked — so `git
+    worktree add` never carries it into the worktree a Crew run gates its base in, or the one a
+    child works its ticket in. Read from beside the checkout, this machine's runner would reach
+    the run started at the repository root and none of the runs that matter. Read from the
+    repository's main working tree, it is one file per clone that every checkout of that clone on
+    this machine sees (ADR-0029).
+
+    A directory git knows nothing about — a throwaway tree, an unpacked release — keeps its own.
+    """
+    try:
+        found = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return root
+    if not found:
+        return root
+    # Relative in the main working tree, absolute in a linked one; the tree is its parent either
+    # way. `.git` beside the checkout is what makes the main tree resolve back to itself.
+    common = pathlib.Path(found)
+    return (common if common.is_absolute() else root / common).parent
+
+
 def configured_runner(root):
     """The `[test] runner` argv this machine hands the run to, or None where none is configured.
 
     Read the way the Driver reads every other project decision: the committed `agentcrew.toml`
-    with the machine's `agentcrew.local.toml` merged over it. Raises ValueError for a document
-    that cannot be read or a runner that is not a non-empty list of non-empty strings — a runner
-    half-configured must stop the run, not silently run the suites here instead.
+    with the machine's `agentcrew.local.toml` merged over it. The committed file is read from the
+    tree under test, because it is that tree's own content and moves with its branch; the overlay
+    from `overlay_root`, because it is the machine's and one worktree of a repository must not
+    have to be told what another already knows.
+
+    Raises ValueError for a document that cannot be read, a `[test]` that is not a table, or a
+    runner that is not a non-empty list of non-empty strings — a runner half-configured must stop
+    the run, not silently run the suites here instead.
     """
     config = merged_config(
-        config_document(root / CONFIG_NAME), config_document(root / LOCAL_CONFIG_NAME)
+        config_document(root / CONFIG_NAME),
+        config_document(overlay_root(root) / LOCAL_CONFIG_NAME),
     )
-    section = config
-    for key in RUNNER_KEYS:
-        section = section.get(key) if isinstance(section, dict) else None
+    section = config.get(TEST_SECTION)
     if section is None:
         return None
+    if not isinstance(section, dict):
+        # Not read past: `test = "..."` is a machine asking for its runner in a shape this script
+        # cannot honour, and running the suites here is the one answer the key exists to prevent.
+        raise ValueError(
+            f"[{TEST_SECTION}] is not a table — write the runner as a `[{TEST_SECTION}]` section"
+            f" with a `{RUNNER_KEY}` argv list under it, or remove the key to run the suites here"
+        )
+    runner = section.get(RUNNER_KEY)
+    if runner is None:
+        return None
     if (
-        not isinstance(section, list)
-        or not section
-        or any(not isinstance(item, str) or not item.strip() for item in section)
+        not isinstance(runner, list)
+        or not runner
+        or any(not isinstance(item, str) or not item.strip() for item in runner)
     ):
         raise ValueError(
             "[test] runner is not a non-empty list of non-empty strings — configure each command"
             " argument as one string, or remove the key to run the suites here"
         )
-    return list(section)
+    return list(runner)
 
 
 def delegate(runner, root, argv):
-    """Start the configured runner with this script's arguments; return its exit status."""
+    """Start the configured runner with this script's arguments; return its exit status.
+
+    The runner is marked as having been handed the run, in its environment, so that a runner that
+    comes back to this script without `--no-delegate` runs the suites rather than handing them
+    over again — see `main`. The mark travels as far as the runner's own environment does, which
+    is the local process tree; a runner that crosses to another machine takes `--no-delegate`
+    with it, exactly as ADR-0029 says, because nothing else can travel that far.
+    """
     rendered = shlex.join(runner)
     report(f"handing the run to `{rendered}` ([test] runner); --no-delegate runs it here")
     try:
-        return subprocess.run([*runner, *argv], cwd=str(root)).returncode
+        return subprocess.run(
+            [*runner, *argv], cwd=str(root), env={**os.environ, DELEGATED_ENV: "1"}
+        ).returncode
     except OSError as error:
         return die(f"[test] runner `{rendered}` could not be started — {error}")
 
@@ -352,7 +410,17 @@ def main(argv=None):
         return die(f"--jobs takes a positive number of worker processes, not {args.jobs}")
 
     root = args.root.resolve()
-    if not args.no_delegate:
+    if args.no_delegate:
+        pass
+    elif os.environ.get(DELEGATED_ENV):
+        # The runner came back here without saying so. Handing the run over again would hand it to
+        # the same command forever, so this is where the hand-over stops: the run is already the
+        # runner's own, and running the suites here is running them where it put them.
+        report(
+            f"the [test] runner came back without --no-delegate ({DELEGATED_ENV} is set);"
+            " running the suites here rather than handing them over again"
+        )
+    else:
         try:
             runner = configured_runner(root)
         except ValueError as error:

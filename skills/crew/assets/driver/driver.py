@@ -4274,7 +4274,9 @@ def queued_ticket_routing(loop, args):
     try:
         return run_plan.queued_routing(cell)
     except run_plan.RunPlanError as error:
-        raise DriverError(str(error), pointer=str(loop.repo_root / CONFIG_NAME)) from error
+        raise DriverError(
+            str(error), pointer=str(run_plan.config_source(loop.repo_root, QUEUED_CELL))
+        ) from error
 
 
 def queued_binding(loop, name):
@@ -4287,7 +4289,7 @@ def queued_binding(loop, name):
     if not name:
         return accounts.inherited(loop.run.coordinator_config_home)
     declared = loop.run.declared_accounts
-    config = pathlib.Path(loop.run.repo_root) / CONFIG_NAME
+    config = run_plan.config_source(loop.run.repo_root, ACCOUNT_NAMES_KEYS)
     if declared and name not in declared:
         raise DriverError(
             f"the account `{name}` is not declared by {config} — it declares"

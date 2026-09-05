@@ -51,3 +51,47 @@ the merge order and the two refusals against a throwaway tree. Readers that take
 *file's path* rather than the Driver's merged document — the dashboard's `--config` — still see
 the committed file alone; each of them is a one-line change to route through `project_config`
 when a machine-level fact first needs to reach it.
+
+## Amendment: the overlay is read from the repository's main working tree
+
+The decision above put the machine's file "beside `agentcrew.toml`" and left it there. That
+sentence is unambiguous at a repository root and silent about the place this key was written for.
+A Crew run gates its base in a fresh worktree and works every ticket in another, and `git worktree
+add` checks out tracked files: an untracked overlay is never in one. So a machine that configured
+`[test] runner` had it honoured by the run it typed at the repository root, and by neither the
+`[preflight] gate` nor any child — the runs the key exists for. What those runs got instead was
+the local suites, silently, which is the outcome this ADR already refuses in its own words.
+
+**`scripts/test.py` resolves the overlay against the repository's main working tree** — `git
+rev-parse --git-common-dir`, whose parent is that tree, and which resolves back to the checkout
+itself when the checkout *is* the main tree. The committed `agentcrew.toml` is still read from the
+tree under test, because it is that tree's own content and moves with its branch; only the
+untracked overlay walks, because it is a fact about the machine and the machine has one of it. A
+directory git knows nothing about keeps its own, so a throwaway tree or an unpacked release is
+unchanged. Copying the overlay into each worktree was the alternative and is not taken: it needs
+every creation site to remember, it goes stale against the file it was copied from, and a worktree
+a person makes by hand still misses it.
+
+Three refusals are sharpened with it, each an instance of the same rule this ADR states:
+
+- **`[test]` that is not a table** — `test = "..."` rather than a `[test]` section — was read
+  past, and became a silent local run. It is now an error, on the rule that a machine which asked
+  for its runner must not quietly get the suites here instead.
+- **A local runner that comes back without `--no-delegate`** delegated again, forever. The
+  hand-over now marks the runner's environment, and a second pass with that mark runs the suites
+  and says why. The mark travels as far as a process environment does; a runner that crosses to
+  another machine still carries `--no-delegate` itself, because nothing else can travel that far.
+- **`[test]` was not a section the config validator knew**, so the one command an adopting project
+  is told to run against its own config — `validate_plugin_tree.py --config agentcrew.toml` —
+  refused the key on the file `scripts/test.py` reads it from. The validator now knows the
+  section and checks `runner` on the same argv rule it checks `[preflight] gate` on.
+
+The consequence about readers that take a config *file's path* stands and gains a second entry
+alongside the dashboard's `--config`: a message that names `agentcrew.toml` for a value merged out
+of the overlay names a file that does not contain it. `run_plan.config_source` resolves the two
+files apart again — on the error path only, where a second parse costs nothing — and a refusal
+that names a file names the one that carries the line: the `[queued]` cell, the `[accounts]`
+list a ticket's account is missing from, and the repair model, witness cell and tracker of
+`configuration_problems`. Each key is resolved for itself, because one key's file says nothing
+about its neighbour's, and a value that is *missing* rather than overridden names the committed
+file, which is where a project has to add one.

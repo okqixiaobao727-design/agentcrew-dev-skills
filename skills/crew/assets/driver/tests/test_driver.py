@@ -1076,6 +1076,23 @@ class AccountTests(DriverTestCase):
         self.assertIn("second", notice)
         self.assertIn(str(self.fixture.registry), notice)
 
+    def test_an_account_list_the_overlay_carries_is_named_against_the_overlay(self):
+        """The file named is the one to open: the run's config is two files merged (ADR-0029)."""
+        self.fixture.register(second=self.fixture.profile("second"))
+        self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
+        self.fixture.commit_feature()
+        # The committed config the fixture already carries declares no accounts at all; the
+        # machine's overlay is what declares this run's, and so what has to be named.
+        (self.fixture.repo / "agentcrew.local.toml").write_text(
+            '[accounts]\nnames = ["first"]\n', encoding="utf-8"
+        )
+
+        result = self.fixture.start()
+
+        notice = self.assert_preflight_failed(result, 1)
+        self.assertIn("second", notice)
+        self.assertIn("agentcrew.local.toml", notice)
+
     def test_an_account_the_config_never_declared_is_told_apart_from_an_unregistered_one(self):
         self.fixture.register(second=self.fixture.profile("second"))
         self.fixture.ticket("01", "first thing", routing=routing_naming("second"))
@@ -4674,7 +4691,34 @@ class QueueTests(DriverTestCase):
         snapshot = self.snapshot(result)
         self.assertEqual(snapshot["reason"], "driver-error")
         self.assertIn("is not a table of routing fields", snapshot["detail"])
+        self.assertEqual(snapshot["pointer"], str(config))
         self.assertEqual(self.creates(), [])
+
+    def test_a_queued_cell_the_overlay_broke_points_at_the_overlay(self):
+        """The pointer opens the file that carries the bad line, not the one it was merged into."""
+        self.start()
+        overlay = self.fixture.repo / "agentcrew.local.toml"
+        overlay.write_text('queued = "tdd"\n', encoding="utf-8")
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(result)["pointer"], str(overlay))
+
+    def test_a_queued_cell_the_committed_file_broke_points_past_an_innocent_overlay(self):
+        self.start()
+        config = self.fixture.repo / "agentcrew.toml"
+        config.write_text(
+            'queued = "tdd"\n' + config.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (self.fixture.repo / "agentcrew.local.toml").write_text(
+            '[repair]\nnote = "this machine"\n', encoding="utf-8"
+        )
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(result)["pointer"], str(config))
 
     def test_a_queued_ticket_naming_no_account_inherits_the_coordinators_own(self):
         self.start()

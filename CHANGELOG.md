@@ -93,6 +93,27 @@ and this project uses [Semantic Versioning](https://semver.org/).
   pending produces exactly the trailing Wave it did before (#193).
 
 ### Fixed
+- The four seams ADR-0029 left open, found reviewing the commit that landed it. `[test]` was not a
+  section the config validator knew, so `python3 scripts/validate_plugin_tree.py --config
+  agentcrew.toml` — the command the README and the setup reference tell an adopting project to
+  run — exited 1 on the very key the test runner's own suite asserts a committed file may carry;
+  the validator now accepts the section and checks its `runner` on the same argv rule the base gate
+  is checked on. The machine's overlay is read from the repository's *main* working tree rather
+  than from beside the checkout under test, because `git worktree add` carries tracked files only:
+  a runner configured on a machine reached a run started at the repository root and neither the
+  base gate, which runs in the fresh Crew worktree, nor any child, which runs in its ticket's —
+  which is to say it reached none of the runs it is configured for. A `[test]` that is not a table
+  is now refused rather than read past into a silent local run, the outcome the key exists to
+  prevent. And a runner that comes back to `scripts/test.py` without `--no-delegate` is handed the
+  run once and then runs the suites, where before it was handed the run forever.
+- A message about a bad config value names the file that carries the line rather than the file it
+  was merged into. The Driver reads one document merged from `agentcrew.toml` and the machine's
+  `agentcrew.local.toml` (ADR-0029), and pointed every complaint at the committed file — so an
+  overlay that broke the `[queued]` cell, declared the `[accounts]` list a ticket's account is
+  missing from, or set the repair model, a `[witness]` field or the tracker, sent its reader to a
+  file that does not contain the value. The two files are read apart again on the error path, and
+  the one that sets the offending key is the one named; a key neither file sets is still named
+  against the committed file, which is where a project has to add it.
 - A worktree's live reading is taken from its status-bearing sessions alone, so a headless session
   the run puts in a ticket's worktree is no longer read as a second implementer. The Witness the
   coordinator runs on an escalation and the Claude Reviewer `review-bridge` starts both run with

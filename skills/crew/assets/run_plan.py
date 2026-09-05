@@ -22,6 +22,17 @@ BLOCKED_BY_SECTION = "blocked by"
 TEMPLATES = pathlib.Path(__file__).resolve().parent / "dispatch" / "templates" / "shapes.toml"
 DEFAULT_CONFIG = pathlib.Path(__file__).resolve().parents[3] / "config" / "agentcrew.default.toml"
 PROJECT_CONFIG_NAME = "agentcrew.toml"
+# The machine's own overlay on that file (ADR-0029). Read here for one purpose only: to say which
+# of the two files a value a run was refused for was written in.
+LOCAL_CONFIG_NAME = "agentcrew.local.toml"
+# The paths into that merged document whose values a run is refused for by name, so that the
+# refusal can name the file the value was written in rather than the one it was merged into.
+ACCOUNT_NAMES_KEYS = ("accounts", "names")
+REPAIR_MODEL_KEYS = ("repair", "model")
+WITNESS_MODEL_KEYS = ("witness", "model")
+WITNESS_BUDGET_KEYS = ("witness", "budget_usd")
+WITNESS_TIMEOUT_KEYS = ("witness", "timeout_seconds")
+TRACKER_KIND_KEYS = ("tracker", "kind")
 CREW_STATE_DIR_NAME = ".crew"
 EXECUTORS = ("claude", "codex")
 # The witness launcher is the Claude CLI; exposing that here makes its complete route available to
@@ -804,16 +815,47 @@ def queued_routing(project_cell):
     return QueuedRouting(review=review, **resolved)
 
 
+def config_source(repo_root, keys):
+    """The file to open at a bad value that path of keys reached: the machine's overlay where it
+    sets that path at all, else the project's committed config.
+
+    Naming a file in a message is an offer to open it at the line that is wrong. What a run is
+    built from is one document merged from two files (ADR-0029), which has forgotten which of them
+    each key came from, so the overlay is read apart again here — on an error path only, where a
+    second parse costs nothing. Where it sets nothing at that path the committed file is named,
+    which is also the answer for a value that is missing rather than wrong: that is the file a
+    project adds one to.
+    """
+    repo = pathlib.Path(repo_root)
+    overlay = repo / LOCAL_CONFIG_NAME
+    try:
+        document = tomllib.loads(overlay.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        # An overlay that cannot be parsed stops the run by its own name long before this; what
+        # reaches here is an overlay that is simply not there.
+        return repo / PROJECT_CONFIG_NAME
+    section = document
+    for key in keys:
+        section = section.get(key) if isinstance(section, dict) else None
+    return repo / PROJECT_CONFIG_NAME if section is None else overlay
+
+
 def configuration_problems(
     repo_root, repair_model, witness_model, witness_budget_usd, witness_timeout_seconds, tracker
 ):
-    """Problems in the configured run decisions, in the Run plan's vocabulary."""
-    config = pathlib.Path(repo_root) / PROJECT_CONFIG_NAME
+    """Problems in the configured run decisions, in the Run plan's vocabulary.
+
+    Each message names the file its own value was written in — the machine's overlay where that is
+    where it came from, the committed file otherwise, which is also where a value that is missing
+    has to be added. One key's file says nothing about its neighbour's, so each is resolved for
+    itself rather than once for the whole document (ADR-0029).
+    """
     problems = []
     if not isinstance(repair_model, str) or not repair_model.strip():
         problems.append(
-            f"repair model: {config} names no [repair] model — the merge ladder's repair rung"
-            " has no model to run on, and it takes a full model ID, never an alias"
+            f"repair model: {config_source(repo_root, REPAIR_MODEL_KEYS)} names no [repair]"
+            " model — the merge ladder's repair rung has no model to run on, and it takes a full"
+            " model ID, never an alias"
         )
     else:
         fault = model_problem("`[repair] model`", repair_model)
@@ -828,8 +870,9 @@ def configuration_problems(
     else:
         if not isinstance(witness_model, str) or not witness_model.strip():
             problems.append(
-                f"witness model: {config} and the shipped defaults name no [witness] model —"
-                " fact-checking an escalation takes a full model ID, never an alias"
+                f"witness model: {config_source(repo_root, WITNESS_MODEL_KEYS)} and the shipped"
+                " defaults name no [witness] model — fact-checking an escalation takes a full"
+                " model ID, never an alias"
             )
         else:
             fault = model_problem("`[witness] model`", witness_model)
@@ -841,19 +884,20 @@ def configuration_problems(
             or witness_budget_usd <= 0
         ):
             problems.append(
-                f"witness budget: {config} and the shipped defaults do not name a positive"
-                " [witness] budget_usd"
+                f"witness budget: {config_source(repo_root, WITNESS_BUDGET_KEYS)} and the shipped"
+                " defaults do not name a positive [witness] budget_usd"
             )
         fault = witness_timeout_problem(
-            f"{config} and the shipped defaults' `[witness] timeout_seconds`",
+            f"{config_source(repo_root, WITNESS_TIMEOUT_KEYS)} and the shipped defaults'"
+            " `[witness] timeout_seconds`",
             witness_timeout_seconds,
         )
         if fault:
             problems.append(f"witness timeout: {fault}")
     if not isinstance(tracker, str) or not tracker.strip():
         problems.append(
-            f"tracker: {config} names no [tracker] kind — a merged ticket has nowhere to be"
-            f" closed; it is one of {', '.join(TRACKERS)}"
+            f"tracker: {config_source(repo_root, TRACKER_KIND_KEYS)} names no [tracker] kind — a"
+            f" merged ticket has nowhere to be closed; it is one of {', '.join(TRACKERS)}"
         )
     elif tracker not in TRACKERS:
         problems.append(
@@ -1225,7 +1269,7 @@ def _read_tickets(feature_dir, run):
             if run.declared_accounts and account_name not in run.declared_accounts:
                 problems.append(
                     f"{identifier} {path}: names the account `{account_name}`, which the run"
-                    f" config {pathlib.Path(run.repo_root) / PROJECT_CONFIG_NAME} does not"
+                    f" config {config_source(run.repo_root, ACCOUNT_NAMES_KEYS)} does not"
                     f" declare — it declares {', '.join(run.declared_accounts)}"
                 )
                 continue

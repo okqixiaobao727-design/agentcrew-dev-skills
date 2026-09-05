@@ -1138,6 +1138,66 @@ class RunPlanTests(unittest.TestCase):
             run_plan.queued_routing("tdd")
 
 
+class ConfigSourceTests(unittest.TestCase):
+    """Which of the two config files a refusal names, now that a run reads them merged (ADR-0029).
+
+    The value itself is passed in, exactly as the Driver resolves it out of the merged document;
+    what is under test is only which file the reader is sent to open.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = pathlib.Path(self._tmp.name)
+        self.committed = self.repo / "agentcrew.toml"
+        self.overlay = self.repo / "agentcrew.local.toml"
+
+    def test_the_committed_file_is_named_where_there_is_no_overlay(self):
+        self.assertEqual(
+            run_plan.config_source(self.repo, run_plan.REPAIR_MODEL_KEYS), self.committed
+        )
+
+    def test_the_committed_file_is_named_where_the_overlay_sets_another_key(self):
+        self.overlay.write_text('[tracker]\nkind = "local"\n', encoding="utf-8")
+
+        self.assertEqual(
+            run_plan.config_source(self.repo, run_plan.REPAIR_MODEL_KEYS), self.committed
+        )
+
+    def test_the_overlay_is_named_where_it_is_the_file_that_sets_the_key(self):
+        self.overlay.write_text('[repair]\nmodel = "opus"\n', encoding="utf-8")
+
+        self.assertEqual(
+            run_plan.config_source(self.repo, run_plan.REPAIR_MODEL_KEYS), self.overlay
+        )
+
+    def test_an_unreadable_overlay_names_the_committed_file_rather_than_raising(self):
+        """The unparsable overlay stops the run by its own name elsewhere; this is a message."""
+        self.overlay.write_text("[repair\n", encoding="utf-8")
+
+        self.assertEqual(
+            run_plan.config_source(self.repo, run_plan.REPAIR_MODEL_KEYS), self.committed
+        )
+
+    def test_a_configuration_problem_names_the_file_its_own_value_was_written_in(self):
+        """One key's file says nothing about its neighbour's: the overlay set only the timeout."""
+        self.overlay.write_text("[witness]\ntimeout_seconds = 9999\n", encoding="utf-8")
+
+        problems = run_plan.configuration_problems(
+            self.repo, None, WITNESS_MODEL, WITNESS_BUDGET_USD, 9999, None
+        )
+
+        timeout = next(problem for problem in problems if problem.startswith("witness timeout:"))
+        self.assertIn(str(self.overlay), timeout)
+        # The repair model and the tracker are missing rather than overridden, and a value that is
+        # missing is added to the project's own file.
+        for prefix in ("repair model:", "tracker:"):
+            with self.subTest(problem=prefix):
+                problem = next(one for one in problems if one.startswith(prefix))
+                self.assertIn(str(self.committed), problem)
+                self.assertNotIn(str(self.overlay), problem)
+
+
 class RunPlanSourceGuardTests(unittest.TestCase):
     """Keep Wave-table structure and duplicated queries out of migrated production callers."""
 

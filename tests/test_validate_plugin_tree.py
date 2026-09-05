@@ -804,6 +804,33 @@ class ProjectConfigTests(unittest.TestCase):
     def test_an_unknown_preflight_field_is_rejected(self):
         self.assert_rejects_with_required('[preflight]\ntimeout = 900\n', "timeout")
 
+    def test_a_project_can_commit_the_test_runner_its_machines_hand_the_run_to(self):
+        """`scripts/test.py` honours a committed `[test] runner`, so this file may carry one.
+
+        Its home is the machine's own uncommitted overlay (ADR-0029), which this validator is
+        never pointed at — but a section refused here is a section no project can commit, and the
+        runner's own suite asserts that a committed one is obeyed.
+        """
+        self.assert_accepts_with_required(
+            '[test]\nrunner = ["ssh", "builder", "python3", "scripts/test.py", "--no-delegate"]\n'
+        )
+
+    def test_a_test_runner_string_is_rejected_in_favour_of_argv(self):
+        self.assert_rejects_with_required(
+            '[test]\nrunner = "ssh builder python3 scripts/test.py"\n', "argv"
+        )
+
+    def test_an_empty_or_blank_test_runner_argv_is_rejected(self):
+        for command in ('[]', '["python3", ""]', '["   "]'):
+            with self.subTest(runner=command):
+                self.assert_rejects_with_required(f"[test]\nrunner = {command}\n", "non-empty")
+
+    def test_a_test_section_that_is_not_a_table_is_rejected(self):
+        self.assert_rejects_with_required('test = "python3 scripts/test.py"\n', "table")
+
+    def test_an_unknown_test_field_is_rejected(self):
+        self.assert_rejects_with_required('[test]\njobs = 4\n', "jobs")
+
     def test_a_project_choosing_another_surface_is_accepted(self):
         self.assert_accepts_with_required('[dashboard]\nsurface = "both"\n')
 

@@ -161,9 +161,12 @@ class TreeFixture:
 
     def __init__(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self._worktrees = []
         self.root = pathlib.Path(self._tmp.name)
 
     def close(self):
+        for holder in self._worktrees:
+            holder.cleanup()
         self._tmp.cleanup()
 
     def suite(self, relative, **modules):
@@ -173,11 +176,49 @@ class TreeFixture:
         for name, body in modules.items():
             (directory / f"{name}.py").write_text(body)
 
-    def run(self, *args):
+    def git(self, *args):
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--root", str(self.root), *args],
+            ["git", "-C", str(self.root), *args], capture_output=True, text=True, check=True
+        )
+
+    def commit(self):
+        """Make this tree a git repository with everything currently in it committed."""
+        self.git("init", "-b", "main")
+        self.git("config", "user.email", "crew@example.invalid")
+        self.git("config", "user.name", "Crew Test")
+        self.git("add", "-A")
+        self.git("commit", "-m", "base")
+
+    def worktree(self):
+        """A linked worktree of this tree, exactly as `git worktree add` leaves one.
+
+        Held in a directory of its own rather than under the tree, so that what it does and does
+        not carry is the only thing the test is looking at: tracked files are checked out into it,
+        and an untracked overlay beside the main checkout is not.
+        """
+        holder = tempfile.TemporaryDirectory()
+        self._worktrees.append(holder)
+        path = pathlib.Path(holder.name) / "worktree"
+        self.git("worktree", "add", "-b", "worktree", str(path))
+        return path
+
+    def environment(self):
+        """This process's environment with the hand-over mark removed.
+
+        The suite has to observe delegation the same way whether or not the gate that is running
+        it was itself handed over by a `[test] runner`, which is what leaves that mark set.
+        """
+        return {name: value for name, value in os.environ.items() if name != runner.DELEGATED_ENV}
+
+    def run(self, *args):
+        return self.run_in(self.root, *args)
+
+    def run_in(self, root, *args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--root", str(root), *args],
             capture_output=True,
             text=True,
+            env=self.environment(),
         )
 
     def run_without_site_packages(self, *args):
@@ -185,6 +226,7 @@ class TreeFixture:
             [sys.executable, "-S", str(SCRIPT), "--root", str(self.root), *args],
             capture_output=True,
             text=True,
+            env=self.environment(),
         )
 
 
@@ -388,6 +430,56 @@ class ConfiguredRunnerTests(unittest.TestCase):
         run = self.tree.run()
 
         self.assertEqual(run.returncode, 3, run.stderr)
+
+    def test_the_overlay_reaches_a_worktree_from_the_repositorys_main_tree(self):
+        """The gate a Crew run runs in a fresh worktree is the run this key exists for (ADR-0029).
+
+        `git worktree add` carries tracked files only, so an overlay read from beside the checkout
+        would reach the run started at the repository root and none of the runs that matter.
+        """
+        self.tree.commit()
+        self.configure("agentcrew.local.toml", self.stub("runner"))
+        worktree = self.tree.worktree()
+        self.assertFalse((worktree / "agentcrew.local.toml").exists())
+
+        run = self.tree.run_in(worktree, "--jobs", "1")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(pathlib.Path(calls[0]["cwd"]).resolve(), worktree.resolve())
+        self.assertEqual(calls[0]["argv"], ["--root", str(worktree), "--jobs", "1"])
+        self.assertNotIn("root: 1 tests in", run.stderr)
+
+    def test_a_tree_git_knows_nothing_about_keeps_its_own_overlay(self):
+        """The lookup walks to a repository's main tree, and stops where there is no repository."""
+        self.configure("agentcrew.local.toml", self.stub("runner"))
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_runner_that_comes_back_without_no_delegate_hands_over_only_once(self):
+        """A runner that is this script again would otherwise hand the run on forever."""
+        self.configure("agentcrew.local.toml", [sys.executable, str(SCRIPT)])
+
+        run = self.tree.run("--jobs", "1")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stderr.count("handing the run to"), 1)
+        self.assertIn("came back without --no-delegate", run.stderr)
+        self.assertIn("total: 2 tests in", run.stderr)
+
+    def test_a_test_section_that_is_not_a_table_is_refused_rather_than_run(self):
+        """A machine quietly getting the local suites is the outcome the key exists to prevent."""
+        (self.tree.root / "agentcrew.local.toml").write_text('test = "runner"\n')
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("[test] is not a table", run.stderr)
+        self.assertNotIn("total:", run.stderr)
 
     def test_a_runner_that_is_not_an_argv_list_is_refused_rather_than_run(self):
         (self.tree.root / "agentcrew.local.toml").write_text('[test]\nrunner = "runner"\n')

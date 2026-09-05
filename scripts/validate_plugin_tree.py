@@ -142,6 +142,11 @@ ACCOUNT_NAMES = "names"
 # The optional project-owned command that checks the integration base before a run is cut.
 PREFLIGHT = "preflight"
 PREFLIGHT_GATE = "gate"
+# The optional command a machine hands the whole test run to (ADR-0029). Machine-level, so its
+# home is the uncommitted `agentcrew.local.toml` — but `scripts/test.py` reads the same key out of
+# the committed file too, and a section this validator refuses is a section no project can commit.
+TEST = "test"
+TEST_RUNNER = "runner"
 
 TRACKER = "tracker"
 TRACKER_KIND = "kind"
@@ -363,7 +368,7 @@ def check_config_text(text, label, complete, aliases, workflows, problems):
 
     expected = {
         "implementer", "reviewer", "hooks", ACCOUNTS, DASHBOARD, PREFLIGHT, REPAIR, WITNESS,
-        TRACKER, QUEUED,
+        TRACKER, QUEUED, TEST,
     }
     for section in sorted(set(config) - expected):
         problems.append(f"{label}: unknown section [{section}]")
@@ -386,6 +391,7 @@ def check_config_text(text, label, complete, aliases, workflows, problems):
     check_hook(config, label, complete, problems)
     check_accounts(config, label, problems)
     check_preflight(config, label, problems)
+    check_test(config, label, problems)
     check_dashboard(config, label, complete, problems)
     check_witness(config, label, complete, aliases, problems)
     # Not governed by `complete`: neither of these is inheritable, so both are required of every
@@ -604,6 +610,34 @@ def check_preflight(config, label, problems):
         )
     for field in sorted(set(preflight) - {PREFLIGHT_GATE}):
         problems.append(f"{label}: [{PREFLIGHT}] carries an unknown field {field!r}")
+
+
+def check_test(config, label, problems):
+    """The optional command a machine hands the whole test run to, expressed as argv.
+
+    Optional in every config, and shaped exactly like the base gate above it, because it is the
+    same kind of value: a command run without a shell, one argument per list item. Where it
+    belongs is the machine's own `agentcrew.local.toml`, which this validator is never pointed
+    at — but `scripts/test.py` honours a committed runner too, and a project that commits one has
+    to be able to run `--config agentcrew.toml` and be told the truth about it (ADR-0029).
+    """
+    section = config.get(TEST)
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append(f"{label}: [{TEST}] must be a table with an optional argv {TEST_RUNNER}")
+        return
+    runner = section.get(TEST_RUNNER)
+    if runner is not None and (
+        not isinstance(runner, list)
+        or not runner
+        or not all(isinstance(argument, str) and argument.strip() for argument in runner)
+    ):
+        problems.append(
+            f"{label}: [{TEST}] {TEST_RUNNER} must be a non-empty argv list of non-empty strings"
+        )
+    for field in sorted(set(section) - {TEST_RUNNER}):
+        problems.append(f"{label}: [{TEST}] carries an unknown field {field!r}")
 
 
 def check_dashboard(config, label, complete, problems):
