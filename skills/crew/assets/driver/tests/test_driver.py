@@ -55,6 +55,7 @@ from harness import (
     REPAIR_MODEL,
     REPORT_NAME,
     ROUTING,
+    TESTS_DIR,
     TMUX_SESSION,
     TRACKER,
     TRIAGE,
@@ -112,6 +113,43 @@ class StubTmuxTests(DriverTestCase):
         stdout, stderr = process.communicate(timeout=5.0)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(stdout, "")
+
+
+class StubInstallationTests(DriverTestCase):
+    """What the fixture leaves on a run's PATH under each stub's name.
+
+    The contract is an executable of that name that runs the stub under the interpreter the tests
+    run under, in one process. The entry used to be a `/bin/sh` script that `exec`ed that
+    interpreter, which started two, and every stub call paid for both (#192). It is pinned here
+    because nothing else would notice a wrapper coming back: a stub reached through a shell
+    answers every test exactly as one reached directly, only slower.
+    """
+
+    STUBS = {
+        "claude": "stub_claude.py",
+        "tmux": "stub_tmux.py",
+        "gh": "stub_gh.py",
+        "review-bridge": "stub_review_bridge.py",
+    }
+
+    def test_every_stub_on_the_path_is_started_by_this_interpreter_and_nothing_else(self):
+        for name in self.STUBS:
+            with self.subTest(stub=name):
+                entry = self.fixture.bin_dir / name
+                self.assertTrue(os.access(entry, os.X_OK), f"{name} is not executable")
+                self.assertEqual(
+                    entry.read_text(encoding="utf-8").splitlines()[0], "#!" + sys.executable
+                )
+
+    def test_each_entry_is_its_stubs_own_source_and_says_which_file_it_came_from(self):
+        """A copy, so the source is the only place a stub is edited and the copy says so."""
+        for name, script in self.STUBS.items():
+            with self.subTest(stub=name):
+                source = TESTS_DIR / script
+                entry = (self.fixture.bin_dir / name).read_text(encoding="utf-8")
+                self.assertIn(str(source), entry.splitlines()[1])
+                body = source.read_text(encoding="utf-8").split("\n", 1)[1]
+                self.assertTrue(entry.endswith(body), f"{name} is not {script}'s own source")
 
 
 class StrictLaunchReadTests(DriverTestCase):
@@ -3602,13 +3640,31 @@ class DriverLifecycleTests(DriverTestCase):
         self.assertReleased()
 
     def test_an_interrupt_in_the_drivers_own_window_releases_the_run(self):
-        """The operator's own Ctrl-C is deliberate, so it must not raise the dead-driver flag."""
+        """The operator's own Ctrl-C is deliberate, so it must not raise the dead-driver flag.
+
+        The exit code and the stopped line are asserted beside the released record, because the
+        record alone cannot tell this exit from the other one that reaches it: a loop that times
+        out on inactivity releases the record too. A test runner with SIGINT ignored passes that
+        on to every driver it starts — Python installs no `KeyboardInterrupt` handler for a signal
+        it inherited as ignored — so the interrupt never arrives and the loop ends its own way
+        instead, on a wake or on the inactivity timeout, both of which release the record. That
+        made a pass out of a run nothing interrupted; a slow green is worth less than a failure
+        (#192).
+        """
         process = self.start(("01", ()))
         self.assertTrue(self.fixture.wait_for(lambda: self.record() == process.pid))
 
         process.send_signal(signal.SIGINT)
-        process.communicate(timeout=30)
+        _, errors = process.communicate(timeout=30)
 
+        self.assertEqual(
+            process.returncode, driver_module.INTERRUPTED_EXIT,
+            f"the driver exited {process.returncode} where an interrupted one exits"
+            f" {driver_module.INTERRUPTED_EXIT}; if this run has SIGINT ignored the driver never"
+            f" received it and ended some other way — a wake, or the loop's inactivity timeout,"
+            f" both of which release the record too: {errors}",
+        )
+        self.assertIn("crew: the driver was stopped", errors)
         self.assertReleased()
 
     # --- the one exit that is not deliberate -------------------------------------------------
@@ -4815,7 +4871,7 @@ class QueueTests(DriverTestCase):
         read success while the source child was still blocked, never told where its finding went.
         """
         self.start()
-        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        self.fixture.ignore_enter()
 
         failed = self.queue_finding()
 
@@ -4833,7 +4889,7 @@ class QueueTests(DriverTestCase):
             [],
         )
 
-        (self.fixture.stub_dir / "tmux-ignore-enter").unlink()
+        self.fixture.ignore_enter(False)
         retried = self.queue_finding()
 
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
@@ -4878,7 +4934,7 @@ class QueueTests(DriverTestCase):
         that was one plan append away from complete.
         """
         self.start()
-        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        self.fixture.ignore_enter()
         failed = self.queue_finding()
         self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
         number, _ = self.opened_issue()
@@ -4887,7 +4943,7 @@ class QueueTests(DriverTestCase):
             config.read_text(encoding="utf-8") + '\n[queued]\neffort = "hihg"\n',
             encoding="utf-8",
         )
-        (self.fixture.stub_dir / "tmux-ignore-enter").unlink()
+        self.fixture.ignore_enter(False)
 
         retried = self.queue_finding()
 
@@ -4937,6 +4993,46 @@ class QueueTests(DriverTestCase):
                 driver_module.build_parser().parse_args(arguments)
 
 
+class ComposerDeadlineTests(unittest.TestCase):
+    """How long an `Enter` is given to empty a composer, and who gets to say so.
+
+    The deadline is a wall-clock one and the thing it waits on is a `capture-pane`, so its cost is
+    the terminal's. Real tmux answers in about a millisecond; the stub these suites run against
+    answers in tens of them, and under gate-level load in more than a hundred — so a harness needs
+    the deadline raised while the shipped default stays the one a real terminal needs (#192).
+    """
+
+    def resolved(self, named=None):
+        """What the driver resolves its deadline to with the variable set to `named`, or unset.
+
+        The variable is moved inside a patched copy of the environment rather than assigned, so a
+        machine that exports one of its own cannot decide what this suite measures.
+        """
+        with mock.patch.dict(os.environ, {}, clear=False):
+            if named is None:
+                os.environ.pop("CREW_COMPOSER_CLEAR_SECONDS", None)
+            else:
+                os.environ["CREW_COMPOSER_CLEAR_SECONDS"] = named
+            return driver_module.composer_clear_seconds()
+
+    def test_the_shipped_deadline_is_a_second_where_the_environment_names_none(self):
+        """The default is the constant, unchanged: a real terminal is not a stubbed one."""
+        self.assertEqual(driver_module.COMPOSER_CLEAR_SECONDS, 1.0)
+        self.assertEqual(self.resolved(), 1.0)
+
+    def test_the_environment_raises_the_deadline_for_a_harness_that_needs_it(self):
+        self.assertEqual(self.resolved("10"), 10.0)
+        self.assertEqual(self.resolved("0.1"), 0.1)
+
+    def test_a_variable_set_to_nothing_at_all_leaves_the_shipped_deadline_standing(self):
+        """An exported-but-empty variable is a machine that named no value, not a zero deadline.
+
+        Spelled the way `CREW_POLL_SECONDS` is read, so the two dials answer an empty export the
+        same way rather than one of them collapsing its wait to nothing.
+        """
+        self.assertEqual(self.resolved(""), 1.0)
+
+
 class AnswerTests(DriverTestCase):
     def start(self, routing=ROUTING):
         self.fixture.ticket("01", "first thing", routing=routing)
@@ -4968,6 +5064,17 @@ class AnswerTests(DriverTestCase):
             [str(self.fixture.bin_dir / "tmux"), "kill-window", "-t", window],
             check=True, capture_output=True, env=self.fixture.environment(),
         )
+
+    def drop_one_enter(self):
+        """Have the stub swallow the first `Enter` and honour the next, on the shipped deadline.
+
+        The dropped `Enter` waits the deadline out before the retry, so this is one of the few
+        tests whose cost *is* the deadline — and one of the few that cannot simply wind it down,
+        because the retry then has to clear inside it. The shipped second is what a real terminal
+        clears inside many times over, and it is well above what this stub costs (#192).
+        """
+        (self.fixture.stub_dir / "tmux-drop-enter-once").touch()
+        self.fixture.composer_deadline_seconds = str(driver_module.COMPOSER_CLEAR_SECONDS)
 
     def test_text_answer_sends_literal_text_then_enter_and_records_the_ruling(self):
         self.start()
@@ -5085,7 +5192,7 @@ class AnswerTests(DriverTestCase):
         self.start()
         text = "Continue with the verified completion"
         window = self.fixture.launch_record("01")["window"]
-        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        self.fixture.ignore_enter()
 
         result = self.answer("--text", text)
 
@@ -5100,7 +5207,7 @@ class AnswerTests(DriverTestCase):
     def assert_blank_text_is_not_recorded(self, text):
         self.start()
         window = self.fixture.launch_record("01")["window"]
-        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        self.fixture.ignore_enter()
 
         result = self.answer("--text", text)
 
@@ -5128,7 +5235,7 @@ class AnswerTests(DriverTestCase):
         """
         self.start()
         window = self.fixture.launch_record("01")["window"]
-        (self.fixture.stub_dir / "tmux-ignore-enter").touch()
+        self.fixture.ignore_enter()
         captures_before = len([
             call for call in self.fixture.tmux_calls() if call["argv"][:1] == ["capture-pane"]
         ])
@@ -5163,7 +5270,7 @@ class AnswerTests(DriverTestCase):
         self.start()
         text = "Continue with the verified completion"
         window = self.fixture.launch_record("01")["window"]
-        (self.fixture.stub_dir / "tmux-drop-enter-once").touch()
+        self.drop_one_enter()
         (self.fixture.stub_dir / "tmux-flicker-clear-once").touch()
 
         result = self.answer("--text", text)
@@ -5204,7 +5311,7 @@ class AnswerTests(DriverTestCase):
         self.start()
         text = "Continue with the verified completion"
         window = self.fixture.launch_record("01")["window"]
-        (self.fixture.stub_dir / "tmux-drop-enter-once").touch()
+        self.drop_one_enter()
 
         result = self.answer("--text", text)
 
@@ -6541,12 +6648,25 @@ class AdoptionTests(DriverTestCase):
 
         adopted = self.fixture.launch()
         record = self.fixture.run_dir / "dashboard-window"
+
+        def recorded_dashboard():
+            """The window this run records, once the record names one that is live.
+
+            Waiting for a dashboard window and a record with something in it was two conditions
+            that can both hold before either is this run's: `make_window` creates the window and
+            records it afterwards, so in between the record still names the window the interrupted
+            run drew — the one killed above — and the comparison below read one run's record
+            against another run's window. Under a loaded gate that window is wide enough to sample
+            (#192).
+            """
+            if not record.exists():
+                return None
+            named = record.read_text().strip()
+            return named if named in self.fixture.windows_named(DASHBOARD_WINDOW) else None
+
         self.assertTrue(
-            self.fixture.wait_for(
-                lambda: self.fixture.windows_named(DASHBOARD_WINDOW)
-                and record.exists() and record.read_text().strip()
-            ),
-            "the adopted run drew no dashboard",
+            self.fixture.wait_for(recorded_dashboard),
+            "the adopted run drew no dashboard it recorded",
         )
 
         windows = self.fixture.windows_named(DASHBOARD_WINDOW)

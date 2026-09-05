@@ -135,9 +135,22 @@ class Fixture:
         self.hook_marker = self.root / "hook-ran.json"
 
     def _link_stub(self, name, script):
+        """Put an executable of `name` on this fixture's PATH that runs `script` under this
+        interpreter; returns nothing.
+
+        The stub's own source under a `#!` naming this interpreter, rather than a `/bin/sh` script
+        that `exec`s it: one process a call instead of two (#192). Written on every install, so an
+        edit to a stub is never shadowed by a stale copy.
+        """
+        source = TESTS_DIR / script
+        body = source.read_text(encoding="utf-8")
+        if body.startswith("#!"):
+            body = body.split("\n", 1)[1]
         target = self.bin_dir / name
         target.write_text(
-            "#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, TESTS_DIR / script)
+            "#!%s\n# copied by the fixture from %s; edit that file, not this copy\n%s"
+            % (sys.executable, source, body),
+            encoding="utf-8",
         )
         target.chmod(0o755)
 

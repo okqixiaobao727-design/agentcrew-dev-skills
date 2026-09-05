@@ -381,7 +381,9 @@ MONITOR_STOP_SECONDS = 5.0
 # how often that is re-read. A Claude composer clears prose in about 20ms but a slash command in
 # up to about 100ms, because the command is resolved and its skill body loaded before the input is
 # cleared; the deadline is a second so a child with a larger context than the probe's still fits
-# inside it (#191).
+# inside it (#191). It is the default rather than the whole answer: a harness whose terminal is a
+# stub answers a read in tens of milliseconds where tmux answers in one, so it raises the deadline
+# through `CREW_COMPOSER_CLEAR_SECONDS` (#192).
 COMPOSER_CLEAR_SECONDS = 1.0
 COMPOSER_POLL_SECONDS = 0.03
 # How many consecutive reads must find the composer clear before the line counts as submitted.
@@ -770,7 +772,7 @@ def type_into_pane(window, text, unreachable, stuck):
     end. One Enter is retried, because the composer sometimes still holds the line after the
     first; a second that also leaves it standing is `stuck` rather than a message anyone received.
 
-    Each Enter is given `COMPOSER_CLEAR_SECONDS` to empty the composer before it counts as
+    Each Enter is given `composer_clear_seconds` to empty the composer before it counts as
     dropped, because a submit is not instantaneous: a slash command stands in the composer for
     roughly five times as long as prose, since Claude Code resolves the command and loads the
     skill body before clearing the input. Deciding on a single immediate read lost the whole
@@ -790,7 +792,7 @@ def type_into_pane(window, text, unreachable, stuck):
 
 
 def composer_clears(window, text):
-    """Whether the typed line leaves the composer within `COMPOSER_CLEAR_SECONDS`.
+    """Whether the typed line leaves the composer within `composer_clear_seconds`.
 
     Polled rather than read once, and settled on `COMPOSER_CLEAR_READS` consecutive clear reads
     rather than the first: the wait is what stops a slow submit being called a failure, and the
@@ -802,7 +804,7 @@ def composer_clears(window, text):
         # same on every read: polling could only spend the deadline to reach the decision the
         # first read already made.
         return False
-    deadline = time.monotonic() + COMPOSER_CLEAR_SECONDS
+    deadline = time.monotonic() + composer_clear_seconds()
     cleared = 0
     while True:
         cleared = 0 if composer_holds(window, text) else cleared + 1
@@ -811,6 +813,19 @@ def composer_clears(window, text):
         if time.monotonic() >= deadline:
             return False
         time.sleep(COMPOSER_POLL_SECONDS)
+
+
+def composer_clear_seconds():
+    """How long one `Enter` is given to empty the composer, in seconds.
+
+    `COMPOSER_CLEAR_SECONDS` is what a real terminal needs and is what ships;
+    `CREW_COMPOSER_CLEAR_SECONDS` raises it, the way `CREW_POLL_SECONDS` raises the loop's poll
+    interval. The deadline is wall clock and what it waits on is a `capture-pane`, so its cost is
+    the terminal's own: tmux answers a read in about a millisecond, and a harness standing a
+    script in for tmux answers in tens of them — enough, under a loaded gate, for a composer that
+    did clear to be read as one still holding and a delivered ruling to be retried (#192).
+    """
+    return float(os.environ.get("CREW_COMPOSER_CLEAR_SECONDS") or COMPOSER_CLEAR_SECONDS)
 
 
 def typed_tail(text):
