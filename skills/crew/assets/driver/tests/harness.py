@@ -96,6 +96,17 @@ TRACKER = "local"
 # The loop's dials, wound down so a test drives a run in seconds rather than in poll intervals.
 POLL_SECONDS = "0.2"
 LOOP_TIMEOUT = "20"
+# The composer-clear deadline every driver started here runs on, in seconds. The stub tmux counts
+# a composer's linger in reads and the driver counts its deadline in seconds, so the two meet only
+# through what a stub read costs: about 27ms on a quiet machine and several times that under a
+# loaded gate, against a shipped second. Raising it costs nothing where the composer clears — the
+# wait ends on the clear, not on the deadline — and it is what stops a delivery that did clear
+# being read as one that did not (#192).
+COMPOSER_DEADLINE_SECONDS = "10"
+# What a test whose composer never clears sets instead. There the deadline is not a ceiling but
+# the whole of the wait, paid once per `Enter`, and a tenth of a second buys the same refusal as
+# ten seconds because nothing in that test can ever clear.
+UNCLEARED_COMPOSER_SECONDS = "0.1"
 # Long enough for the loop to have polled a status many times over, which is what makes "it was
 # never nudged" an observation rather than a race won.
 QUIET_SECONDS = 3.0
@@ -196,6 +207,9 @@ class Fixture:
         # Whether this fixture's machine has Review-Switch installed. The default is the machine
         # a reviewed run needs, so every test that is not about the check sees the command.
         self.review_command_installed = True
+        # How long a driver started here gives an `Enter` to empty a composer. A test about a
+        # delivery that never clears winds it down, because there the deadline is the wait.
+        self.composer_deadline_seconds = COMPOSER_DEADLINE_SECONDS
         self.running = []
         # The one session the stub server holds: a window asked for in any other is refused, as a
         # real tmux refuses a session it does not have.
@@ -203,11 +217,48 @@ class Fixture:
         self.codex_bridge = TESTS_DIR / "stub_codex_bridge.py"
 
     def _link_stub(self, name, script):
+        """Put an executable of `name` on this fixture's PATH that runs `script` under this
+        interpreter; returns nothing.
+
+        One process, not two: this was a `/bin/sh` script that `exec`ed the interpreter, so every
+        stub call paid a shell start on top of the interpreter's, and a heavy test makes about
+        seventy of them (#192). The stub's own source is copied under a `#!` naming the interpreter
+        the tests run under — rather than loaded by a shim, which costs more than the shell it
+        would replace: on this repo's test runner a `/bin/sh` shim measured 22.13ms a call, a
+        `runpy` shim 23.76ms, and this copy 21.74ms. It is written on every install, never cached
+        across fixtures, so an edit to a stub cannot be shadowed by a stale copy. What the copy
+        does move is `__file__`, which is this directory for a stub run by path and the fixture's
+        `bin` for one installed here: a stub that resolves anything from `__file__` belongs on the
+        first path and not on this one.
+        """
+        source = TESTS_DIR / script
+        body = source.read_text(encoding="utf-8")
+        if body.startswith("#!"):
+            body = body.split("\n", 1)[1]
         target = self.bin_dir / name
         target.write_text(
-            "#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, TESTS_DIR / script)
+            "#!%s\n# copied by the fixture from %s; edit that file, not this copy\n%s"
+            % (sys.executable, source, body),
+            encoding="utf-8",
         )
         target.chmod(0o755)
+
+    def ignore_enter(self, ignored=True):
+        """Make the stub composer swallow every `Enter`, or let them through again.
+
+        The deadline moves with it, for every driver started after this call: while nothing can
+        clear, an `Enter` waits the whole deadline out for a refusal that a tenth of a second
+        reaches just as surely, and a delivery pays that twice. A loop already running keeps the
+        deadline it was started on, so this is the deadline the `answer`, `rule` or `queue`
+        command that follows runs on — which is the delivery these tests are about (#192).
+        """
+        marker = self.stub_dir / "tmux-ignore-enter"
+        if ignored:
+            marker.touch()
+            self.composer_deadline_seconds = UNCLEARED_COMPOSER_SECONDS
+        else:
+            marker.unlink()
+            self.composer_deadline_seconds = COMPOSER_DEADLINE_SECONDS
 
     def uninstall_review_command(self):
         """Take Review-Switch off this fixture's machine — the stub, and any real installation.
@@ -350,6 +401,7 @@ class Fixture:
         environment["CLAUDE_CONFIG_DIR"] = str(self.config_dir)
         environment["AGENTCREW_ACCOUNT_REGISTRY"] = str(self.registry)
         environment["CREW_POLL_SECONDS"] = "1"
+        environment["CREW_COMPOSER_CLEAR_SECONDS"] = str(self.composer_deadline_seconds)
         environment.pop("AGENTCREW_STUB_TRANSCRIPT_MODEL", None)
         environment.update(overrides or {})
         return environment

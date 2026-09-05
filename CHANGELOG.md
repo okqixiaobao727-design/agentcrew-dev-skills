@@ -7,6 +7,38 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Each test fixture puts its stub commands on `PATH` as the stub's own source under a `#!` naming
+  the interpreter the tests run under, where it used to write a `/bin/sh` script that `exec`ed
+  that interpreter. Every stub call started two processes where one would do, and a heavy driver
+  test makes about seventy of them. Measured on this repo's test runner, over 60 interleaved calls
+  of one stub: the `/bin/sh` shim 22.13ms a call, a `runpy` loader 23.76ms, the copy 21.74ms — so
+  the shell was worth about 0.4ms a call there, not the 26ms the issue estimated, and a loader
+  costs more than the shell it replaces. The copy is rewritten on every install, never cached
+  across fixtures, and carries a comment naming the file it came from (#192).
+
+### Fixed
+- The composer-clear deadline is overridable by the environment. `COMPOSER_CLEAR_SECONDS` stays
+  the shipped 1.0s that a real terminal needs, and `CREW_COMPOSER_CLEAR_SECONDS` raises it the way
+  `CREW_POLL_SECONDS` raises the loop's poll interval. The deadline is wall clock and what it
+  waits on is a `capture-pane`: tmux answers one in about a millisecond, a stub standing in for
+  tmux in tens of them, and under a loaded gate in more than a hundred — so a delivered ruling
+  read as one still standing in the composer, and was retried, in the driver's own suite rather
+  than in any run. The driver's fixture now runs on ten seconds, which costs nothing where the
+  composer clears, and a test about a delivery that never clears winds it down to a tenth of a
+  second, where the deadline is the whole of the wait (#192).
+- The adoption test that checks a run draws the dashboard the interrupted one left waits for the
+  record to name a live window, not for a window and a non-empty record. `make_window` creates the
+  window and records it afterwards, so in between the record still named the interrupted run's
+  window — the one the test had just killed — and the two facts were compared against each other
+  under a loaded gate (#192).
+- The Ctrl-C lifecycle test asserts the driver's interrupted exit code and its `the driver was
+  stopped` line, not only that the run's pid record was released. The loop's inactivity timeout
+  releases that record too, so a test runner with SIGINT ignored — which a background job of a
+  non-interactive shell inherits, and which stops Python from installing a `KeyboardInterrupt`
+  handler at all — passed the test twenty seconds later without the driver ever receiving the
+  signal (#192).
+
 ## [0.9.19] - 2026-09-05
 
 ### Added

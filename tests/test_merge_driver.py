@@ -101,8 +101,16 @@ class Fixture:
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         claude = self.bin_dir / "claude"
+        # The stub's own source under a `#!` naming this interpreter, rather than a
+        # `/bin/sh` script that `exec`s it: one process a call instead of two (#192).
+        repair = TESTS_DIR / "stub_claude_repair.py"
+        body = repair.read_text(encoding="utf-8")
+        if body.startswith("#!"):
+            body = body.split("\n", 1)[1]
         claude.write_text(
-            "#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, TESTS_DIR / "stub_claude_repair.py")
+            "#!%s\n# copied by the fixture from %s; edit that file, not this copy\n%s"
+            % (sys.executable, repair, body),
+            encoding="utf-8",
         )
         claude.chmod(0o755)
         self.tickets = []
