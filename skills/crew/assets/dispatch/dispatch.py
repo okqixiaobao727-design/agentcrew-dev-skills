@@ -98,13 +98,16 @@ import tomllib
 TEMPLATES = pathlib.Path(__file__).resolve().parent / "templates" / "shapes.toml"
 SKILL_DOCUMENT = pathlib.Path(__file__).resolve().parents[2] / "SKILL.md"
 WITNESS_SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "witness.py"
-# The log's own writer: the event shape and its closed sets stay the log's alone.
+# The log's own writer, named for the copy of it a run keeps beside its log: what this renderer
+# needs the file name for is the lifecycle-hook commands it hands Review-Switch, which a child's
+# session runs as commands. Dispatch's own appends go through the module below.
 MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 
 # The account module beside it: the one place a row's account binding becomes an environment, so
 # this renderer decides neither what "inherit" means nor how an account is spelled into a process.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import accounts  # noqa: E402
+import machine_log  # noqa: E402
 import run_plan  # noqa: E402
 
 # Guard assets every Claude worktree carries before a child starts in it.
@@ -974,31 +977,29 @@ def log_launch(log, ticket, details):
 
     Dispatch is what knows a child came up, so dispatch is what records it: wave advancement and
     the dashboard read the launched set without a coordinator turn spent on bookkeeping
-    (ADR-0001).
+    (ADR-0001). Dispatch runs in the same interpreter as the Machine log module, so it calls that
+    module's writer rather than starting it as a command (ADR-0030).
     """
-    arguments = [
-        sys.executable, str(MACHINE_LOG), "--log", str(log), "launch",
-        "--ticket", ticket.id,
-        "--child", str(details.get("child") or ""),
-        "--workflow", ticket.workflow,
-        "--executor", ticket.executor,
-        "--model", ticket.model,
-        "--effort", ticket.effort,
-        "--branch", branch_name(ticket),
-        "--worktree", str(details["worktree"]),
-    ]
-    # What makes a run's spend attributable after the fact: which account paid for this child.
-    # Only the Claude lane has one — a Codex child launches under its own vendor's credentials,
-    # and recording a Claude profile against it would record an account it never ran on.
-    if details.get("account"):
-        arguments += ["--account", str(details["account"])]
-    if details.get("window"):
-        arguments += ["--window", str(details["window"])]
-    result = subprocess.run(arguments, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise LaunchError(
-            f"machine log append failed: {(result.stderr or result.stdout).strip()}"
+    try:
+        machine_log.record_launch(
+            log,
+            ticket=ticket.id,
+            child=str(details.get("child") or ""),
+            workflow=ticket.workflow,
+            executor=ticket.executor,
+            model=ticket.model,
+            effort=ticket.effort,
+            branch=branch_name(ticket),
+            worktree=str(details["worktree"]),
+            # What makes a run's spend attributable after the fact: which account paid for this
+            # child. Only the Claude lane has one — a Codex child launches under its own vendor's
+            # credentials, and recording a Claude profile against it would record an account it
+            # never ran on.
+            account=str(details["account"]) if details.get("account") else None,
+            window=str(details["window"]) if details.get("window") else None,
         )
+    except OSError as error:
+        raise LaunchError(f"machine log append failed: {error}") from error
 
 
 def log_note(log, ticket, details):
@@ -1021,13 +1022,10 @@ def log_launch_failure_note(log, ticket, error):
     """Record why a live child failed verification; return any logging failure as a note."""
     if not log:
         return ""
-    arguments = [
-        sys.executable, str(MACHINE_LOG), "--log", str(log), "launch-failed",
-        "--ticket", ticket.id, "--detail", str(error),
-    ]
-    result = subprocess.run(arguments, capture_output=True, text=True)
-    if result.returncode != 0:
-        return f"log-failed={str(result.stderr or result.stdout).strip()}"
+    try:
+        machine_log.record_launch_failed(log, ticket=ticket.id, detail=str(error))
+    except OSError as failure:
+        return f"log-failed={failure}"
     return ""
 
 

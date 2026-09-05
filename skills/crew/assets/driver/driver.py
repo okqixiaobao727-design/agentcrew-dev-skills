@@ -1154,28 +1154,29 @@ def validate_recorded_crew_worktree(run, error_type=DriverError):
 
 def install_hook(log, settings, role, ticket=None, session_id=None, run_dir=None):
     """Register one side's log hook; session_id scopes the coordinator's bounded-read hook."""
-    arguments = [
-        sys.executable, MACHINE_LOG, "--log", log, "install",
-        "--settings", settings, "--role", role,
-    ]
-    if ticket:
-        arguments += ["--ticket", ticket]
-    if session_id is not None:
-        arguments += ["--session-id", session_id]
-    if run_dir is not None:
-        arguments += ["--run-dir", run_dir]
-    run_command(arguments, f"the {role} hook could not be installed in {settings}")
+    try:
+        machine_log.install_settings(
+            str(log), str(settings), role, ticket=ticket or None,
+            session_id=session_id, run_dir=None if run_dir is None else str(run_dir),
+        )
+    except (machine_log.SettingsError, OSError) as error:
+        raise DriverError(
+            f"the {role} hook could not be installed in {settings}: {error}"
+        ) from error
 
 
 def record_base_gate(log, gate):
-    """Record whether this fresh run checked its base, through the Machine-log CLI."""
-    status = "not-configured" if gate is None else "passed"
-    arguments = [
-        sys.executable, MACHINE_LOG, "--log", log, "base-gate", "--status", status,
-    ]
-    for value in gate or ():
-        arguments.append(f"--argument={value}")
-    run_command(arguments, "the base-gate result could not be recorded", pointer=str(log))
+    """Record whether this fresh run checked its base, through the Machine log's own writer."""
+    try:
+        machine_log.record_base_gate(
+            log,
+            status="not-configured" if gate is None else "passed",
+            argv=[str(value) for value in gate or ()],
+        )
+    except (ValueError, OSError) as error:
+        raise DriverError(
+            f"the base-gate result could not be recorded: {error}", pointer=str(log)
+        ) from error
 
 
 def outstanding_queued_wave(plan, projection):
@@ -1744,16 +1745,14 @@ def clear_actions(run_dir, run, log_path, plan):
         else:
             shutil.rmtree(state_dir)
 
-    machine_log = run_dir / MACHINE_LOG.name
-    if not machine_log.exists():
-        raise ClearError(f"the run carries no durable machine log at {machine_log}")
-    clear_command(
-        [
-            sys.executable, str(machine_log), "--log", str(log_path), "uninstall",
-            "--settings", str(repo / SETTINGS_PATH),
-        ],
-        "machine-log uninstall",
-    )
+    durable_writer = run_dir / MACHINE_LOG.name
+    if not durable_writer.exists():
+        raise ClearError(f"the run carries no durable machine log at {durable_writer}")
+    settings = repo / SETTINGS_PATH
+    try:
+        machine_log.uninstall_settings(str(log_path), str(settings))
+    except (machine_log.SettingsError, OSError) as error:
+        raise ClearError(f"machine-log uninstall failed: {error}") from error
 
 
 def run_clear(args):
@@ -1890,10 +1889,12 @@ def sweep_hook_logs(settings_path):
 
 def uninstall_hook(log, settings):
     """Take every hook writing `log` out of that settings file, through the log's own operation."""
-    run_command(
-        [sys.executable, MACHINE_LOG, "--log", log, "uninstall", "--settings", settings],
-        f"the hook writing {log} could not be uninstalled from {settings}",
-    )
+    try:
+        machine_log.uninstall_settings(str(log), str(settings))
+    except (machine_log.SettingsError, OSError) as error:
+        raise DriverError(
+            f"the hook writing {log} could not be uninstalled from {settings}: {error}"
+        ) from error
 
 
 def sweep_landed(run_dir):
@@ -2625,12 +2626,12 @@ def uninstall_run_hooks(run_dir, run, records):
         if path in seen:
             continue
         seen.add(path)
-        run_command(
-            [sys.executable, MACHINE_LOG, "--log", run_dir / LOG_NAME,
-             "uninstall", "--settings", path],
-            f"the run hook could not be uninstalled from {path}",
-            pointer=str(path),
-        )
+        try:
+            machine_log.uninstall_settings(str(run_dir / LOG_NAME), str(path))
+        except (machine_log.SettingsError, OSError) as error:
+            raise DriverError(
+                f"the run hook could not be uninstalled from {path}: {error}", pointer=str(path)
+            ) from error
 
 
 def write_report(run_dir, run, plan, records, cost_output):
@@ -2718,26 +2719,27 @@ class WaveActivation:
     def record_adoption(self, ticket, launch):
         """Append the launch fact that makes one child adoptable; return nothing."""
         worktree = launch.get("worktree") or dispatch.worktree_path(self.loop.run, ticket)
-        arguments = [
-            sys.executable, MACHINE_LOG, "--log", self.loop.log, "launch",
-            "--ticket", ticket.id,
-            "--child", str(launch.get("child") or ""),
-            "--workflow", ticket.workflow,
-            "--executor", ticket.executor,
-            "--model", ticket.model,
-            "--effort", ticket.effort,
-            "--branch", dispatch.branch_name(ticket),
-            "--worktree", str(worktree),
-            "--window", self.child_window(ticket, launch),
-        ]
-        if ticket.executor == CLAUDE:
-            arguments += ["--account", str(ticket.binding.directory)]
-        run_command(
-            arguments,
-            f"ticket {ticket.id}'s observed child could not be adopted",
-            ticket=ticket.id,
-            pointer=str(self.loop.log),
-        )
+        try:
+            machine_log.record_launch(
+                self.loop.log,
+                ticket=ticket.id,
+                child=str(launch.get("child") or ""),
+                workflow=ticket.workflow,
+                executor=ticket.executor,
+                model=ticket.model,
+                effort=ticket.effort,
+                branch=dispatch.branch_name(ticket),
+                worktree=str(worktree),
+                window=self.child_window(ticket, launch),
+                account=(
+                    str(ticket.binding.directory) if ticket.executor == CLAUDE else None
+                ),
+            )
+        except OSError as error:
+            raise DriverError(
+                f"ticket {ticket.id}'s observed child could not be adopted: {error}",
+                ticket=ticket.id, pointer=str(self.loop.log),
+            ) from error
 
     def reverify(self, ticket, launch):
         """Return an amended launch after checking the executor's original proof surface once."""
@@ -3014,17 +3016,15 @@ class Loop:
         The driver writes every parked and failed receipt the run earns. They used to be the
         coordinator's to type, and a wave settles on what the log holds.
         """
-        command = [
-            sys.executable, MACHINE_LOG, "--log", self.log, "receipt",
-            "--ticket", ticket, "--verdict", verdict, "--detail", detail,
-        ]
-        if sha is not None:
-            command.extend(("--sha", sha))
-        run_command(
-            command,
-            f"the {verdict} receipt for {ticket} could not be recorded",
-            ticket=ticket, pointer=str(self.log),
-        )
+        try:
+            machine_log.record_receipt(
+                self.log, ticket=ticket, verdict=verdict, sha=sha, detail=detail
+            )
+        except (ValueError, OSError) as error:
+            raise DriverError(
+                f"the {verdict} receipt for {ticket} could not be recorded: {error}",
+                ticket=ticket, pointer=str(self.log),
+            ) from error
 
     def deliver(self, ticket, launch, text=None, keys=None):
         """Say one thing to a child on its own channel, and record it; returns nothing.
@@ -3093,15 +3093,16 @@ class Loop:
 
     def record_ruling(self, ticket, launch, text):
         """Put one thing the run said to a child into the log; returns nothing."""
-        run_command(
-            [
-                sys.executable, MACHINE_LOG, "--log", self.log, "message",
-                "--role", COORDINATOR_ROLE, "--ticket", ticket,
-                "--to", launch.get("child") or ticket, "--message", text,
-            ],
-            f"what was said to {ticket} could not be recorded",
-            ticket=ticket, pointer=str(self.log),
-        )
+        try:
+            machine_log.record_message(
+                self.log, role=COORDINATOR_ROLE, ticket=ticket,
+                to=launch.get("child") or ticket, message=text,
+            )
+        except OSError as error:
+            raise DriverError(
+                f"what was said to {ticket} could not be recorded: {error}",
+                ticket=ticket, pointer=str(self.log),
+            ) from error
 
     # --- the rule table, row by row ---------------------------------------------------------
 
@@ -3425,16 +3426,16 @@ class Loop:
         return following
 
     def record_advance(self, wave, decision, detail):
-        """Write one existing advance decision through the Machine-log boundary; return nothing."""
-        run_command(
-            [
-                sys.executable, MACHINE_LOG, "--log", self.log,
-                "advance", "--wave", str(wave), "--decision", decision,
-                "--detail", detail,
-            ],
-            f"wave {wave}'s {decision} decision could not be recorded",
-            pointer=str(self.log),
-        )
+        """Write one existing advance decision through the log's own writer; return nothing."""
+        try:
+            machine_log.record_advance(
+                self.log, wave=wave, decision=decision, detail=detail
+            )
+        except (ValueError, OSError) as error:
+            raise DriverError(
+                f"wave {wave}'s {decision} decision could not be recorded: {error}",
+                pointer=str(self.log),
+            ) from error
 
     @staticmethod
     def toast(text):
@@ -3534,15 +3535,16 @@ class Loop:
                 pointer=str(self.log),
             )
 
-        run_command(
-            [
-                sys.executable, MACHINE_LOG, "--log", self.log, "advance",
-                "--wave", str(wave), "--decision", STOPPED,
-                "--detail", "the chain stopped on reasons the rule table had already settled",
-            ],
-            f"the end of the run at wave {wave} could not be recorded",
-            pointer=str(self.log),
-        )
+        try:
+            machine_log.record_advance(
+                self.log, wave=wave, decision=STOPPED,
+                detail="the chain stopped on reasons the rule table had already settled",
+            )
+        except (ValueError, OSError) as error:
+            raise DriverError(
+                f"the end of the run at wave {wave} could not be recorded: {error}",
+                pointer=str(self.log),
+            ) from error
 
     def unsettled_halt(self, wave, projection):
         """The wave's tickets whose halt no rule of the table has already accounted for.
@@ -3592,15 +3594,16 @@ class Loop:
             if number in already or number not in tickets:
                 continue
             undo = close_ticket(self.run, tickets[number], number)
-            run_command(
-                [
-                    sys.executable, MACHINE_LOG, "--log", self.log, "outcome",
-                    "--ticket", number, "--outcome", COMPLETED,
-                    "--detail", f"closed in the {self.run.tracker} tracker; undo: {undo}",
-                ],
-                f"the close of {number} could not be recorded",
-                ticket=number, pointer=str(self.log),
-            )
+            try:
+                machine_log.record_outcome(
+                    self.log, ticket=number, outcome=COMPLETED,
+                    detail=f"closed in the {self.run.tracker} tracker; undo: {undo}",
+                )
+            except (ValueError, OSError) as error:
+                raise DriverError(
+                    f"the close of {number} could not be recorded: {error}",
+                    ticket=number, pointer=str(self.log),
+                ) from error
 
     # --- taking over a run already on the ground -----------------------------------------------
 
@@ -4541,15 +4544,16 @@ def run_queue(args):
                     f"the queued ticket {identifier} could not be written to {path}: {error}",
                     ticket=identifier, pointer=str(path),
                 ) from error
-        run_command(
-            [
-                sys.executable, MACHINE_LOG, "--log", loop.log, "queued",
-                "--ticket", identifier, "--source", source, "--open", open_word,
-                "--locator", locator, "--finding", finding,
-            ],
-            f"the queued ticket {identifier} could not be recorded",
-            ticket=identifier, pointer=str(loop.log),
-        )
+        try:
+            machine_log.record_queued(
+                loop.log, ticket=identifier, source=source, open=open_word,
+                locator=locator, finding=finding,
+            )
+        except (ValueError, OSError) as error:
+            raise DriverError(
+                f"the queued ticket {identifier} could not be recorded: {error}",
+                ticket=identifier, pointer=str(loop.log),
+            ) from error
         records = loop.records()
     else:
         path = queued_staged_path(

@@ -53,8 +53,6 @@ import accounts  # noqa: E402
 import run_plan  # noqa: E402
 import machine_log  # noqa: E402
 
-MACHINE_LOG = pathlib.Path(__file__).resolve().parent / "machine_log.py"
-
 # The only verdict that lands. A failed or parked branch is never merged, and a ticket with no
 # receipt has not been verified by anything, which is not the same as being landable.
 LANDABLE = machine_log.LANDABLE
@@ -115,14 +113,16 @@ def git_or_raise(repo, *args):
 # --- the machine log ------------------------------------------------------------------------
 
 
-def log_event(log, *args):
-    """Append one event through the log's own writer, so its closed sets stay the only ones."""
-    result = subprocess.run(
-        [sys.executable, str(MACHINE_LOG), "--log", str(log), *args],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise WaveError(f"machine log: {(result.stderr or result.stdout).strip()}")
+def log_event(writer, log, **fields):
+    """Append one event through the log's own writer, so its closed sets stay the only ones.
+
+    This script imports the Machine log module for its vocabulary already, and runs in an
+    interpreter of its own, so an append is a call rather than a command (ADR-0030).
+    """
+    try:
+        writer(str(log), **fields)
+    except (ValueError, OSError) as error:
+        raise WaveError(f"machine log: {error}") from error
 
 
 def unverified_reason(repo, branch, receipt):
@@ -469,9 +469,8 @@ def merge_recorder(run, ticket, branch, options):
     """A one-argument writer of this ticket's `merge` events, so every one of them agrees."""
     def record(result, **fields):
         log_event(
-            options["log"], "merge", "--ticket", ticket.id, "--result", result,
-            "--branch", branch, "--into", run.integration_branch,
-            *[flag for name, value in fields.items() for flag in (f"--{name}", value)],
+            machine_log.record_merge, options["log"], ticket=ticket.id, result=result,
+            branch=branch, into=run.integration_branch, **fields,
         )
     return record
 

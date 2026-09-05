@@ -52,9 +52,6 @@ import machine_log  # noqa: E402
 import run_plan  # noqa: E402
 
 TIMESTAMP_FORMAT = machine_log.TIMESTAMP_FORMAT
-# The writer that owns the log's schema: a receipt this script verifies is appended through it
-# rather than formatted here, so the closed sets stay in one place.
-MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 
 CLAUDE_BIN = "claude"
 TMUX_BIN = "tmux"
@@ -645,7 +642,7 @@ def write_agents_cache(states, moment, account=None):
             temporary.unlink(missing_ok=True)
 
 
-def announce_fallback(run_dir, records, timeout=None, account=None, announced=None):
+def announce_fallback(run_dir, records, account=None, announced=None):
     """Record in the run's own log that this lane is reading its fallback; returns nothing.
 
     ADR-0008's silence holds on screen, so the one place a relocated sessions directory can be
@@ -657,6 +654,9 @@ def announce_fallback(run_dir, records, timeout=None, account=None, announced=No
     them had written anything, so a second falling-back account would otherwise repeat the line
     the first had just written. The accounts are read in the wave table's order, so the directory
     the line names is the first one a run could not read.
+
+    It takes no deadline. The append is one `write` on a descriptor opened `O_APPEND` in this
+    interpreter (ADR-0030), so there is no process for a tick to have to outwait.
     """
     if run_dir is None or announced:
         return
@@ -664,15 +664,11 @@ def announce_fallback(run_dir, records, timeout=None, account=None, announced=No
         return
     if announced is not None:
         announced.append(account)
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(
-            [
-                sys.executable, str(MACHINE_LOG),
-                "--log", str(pathlib.Path(run_dir) / MACHINE_LOG_NAME), LIVE_SOURCE_EVENT,
-                "--lane", CLAUDE, "--source", FALLBACK_SOURCE,
-                "--reason", FALLBACK_REASON.format(directory=sessions_directory(account)),
-            ],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout,
+    with contextlib.suppress(OSError, ValueError):
+        machine_log.record_live_source(
+            pathlib.Path(run_dir) / MACHINE_LOG_NAME,
+            lane=CLAUDE, source=FALLBACK_SOURCE,
+            reason=FALLBACK_REASON.format(directory=sessions_directory(account)),
         )
 
 
@@ -707,7 +703,7 @@ def claude_states(claude_bin, run_dir=None, timeout=None, records=(), binding=No
         return None
     if states is not None:
         return states
-    announce_fallback(run_dir, records, timeout, home, announced)
+    announce_fallback(run_dir, records, home, announced)
     answered_by = accounts.login_home(binding)
     cached = read_agents_cache(time.time(), answered_by)
     if cached is not NO_CACHE:
@@ -2710,21 +2706,19 @@ def render_cost(rows, coordinator=None):
 
 def log_session_cost(log, row):
     """Append this child's one `session-cost` line, through the log's own writer."""
-    command = [
-        sys.executable, str(MACHINE_LOG), "--log", str(log), "session-cost",
-        "--ticket", row["ticket"], "--executor", row["executor"], "--model", row["model"],
-    ]
-    if row["sessions"]:
-        command += ["--session", SESSION_SEPARATOR.join(row["sessions"])]
-    if row["counters"] is not None:
-        for name in COUNTERS:
-            command += [f"--{name.replace('_', '-')}-tokens", str(row["counters"][name])]
-        command += ["--total-tokens", str(counted(row["counters"]))]
-    if row["detail"]:
-        command += ["--detail", row["detail"]]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise MonitorError(f"machine log append failed: {result.stderr.strip()}")
+    counters = row["counters"] or {}
+    try:
+        machine_log.record_session_cost(
+            log,
+            ticket=row["ticket"], executor=row["executor"], model=row["model"],
+            session=SESSION_SEPARATOR.join(row["sessions"]) if row["sessions"] else None,
+            detail=row["detail"] or None,
+            total_tokens=counted(row["counters"]) if row["counters"] is not None else None,
+            # The log's field names are this script's counter names with the unit spelled out.
+            **{f"{name}_tokens": counters.get(name) for name in COUNTERS},
+        )
+    except (ValueError, OSError) as error:
+        raise MonitorError(f"machine log append failed: {error}") from error
 
 
 def run_cost(args):
@@ -2794,15 +2788,10 @@ def receipt_problem(worktree, sha, base):
 
 def log_receipt(log, ticket, sha):
     """Append the one `receipt` line a landable verdict earns, through the log's own writer."""
-    result = subprocess.run(
-        [
-            sys.executable, str(MACHINE_LOG), "--log", str(log), "receipt",
-            "--ticket", ticket, "--verdict", LANDABLE, "--sha", sha,
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise MonitorError(f"machine log append failed: {result.stderr.strip()}")
+    try:
+        machine_log.record_receipt(log, ticket=ticket, verdict=LANDABLE, sha=sha)
+    except (ValueError, OSError) as error:
+        raise MonitorError(f"machine log append failed: {error}") from error
 
 
 def run_verify(args):

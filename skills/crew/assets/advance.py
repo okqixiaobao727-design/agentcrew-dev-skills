@@ -61,7 +61,6 @@ import machine_log  # noqa: E402
 import run_plan  # noqa: E402
 
 ASSETS = pathlib.Path(__file__).resolve().parent
-MACHINE_LOG = ASSETS / "machine_log.py"
 MERGE_DRIVER = ASSETS / "merge_driver.py"
 
 LANDABLE = machine_log.LANDABLE
@@ -111,11 +110,18 @@ def run_shielded(command):
 # --- the machine log --------------------------------------------------------------------------
 
 
-def log_event(log, *arguments):
-    """Append one event through the log's own writer, so its closed sets stay the only ones."""
-    result = run_shielded([sys.executable, str(MACHINE_LOG), "--log", str(log), *arguments])
-    if result.returncode != 0:
-        raise AdvanceError(f"machine log: {(result.stderr or result.stdout).strip()}")
+def log_event(writer, log, **fields):
+    """Append one event through the log's own writer, so its closed sets stay the only ones.
+
+    This script imports the Machine log module already — it reads the log through it twice per
+    advance — so an append is a call rather than a command (ADR-0030). Nothing is lost by not
+    shielding it the way a merge step is shielded: the interrupt this script takes only sets a
+    flag, and one record is one `write` on a descriptor opened `O_APPEND`.
+    """
+    try:
+        writer(str(log), **fields)
+    except (ValueError, OSError) as error:
+        raise AdvanceError(f"machine log: {error}") from error
 
 
 def already_advanced(records, wave, following):
@@ -170,10 +176,10 @@ def land(table_path, wave, options):
 
 
 def record(options, wave, decision, detail=None):
-    arguments = ["advance", "--wave", str(wave), "--decision", decision]
-    if detail:
-        arguments += ["--detail", detail]
-    log_event(options["log"], *arguments)
+    log_event(
+        machine_log.record_advance, options["log"],
+        wave=wave, decision=decision, detail=detail or None,
+    )
 
 
 def block_descendants(plan, projection, roots, options):
@@ -196,8 +202,8 @@ def block_descendants(plan, projection, roots, options):
             continue
         detail = "descendant of " + ", ".join(why)
         log_event(
-            options["log"], "outcome", "--ticket", number,
-            "--outcome", BLOCKED, "--detail", detail,
+            machine_log.record_outcome, options["log"],
+            ticket=number, outcome=BLOCKED, detail=detail,
         )
         lines.append(f"{number} {BLOCKED} {detail}")
     return lines
