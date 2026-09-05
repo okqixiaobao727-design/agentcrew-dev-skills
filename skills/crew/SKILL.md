@@ -30,8 +30,10 @@ blocks known destructive command shapes; this rule stands where the hook misses.
 **Judgment material is read whole; facts are delegated** — read `<run-dir>/spec.md` whole at run
 start, before the first ruling: staging generated it as this run's **Reference index** to the
 maintainer-authored Markdown the coordinator may read whole. The hook compares physical locations.
-Code, tests and git remain facts for the witness brief. The driver checks every escalation pointer
-automatically. When a ruling needs an uncited fact, ask the same Witness directly:
+Code, tests and git remain facts for the witness brief. Every escalation carries the Witness line
+that checks its pointers; you run it yourself, before you rule, as
+[`references/triage.md`](references/triage.md) says. When a ruling needs an uncited fact, ask the
+same Witness directly:
 
 ```bash
 python3 <crew-skill-dir>/assets/witness.py ask \

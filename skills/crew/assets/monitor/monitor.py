@@ -191,11 +191,11 @@ REVIEW_EVENT = "review"
 REVIEW_RUNNING = "running"
 # What the summary line says while the run is waiting on the operator, so a halted wave is never
 # mistaken for a frozen frame.
+# A delivered escalation is the coordinator's from the moment the child sent it, so this covers
+# the whole of the wait — the fact-check the coordinator runs itself included. The `⏳ fact-check
+# running` marker beside it named the Driver's own witness subprocess, which no longer exists:
+# nothing the log holds can tell a coordinator reading an ASK from one running the Witness (#194).
 AWAITING_RULING = "⚠ awaiting your ruling"
-# What the same slot says while the Driver is still checking an escalation and no coordinator
-# action is possible yet. The Machine-log projection owns that condition; this renderer only names
-# it.
-FACT_CHECK_RUNNING = "⏳ fact-check running"
 # The run directory's record of the driver driving it: the pid its loop wrote on the way in, which
 # every deliberate exit takes away again and a kill cannot. A record naming a process that is not
 # running is therefore a killed driver by construction — the one thing the operator could not see
@@ -905,16 +905,12 @@ def review_note(events, moment):
     return None
 
 
-def annotations(events, state, anomaly, moment, fact_check_since=None):
+def annotations(events, state, anomaly, moment):
     """The lines drawn under one row: its review, its anomaly, and what last happened to it."""
     lines = []
     review = review_note(events, moment)
     if review:
         lines.append(review)
-    if fact_check_since is not None:
-        started = parse_timestamp(fact_check_since)
-        seconds = max(int((moment - started).total_seconds()), 0) if started is not None else 0
-        lines.append(f"fact-check running · {seconds}s")
     if anomaly is not None:
         lines.append(f"anomaly: {anomaly[0]} · {anomaly[1]}")
     if state in ABNORMAL_STATES and events:
@@ -992,12 +988,8 @@ def build_rows(plan, projection, moment, sources):
                 "launched": launch is not None,
                 "settled": settling is not None,
                 "escalation_count": escalation_count,
-                "fact_check_running": facts.fact_check_running,
                 "awaiting_ruling": facts.awaiting_ruling,
-                "annotations": annotations(
-                    events, state, anomaly, moment,
-                    (facts.escalation or {}).get("ts") if facts.fact_check_running else None,
-                ),
+                "annotations": annotations(events, state, anomaly, moment),
             })
     return rows
 
@@ -1028,7 +1020,7 @@ def summary(rows, run_id, waves, moment, awaiting_ruling=False, banner=None):
     drawn, and what stopped moving is the run rather than the renderer.
 
     A liveness banner says that instead, in the same slot — a driver that was killed, or a wake
-    standing with no waiter left to carry it back. The slot holds one sentence, so the three can
+    standing with no waiter left to carry it back. The slot holds one sentence, so the two can
     never be believed at once, and a run halted on a ruling that also lost a process is drawn as
     the lost process: that is the reading the operator has to act on.
     """
@@ -1037,12 +1029,7 @@ def summary(rows, run_id, waves, moment, awaiting_ruling=False, banner=None):
         counts[row["state"]] += 1
     started = [row["started"] for row in rows if row["started"] is not None]
     ticket_awaiting_ruling = any(row["awaiting_ruling"] for row in rows)
-    fact_check_running = any(row["fact_check_running"] for row in rows)
-    activity = (
-        AWAITING_RULING if awaiting_ruling or ticket_awaiting_ruling
-        else FACT_CHECK_RUNNING if fact_check_running
-        else ""
-    )
+    activity = AWAITING_RULING if awaiting_ruling or ticket_awaiting_ruling else ""
     parts = [
         f"wave {len({row['wave'] for row in rows if row['launched']})}/{waves}",
         " ".join(f"{state}={counts[state]}" for state in STATE_ORDER if counts[state]),

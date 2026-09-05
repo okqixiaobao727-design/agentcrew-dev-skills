@@ -79,22 +79,24 @@ WAVE  TICKET  TITLE                       EXECUTOR                         STATE
 
 The summary line above the table is the run at a glance: the run id (the run directory's own
 name), how many of its waves have been launched, a count per state, and the run's total elapsed
-time from its first launch. While an escalation's fact-check is running it carries `⏳ fact-check
-running`; once the wake snapshot has landed and the hand-over line has been recorded, that marker
-becomes `⚠ awaiting your ruling`. The two distinguish work only the Driver can finish from work
-the coordinator can act on:
+time from its first launch. While one escalation is in front of the coordinator and unanswered it
+carries `⚠ awaiting your ruling`:
 
 ```
-crew crew-run-3 — wave 2/5 · pending=6 merged=4 · ⏳ fact-check running · elapsed 01:10:21
 crew crew-run-3 — wave 2/5 · pending=6 merged=4 · ⚠ awaiting your ruling · elapsed 01:12:44
 ```
 
-The Machine-log projection decides both markers. Any ticket whose projected
-`fact_check_running` fact is true puts up the first. The existing `awaiting_ruling` ticket fact
-puts up the second after hand-over and a later coordinator ruling takes it away; the Run
-projection's existing halted fact still supplies the same marker for merge and interruption
-escalations. A `witness` event does not decide either marker. A liveness banner still owns this one
-summary slot when present; otherwise awaiting-ruling takes precedence over fact-check running.
+The Machine-log projection decides the marker. Any ticket whose projected `awaiting_ruling` fact
+is true puts it up — from the escalation itself where a child's message tool delivered it, from
+the Driver's hand-over line where nothing did — and a later coordinator ruling takes it away; the
+Run projection's existing halted fact still supplies the same marker for merge and interruption
+escalations. A `witness` event does not decide it: the coordinator runs the fact-check itself, as
+part of the ruling turn rather than before it (#194). A liveness banner owns this one summary slot
+when present.
+
+The `⏳ fact-check running` marker beside it is retired. It named the Driver's own witness
+subprocess, which no longer exists, and nothing the log holds distinguishes a coordinator reading
+an ASK from one running the Witness — so the marker would assert something it does not know.
 
 ### The driver's own liveness
 
@@ -233,13 +235,11 @@ has to grow a column:
 | Annotation | Drawn when |
 | --- | --- |
 | `↳ review: <lane> <state> · <elapsed>` | the log's last `review` line says a review is `running` |
-| `↳ fact-check running · <seconds>s` | `fact_check_running`; seconds since escalation |
 | `↳ anomaly: duplicate · more than one session in <worktree>` | one worktree, two sessions |
 | `↳ anomaly: unknown · <source> could not be read` | the lane's source failed or is unknown |
 | `↳ last event: <event> <word> — <detail> · <stamp>` | the row's state is an abnormal one |
 
-The fact-check line follows any review line and precedes anomaly and last-event lines; it does not
-replace them. The abnormal states are `waiting`, `reworking`, `failed` and `vanished`: a row in any
+The abnormal states are `waiting`, `reworking`, `failed` and `vanished`: a row in any
 of them owes the operator that last line, and every other row stays quiet unless another annotation
 above applies.
 

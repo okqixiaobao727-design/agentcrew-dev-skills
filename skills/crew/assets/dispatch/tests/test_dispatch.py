@@ -810,12 +810,53 @@ class ClaudeRenderTests(DispatchTestCase):
         self.assertIn(RENDERED_RUN_AGAIN_BUDGET, prompt)
         self.assertEqual(prompt.count("returns `refused`"), 1)
         escalation = rendered.split("Escalate at any phase", 1)[1]
-        self.assertTrue(all(len(line) <= 98 for line in escalation.splitlines()), escalation)
+        # The width rule is about prose. The witness command line is a rendered absolute path and
+        # cannot be wrapped without changing what it means, so it is measured out (#194).
+        prose = [
+            line for line in escalation.splitlines() if not line.startswith("python3 ")
+        ]
+        self.assertTrue(all(len(line) <= 98 for line in prose), escalation)
         self.assertIn(
             "  2-3 options with your pick marked.\n"
             "  A review that cannot run or returns `refused`",
             escalation,
         )
+
+    def test_a_dispatched_child_carries_the_run_named_witness_line_it_never_runs(self):
+        """One fixed line, filled for this run and this ticket, for the coordinator to copy (#194).
+
+        The child sends it and does not run it: the coordinator runs the Witness itself, once,
+        before it rules, and the child's own message is the only thing that carries the line
+        there.
+        """
+        log = self.fixture.root / "run" / "log.jsonl"
+        result = self.fixture.run_dispatch("render", self.table, extra=("--log", str(log)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        turn = self.fixture.turn("06")
+
+        run_dir = str(log.parent)
+        self.assertIn(f"check --run {run_dir} --ticket 06", turn)
+        self.assertIn("Do not run it", turn)
+        # The Run holds the rest, so the line names none of it.
+        carried = next(
+            line for line in turn.splitlines() if line.startswith("python3 ") and "check" in line
+        )
+        for named_elsewhere in ("--worktree", "--model", "--budget-usd", "--escalation"):
+            with self.subTest(flag=named_elsewhere):
+                self.assertNotIn(named_elsewhere, carried)
+
+    def test_a_run_with_no_machine_log_carries_no_witness_line_at_all(self):
+        """Nothing records the escalation, so there is no line for a coordinator to run (#194).
+
+        The driver-less flow keeps the other half of the arrangement, where the developer runs the
+        manual line itself and pastes the brief under the message before it sends. Telling this
+        child to carry a line and not run it would promise a fact-check nobody can perform.
+        """
+        turn = self.fixture.turn("06")
+
+        self.assertNotIn("Do not run it", turn)
+        self.assertNotIn("<witness command>", turn)
+        self.assertNotIn("witness.py", turn)
 
     def test_the_review_block_fills_every_value_the_dispatcher_owns(self):
         prompt = self.initial_prompt()

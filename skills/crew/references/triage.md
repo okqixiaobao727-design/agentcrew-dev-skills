@@ -1,11 +1,34 @@
 # Triage: rule on a child
 
-Reached from a `judgment-needed` or `driver-error` wake snapshot. Rule from its `detail`, `ticket`,
-`child` and `window`; a child escalation also carries its fact-check in `brief`. A failed fact-check
-carries an empty `brief` and a plain-string `witness_reason` beside it; that field is absent on
-success. The snapshot may instead carry a semantic conflict bounced back a second time, or a state
-the rule table has no row for. A Claude child `waiting` at a permission prompt is that last case —
-read the question with `tmux capture-pane -p -t <window>`.
+Reached two ways. A Claude child's `CREW ASK` arrives as a message in this session, sent by the
+child's own message tool: that message is the whole escalation, and nothing wakes you a second time
+for it. Everything else arrives as a `judgment-needed` or `driver-error` wake snapshot — a Codex
+child's escalation, which no message channel carried and the bridge transcribed into the log; a
+semantic conflict bounced back a second time; or a state the rule table has no row for. Rule from
+the message, or from the snapshot's `detail`, `ticket`, `child` and `window`. A Claude child
+`waiting` at a permission prompt is that last case — read the question with
+`tmux capture-pane -p -t <window>`.
+
+## Fact-check the escalation before you rule
+
+An escalation ends on the Witness line that checks its pointers, already filled in with this run
+and this ticket. Copy it out of the message and run it, in the foreground, with a Bash tool
+timeout of `600000` ms — the tool's maximum, which is what any configured witness timeout is held
+below, so the session always ends before the tool gives up on it:
+
+```bash
+python3 <crew-skill-dir>/assets/witness.py check --run <run-dir> --ticket <NN>
+```
+
+A Codex escalation carries no such line, because the child never sent a message to carry it. Spell
+the same command out from the snapshot's `ticket` and this run's directory.
+
+It prints one JSON object, and `brief` is the fact-check: one line per pointer, each `held`,
+`contradicted` or `missing`. `outcome` says how much of the escalation it covered — `checked` is
+every cited pointer, `partial` is some of them with `reason` naming the rest, and `failed` is none
+of them, with an empty `brief` and `reason` saying why. A failed fact-check is not an error and
+stops nothing: rule without a brief. Run twice for one escalation, the second run prints the brief
+already recorded, marked `"recorded": true`, and buys no second opinion.
 
 ## Decide
 

@@ -58,8 +58,8 @@ class TicketFacts:
     settlement_state: str
     unanswered_child_message: Mapping[str, object] | None
     escalation: Mapping[str, object] | None
+    standing_escalation: Mapping[str, object] | None
     witness: Mapping[str, object] | None
-    fact_check_running: bool
     awaiting_receipt: bool
     awaiting_ruling: bool
     outstanding_nudge: bool
@@ -98,10 +98,25 @@ re-derive a named projection fact from them.
   written as "every operation but `ask`", so an operation added later is a fact-check by default.
   The handed-over ruling consumes the pending message but retains this factual pair for audit and
   report readers.
-- `fact_check_running` is true from the newest escalation until its later
-  `CREW RULED <NN> — handed to the coordinator` line. A `witness` event of any outcome does not
-  clear it: that event says the check process ended, not that the wake snapshot reached disk. A
-  later escalation starts a new occurrence and governs the fact.
+- `standing_escalation` is the escalation this ticket is still owed a ruling on, and it is what a
+  `witness` event pairs with. It is the newest escalation from the moment it is recorded, and it
+  is cleared by any other word from the child and by any settling event — except the Driver's
+  `CREW RULED <NN> — handed to the coordinator` line, which is a delivery note rather than an
+  answer. That exception is the whole of the difference: the hand-over consumes the pending
+  message, so a fact that read `unanswered_child_message` alone would say a Codex child's
+  escalation had been answered the instant it was put in front of the coordinator, and the
+  fact-check the coordinator then runs for it would find nothing to check (#194).
+- `awaiting_ruling` is true while one escalation is in front of the coordinator and unanswered.
+  It starts at a **delivered** escalation — one whose record carries a `from` address, meaning the
+  child's own message tool put it there — because that escalation reached the coordinator without
+  the Driver doing anything. An escalation with no address reached nobody, so it starts instead at
+  the Driver's later `CREW RULED <NN> — handed to the coordinator` line, which is the Driver saying
+  it has now handed that one over. Any other ruling, and any other word from the child, ends it.
+  A `witness` event does not: the fact-check is part of the ruling turn, not the end of it.
+- `delivered(record)` is that address test, and it is the log's own: only the `SendMessage` hook
+  writes `from`, out of the sending session's environment (ADR-0023). The `message` subcommand the
+  Codex bridge transcribes a turn's final message with cannot supply one. So the address says a
+  channel carried the message, and its absence says the log is the only place it exists.
 - `latest_settling_event` means the last receipt or outcome with a non-empty value. It answers
   whether the ticket has received a settling event.
 - `settlement_state` retains the closed Machine-log vocabulary and its category precedence: a valid
@@ -367,10 +382,12 @@ written; the event shape and the rule that the last line holds are unchanged.
 
 The Witness writes this line itself, on completion of every operation it offers, and no caller
 transcribes those fields: it is the one process that holds them, and the coordinator-initiated
-`ask` has no caller to write them down at all. A `check` line falls after the child escalation and
-before its handed-over ruling. `model` and the budget that bounded the run come from the run's
-`[witness]` configuration; `executor` and `model` are the resolved witness route, while the hard
-budget remains in the Wave table.
+`ask` has no caller to write them down at all. Both operations are the coordinator's to run: it
+fact-checks each escalation itself, once, before it rules (#194), so a `check` line falls after the
+child escalation and before the ruling that answers it. A second `check` for one escalation writes
+no second line — it prints the brief this one already holds. `model` and the budget that bounded
+the run come from the run's `[witness]` configuration; `executor` and `model` are the resolved
+witness route, while the hard budget remains in the Wave table.
 
 `reason` is empty for `checked` and non-empty for `partial` and `failed`. `brief` is what the
 operation found, verbatim — the fact-check's findings for a `check`, the answer for an `ask` —

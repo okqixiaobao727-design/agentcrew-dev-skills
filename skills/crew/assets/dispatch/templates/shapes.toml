@@ -79,6 +79,18 @@ Re-read each pointer as you write it. The coordinator rules from this message an
 that checks its pointers. Progress, reasoning and assumptions belong in your commits and receipt.
 '''
 
+# What a dispatched child adds under that shared block: it carries the brief's command line and
+# never runs it. The coordinator runs it, once, before it rules (#194), and only the child's own
+# message reaches the coordinator to carry it there. A manual run's developer has the other half
+# of this — it runs the line itself and pastes the brief — because a run with no driver records no
+# escalation for a coordinator's command to find. Both spellings fill one `<witness command>`.
+witness_carried = '''
+End the message with this line, exactly as it stands and on a line of its own. Do not run it: it
+is filled in for this run and this ticket, and it is the coordinator that runs it, before it rules
+on what you sent.
+<witness command>
+'''
+
 # A Claude child addresses the coordinator by socket, on every account (ADR-0023): the name beside
 # it is a label to read, never a thing to send to.
 coordinator_claude = '''

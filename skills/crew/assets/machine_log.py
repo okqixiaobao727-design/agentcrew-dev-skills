@@ -220,8 +220,8 @@ class TicketFacts:
     settlement_state: str = LIVE
     unanswered_child_message: Mapping | None = None
     escalation: Mapping | None = None
+    standing_escalation: Mapping | None = None
     witness: Mapping | None = None
-    fact_check_running: bool = False
     awaiting_receipt: bool = False
     awaiting_ruling: bool = False
     outstanding_nudge: bool = False
@@ -279,6 +279,32 @@ def _current_settlement_epoch(records):
         None,
     )
     return records[relaunched:] if relaunched is not None else records
+
+
+def delivered(record):
+    """Whether a message channel carried this record to its addressee; a log fact, not a guess.
+
+    The sender address is written by the `SendMessage` hook out of the sending session's own
+    environment (ADR-0023), and by nothing else — the `message` subcommand the Codex bridge
+    transcribes a turn's final message with cannot supply one. So an address on the record says
+    the child's own message tool delivered it, and its absence says the log is the only place the
+    message exists. That is what decides whether the Driver hands an escalation over: a delivered
+    one is already in front of the coordinator, and waking it again would rule twice on one
+    question (#194).
+    """
+    origin = (record or {}).get("from")
+    return isinstance(origin, str) and bool(origin.strip())
+
+
+def handed_over(message):
+    """Whether this ruling is the Driver's hand-over line rather than an answer to the child.
+
+    The line the Driver records when it wakes the coordinator for an escalation no channel
+    delivered. It reaches the log as a ruling because it is what the run's report has of one, but
+    it answers nothing: the escalation it announces is still waiting for the ruling it was handed
+    over for (#194).
+    """
+    return isinstance(message, str) and message.lstrip().startswith(HANDED_OVER_MARKER)
 
 
 def child_paused(records, ticket):
@@ -386,8 +412,8 @@ def project(records):
             {
                 "unanswered_child_message": None,
                 "escalation": None,
+                "standing_escalation": None,
                 "witness": None,
-                "fact_check_running": False,
                 "awaiting_receipt": False,
                 "awaiting_ruling": False,
                 "outstanding_nudge": False,
@@ -409,8 +435,12 @@ def project(records):
             if event == "escalation":
                 episode["escalation"] = record
                 episode["witness"] = None
-                episode["fact_check_running"] = True
-            episode["awaiting_ruling"] = False
+            # A delivered escalation is the coordinator's from the moment the child sent it: the
+            # message tool put it in front of the coordinator, which runs the fact-check itself
+            # and rules (#194). One nobody delivered waits for the Driver's hand-over line below,
+            # and every other word from a child ends whatever ruling was owed.
+            episode["standing_escalation"] = record if event == "escalation" else None
+            episode["awaiting_ruling"] = event == "escalation" and delivered(record)
             episode["outstanding_nudge"] = False
         elif event == PAUSED and record.get("role") == CHILD:
             # The silence a standing nudge addressed is over: the turn it started ended on the
@@ -423,13 +453,14 @@ def project(records):
             # same ticket, and taking the latest event of any kind would let that answer displace
             # the fact-check the standing escalation is waiting on. Written as "not `ask`" so an
             # operation added later is a fact-check here by default, not by an edit to this line.
-            pending = episode["unanswered_child_message"]
             if (
                 record.get("operation") != WITNESS_ASK
-                and (pending or {}).get("event") == "escalation"
+                and episode["standing_escalation"] is not None
             ):
                 episode["witness"] = record
         elif event in ("receipt", "ruling", "outcome"):
+            if not (event == "ruling" and handed_over(message)):
+                episode["standing_escalation"] = None
             pending = episode["unanswered_child_message"]
             pending_verb, pending_line = final_verb((pending or {}).get("message"))
             completion_sha = (
@@ -461,12 +492,10 @@ def project(records):
             episode["instruction_messages"].append(message)
             if any(message.lstrip().startswith(marker) for marker in RECEIPT_WAIT_MARKERS):
                 episode["awaiting_receipt"] = True
-            episode["awaiting_ruling"] = message.lstrip().startswith(HANDED_OVER_MARKER)
-            if episode["awaiting_ruling"]:
-                episode["fact_check_running"] = False
+            episode["awaiting_ruling"] = handed_over(message)
             if message.lstrip().startswith(NUDGE_MARKER):
                 episode["outstanding_nudge"] = True
-            elif not message.lstrip().startswith(HANDED_OVER_MARKER):
+            elif not handed_over(message):
                 episode["outstanding_nudge"] = False
         elif event == "receipt":
             episode["awaiting_receipt"] = False
@@ -549,8 +578,8 @@ def project(records):
             settlement_state=settlement_state(events, ticket),
             unanswered_child_message=episode.get("unanswered_child_message"),
             escalation=episode.get("escalation"),
+            standing_escalation=episode.get("standing_escalation"),
             witness=episode.get("witness"),
-            fact_check_running=episode.get("fact_check_running", False),
             awaiting_receipt=episode.get("awaiting_receipt", False),
             awaiting_ruling=episode.get("awaiting_ruling", False),
             outstanding_nudge=episode.get("outstanding_nudge", False),

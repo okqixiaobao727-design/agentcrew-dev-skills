@@ -30,9 +30,10 @@ run file, which is what keeps the oracle boundary intact; `monitor-wave.sh` and 
 launch line and goes on working, and only one of the four reasons ends it.
 
 A `judgment-needed` snapshot for a child escalation carries the child's message in `detail` and
-the checked text in `brief`. A partial Witness keeps that non-empty brief and adds its plain-string
-`witness_reason`; a failed Witness carries an empty brief and its reason. `witness_reason` is absent
-only on a fully checked result, and the snapshot's existing `reason` remains the wake reason.
+carries no brief: the coordinator runs the Witness itself, once, before it rules (#194). Only an
+escalation nothing delivered reaches this snapshot at all — a Codex child's, transcribed into the
+log by the bridge. One a Claude child sent with its own message tool is already in front of the
+coordinator, and the Driver leaves it alone.
 
 The `clear` subcommand is an operator terminal command rather than a coordinator lifecycle
 event: it prints a multi-line inventory, asks for confirmation, and reports errors directly instead
@@ -144,7 +145,6 @@ MONITOR_WAVE = ASSETS / "monitor-wave.sh"
 CODEX_BRIDGE = ASSETS / "codex" / "codex_bridge.py"
 ADVANCE = ASSETS / "advance.py"
 LAUNCH = ASSETS / "launch" / "launch.py"
-WITNESS = ASSETS / "witness.py"
 
 # The renderer owns what a ticket's branch is called.
 sys.path.insert(0, str(DISPATCH.parent))
@@ -3063,111 +3063,15 @@ class Loop:
 
     # --- the rule table, row by row ---------------------------------------------------------
 
-    def run_witness(self, ticket, launch, message):
-        """Run one escalation witness; returns its checked, partial or failed document.
-
-        The witness records its own Machine-log event, with the brief in it, so nothing is
-        transcribed here (#196). What is still read from the document is the wake snapshot this
-        escalation is handed to the coordinator with.
-        """
-        started = time.monotonic()
-        _, witness_model, witness_budget_usd, witness_timeout = run_plan.witness_routing(
-            self.run.witness_model, self.run.witness_budget_usd, self.run.witness_timeout_seconds
-        )
-
-        def failed(reason):
-            return {
-                "brief": "",
-                "outcome": "failed",
-                "reason": str(reason).strip() or "witness process failed",
-                "covered_count": 0,
-                "uncovered_count": 0,
-                "duration_seconds": round(time.monotonic() - started, 3),
-            }
-
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable, WITNESS, "check", "--escalation", "-",
-                    "--worktree", launch["worktree"],
-                    "--model", witness_model,
-                    "--budget-usd", f"{witness_budget_usd:g}",
-                    "--timeout-seconds", f"{witness_timeout:g}",
-                    "--log", str(self.log),
-                    "--ticket", ticket,
-                ],
-                input=message,
-                capture_output=True,
-                text=True,
-                env=accounts.process_environment(self.plan.ticket(ticket).binding),
-                # The witness owns the session timeout. One poll interval lets it shape and print
-                # that failure before this outer guard treats the whole process as the overrun.
-                timeout=witness_timeout + self.args.poll_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            document = failed("witness process timed out")
-        except (OSError, KeyError, TypeError) as error:
-            document = failed(error)
-        else:
-            if result.returncode:
-                document = failed(
-                    result.stderr.strip()
-                    or result.stdout.strip()
-                    or f"witness process exited {result.returncode}"
-                )
-            else:
-                try:
-                    document = json.loads(result.stdout)
-                except (TypeError, json.JSONDecodeError) as error:
-                    document = failed(f"witness process returned invalid JSON: {error}")
-                if not isinstance(document, dict):
-                    document = failed("witness process returned no result object")
-
-        outcome = document.get("outcome")
-        brief = document.get("brief")
-        reason = document.get("reason")
-        covered_count = document.get("covered_count")
-        uncovered_count = document.get("uncovered_count")
-        duration = document.get("duration_seconds")
-        coverage_is_sound = all(
-            isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            for value in (covered_count, uncovered_count)
-        )
-        sound = (
-            outcome in machine_log.WITNESS_OUTCOMES
-            and isinstance(brief, str)
-            and isinstance(reason, str)
-            and coverage_is_sound
-            and isinstance(duration, (int, float))
-            and not isinstance(duration, bool)
-            and duration >= 0
-            and (
-                (
-                    outcome == "checked" and bool(brief) and not reason
-                    and not uncovered_count
-                )
-                or (
-                    outcome == "partial" and bool(brief) and bool(reason.strip())
-                    and bool(covered_count)
-                )
-                or (
-                    outcome == "failed" and not brief and bool(reason.strip())
-                    and not covered_count
-                )
-            )
-        )
-        if not sound:
-            document = failed("witness process returned a contradictory result")
-
-        # The witness records itself; a record that failed is the witness's own account of the
-        # failure, printed here so it is visible in this pane rather than only in the document.
-        record_error = document.get("record_error")
-        if isinstance(record_error, str) and record_error.strip():
-            print(f"{ticket}: {record_error.strip()}", flush=True)
-        return document
-
     def hand_over(self, ticket, launch, message):
-        """Check this escalation and raise the wake that hands it to the coordinator; never returns.
+        """Raise the wake that hands one undelivered escalation to the coordinator; never returns.
+
+        Reached only for an escalation no message channel carried — a Codex child's, transcribed
+        into the log by the bridge. A Claude child's own message tool put its escalation in front
+        of the coordinator already, and waking it for that would be the second wake #194 removes.
+        No fact-check runs here: the coordinator runs the Witness itself, once, before it rules,
+        so the snapshot carries the escalation and nothing about a brief
+        ([ADR-0010](../../../../docs/adr/0010-the-driver-runs-the-run-the-coordinator-rules.md)).
 
         The loop writes the wake snapshot atomically before it records the hand-over line. Written
         there rather than when the run comes back, because the one thing the driver knows for
@@ -3183,7 +3087,6 @@ class Loop:
         without this the escalation would still be standing on the next poll and the run could
         never go on.
         """
-        witness_result = self.run_witness(ticket, launch, message)
         handed_over = HandOverIntent(
             ticket=ticket,
             launch=launch,
@@ -3192,12 +3095,8 @@ class Loop:
         raise Wake(
             JUDGMENT_NEEDED, ticket=ticket, pointer=str(self.log),
             hand_over=handed_over,
-            detail=message, brief=witness_result["brief"],
+            detail=message,
             child=launch.get("child"), window=launch.get("window"),
-            **(
-                {"witness_reason": witness_result["reason"]}
-                if witness_result["outcome"] in ("partial", "failed") else {}
-            ),
         )
 
     def rule_on_messages(self, projection):
@@ -3205,6 +3104,14 @@ class Loop:
 
         Returns whether anything was settled, so a poll that changed the run is followed by another
         read rather than by a wait.
+
+        A delivered escalation is left where it stands. The child's own message tool carried it to
+        the coordinator, which fact-checks it and rules; the ruling reaches the log through the
+        ruling hook and ends the escalation there. Waking for it as well is the double wake #194
+        removes, and there is deliberately no backstop for one the coordinator never answers: the
+        Driver is blocked for the whole of nothing, but the coordinator is blocked for the whole of
+        each fact-check, so any window short enough to be useful re-creates the double wake under
+        load. A lost escalation stands on the dashboard until the operator resumes the run.
         """
         acted = False
         pending = [
@@ -3224,6 +3131,8 @@ class Loop:
                     )
                 continue
             if record.get("event") == "escalation":
+                if machine_log.delivered(record):
+                    continue
                 self.hand_over(ticket, launch, message)
             acted = self.rule_on_receipt(ticket, launch, message, projection) or acted
         return acted
@@ -3801,8 +3710,21 @@ class Loop:
         self.arm(wave, projection)
         return wave
 
-    def paused_ticket(self, wave):
-        """Return the first live ticket of `wave` waiting on a usage limit, or None for none.
+    def waiting_ticket(self, wave):
+        """Return the first live ticket of `wave` whose wait someone else keeps, or None.
+
+        Two waits look exactly like a stall from here and are not one, because each has an end
+        another party is keeping:
+
+        - A child paused on its vendor's usage limit. The harness resumes the session by itself
+          when the limit resets, and the wait outlasts any deadline worth setting for the states
+          that really are stalls (#190).
+        - A ticket owed a ruling. Its escalation is in front of the coordinator — delivered by the
+          child's own message tool, or handed over by this Driver — and the Driver no longer exits
+          on a delivered one, so the whole of the coordinator's turn now happens while this loop
+          polls. That turn is a fact-check of 70-300s (#173) plus the ruling itself, and several
+          children asking at once queue behind each other; a run that timed out over it would kill
+          itself for the coordinator doing the one job it has (#194).
 
         Asked only when the inactivity deadline has run out, because that is the one moment the
         answer changes anything and the question costs a whole read of the log.
@@ -3810,7 +3732,9 @@ class Loop:
         projection = machine_log.project(self.records())
         for ticket in self.tickets_of(wave):
             facts = projection.ticket(ticket.id)
-            if facts.settlement_state == machine_log.LIVE and facts.paused:
+            if facts.settlement_state != machine_log.LIVE:
+                continue
+            if facts.paused or facts.awaiting_ruling:
                 return ticket.id
         return None
 
@@ -3825,11 +3749,9 @@ class Loop:
             here = (following, len(self.records()), len(self.monitors))
             if here != seen:
                 seen, deadline = here, time.monotonic() + self.args.timeout
-            elif time.monotonic() >= deadline and self.paused_ticket(following):
-                # A wave holding a child paused on its vendor's usage limit is not a wave doing
-                # nothing: the wait has a known end the harness itself keeps, and it outlasts any
-                # inactivity deadline worth setting for the states that really are stalls. The
-                # deadline runs again from the moment the log says the pause is over.
+            elif time.monotonic() >= deadline and self.waiting_ticket(following):
+                # A wave whose wait someone else is keeping is not a wave doing nothing. The
+                # deadline runs again from the moment the log says that wait is over.
                 deadline = time.monotonic() + self.args.timeout
             elif time.monotonic() >= deadline:
                 raise DriverError(

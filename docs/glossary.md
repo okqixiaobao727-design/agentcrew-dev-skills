@@ -303,9 +303,11 @@ Witness session. An escalation `check` receives the normalised cited-pointer lis
 numbered input and marks each covered pointer held, contradicted or missing. `checked` carries all
 findings and no reason; `partial` carries the usable covered findings plus a reason naming each
 omitted or structurally rejected expected pointer. Repeated and out-of-order expected pointers stay
-out of the brief, while extra cited pointers become uncited findings. `failed` carries no brief. The
-Driver launches `check` automatically, or a child launches
-it before sending in a run without a driver. An `ask` is coordinator-initiated and returns
+out of the brief, while extra cited pointers become uncited findings. `failed` carries no brief and
+is not an error: the coordinator rules without one. The coordinator launches `check` itself, once,
+before it rules, on the fixed command line the escalation carries (#194); in a run without a driver
+the checking session is launched by hand with the escalation on its stdin. An `ask` is
+coordinator-initiated and returns
 independently stated factual claims, each with at least one pointer. Both operations carry no
 recommendation or ruling, and both record their own Machine-log `witness` event with the brief in
 it, so a later reader takes the finding from the log rather than paying for a second session. The

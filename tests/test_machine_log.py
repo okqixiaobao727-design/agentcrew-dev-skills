@@ -538,10 +538,33 @@ class RunProjectionTests(unittest.TestCase):
 
         self.assertEqual(projection.ticket("7").witness, later)
 
-    def test_fact_check_runs_from_each_escalation_until_its_hand_over_ruling(self):
+    def test_a_delivered_escalation_awaits_a_ruling_from_the_moment_it_was_sent(self):
         escalation = {
             "event": "escalation", "ticket": "7", "role": "child",
+            "from": "uds:/tmp/crew-7.sock",
             "message": "CREW ASK 7 design — choose the projection fact",
+        }
+        ruling = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": "Choose option A.",
+        }
+
+        self.assertTrue(machine_log.project([escalation]).ticket("7").awaiting_ruling)
+        for outcome in ("checked", "partial", "failed"):
+            with self.subTest(outcome=outcome):
+                # The coordinator runs the fact-check as part of its ruling turn, so the event it
+                # writes says nothing about whether the ruling has been made (#194).
+                witness = {"event": "witness", "ticket": "7", "outcome": outcome}
+                checked = machine_log.project([escalation, witness]).ticket("7")
+                self.assertTrue(checked.awaiting_ruling)
+
+                answered = machine_log.project([escalation, witness, ruling]).ticket("7")
+                self.assertFalse(answered.awaiting_ruling)
+
+    def test_an_undelivered_escalation_awaits_a_ruling_only_once_handed_over(self):
+        escalation = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — a Codex child, transcribed by the bridge",
         }
         hand_over = {
             "event": "ruling", "ticket": "7", "role": "coordinator",
@@ -551,21 +574,80 @@ class RunProjectionTests(unittest.TestCase):
             ),
         }
 
-        self.assertTrue(machine_log.project([escalation]).ticket("7").fact_check_running)
-        for outcome in ("checked", "partial", "failed"):
-            with self.subTest(outcome=outcome):
-                witness = {"event": "witness", "ticket": "7", "outcome": outcome}
-                before_hand_over = machine_log.project([escalation, witness]).ticket("7")
-                self.assertTrue(before_hand_over.fact_check_running)
-                self.assertFalse(before_hand_over.awaiting_ruling)
+        standing = machine_log.project([escalation]).ticket("7")
+        self.assertFalse(standing.awaiting_ruling)
+        self.assertTrue(machine_log.project([escalation, hand_over]).ticket("7").awaiting_ruling)
 
-                after_hand_over = machine_log.project([
-                    escalation, witness, hand_over,
-                ]).ticket("7")
-                self.assertFalse(after_hand_over.fact_check_running)
-                self.assertTrue(after_hand_over.awaiting_ruling)
+    def test_the_hand_over_line_leaves_the_escalation_standing_and_a_ruling_ends_it(self):
+        """The line that puts a Codex escalation in front of the coordinator does not answer it.
 
-    def test_the_newest_escalation_governs_the_fact_check_episode(self):
+        It consumes the pending child message, which is what stops the Driver handing the same
+        escalation over on every poll. The fact-check the coordinator then runs is owed for
+        exactly that escalation, so the escalation has to outlive the line announcing it (#194).
+        """
+        escalation = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "message": "CREW ASK 7 design — a Codex child, transcribed by the bridge",
+        }
+        hand_over = {
+            "event": "ruling", "ticket": "7", "role": "coordinator",
+            "message": (
+                "CREW RULED 7 — this escalation was handed to the coordinator, which is where "
+                "it is answered."
+            ),
+        }
+        witness = {"event": "witness", "ticket": "7", "operation": "check", "outcome": "checked"}
+        ruling = {
+            "event": "ruling", "ticket": "7", "role": "coordinator", "message": "Choose option A.",
+        }
+
+        self.assertEqual(machine_log.project([escalation]).ticket("7").standing_escalation,
+                         escalation)
+        handed_over = machine_log.project([escalation, hand_over]).ticket("7")
+        self.assertEqual(handed_over.standing_escalation, escalation)
+        self.assertIsNone(handed_over.unanswered_child_message)
+
+        # And the fact-check written after that line pairs with it, so a second run replays.
+        checked = machine_log.project([escalation, hand_over, witness]).ticket("7")
+        self.assertEqual(checked.witness, witness)
+
+        answered = machine_log.project([escalation, hand_over, witness, ruling]).ticket("7")
+        self.assertIsNone(answered.standing_escalation)
+        self.assertEqual(answered.escalation, escalation, "the audit pair is still retained")
+
+    def test_a_settling_event_or_another_word_from_the_child_ends_the_standing_escalation(self):
+        escalation = {
+            "event": "escalation", "ticket": "7", "role": "child",
+            "from": "uds:/tmp/a.sock", "message": "CREW ASK 7 design — which table?",
+        }
+        for name, closing in {
+            "a word from the child": {
+                "event": "message", "ticket": "7", "role": "child",
+                "message": "CREW PARKED 7 — nothing to do",
+            },
+            "a receipt": {"event": "receipt", "ticket": "7", "verdict": "landable"},
+            "an outcome": {"event": "outcome", "ticket": "7", "verdict": "failed"},
+        }.items():
+            with self.subTest(case=name):
+                facts = machine_log.project([escalation, closing]).ticket("7")
+
+                self.assertIsNone(facts.standing_escalation)
+
+    def test_delivery_is_decided_by_the_sender_address_alone(self):
+        def escalation(**extra):
+            return {
+                "event": "escalation", "ticket": "7", "role": "child",
+                "message": "CREW ASK 7 design — anything", **extra,
+            }
+
+        self.assertTrue(machine_log.delivered(escalation(**{"from": "uds:/tmp/a.sock"})))
+        self.assertFalse(machine_log.delivered(escalation()))
+        self.assertFalse(machine_log.delivered(escalation(**{"from": None})))
+        self.assertFalse(machine_log.delivered(escalation(**{"from": "   "})))
+        self.assertFalse(machine_log.delivered(escalation(**{"from": 7})))
+        self.assertFalse(machine_log.delivered(None))
+
+    def test_the_newest_escalation_governs_the_ruling_episode(self):
         first = {
             "event": "escalation", "ticket": "7", "role": "child",
             "message": "CREW ASK 7 design — first",
@@ -584,15 +666,17 @@ class RunProjectionTests(unittest.TestCase):
         }
 
         ruled = machine_log.project([first, hand_over, coordinator_ruling]).ticket("7")
-        self.assertFalse(ruled.fact_check_running)
         self.assertFalse(ruled.awaiting_ruling)
 
         newest = machine_log.project([
             first, hand_over, coordinator_ruling, second,
         ]).ticket("7")
         self.assertEqual(newest.escalation, second)
-        self.assertTrue(newest.fact_check_running)
+        # Undelivered, like the first: this one waits for its own hand-over line.
         self.assertFalse(newest.awaiting_ruling)
+        self.assertTrue(machine_log.project([
+            first, hand_over, coordinator_ruling, second, hand_over,
+        ]).ticket("7").awaiting_ruling)
 
     def test_only_receipt_evidence_consumes_a_valid_completion_claim(self):
         claim = {

@@ -49,6 +49,10 @@ COORDINATOR_SESSION = "2cd60d75-fa21-4d9c-adf2-b4073f60fbb6"
 # The whole address a child of this run sends to, as the launcher reads it off the harness: the
 # socket the coordinator bound, under the `uds:` scheme, spelled exactly as the harness spelled it.
 COORDINATOR_ADDRESS = "uds:/tmp/cc-socks/1504.sock"
+# The socket one child's own session receives at, which its `SendMessage` hook writes as the
+# message's sender. Its presence is what says a channel delivered the message (#194).
+CHILD_SOCKET = "/tmp/cc-socks/2117.sock"
+CHILD_ADDRESS = "uds:" + CHILD_SOCKET
 PERMISSION_MODE = "acceptEdits"
 TMUX_SESSION = "$7:"
 # The pane the coordinator itself is sitting in, as tmux names one and as the launcher reads it
@@ -85,8 +89,6 @@ WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_TIMEOUT_SECONDS = 300
 WITNESS_BUDGET_USD = 2.0
 WITNESS_BRIEF = "README.md:1 — held — the fixture file exists"
-WITNESS_FAILURE = "stub witness failed on purpose"
-WITNESS_OVERRUN = "witness session timed out"
 # A file carrying a line that reads as an opening conflict marker: the merge driver will not
 # rewrite a conflict in it, so this is the shape that still climbs to the repair rung.
 UNREWRITABLE = "one\n<<<<<<< left over from an earlier merge\nthree\n"
@@ -507,7 +509,12 @@ class Fixture:
         return git(worktree, "rev-parse", "HEAD").stdout.strip()
 
     def says(self, ticket, message):
-        """Write into the log what a child's own hook writes when it sends that message."""
+        """Write into the log what a child writes when it records a message itself.
+
+        This is the Codex lane's shape and the Claude lane's receipt: the `message` subcommand,
+        which carries no sender address because nothing delivered it. `sends` below is the other
+        half — a message a child's own tool put on the bus.
+        """
         subprocess.run(
             [
                 sys.executable, str(MACHINE_LOG), "--log", str(self.run_dir / "log.jsonl"),
@@ -515,6 +522,45 @@ class Fixture:
                 "--to", COORDINATOR_NAME, "--message", message,
             ],
             check=True, capture_output=True,
+        )
+
+    def sends(self, ticket, message, address=CHILD_ADDRESS):
+        """Write what a Claude child's own `SendMessage` hook writes: the message and its sender.
+
+        Through the hook entry point rather than by composing the record, so the address lands the
+        one way a real run puts it there — read off the sending session's environment (ADR-0023).
+        """
+        payload = {
+            "tool_name": "SendMessage",
+            "tool_input": {"to": COORDINATOR_NAME, "message": message},
+        }
+        environment = dict(os.environ)
+        environment["CLAUDE_CODE_MESSAGING_SOCKET"] = address.removeprefix("uds:")
+        subprocess.run(
+            [
+                sys.executable, str(MACHINE_LOG), "--log", str(self.run_dir / "log.jsonl"),
+                "hook", "--role", "child", "--ticket", ticket,
+            ],
+            input=json.dumps(payload), text=True,
+            check=True, capture_output=True, env=environment,
+        )
+
+    def checks(self, ticket, env_overrides=None):
+        """Run the fact-check the coordinator runs before it rules (#194).
+
+        The real Witness command line, against this run's own log and plan — which is what the
+        escalation carries and the coordinator copies. The Driver runs nothing of the sort any
+        more, so a witness event in a driver test gets here the way it gets there.
+        """
+        return subprocess.run(
+            [
+                sys.executable, str(WITNESS), "check",
+                "--run", str(self.run_dir), "--ticket", ticket,
+            ],
+            check=True, capture_output=True, text=True,
+            env=self.environment({
+                "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF, **(env_overrides or {}),
+            }),
         )
 
     def reviews(self, ticket, state, lane=REVIEW_LANE):

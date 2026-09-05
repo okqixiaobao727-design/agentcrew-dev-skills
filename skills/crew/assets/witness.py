@@ -514,28 +514,148 @@ def record(document, log, ticket, operation, model):
     return document
 
 
+def recorded_document(event):
+    """The document a Machine-log `witness` event holds, as its own run printed it.
+
+    Reconstructed from the record rather than kept anywhere, because the log is where the fact
+    lives: the event carries the brief, the outcome, the reason, the coverage and the duration of
+    the session that produced them. `recorded` says the session is not being run again, so a
+    reader can tell a replay from a fresh check that happened to be this fast.
+
+    The token counters are deliberately left out. They were counted when the session ran and are
+    already in the run's cost rollup; printing them again beside a replay is an invitation to add
+    them twice.
+    """
+    return {
+        "brief": event.get("brief") or "",
+        "outcome": event.get("outcome"),
+        "reason": event.get("reason") or "",
+        "covered_count": event.get("covered_count"),
+        "uncovered_count": event.get("uncovered_count"),
+        "duration_seconds": event.get("duration_seconds"),
+        "recorded": True,
+    }
+
+
+class RunIdentity:
+    """Holds the log, the ticket and the model one operation records against, as it learns them.
+
+    Made before the Run is resolved rather than after it, because each step of the walk below
+    names the run more exactly than the last, and an operation that fails halfway through still
+    owes its own recorded event on everything already known (#196).
+    """
+
+    def __init__(self, ticket):
+        self.log = None
+        self.ticket = ticket
+        self.model = None
+
+
+def resolve_run(run, ticket_id, identity):
+    """Return the Run's plan and this ticket, filling `identity` with each as the walk reaches it.
+
+    The command line names only the run and the ticket, which is what lets one fixed line be
+    rendered into a child's first turn, copied into its escalation, and copied again by the
+    coordinator that rules on it (#194). Everything else an operation needs is in the Run.
+    """
+    run_dir = run_plan.resolve_run_dir(run)
+    # Derived rather than asked for: this form already names the run the work belongs to, and a
+    # log passed beside it could name a different one.
+    identity.log = run_dir / machine_log.LOG_NAME
+    plan = run_plan.load(run_dir / WAVE_TABLE)
+    ticket = plan.ticket(ticket_id)
+    identity.ticket = ticket.id
+    identity.model = plan.run.witness_model
+    return plan, ticket
+
+
+def run_facts(identity):
+    """Return what this run's Machine log says about the ticket `identity` names."""
+    return machine_log.project(machine_log.read_records(identity.log)).ticket(identity.ticket)
+
+
+def run_check_subject(plan, ticket, escalation):
+    """Return the Run-named form's subject: the standing escalation, in its child's worktree."""
+    return {
+        "escalation": escalation.get("message") or "",
+        "worktree": dispatch.worktree_path(plan.run, ticket),
+        "model": plan.run.witness_model,
+        "budget": plan.run.witness_budget_usd,
+        "session_environment": accounts.process_environment(ticket.binding),
+    }
+
+
+def manual_check_subject(args):
+    """Return the driver-less form's subject: everything named on the command line itself."""
+    return {
+        "escalation": read_escalation(args.escalation),
+        "worktree": args.worktree,
+        "model": args.model,
+        "budget": args.budget_usd,
+        "session_environment": environment(args.account),
+    }
+
+
+def record_run(document, identity, operation):
+    """Return `document` recorded against the log, ticket and model `identity` names."""
+    return record(document, identity.log, identity.ticket, operation, identity.model)
+
+
 def check(args):
+    """Return one escalation's fact-check, in the Run's terms or in the ones a command line names.
+
+    Two forms, one operation and one recorded event: the Run-named form reads the standing
+    escalation, the worktree and the witness routing out of the Run itself, and the driver-less
+    form names all three because there is no Run to read them from.
+    """
     started = time.monotonic()
     expected = []
+    identity = RunIdentity(args.ticket)
     try:
-        _, _, _, timeout = run_plan.witness_routing(
-            args.model, args.budget_usd, args.timeout_seconds
-        )
-        escalation = read_escalation(args.escalation)
+        if args.run is None:
+            identity.log, identity.model = args.log, args.model
+            subject = manual_check_subject(args)
+        else:
+            plan, ticket = resolve_run(args.run, args.ticket, identity)
+            facts = run_facts(identity)
+            if facts.witness is not None:
+                # Run a second time for one escalation, this prints the brief already recorded
+                # rather than buying a second opinion on the same question, and records nothing:
+                # the event it would write is the one it is reading. Which fact-check belongs to
+                # which escalation is the projection's judgment and not a comparison made here —
+                # it pairs an event with the escalation standing when the event was written, and
+                # drops that pairing the moment a new escalation arrives.
+                return recorded_document(facts.witness)
+            if facts.standing_escalation is None:
+                # Not an error, and recorded like any other refusal so the run's account of what
+                # this ticket's witness did stays whole: a coordinator that copied the line before
+                # the escalation was logged, or after its own ruling answered it, has nothing to
+                # check and is told so.
+                return record_run(
+                    failed(
+                        f"ticket {ticket.id} has no standing escalation to check",
+                        started, coverage=(0, 0),
+                    ),
+                    identity, "check",
+                )
+            subject = run_check_subject(plan, ticket, facts.standing_escalation)
+        model, budget = subject["model"], subject["budget"]
+        _, _, _, timeout = run_plan.witness_routing(model, budget, args.timeout_seconds)
+        escalation = subject["escalation"]
         if not escalation.strip():
             document = failed("escalation is empty", started, coverage=(0, 0))
-            return record(document, args.log, args.ticket, "check", args.model)
-        expected = pointers(escalation, args.worktree)
-        worktree = checked_context(args.worktree, args.model, args.budget_usd, timeout)
+            return record_run(document, identity, "check")
+        expected = pointers(escalation, subject["worktree"])
+        worktree = checked_context(subject["worktree"], model, budget, timeout)
         document = execute(
             dispatch.render_witness_prompt(
                 escalation, operation="check", check_pointers=expected
             ),
             worktree,
-            args.model,
-            args.budget_usd,
+            model,
+            budget,
             timeout,
-            environment(args.account),
+            subject["session_environment"],
             CHECK_SCHEMA,
             lambda value: check_result(value, expected),
             started,
@@ -543,31 +663,22 @@ def check(args):
         )
     except (
         OSError, subprocess.CalledProcessError, accounts.AccountsError, run_plan.RunPlanError,
-        ValueError,
+        TypeError, ValueError,
     ) as error:
         document = failed(error, started, coverage=(0, len(expected)))
-    return record(document, args.log, args.ticket, "check", args.model)
+    return record_run(document, identity, "check")
 
 
 def ask(args):
+    """Return the answer to one coordinator-initiated factual question about a ticket."""
     started = time.monotonic()
-    log = None
-    identifier = args.ticket
-    model = None
+    identity = RunIdentity(args.ticket)
     try:
-        run_dir = run_plan.resolve_run_dir(args.run)
-        # Derived rather than asked for: `ask` already names the run it belongs to, and a Machine
-        # log passed beside it could name a different one.
-        log = run_dir / machine_log.LOG_NAME
-        plan = run_plan.load(run_dir / WAVE_TABLE)
-        ticket = plan.ticket(args.ticket)
-        identifier = ticket.id
-        model = plan.run.witness_model
+        plan, ticket = resolve_run(args.run, args.ticket, identity)
         # After the run is resolved rather than before it, so that the refusal is an event this
         # run recorded against its ticket, on the model it would have spent.
         if not args.question.strip():
-            document = failed("question is empty", started)
-            return record(document, log, identifier, "ask", model)
+            return record_run(failed("question is empty", started), identity, "ask")
         _, _, _, timeout = run_plan.witness_routing(
             plan.run.witness_model, plan.run.witness_budget_usd, args.timeout_seconds
         )
@@ -597,17 +708,23 @@ def ask(args):
         TypeError, ValueError,
     ) as error:
         document = failed(error, started)
-    return record(document, log, identifier, "ask", model)
+    return record_run(document, identity, "ask")
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     operations = parser.add_subparsers(dest="operation", required=True)
     check = operations.add_parser("check", help="fact-check one escalation")
-    check.add_argument("--escalation", required=True, help="an escalation file, or - for stdin")
-    check.add_argument("--worktree", required=True, help="the child worktree to check")
-    check.add_argument("--model", required=True, help="the full Claude model ID")
-    check.add_argument("--budget-usd", required=True, type=float, help="the hard session budget")
+    # The Run-named form, which is the one an escalation carries and a coordinator copies: it
+    # names the Run and the ticket, and the Run holds the standing escalation, the worktree and
+    # the witness routing. The driver-less form below names all of them because nothing holds
+    # them. Neither `--run` nor `--worktree` is required on its own; `check_form_problem` refuses
+    # a command line that names both forms or neither.
+    check.add_argument("--run", help="the active run directory, whose standing escalation to check")
+    check.add_argument("--escalation", help="an escalation file, or - for stdin")
+    check.add_argument("--worktree", help="the child worktree to check")
+    check.add_argument("--model", help="the full Claude model ID")
+    check.add_argument("--budget-usd", type=float, help="the hard session budget")
     check.add_argument(
         "--timeout-seconds", type=float,
         help="how long the fresh session may run, over the configured `[witness] timeout_seconds`",
@@ -628,10 +745,47 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
+# What the driver-less form names for itself because there is no Run to read it from, and so what
+# that form is incomplete without.
+MANUAL_CHECK_FLAGS = ("escalation", "worktree", "model", "budget_usd")
+# What a Run supplies instead, and so what may never be named beside `--run`. The two beyond the
+# required four are the optional ones: beside a `--run` the log is derived from the run directory
+# and the account comes from the ticket's binding, so either named there would read as
+# configuration and then be silently ignored.
+RUN_SUPPLIED_FLAGS = MANUAL_CHECK_FLAGS + ("log", "account")
+
+
+def check_form_problem(args):
+    """Why this `check` command line names no usable form, or None where it names exactly one.
+
+    Refused here rather than resolved to a default, because the two forms disagree about where a
+    fact comes from: a `--worktree` beside a `--run` would silently override what the Run plan
+    says the child is working in, and a form half-named is a caller that believed the other half
+    was implied.
+    """
+    supplied = [name for name in RUN_SUPPLIED_FLAGS if getattr(args, name) is not None]
+    if args.run is not None:
+        if supplied:
+            named = ", ".join(f"--{name.replace('_', '-')}" for name in supplied)
+            return f"check takes --run with --ticket, or {named} without it, never both"
+        if not args.ticket:
+            return "check --run names the ticket whose escalation to check with --ticket"
+        return None
+    missing = [name for name in MANUAL_CHECK_FLAGS if getattr(args, name) is None]
+    if missing:
+        named = ", ".join(f"--{name.replace('_', '-')}" for name in missing)
+        return f"check without --run needs {named}"
+    if bool(args.log) != bool(args.ticket):
+        return "check records against a --log and a --ticket, or neither"
+    return None
+
+
 def main(argv=None):
     args = parse_args(argv)
-    if args.operation == "check" and bool(args.log) != bool(args.ticket):
-        raise SystemExit("witness: check records against a --log and a --ticket, or neither")
+    if args.operation == "check":
+        problem = check_form_problem(args)
+        if problem is not None:
+            raise SystemExit(f"witness: {problem}")
     operation = {"check": check, "ask": ask}[args.operation]
     print(json.dumps(operation(args)))
     return 0

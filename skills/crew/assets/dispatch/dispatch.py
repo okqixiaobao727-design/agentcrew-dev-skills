@@ -234,6 +234,48 @@ def project_witness_routing(ticket):
     return model, budget, timeout
 
 
+def manual_witness_command(worktree, model, budget, timeout):
+    """The driver-less Witness line: every value named on it, the escalation arriving on stdin.
+
+    Used where there is no Run to read a standing escalation out of — the manual advisor flow, and
+    a dispatch given no machine log.
+    """
+    return shlex.join([
+        "python3", str(WITNESS_SCRIPT),
+        "check", "--escalation", "-", "--worktree", str(worktree),
+        "--model", model,
+        "--budget-usd", f"{budget:g}",
+        # Carried on the command line beside the model and the budget: a driver-less flow has no
+        # run to resolve routing from, so what this line omits is not configured at all — it is
+        # the shipped default (#196).
+        "--timeout-seconds", f"{timeout:g}",
+    ])
+
+
+def witness_command(ticket, log):
+    """Return the fixed Witness line this child carries in every escalation, or None for no Run.
+
+    The coordinator runs the Witness itself, once, before it rules, and this is the line it runs
+    (#194): rendered here with the run and the ticket already filled in, copied into the child's
+    message, copied again out of that message by the coordinator. It names only the run and the
+    ticket because the Run holds the rest — the standing escalation, the worktree the child works
+    in, and the witness model, budget and timeout the project configured. The run directory is the
+    machine log's own, which is the one path that says which Run this child belongs to.
+
+    A dispatch given no log has no Run to name and nothing recording the escalation for such a
+    command to find, so there is no line for a coordinator to run and this returns None: that
+    child's turn carries no such instruction at all. The driver-less flow keeps the other half of
+    the arrangement instead, where the developer runs the manual line itself and pastes the brief
+    under the message before it sends.
+    """
+    if log is None:
+        return None
+    return shlex.join([
+        "python3", str(WITNESS_SCRIPT),
+        "check", "--run", str(pathlib.Path(log).parent), "--ticket", str(ticket.id),
+    ])
+
+
 def render_roles(spec, ticket, coordinator_name, coordinator_address, templates):
     """Return the manual advisor and developer prompts rendered from their shared blocks."""
     witness_model, witness_budget, witness_timeout = project_witness_routing(ticket)
@@ -264,16 +306,11 @@ def render_roles(spec, ticket, coordinator_name, coordinator_address, templates)
                 block(templates["turn"]["escalate"]),
                 {"<review caller budget>": caller_budget},
             ),
-            "<witness command>": shlex.join([
-                "python3", str(WITNESS_SCRIPT),
-                "check", "--escalation", "-", "--worktree", ".",
-                "--model", witness_model,
-                "--budget-usd", f"{witness_budget:g}",
-                # Carried on the command line beside the model and the budget: the manual flow
-                # has no run to resolve routing from, so what this line omits is not configured
-                # at all — it is the shipped default (#196).
-                "--timeout-seconds", f"{witness_timeout:g}",
-            ]),
+            # Filled after `<escalation paragraph>` above, which is the block that carries this
+            # token: `fill` replaces in the order the mapping was written.
+            "<witness command>": manual_witness_command(
+                ".", witness_model, witness_budget, witness_timeout
+            ),
         },
     )
     return f"{advisor}\n\n{developer}"
@@ -443,7 +480,9 @@ def render_turn(run, ticket, templates, review_script, log=None):
     # fact is what selects that variant and the only thing that does; everything else in the turn
     # is the ticket's workflow, rendered exactly as an ordinary child's is.
     queued = templates["queued"] if ticket.queued is not None else None
+    carried = witness_command(ticket, log)
     values = {
+        **({"<witness command>": carried} if carried is not None else {}),
         "<absolute ticket path>": ticket.path,
         "<absolute spec path>": run.spec_path,
         "<ticket base commit>": base_commit(run, ticket),
@@ -494,7 +533,10 @@ def render_turn(run, ticket, templates, review_script, log=None):
     text = text.replace("<workflow block>", workflow_block)
     text = text.replace("<review step>", review_block)
     text = text.replace("<coordinator paragraph>", coordinator)
-    text = text.replace("<escalation paragraph>", block(turn["escalate"]))
+    escalation = block(turn["escalate"])
+    if carried is not None:
+        escalation = f"{escalation}\n\n{block(turn['witness_carried'])}"
+    text = text.replace("<escalation paragraph>", escalation)
     text = text.replace("<completion paragraph>", completion)
     return fill(text, values) + "\n"
 

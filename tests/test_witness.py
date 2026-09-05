@@ -54,6 +54,10 @@ ASK_OUTPUT = {
     ],
 }
 ASK_BRIEF = "Issue 154 requires the tracker body and authoritative comments — #154"
+RUN_BRIEF = (
+    "README.md:1 — held — the fixture line is there\n"
+    "#130 — contradicted — the ticket says otherwise"
+)
 STRUCTURED_FROM_BRIEF = object()
 
 
@@ -885,6 +889,212 @@ class WitnessTests(unittest.TestCase):
 
         self.assert_failed_result(result)
         self.assertEqual(self.events(self.state_dir / "log.jsonl"), [])
+
+    # --- the Run-named form the coordinator copies out of an escalation (#194) ----------------
+
+    def escalate(self, message=None, **extra):
+        """Put one standing escalation in the run's log, as the SendMessage hook writes one."""
+        log = self.state_dir / "log.jsonl"
+        record = {
+            "ts": "2026-09-04T01:02:03Z", "event": "escalation", "ticket": "154", "role": "child",
+            "message": message or (
+                "CREW ASK 154 design — is the fixture line still there? README.md:1, #130"
+            ),
+            **extra,
+        }
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        return record
+
+    def run_check(self, run_dir=None, ticket="154", brief=RUN_BRIEF, **extra):
+        environment = dict(os.environ)
+        environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
+        environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
+        environment["AGENTCREW_STUB_REPAIR"] = extra.pop("behaviour", "witness")
+        environment["AGENTCREW_STUB_WITNESS_BRIEF"] = brief
+        environment["AGENTCREW_STUB_WITNESS_OUTPUT"] = json.dumps(check_output(brief))
+        return subprocess.run(
+            [
+                sys.executable, str(WITNESS), "check",
+                "--run", str(run_dir or self.run_dir),
+                "--ticket", ticket,
+                *extra.pop("extra", ()),
+            ],
+            capture_output=True, text=True, env=environment,
+        )
+
+    def test_the_run_named_form_checks_the_standing_escalation_in_the_runs_own_terms(self):
+        self.escalate()
+
+        result = self.run_check()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], RUN_BRIEF)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, calls)
+        call = calls[0]
+        # The worktree, the account, the model and the budget all come from the Run plan: the
+        # command line named only the run and the ticket.
+        self.assertEqual(pathlib.Path(call["cwd"]).resolve(), self.ask_worktree.resolve())
+        self.assertEqual(call["env"]["CLAUDE_CONFIG_DIR"], str(self.ask_account))
+        argv = call["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], MODEL)
+        self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "3.5")
+        prompt = argv[argv.index("--print") + 1]
+        self.assertIn("is the fixture line still there?", prompt)
+        self.assertIn("README.md:1", prompt)
+
+    def test_the_run_named_form_records_its_own_event_against_the_runs_log(self):
+        self.escalate()
+
+        result = self.run_check()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [
+            event for event in self.events(self.state_dir / "log.jsonl")
+            if event["event"] == "witness"
+        ]
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["operation"], "check")
+        self.assertEqual(events[0]["ticket"], "154")
+        self.assertEqual(events[0]["brief"], RUN_BRIEF)
+        self.assertEqual(events[0]["outcome"], "checked")
+
+    def test_a_second_check_of_one_escalation_replays_the_recorded_brief(self):
+        self.escalate()
+        first = self.run_check()
+        self.assertEqual(json.loads(first.stdout)["outcome"], "checked", first.stdout)
+
+        second = self.run_check()
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        document = json.loads(second.stdout)
+        self.assertEqual(document["brief"], RUN_BRIEF)
+        self.assertEqual(document["outcome"], "checked")
+        self.assertTrue(document["recorded"])
+        # No second session, and no second event: the replay is the event it is reading.
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(
+            len([
+                event for event in self.events(self.state_dir / "log.jsonl")
+                if event["event"] == "witness"
+            ]),
+            1,
+        )
+
+    def test_a_newer_escalation_earns_its_own_check_rather_than_the_recorded_one(self):
+        self.escalate()
+        self.run_check()
+        self.escalate(
+            message="CREW ASK 154 scope — a second question about README.md:1 and #130"
+        )
+
+        result = self.run_check()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("recorded", json.loads(result.stdout))
+        self.assertEqual(len(self.calls()), 2)
+        prompt = self.calls()[1]["argv"][self.calls()[1]["argv"].index("--print") + 1]
+        self.assertIn("a second question", prompt)
+
+    def test_a_handed_over_codex_escalation_is_checked_by_the_same_command(self):
+        """The one escalation the Driver hands over is the one nothing else could fact-check.
+
+        A Codex child's escalation reaches the log through the bridge with no sender address, and
+        the Driver wakes the coordinator for it by recording its hand-over line. That line
+        consumes the pending child message, so the escalation has to stay standing behind it or
+        the command the wake tells the coordinator to run has nothing to check (#194).
+        """
+        escalation = self.escalate()
+        log = self.state_dir / "log.jsonl"
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "ts": "2026-09-04T01:02:33Z", "event": "ruling", "ticket": "154",
+                "role": "coordinator",
+                "message": (
+                    "CREW RULED 154 — this escalation was handed to the coordinator, which is "
+                    "where it is answered."
+                ),
+            }) + "\n")
+        self.assertNotIn("from", escalation, "a bridged escalation carries no sender address")
+
+        result = self.run_check()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], RUN_BRIEF)
+        self.assertEqual(len(self.calls()), 1)
+
+        # And the replay rule holds for it too: the recorded brief, no second session.
+        replay = json.loads(self.run_check().stdout)
+
+        self.assertTrue(replay["recorded"])
+        self.assertEqual(replay["brief"], RUN_BRIEF)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_no_standing_escalation_is_a_recorded_refusal_and_not_an_error(self):
+        result = self.run_check()
+
+        document = self.assert_failed_result(result)
+        self.assertIn("no standing escalation", document["reason"])
+        self.assertEqual(self.calls(), [])
+        events = [
+            event for event in self.events(self.state_dir / "log.jsonl")
+            if event["event"] == "witness"
+        ]
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["outcome"], "failed")
+
+    def test_a_ruled_escalation_is_no_longer_standing(self):
+        self.escalate()
+        log = self.state_dir / "log.jsonl"
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "ts": "2026-09-04T01:03:03Z", "event": "ruling", "ticket": "154",
+                "role": "coordinator", "message": "Choose option A.",
+            }) + "\n")
+
+        document = self.assert_failed_result(self.run_check())
+
+        self.assertIn("no standing escalation", document["reason"])
+        self.assertEqual(self.calls(), [])
+
+    def test_the_run_named_form_fails_cleanly_on_a_run_it_cannot_read(self):
+        missing = self.root / "missing-run"
+
+        document = self.assert_failed_result(self.run_check(run_dir=missing))
+
+        self.assertIn(str(missing / ".crew" / "wave-table.json"), document["reason"])
+        self.assertEqual(self.calls(), [])
+
+    def test_the_two_check_forms_are_never_mixed_or_half_named(self):
+        cases = {
+            "both forms": [
+                "--run", str(self.run_dir), "--ticket", "154",
+                "--escalation", str(self.escalation), "--worktree", str(self.worktree),
+                "--model", MODEL, "--budget-usd", BUDGET_USD,
+            ],
+            "run without ticket": ["--run", str(self.run_dir)],
+            # The Run derives the log from its own directory and takes the account from the
+            # ticket's binding, so either named beside it would be read and then ignored.
+            "log beside a run": ["--run", str(self.run_dir), "--ticket", "154", "--log", "l.jsonl"],
+            "account beside a run": ["--run", str(self.run_dir), "--ticket", "154",
+                                     "--account", "work"],
+            "manual half named": ["--escalation", str(self.escalation), "--model", MODEL],
+            "neither form": [],
+        }
+        for name, argv in cases.items():
+            with self.subTest(case=name):
+                result = subprocess.run(
+                    [sys.executable, str(WITNESS), "check", *argv],
+                    capture_output=True, text=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("witness:", result.stderr)
 
     # --- the session timeout every caller can honour ------------------------------------------
 

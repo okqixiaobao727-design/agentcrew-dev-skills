@@ -64,9 +64,7 @@ from harness import (
     WITNESS,
     WITNESS_BRIEF,
     WITNESS_BUDGET_USD,
-    WITNESS_FAILURE,
     WITNESS_MODEL,
-    WITNESS_OVERRUN,
     WITNESS_TIMEOUT_SECONDS,
     git,
     run_plan,
@@ -1838,12 +1836,10 @@ class LoopTests(DriverTestCase):
         )
 
     def test_the_report_costs_a_witness_and_keeps_a_design_ruling_rendered_as_before(self):
-        process = self.start(("01", ()), env_overrides={
-            "CLAUDE_CODE_SESSION_ID": "",
-            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
-        })
-        self.fixture.says("01", "CREW ASK 01 design — use which seam? ts=1")
+        process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
+        self.fixture.says("01", "CREW ASK 01 design — check README.md:1 ts=1")
         self.woken(process, "judgment-needed")
+        self.fixture.checks("01")
         resumed = self.fixture.resume()
         self.assertIn("resumed", resumed.stdout.readline())
         ruling = "Use the existing public CLI seam"
@@ -1862,10 +1858,7 @@ class LoopTests(DriverTestCase):
         self.assertRegex(cost, r"(?m)^TOTAL(?:\s+--){2}\s+11\s+22\s+33\s+44\s+110\s+--$")
 
     def test_the_report_lists_each_wrap_up_leftover_beside_its_placement(self):
-        process = self.start(("01", ()), env_overrides={
-            "CLAUDE_CODE_SESSION_ID": "",
-            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
-        })
+        process = self.start(("01", ()), env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
         first = "Unreleased lock at src/lock.py:41"
         second = "Duplicate cleanup in src/cleanup.py:9"
         third = "Missing assertion in tests/test_lock.py:88"
@@ -2649,7 +2642,6 @@ class LoopTests(DriverTestCase):
         self.assertEqual(len(hand_overs), 1, hand_overs)
         self.assertEqual(observation.read_text(), "present\n")
         facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
-        self.assertFalse(facts.fact_check_running)
         self.assertTrue(facts.awaiting_ruling)
         self.assertEqual(json.loads(wake_path.read_text()), snapshot)
 
@@ -2663,7 +2655,6 @@ class LoopTests(DriverTestCase):
 
         self.assertEqual(self.instructions("01", "CREW RULED"), [])
         facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
-        self.assertTrue(facts.fact_check_running)
         self.assertFalse(facts.awaiting_ruling)
 
     def test_a_hand_over_log_failure_is_visible_and_leaves_the_escalation_open(self):
@@ -2684,7 +2675,6 @@ class LoopTests(DriverTestCase):
         self.assertTrue((self.fixture.run_dir / WAKE_NAME).is_file())
         self.assertEqual(self.instructions("01", "CREW RULED"), [])
         facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
-        self.assertTrue(facts.fact_check_running)
         self.assertFalse(facts.awaiting_ruling)
 
     def test_a_wrap_up_crew_ask_wakes_the_coordinator_carrying_the_ticket_and_ask(self):
@@ -2699,227 +2689,21 @@ class LoopTests(DriverTestCase):
         self.assertIn(message, snapshot["detail"])
         self.assertIsNone(self.verdict("01"), "a wrap-up ASK is not an outcome")
 
-    def test_a_wrap_up_crew_ask_wakes_with_its_witness_brief_beside_the_detail(self):
-        process = self.start(("01", ()), env_overrides={
-            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
-        })
+    def test_an_escalation_wake_carries_the_ask_and_runs_no_fact_check(self):
+        """The Driver no longer checks anything: the coordinator runs the Witness itself (#194)."""
+        process = self.start(("01", ()))
 
         message = "CREW ASK 01 wrap-up — check README.md:1 ts=1"
         self.fixture.says("01", message)
         snapshot = self.woken(process, "judgment-needed")
 
         self.assertEqual(snapshot["detail"], message)
-        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
+        self.assertNotIn("brief", snapshot)
         self.assertNotIn("witness_reason", snapshot)
-        # Recorded once, by the witness itself: the driver transcribes none of these fields, and
-        # the brief the coordinator was woken with is in the log without a second run (#196).
-        witness = self.events("witness", ticket="01")
-        self.assertEqual(len(witness), 1, witness)
-        self.assertEqual(witness[0]["operation"], "check")
-        self.assertEqual(witness[0]["brief"], WITNESS_BRIEF)
-        self.assertEqual(witness[0]["outcome"], "checked")
-
-    def test_a_failed_witness_still_wakes_with_an_empty_brief_and_its_reason(self):
-        process = self.start(("01", ()), env_overrides={
-            "AGENTCREW_STUB_WITNESS_BEHAVIOUR": "fail",
-            "AGENTCREW_STUB_WITNESS_FAILURE": WITNESS_FAILURE,
-        })
-
-        message = "CREW ASK 01 scope — check README.md:1 ts=1"
-        self.fixture.says("01", message)
-        snapshot = self.woken(process, "judgment-needed")
-
-        self.assertEqual(snapshot["reason"], "judgment-needed")
-        self.assertEqual(snapshot["detail"], message)
-        self.assertEqual(snapshot["brief"], "")
-        self.assertEqual(snapshot["witness_reason"], WITNESS_FAILURE)
-        witness = self.events("witness", ticket="01")
-        self.assertEqual(len(witness), 1, witness)
-        self.assertEqual(witness[0]["outcome"], "failed")
-        self.assertEqual(witness[0]["reason"], WITNESS_FAILURE)
-        self.assertEqual(witness[0]["covered_count"], 0)
-        self.assertEqual(witness[0]["uncovered_count"], 1)
-
-    def test_a_partial_witness_wakes_with_its_brief_reason_and_coverage(self):
-        brief = "README.md:1 — held — the fixture file exists"
-        structured_output = {
-            "cited": [{
-                "pointer": "README.md:1",
-                "status": "held",
-                "reason": "the fixture file exists",
-            }],
-            "uncited": [],
-        }
-        process = self.start(("01", ()), env_overrides={
-            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
-            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
-        })
-
-        message = "CREW ASK 01 scope — check README.md:1, #130 and ADR-0004 ts=1"
-        self.fixture.says("01", message)
-        snapshot = self.woken(process, "judgment-needed")
-
-        self.assertEqual(snapshot["brief"], brief)
-        self.assertIn("#130", snapshot["witness_reason"])
-        self.assertIn("ADR-0004", snapshot["witness_reason"])
-        witness = self.events("witness", ticket="01")[0]
-        self.assertEqual(witness["outcome"], "partial")
-        self.assertEqual(witness["covered_count"], 1)
-        self.assertEqual(witness["uncovered_count"], 2)
-        self.assertEqual(snapshot["witness_reason"], witness["reason"])
-
-    def test_a_structural_partial_forwards_zero_uncovered_without_rederiving_it(self):
-        brief = "\n".join((
-            "README.md:1 — held — the fixture file exists",
-            "#130 — held — the ticket exists",
-            "ADR-0004 — held — the decision exists",
-            "uncited docs/context.md:7 — held — the extra context exists",
-        ))
-        structured_output = {
-            "cited": [
-                {
-                    "pointer": "README.md:1",
-                    "status": "held",
-                    "reason": "the fixture file exists",
-                },
-                {
-                    "pointer": "#130",
-                    "status": "held",
-                    "reason": "the ticket exists",
-                },
-                {
-                    "pointer": "ADR-0004",
-                    "status": "held",
-                    "reason": "the decision exists",
-                },
-                {
-                    "pointer": "docs/context.md:7",
-                    "status": "held",
-                    "reason": "the extra context exists",
-                },
-            ],
-            "uncited": [],
-        }
-        process = self.start(("01", ()), env_overrides={
-            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
-            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
-        })
-
-        message = "CREW ASK 01 scope — check README.md:1, #130 and ADR-0004 ts=1"
-        self.fixture.says("01", message)
-        snapshot = self.woken(process, "judgment-needed")
-
-        witness = self.events("witness", ticket="01")[0]
-        self.assertEqual(snapshot["brief"], brief)
-        self.assertIn("extra cited", snapshot["witness_reason"])
-        self.assertEqual(witness["outcome"], "partial")
-        self.assertEqual(witness["covered_count"], 3)
-        self.assertEqual(witness["uncovered_count"], 0)
-        self.assertEqual(snapshot["witness_reason"], witness["reason"])
-
-    def test_a_pointer_free_escalation_keeps_the_witness_uncited_brief(self):
-        brief = "uncited #200 — held — the follow-up ticket exists"
-        structured_output = {
-            "cited": [],
-            "uncited": [{
-                "pointer": "#200",
-                "status": "held",
-                "reason": "the follow-up ticket exists",
-            }],
-        }
-        process = self.start(("01", ()), env_overrides={
-            "AGENTCREW_STUB_WITNESS_BRIEF": brief,
-            "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(structured_output),
-        })
-
-        message = "CREW ASK 01 wrap-up — place the remaining follow-up ts=1"
-        self.fixture.says("01", message)
-        snapshot = self.woken(process, "judgment-needed")
-
-        self.assertEqual(snapshot["brief"], brief)
-        self.assertNotIn("witness_reason", snapshot)
-        witness = self.events("witness", ticket="01")[0]
-        self.assertEqual(witness["outcome"], "checked")
-        self.assertEqual(witness["covered_count"], 0)
-        self.assertEqual(witness["uncovered_count"], 0)
-
-    def test_an_overrun_witness_still_wakes_with_the_timeout_reason(self):
-        process = self.start(("01", ()), env_overrides={
-            "AGENTCREW_STUB_WITNESS_BEHAVIOUR": "overrun",
-            "AGENTCREW_STUB_WITNESS_FAILURE": WITNESS_OVERRUN,
-        })
-
-        self.fixture.says("01", "CREW ASK 01 stuck — check README.md:1 ts=1")
-        snapshot = self.woken(process, "judgment-needed")
-
-        self.assertEqual(snapshot["brief"], "")
-        self.assertEqual(snapshot["witness_reason"], WITNESS_OVERRUN)
+        self.assertEqual(self.events("witness", ticket="01"), [])
         self.assertEqual(
-            self.events("witness", ticket="01")[0]["reason"], WITNESS_OVERRUN
+            [call for call in self.fixture.claude_calls() if "--print" in call["argv"]], []
         )
-
-    def test_a_checked_brief_survives_an_incomplete_usage_block_without_cost(self):
-        process = self.start(("01", ()), env_overrides={
-            "AGENTCREW_STUB_WITNESS_BEHAVIOUR": "partial-usage",
-            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
-        })
-
-        self.fixture.says("01", "CREW ASK 01 scope — check README.md:1 ts=1")
-        snapshot = self.woken(process, "judgment-needed")
-
-        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
-        self.assertNotIn("witness_reason", snapshot)
-        witness = self.events("witness", ticket="01")[0]
-        self.assertEqual(witness["outcome"], "checked")
-        self.assertEqual(witness["reason"], "")
-        self.assertGreaterEqual(witness["duration_seconds"], 0)
-        for field in (
-            "input_tokens", "output_tokens", "cache_read_tokens",
-            "cache_creation_tokens", "total_tokens",
-        ):
-            self.assertNotIn(field, witness)
-
-    def test_the_witness_uses_its_configured_route_and_records_its_run(self):
-        model = "claude-haiku-4-5-20251001"
-        budget_usd = 1.25
-        profile = self.fixture.profile("paid")
-        self.fixture.register(paid=profile)
-        self.fixture.configure(
-            accounts=["paid"], witness_model=model, witness_budget_usd=budget_usd,
-        )
-        process = self.start(
-            ("01", ()), routing=routing_naming("paid"), env_overrides={
-                "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
-            },
-        )
-
-        self.fixture.says("01", "CREW ASK 01 design — check README.md:1 ts=1")
-        snapshot = self.woken(process, "judgment-needed")
-
-        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
-        calls = [call for call in self.fixture.claude_calls() if "--print" in call["argv"]]
-        self.assertEqual(len(calls), 1, calls)
-        call = calls[0]
-        self.assertEqual(call["argv"][call["argv"].index("--model") + 1], model)
-        self.assertEqual(
-            call["argv"][call["argv"].index("--max-budget-usd") + 1], str(budget_usd)
-        )
-        self.assertEqual(pathlib.Path(call["cwd"]).resolve(), self.fixture.worktree("01"))
-        self.assertEqual(call["configHome"], str(profile))
-        witness = self.events("witness", ticket="01")
-        self.assertEqual(len(witness), 1, witness)
-        self.assertEqual(witness[0]["executor"], "claude")
-        self.assertEqual(witness[0]["model"], model)
-        self.assertEqual(witness[0]["outcome"], "checked")
-        self.assertEqual(witness[0]["reason"], "")
-        self.assertEqual(witness[0]["covered_count"], 1)
-        self.assertEqual(witness[0]["uncovered_count"], 0)
-        self.assertGreaterEqual(witness[0]["duration_seconds"], 0)
-        self.assertEqual(witness[0]["input_tokens"], 11)
-        self.assertEqual(witness[0]["output_tokens"], 22)
-        self.assertEqual(witness[0]["cache_read_tokens"], 33)
-        self.assertEqual(witness[0]["cache_creation_tokens"], 44)
-        self.assertEqual(witness[0]["total_tokens"], 110)
 
     def test_a_configured_witness_timeout_reaches_the_run_the_driver_holds_it_to(self):
         self.fixture.configure(witness_timeout_seconds=420)
@@ -2928,21 +2712,75 @@ class LoopTests(DriverTestCase):
 
         self.assertEqual(self.fixture.table()["run"]["witness_timeout_seconds"], 420)
 
-    def test_a_codex_childs_escalation_carries_the_same_witness_brief(self):
-        process = self.start(
-            ("01", ()), routing=CODEX_ROUTING, env_overrides={
-                "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
-            },
-        )
+    def test_a_codex_childs_escalation_is_the_one_the_driver_hands_over(self):
+        """No channel carried it — the bridge transcribed it — so the Driver is its only route."""
+        process = self.start(("01", ()), routing=CODEX_ROUTING)
 
         message = "CREW ASK 01 scope — check README.md:1 ts=1"
         self.fixture.says("01", message)
         snapshot = self.woken(process, "judgment-needed")
 
         self.assertEqual(snapshot["detail"], message)
-        self.assertEqual(snapshot["brief"], WITNESS_BRIEF)
-        self.assertNotIn("witness_reason", snapshot)
-        self.assertEqual(self.events("witness", ticket="01")[0]["outcome"], "checked")
+        self.assertNotIn("brief", snapshot)
+        self.assertEqual(len(self.instructions("01", "CREW RULED")), 1)
+
+    def test_a_delivered_escalation_is_left_alone_and_wakes_nobody(self):
+        """The child's own message tool already put it in front of the coordinator (#194)."""
+        process = self.start(("01", ()))
+
+        self.fixture.sends("01", "CREW ASK 01 scope — which table? ts=1")
+        self.fixture.answers("01", "Use the retention_audit table.")
+        self.fixture.completes("01")
+        snapshot = self.woken(process, "run-complete")
+
+        self.assertEqual(snapshot["reason"], "run-complete")
+        # No hand-over line, no witness event, and no second wake for a question already asked.
+        self.assertEqual(self.instructions("01", "CREW RULED"), [])
+        self.assertEqual(self.events("witness", ticket="01"), [])
+
+    def test_a_standing_ruling_holds_the_runs_inactivity_deadline(self):
+        """The coordinator's whole turn now happens while this loop polls, so it cannot be a stall.
+
+        A delivered escalation no longer ends the Driver, and the ruling that answers it costs a
+        fact-check of 70-300s plus the turn around it. A deadline that fired over that would stop
+        the run for the coordinator doing its one job (#194), exactly as it would have for a child
+        waiting out a vendor limit (#190).
+        """
+        process = self.start(("01", ()), extra=("--timeout", "3"))
+
+        self.fixture.sends("01", "CREW ASK 01 scope — which table? ts=1")
+        # Well past the deadline the escalation reset, as the pause test waits out its own: a
+        # wait that ended on the deadline would prove nothing about the rung that holds it.
+        time.sleep(8.0)
+
+        self.assertIsNone(process.poll(), "the run stopped while the coordinator was ruling")
+
+        # The ruling lands and the run carries on, as it would have all along.
+        self.fixture.answers("01", "Use the retention_audit table.")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
+
+        self.assertEqual(self.verdict("01"), "completed")
+
+    def test_a_delivered_escalation_holds_its_child_against_the_idle_nudge(self):
+        """It is not silence: the child asked and is waiting for the answer."""
+        process = self.start(("01", ()))
+
+        self.fixture.sends("01", "CREW ASK 01 scope — which table? ts=1")
+        self.fixture.goes("01", "idle")
+
+        self.assertFalse(
+            self.fixture.wait_for(
+                lambda: self.instructions("01", "CREW NUDGE"), timeout=3.0
+            ),
+            "a child waiting on a ruling was nudged",
+        )
+        facts = driver_module.machine_log.project(self.fixture.log_records()).ticket("01")
+        self.assertTrue(facts.awaiting_ruling)
+        self.fixture.answers("01", "Use the retention_audit table.")
+        self.fixture.goes("01", "busy")
+        self.fixture.completes("01")
+        self.woken(process, "run-complete")
 
     def test_a_second_escalation_after_a_ruling_wakes_the_coordinator_again(self):
         """A resume steps past the ASK it was run for, and past nothing else that ticket says."""
@@ -4192,9 +4030,7 @@ class DiagnosingChildChainTests(DriverTestCase):
         """One planned ticket up and its loop running; the queued Wave is placed behind it."""
         self.fixture.ticket("01", "thing 01", routing=routing)
         self.fixture.commit_feature()
-        process = self.fixture.launch(
-            env_overrides={"AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF},
-        )
+        process = self.fixture.launch()
         self.await_launch("01", "01 never launched")
         return process
 
@@ -4477,10 +4313,7 @@ class QueueTests(DriverTestCase):
         self.fixture.commit_feature()
         if tracker == "github":
             self.fixture.issues({"01": {"labels": [], "closed": False, "comments": []}})
-        process = self.fixture.launch(env_overrides={
-            "CLAUDE_CODE_SESSION_ID": "",
-            "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
-        })
+        process = self.fixture.launch(env_overrides={"CLAUDE_CODE_SESSION_ID": ""})
         self.assertTrue(
             self.fixture.wait_for(lambda: self.fixture.verified_launch("01") is not None),
             "01 never launched",

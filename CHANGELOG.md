@@ -8,6 +8,34 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- The coordinator runs the escalation fact-check itself, once, before it rules, and the Driver
+  runs none. The brief used to be attached to an escalation after it had been sent: a Claude child
+  sent its `CREW ASK` straight to the coordinator, which ruled at once, and the Driver then read
+  the same escalation out of the Machine log, ran the Witness and woke the coordinator with a
+  snapshot whose `detail` was byte-identical to the message already answered. Measured in one run:
+  8 of 8 escalations, 8 wasted coordinator turns, 6 of them with an empty brief, and the one brief
+  that carried value arrived after the ruling it contradicted. An escalation now ends on one fixed
+  Witness command line, rendered into the child's first turn by dispatch with the run directory and
+  the ticket already filled in, copied by the child and copied again by the coordinator. That line
+  finds the ticket's standing escalation in the log, checks its pointers, records its own `witness`
+  event and prints the brief; run a second time for one escalation it prints the brief it already
+  recorded rather than buying a second opinion. A fact-check that fails or times out prints no
+  brief and is not an error, and the coordinator rules without one (#194).
+- The Driver hands over only an escalation whose Machine-log record carries no sender address — a
+  Codex child's, transcribed by the bridge, which no message channel delivered. One with an address
+  was delivered by the child's own message tool and is already in front of the coordinator, so the
+  Driver leaves it alone and keeps no backstop for it: the coordinator is blocked for the whole of
+  each fact-check, so any window short enough to be a useful backstop re-creates the double wake
+  under the load that was measured. A lost escalation stands on the dashboard as an unanswered ASK
+  until the operator resumes the run. Because the Driver no longer exits on a delivered escalation,
+  the coordinator's whole ruling turn now happens while the loop polls, and a ticket owed a ruling
+  holds the run's inactivity deadline the way a child paused on a vendor limit already did (#194).
+- The dashboard's `⏳ fact-check running` marker is retired, and `awaiting your ruling` covers the
+  whole of the wait. The marker named the Driver's own witness subprocess, which no longer exists,
+  and nothing the Machine log holds tells a coordinator reading an ASK from one running the
+  Witness — so it would have asserted what it did not know. The projection's `fact_check_running`
+  fact and the row annotation that drew its elapsed go with it; `awaiting_ruling` now starts at a
+  delivered escalation and, for an undelivered one, at the Driver's hand-over line (#194).
 - The Witness no longer compares the worktree's working state before and after its session. The
   guard defended against a Witness write, which its plan permission mode and single read-only
   allowed Bash form already make impossible; what it caught instead was the escalating child, still
