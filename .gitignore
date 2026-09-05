@@ -6,6 +6,9 @@ __pycache__/
 
 # The maintainer's own machine nicknames and account names: local policy, never shipped.
 .agentcrew-local-identifiers
+# This machine's overlay on agentcrew.toml, merged over it key by key (ADR-0029): what is
+# true of one machine, never of the project.
+agentcrew.local.toml
 # Added by code-review-graph
 .code-review-graph/
 # A crew run's own working directory — spec, tickets, decisions and rendered first turns for the

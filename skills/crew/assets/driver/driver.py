@@ -201,6 +201,10 @@ SETTINGS_PATH = pathlib.Path(".claude") / "settings.local.json"
 # The project config the dashboard's surface, the launch hook, and the run's configured routing
 # decisions are read from.
 CONFIG_NAME = "agentcrew.toml"
+# The machine's own overlay on that config, beside it and never committed: a table it names is
+# merged over the committed one key by key, so a key can point somewhere on one machine without
+# the shipped decision changing for anyone else.
+LOCAL_CONFIG_NAME = "agentcrew.local.toml"
 LAUNCH_HOOK_SECTION = ("hooks", "on-child-launch")
 # The repair rung's model and the tracker a merged ticket is closed in. Both are routing decisions
 # and both live in the project's committed config rather than in a launch flag: the only caller
@@ -898,14 +902,37 @@ def repository_root(feature_dir, given):
 
 
 def project_config(repo):
-    """The project's `agentcrew.toml`, or an empty document where the repo carries none."""
-    config = repo / CONFIG_NAME
-    if not config.exists():
+    """The project's `agentcrew.toml` with this machine's `agentcrew.local.toml` merged over it.
+
+    Either file may be absent; a repo carrying neither is an empty document. The overlay wins key
+    by key: a table it names is merged into the committed table of that name rather than replacing
+    it, so one overridden key leaves its neighbours as the project committed them (ADR-0029).
+    """
+    return merged_config(
+        config_document(repo / CONFIG_NAME), config_document(repo / LOCAL_CONFIG_NAME)
+    )
+
+
+def config_document(path):
+    """One TOML document, or an empty one where the file is not there."""
+    if not path.exists():
         return {}
     try:
-        return tomllib.loads(config.read_text(encoding="utf-8"))
+        return tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as error:
-        raise DriverError(f"{config} is unreadable: {error}") from error
+        raise DriverError(f"{path} is unreadable: {error}") from error
+
+
+def merged_config(base, overlay):
+    """`overlay` laid over `base`: tables merge recursively, any other value replaces."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        below = merged.get(key)
+        if isinstance(value, dict) and isinstance(below, dict):
+            merged[key] = merged_config(below, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def config_value(config, keys):

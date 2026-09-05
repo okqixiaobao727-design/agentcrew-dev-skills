@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A machine's own overlay on the crew config file (ADR-0029). `agentcrew.local.toml`, beside
+  `agentcrew.toml` and never committed, is merged over it key by key wherever the Driver reads the
+  project's config: a table it names overrides only the keys it sets, and an overlay that cannot be
+  parsed stops the run by its own name. `scripts/test.py` reads the same two documents and honours
+  one key of its own, `[test] runner`: an argv list the script hands the whole run to, with its own
+  arguments and exit status, so a machine can run the suites elsewhere while the gate, CI and every
+  agent keep naming the one command. `--no-delegate` runs the suites where the script is invoked. A
+  runner that is not an argv list or cannot be started is an error, never a quiet local run.
+
 ### Changed
 - The coordinator runs the escalation fact-check itself, once, before it rules, and the Driver
   runs none. The brief used to be attached to an escalation after it had been sent: a Claude child

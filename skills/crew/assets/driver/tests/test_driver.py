@@ -529,6 +529,49 @@ class PreflightTests(DriverTestCase):
         self.assertEqual(base_gate[0]["argv"], ["base-gate", "--full"])
         self.assertEqual(len(self.fixture.gate_calls()), 1)
 
+    def test_the_machine_s_own_overlay_configures_the_base_gate_beside_the_committed_config(self):
+        """`agentcrew.local.toml` is read over `agentcrew.toml`, uncommitted (ADR-0029)."""
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        self.fixture.configure_gate(output="base is green\n")
+        # The committed config names no gate; only the machine's overlay does.
+        self.fixture.configure()
+        (self.fixture.repo / "agentcrew.local.toml").write_text(
+            '[preflight]\ngate = ["base-gate", "--full"]\n', encoding="utf-8"
+        )
+
+        self.started()
+
+        self.assertTrue(
+            self.fixture.wait_for(lambda: len(self.events("base-gate")) == 1),
+            "the base gate the overlay configured was not run",
+        )
+        self.assertEqual(self.events("base-gate")[0]["argv"], ["base-gate", "--full"])
+        self.assertEqual(len(self.fixture.gate_calls()), 1)
+
+    def test_the_overlay_merges_into_a_committed_table_rather_than_replacing_it(self):
+        """An overlay naming `[repair]` for one key leaves the committed `model` standing."""
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        (self.fixture.repo / "agentcrew.local.toml").write_text(
+            '[repair]\nnote = "this machine"\n', encoding="utf-8"
+        )
+
+        self.started()
+
+        self.assertEqual(self.fixture.table()["run"]["repair_model"], REPAIR_MODEL)
+
+    def test_an_unreadable_overlay_stops_the_run_by_name(self):
+        self.fixture.ticket("01", "first thing")
+        self.fixture.commit_feature()
+        (self.fixture.repo / "agentcrew.local.toml").write_text("[preflight\n", encoding="utf-8")
+
+        result = self.fixture.start()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("agentcrew.local.toml", result.stdout + result.stderr)
+        self.assert_nothing_launched()
+
     def test_a_dirty_working_tree_is_reported_without_running_the_base_gate(self):
         self.fixture.ticket("01", "first thing")
         self.fixture.commit_feature()
@@ -4579,6 +4622,26 @@ class QueueTests(DriverTestCase):
         # The fields the project cell left alone are still the shipped cell's.
         self.assertEqual(ticket["workflow"], "tdd")
         self.assertEqual(ticket["executor"], "claude")
+
+    def test_the_machine_s_overlay_routes_a_queued_ticket_over_the_project_s_own_cell(self):
+        self.start()
+        config = self.fixture.repo / "agentcrew.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8")
+            + f'\n[queued]\nmodel = "{CLAUDE_MODEL}"\neffort = "low"\n',
+            encoding="utf-8",
+        )
+        (self.fixture.repo / "agentcrew.local.toml").write_text(
+            '[queued]\neffort = "high"\n', encoding="utf-8"
+        )
+
+        result = self.queue_finding()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ticket = self.placed()
+        # The overlay's key wins; the committed cell's other key is still read beside it.
+        self.assertEqual(ticket["effort"], "high")
+        self.assertEqual(ticket["model"], CLAUDE_MODEL)
 
     def test_the_finding_is_carried_exactly_as_the_child_stated_it(self):
         self.start()

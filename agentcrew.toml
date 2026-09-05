@@ -15,6 +15,12 @@
 #
 # Each cell's name is the case that selects it. The comment above each group says what the
 # classification turns on, so the case a cell answers is readable from this file alone.
+#
+# What is true of one machine rather than of the project goes in `agentcrew.local.toml` beside
+# this file, gitignored: it is merged over this file key by key, so a table it names overrides
+# only the keys it sets (ADR-0029). One key only that file is expected to carry: `[test] runner`,
+# an argv list `scripts/test.py` hands the whole run to, with its own arguments, on machines that
+# run the suites somewhere other than where the script is invoked.
 
 # --- Implementer table ------------------------------------------------------
 # Which agent writes the ticket's code, one cell per case of `/route`'s classification.

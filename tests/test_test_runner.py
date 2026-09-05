@@ -10,6 +10,7 @@ script exists to avoid.
 """
 
 import importlib.util
+import json
 import os
 import pathlib
 import shutil
@@ -128,6 +129,19 @@ import unittest
 class Undecodable(unittest.TestCase):
     def test_it_writes_bytes_no_locale_can_decode(self):
         os.write(2, b"\\xff\\xfe raw bytes at the descriptor\\n")
+"""
+
+
+# A stand-in for a machine's own `[test] runner`: it records where it was started and with what,
+# and exits as the fixture told it to, so a test can see exactly what the script handed over.
+RUNNER_STUB = """
+import json
+import os
+import sys
+
+with open({record!r}, "a") as handle:
+    handle.write(json.dumps({{"cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n")
+sys.exit({exit_code})
 """
 
 
@@ -299,6 +313,108 @@ class RunnerCLITests(unittest.TestCase):
 
         self.assertEqual(run.returncode, 2)
         self.assertIn("skills/*/assets/**/tests", run.stderr)
+
+
+class ConfiguredRunnerTests(unittest.TestCase):
+    """A machine's `[test] runner` takes the run over, with the script's own arguments."""
+
+    def setUp(self):
+        self.tree = TreeFixture()
+        self.addCleanup(self.tree.close)
+        self.tree.suite("tests", test_root=PASSING_TEST)
+        self.tree.suite("skills/crew/assets/alpha/tests", test_alpha=PASSING_TEST)
+        self.record = self.tree.root / "runner-calls"
+
+    def stub(self, name, exit_code=0):
+        """Install a runner stub under `name`; return the argv that configures it."""
+        path = self.tree.root / f"{name}.py"
+        path.write_text(RUNNER_STUB.format(record=str(self.record), exit_code=exit_code))
+        return [sys.executable, str(path)]
+
+    def configure(self, filename, runner):
+        rendered = ", ".join(f'"{item}"' for item in runner)
+        (self.tree.root / filename).write_text(f"[test]\nrunner = [{rendered}]\n")
+
+    def calls(self):
+        if not self.record.exists():
+            return []
+        return [json.loads(line) for line in self.record.read_text().splitlines()]
+
+    def test_a_runner_in_the_local_overlay_is_handed_the_run_and_its_arguments(self):
+        self.configure("agentcrew.local.toml", self.stub("runner"))
+
+        run = self.tree.run("--asset", "alpha", "--jobs", "1")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(pathlib.Path(calls[0]["cwd"]).resolve(), self.tree.root.resolve())
+        self.assertEqual(
+            calls[0]["argv"],
+            ["--root", str(self.tree.root), "--asset", "alpha", "--jobs", "1"],
+        )
+        self.assertIn("handing the run to", run.stderr)
+        self.assertNotIn("alpha: 1 tests in", run.stderr)
+
+    def test_the_runner_s_exit_status_is_the_script_s(self):
+        self.configure("agentcrew.local.toml", self.stub("runner", exit_code=7))
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_no_delegate_runs_the_suites_here_despite_the_runner(self):
+        self.configure("agentcrew.local.toml", self.stub("runner"))
+
+        run = self.tree.run("--no-delegate")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("total: 2 tests in", run.stderr)
+
+    def test_the_overlay_wins_over_the_committed_config_key_by_key(self):
+        self.configure("agentcrew.toml", self.stub("committed", exit_code=3))
+        self.configure("agentcrew.local.toml", self.stub("local"))
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_committed_runner_is_honoured_where_no_overlay_is_laid_over_it(self):
+        self.configure("agentcrew.toml", self.stub("committed", exit_code=3))
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 3, run.stderr)
+
+    def test_a_runner_that_is_not_an_argv_list_is_refused_rather_than_run(self):
+        (self.tree.root / "agentcrew.local.toml").write_text('[test]\nrunner = "runner"\n')
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("[test] runner", run.stderr)
+        self.assertNotIn("total:", run.stderr)
+
+    def test_a_runner_that_cannot_be_started_is_an_error_not_a_local_run(self):
+        self.configure("agentcrew.local.toml", [str(self.tree.root / "absent-runner")])
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("could not be started", run.stderr)
+        self.assertNotIn("total:", run.stderr)
+
+    def test_an_unreadable_overlay_stops_the_run(self):
+        (self.tree.root / "agentcrew.local.toml").write_text("[test\n")
+
+        run = self.tree.run()
+
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("agentcrew.local.toml", run.stderr)
+        self.assertNotIn("total:", run.stderr)
 
 
 class ParallelGateTests(unittest.TestCase):

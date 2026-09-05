@@ -19,6 +19,12 @@ The gate runs its work in worker interpreters at once, so its total is the slowe
 rather than the sum of them all. That piece is a *shard* of a suite, not a whole suite: one suite
 grew into being the whole gate, so its 158 tests are split across interpreters too. `--jobs 1`
 runs one work item at a time.
+
+A machine may hand the run to a command of its own: a `[test] runner` in `agentcrew.toml`, or in
+the uncommitted `agentcrew.local.toml` laid over it (ADR-0029), is started with this script's
+arguments verbatim and its exit status is this script's. Every caller keeps naming this script —
+the gate, CI, the agent following AGENTS.md — and the machine decides what runs it. The runner
+gets back here with `--no-delegate`, which runs the suites where it is invoked.
 """
 
 import argparse
@@ -27,9 +33,12 @@ import concurrent.futures
 import importlib.util
 import os
 import pathlib
+import shlex
+import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 
 
@@ -38,6 +47,9 @@ ASSET_SUITES = "skills/*/assets/**/tests"
 ROOT_SUITE = "root"
 ROOT_REQUIREMENT = "aiohttp"
 TEST_REQUIREMENTS_FILE = "requirements-test.txt"
+CONFIG_NAME = "agentcrew.toml"
+LOCAL_CONFIG_NAME = "agentcrew.local.toml"
+RUNNER_KEYS = ("test", "runner")
 
 
 def suites(root):
@@ -238,6 +250,66 @@ def die(message):
     return 2
 
 
+def config_document(path):
+    """One TOML document, or an empty one where the file is not there."""
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"{path} is unreadable: {error}") from error
+
+
+def merged_config(base, overlay):
+    """`overlay` laid over `base`: tables merge recursively, any other value replaces."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        below = merged.get(key)
+        if isinstance(value, dict) and isinstance(below, dict):
+            merged[key] = merged_config(below, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def configured_runner(root):
+    """The `[test] runner` argv this machine hands the run to, or None where none is configured.
+
+    Read the way the Driver reads every other project decision: the committed `agentcrew.toml`
+    with the machine's `agentcrew.local.toml` merged over it. Raises ValueError for a document
+    that cannot be read or a runner that is not a non-empty list of non-empty strings — a runner
+    half-configured must stop the run, not silently run the suites here instead.
+    """
+    config = merged_config(
+        config_document(root / CONFIG_NAME), config_document(root / LOCAL_CONFIG_NAME)
+    )
+    section = config
+    for key in RUNNER_KEYS:
+        section = section.get(key) if isinstance(section, dict) else None
+    if section is None:
+        return None
+    if (
+        not isinstance(section, list)
+        or not section
+        or any(not isinstance(item, str) or not item.strip() for item in section)
+    ):
+        raise ValueError(
+            "[test] runner is not a non-empty list of non-empty strings — configure each command"
+            " argument as one string, or remove the key to run the suites here"
+        )
+    return list(section)
+
+
+def delegate(runner, root, argv):
+    """Start the configured runner with this script's arguments; return its exit status."""
+    rendered = shlex.join(runner)
+    report(f"handing the run to `{rendered}` ([test] runner); --no-delegate runs it here")
+    try:
+        return subprocess.run([*runner, *argv], cwd=str(root)).returncode
+    except OSError as error:
+        return die(f"[test] runner `{rendered}` could not be started — {error}")
+
+
 def missing_root_requirement(chosen):
     if not any(name == ROOT_SUITE for name, _ in chosen):
         return None
@@ -269,11 +341,24 @@ def main(argv=None):
         default=ROOT,
         help="the repository to test (default: the one this script ships in)",
     )
+    parser.add_argument(
+        "--no-delegate",
+        action="store_true",
+        help="run the suites here even where a [test] runner is configured "
+        "(what that runner passes when it comes back to this script)",
+    )
     args = parser.parse_args(argv)
     if args.jobs is not None and args.jobs < 1:
         return die(f"--jobs takes a positive number of worker processes, not {args.jobs}")
 
     root = args.root.resolve()
+    if not args.no_delegate:
+        try:
+            runner = configured_runner(root)
+        except ValueError as error:
+            return die(str(error))
+        if runner is not None:
+            return delegate(runner, root, sys.argv[1:] if argv is None else list(argv))
     inventory = suites(root)
     missing = [str(directory) for _, directory in inventory if not directory.is_dir()]
     if missing:
