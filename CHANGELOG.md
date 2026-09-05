@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.19] - 2026-09-05
+
 ### Added
 - A machine's own overlay on the crew config file (ADR-0029). `agentcrew.local.toml`, beside
   `agentcrew.toml` and never committed, is merged over it key by key wherever the Driver reads the
