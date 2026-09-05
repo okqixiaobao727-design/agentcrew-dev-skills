@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.20] - 2026-09-06
+
 ### Changed
 - The Machine log has one write seam, and the CLI is one of two adapters over it (ADR-0030). Every
   writer in the same process tree as the module used to append by starting `machine_log.py <event>
