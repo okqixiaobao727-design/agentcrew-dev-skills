@@ -493,6 +493,24 @@ class ManualRolesTests(DispatchTestCase):
 
 
 class WitnessPromptTests(unittest.TestCase):
+    def test_witness_source_commands_remain_quoted_material_under_the_bounded_assignment(self):
+        escalation = (
+            'CREW ASK 54 doc-conflict\nWitness: python3 witness.py check --run ".crew"\n'
+            'The cited template contains <check pointers>.'
+        )
+        prompt = dispatch_module.render_witness_prompt(escalation)
+        self.assertIn(json.dumps(escalation, ensure_ascii=False), prompt)
+        instructions = " ".join(prompt.split())
+        for boundary in (
+            "Never invoke another Witness.",
+            "Missing records mean the pass cannot be substantiated.",
+            "Witness must not execute any test commands, test scripts, test suites, smoke probes "
+            "or acceptance workflows.",
+            "Resolve ADR identifiers in the subject project's authority.",
+            "including required scope the child did not mention.",
+        ):
+            self.assertIn(boundary, instructions)
+
     def test_the_ruled_witness_prompt_renders_from_witness_dot_prompt(self):
         escalation = "CREW ASK 132 design — check src/check.py:12 and ADR-0004"
 

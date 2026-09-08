@@ -1138,6 +1138,10 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(recorded[1]["detail"], "round one")
 
     def test_a_witness_records_the_fact_check_and_its_session_cost(self):
+        timeline = {
+            "start": 0, "first_tool_call": 10, "first_completed_finding": None,
+            "last_activity": 200, "end": 900.125,
+        }
         result = run_cli(
             "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
@@ -1146,7 +1150,7 @@ class EventTests(MachineLogTestCase):
             "--covered-count", "0", "--uncovered-count", "3",
             "--input-tokens", "11", "--output-tokens", "22",
             "--cache-read-tokens", "33", "--cache-creation-tokens", "44",
-            "--total-tokens", "110", log=self.log,
+            "--total-tokens", "110", "--timeline", json.dumps(timeline), log=self.log,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1168,6 +1172,7 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["cache_read_tokens"], 33)
         self.assertEqual(entry["cache_creation_tokens"], 44)
         self.assertEqual(entry["total_tokens"], 110)
+        self.assertEqual(entry["timeline"], timeline)
 
     def test_a_partial_witness_records_its_required_coverage_counts(self):
         result = run_cli(
@@ -1339,11 +1344,6 @@ class EventTests(MachineLogTestCase):
                 "--outcome", "partial", "--reason", "", "--brief", "a fact — #154",
                 "--duration-seconds", "1",
                 "--covered-count", "10", "--uncovered-count", "2",
-            ]),
-            ("partial without covered pointers", [
-                "--outcome", "partial", "--reason", "uncovered", "--brief", "a fact — #154",
-                "--duration-seconds", "1",
-                "--covered-count", "0", "--uncovered-count", "2",
             ]),
             ("failed with a covered pointer", [
                 "--outcome", "failed", "--reason", "failed", "--brief", "",

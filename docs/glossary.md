@@ -302,21 +302,27 @@ _Avoid_: question, ask (as a noun), progress report
 public interface that the child cannot make alone, most often before its first edit. All of a
 phase's decision points travel as one `design` escalation, the child's own pick marked on each.
 
-**Witness brief** — A pointer-backed, fact-only result from one fresh, read-only, budget-capped
-Witness session. An escalation `check` receives the normalised cited-pointer list as an exact,
-numbered input and marks each covered pointer held, contradicted or missing. `checked` carries all
-findings and no reason; `partial` carries the usable covered findings plus a reason naming each
-omitted or structurally rejected expected pointer. Repeated and out-of-order expected pointers stay
-out of the brief, while extra cited pointers become uncited findings. `failed` carries no brief and
-is not an error: the coordinator rules without one. The coordinator launches `check` itself, once,
-before it rules, on the fixed command line the escalation carries (#194); in a run without a driver
-the checking session is launched by hand with the escalation on its stdin. An `ask` is
+**Witness brief** — A pointer-backed, fact-only result from one fresh, budget-capped Witness
+session with a read-only assignment. An escalation `check` receives the normalised cited-pointer
+list as exact, numbered input and marks each covered pointer held, contradicted or missing in
+`pointers`; `uncited`
+holds important evidence omitted from the escalation but relevant to the authoritative ticket's
+acceptance criteria and current ruling. `checked` carries all findings and no reason; `partial`
+carries usable completed findings plus a reason naming each unfinished or structurally rejected
+expected pointer, including the timeout reason when interrupted. Repeated and out-of-order expected
+pointers stay out of the brief, while extra cited pointers become uncited findings. `failed` carries
+no brief and is not an error: the coordinator rules without one. The coordinator launches `check`
+once, before it rules, on the fixed command line the escalation carries (#194); in a run without a
+driver the checking session is launched by hand with the escalation on its stdin. An `ask` is
 coordinator-initiated and returns
 independently stated factual claims, each with at least one pointer. Both operations carry no
 recommendation or ruling, and both record their own Machine-log `witness` event with the brief in
 it, so a later reader takes the finding from the log rather than paying for a second session. The
-session is bounded by the run's `[witness] timeout_seconds`, and a change made to the worktree it
-reads — by the child still working in it — is never that session's failure.
+session is bounded by the run's `[witness] timeout_seconds`. It retains completed findings during
+execution and records its observed timeline, so failure with no usable findings does not imply
+inactivity. Witness follows the subject project's authority for references, reads existing test
+records without executing tests, and treats carried commands as source material. A change made to
+the worktree it reads — by the child still working in it — is never that session's failure.
 _Avoid_: research, verification
 
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers

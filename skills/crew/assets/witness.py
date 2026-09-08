@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Run one fresh, read-only, budget-capped Witness operation."""
+"""Run one fresh, budget-capped Witness operation with a non-mutating assignment."""
 
 import argparse
 import json
 import os
 import pathlib
 import re
+import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -21,8 +23,7 @@ import dispatch  # noqa: E402
 CLAUDE = "claude"
 HEADLESS_FLAG = "--print"
 BUDGET_FLAG = "--max-budget-usd"
-READ_ONLY_PERMISSION_MODE = "plan"
-TRACKER_READ_TOOL = "Bash(gh issue view:*)"
+ACTIVE_ENV = "AGENTCREW_WITNESS_ACTIVE"
 # A path part starts with a letter, underscore, dot, tilde, or slash; contains at
 # least one ASCII letter; and is not a bare version/number token matching
 # v?[0-9]+([.-][0-9]+)*. ASCII boundary classes deliberately let a pointer touch CJK prose.
@@ -101,12 +102,22 @@ class Pointer(str):
     """One normalised pointer value returned by the pointer grammar."""
 
 
+def execution_timeline(end=None):
+    """Return an operation's milestones with unobserved activity left null."""
+    return {
+        "start": 0, "first_tool_call": None, "first_completed_finding": None,
+        "last_activity": None, "end": end,
+    }
+
+
 def failed(reason, started, usage=None, coverage=None):
+    duration = round(time.monotonic() - started, 3)
     document = {
         "brief": "",
         "outcome": "failed",
         "reason": str(reason).strip() or "witness failed",
-        "duration_seconds": round(time.monotonic() - started, 3),
+        "duration_seconds": duration,
+        "timeline": execution_timeline(duration),
     }
     if coverage is not None:
         document["covered_count"], document["uncovered_count"] = coverage
@@ -258,6 +269,13 @@ def structured_check_findings(value, expected):
         if pointer in expected_indexes and expected_indexes[pointer] in selected_indexes
     }
     lines = [cited_by_index[index] for index in sorted(selected_indexes)]
+    usable = {
+        "cited": [
+            item for pointer, _, item in cited_findings
+            if pointer in expected_indexes and expected_indexes[pointer] in selected_indexes
+        ],
+        "uncited": [],
+    }
 
     missing = []
     structural_rejections = []
@@ -287,20 +305,22 @@ def structured_check_findings(value, expected):
             extra_cited.add(pointer)
         if pointer not in rendered_uncited:
             lines.append(finding_line(item, "uncited "))
+            usable["uncited"].append(item)
             rendered_uncited.add(pointer)
-    for pointer, line, _ in uncited_findings:
+    for pointer, line, item in uncited_findings:
         if pointer not in expected_indexes and pointer not in rendered_uncited:
             lines.append(line)
+            usable["uncited"].append(item)
             rendered_uncited.add(pointer)
 
     uncovered = [
         pointer for index, pointer in enumerate(expected) if index not in selected_indexes
     ]
-    return lines, uncovered, missing, structural_rejections
+    return lines, uncovered, missing, structural_rejections, usable
 
 
 def check_result(value, expected):
-    findings, uncovered, missing, structural_rejections = structured_check_findings(
+    findings, uncovered, missing, structural_rejections, _ = structured_check_findings(
         value, expected
     )
     covered_count = len(expected) - len(uncovered)
@@ -313,16 +333,17 @@ def check_result(value, expected):
         reason_parts.append(f"uncovered pointers: {', '.join(missing)}")
     reason_parts.extend(structural_rejections)
     reason = "; ".join(reason_parts)
-    if not covered_count and (uncovered or structural_rejections):
-        return {"brief": "", "outcome": "failed", "reason": reason, **coverage}
-    brief = "\n".join(findings)
-    if not brief:
+    if not findings:
         return {
             "brief": "",
             "outcome": "failed",
-            "reason": "witness matched none of the expected or uncited pointers",
+            "reason": reason or "witness matched none of the expected or uncited pointers",
             **coverage,
         }
+    brief = "\n".join([
+        "pointers", *(line for line in findings if not line.startswith("uncited ")),
+        "uncited", *(line for line in findings if line.startswith("uncited ")),
+    ])
     if uncovered or structural_rejections:
         return {
             "brief": brief,
@@ -368,12 +389,10 @@ def command(prompt, model, budget, schema):
         model,
         BUDGET_FLAG,
         f"{budget:g}",
-        "--permission-mode",
-        READ_ONLY_PERMISSION_MODE,
-        "--allowedTools",
-        TRACKER_READ_TOOL,
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
         "--json-schema",
         json.dumps(schema, separators=(",", ":")),
     ]
@@ -386,64 +405,240 @@ def environment(account):
     return current
 
 
+class _SessionOutput:
+    """The validated findings and observed milestones of one session's output."""
+
+    def __init__(self, started, expected):
+        self.started = started
+        self.expected = None if expected is None else tuple(map(str, expected))
+        self.schema = ASK_SCHEMA if expected is None else CHECK_SCHEMA
+        self.progress = {"claims": []} if expected is None else {"cited": [], "uncited": []}
+        self.timeline = execution_timeline()
+        self.content = None
+        self.response = None
+        self.final_error = ""
+        self.text_blocks = {}
+        self.streamed_text = False
+
+    def elapsed(self):
+        return round(time.monotonic() - self.started, 3)
+
+    def render(self, value):
+        if self.expected is not None:
+            return check_result(value, self.expected)
+        return {"brief": structured_ask_brief(value), "outcome": "checked", "reason": ""}
+
+    def retain(self, value):
+        content = self.render(value)
+        self.progress, self.content = value, content
+        if content.get("brief") and self.timeline["first_completed_finding"] is None:
+            self.timeline["first_completed_finding"] = self.timeline["last_activity"]
+
+    def submit(self, line):
+        try:
+            envelope = json.loads(line)
+            if not isinstance(envelope, dict) or set(envelope) != {"witness_finding"}:
+                return
+            item = envelope["witness_finding"]
+            if not isinstance(item, dict) or set(item) != {"section", "finding"}:
+                return
+            section = item["section"]
+            if not isinstance(section, str) or section not in self.progress:
+                return
+            candidate = {name: list(items) for name, items in self.progress.items()}
+            candidate[section].append(item["finding"])
+            self.retain(candidate)
+        except (ValueError, TypeError):
+            return
+
+    def accept_final(self, value):
+        # Validate the final batch before it can replace earlier evidence. Its pointer
+        # identities supersede earlier wording; omitted, usable evidence is retained.
+        self.render(value)
+        merged = {name: list(items) for name, items in value.items()}
+        if self.expected is None:
+            final_pointers = {pointer for item in value["claims"] for pointer in item["pointers"]}
+            merged["claims"].extend(
+                item for item in self.progress["claims"]
+                if final_pointers.isdisjoint(item["pointers"])
+            )
+        else:
+            *_, usable = structured_check_findings(self.progress, self.expected)
+            final_pointers = {item["pointer"] for items in value.values() for item in items}
+            positions = {pointer: index for index, pointer in enumerate(self.expected)}
+            for item in usable["cited"]:
+                if item["pointer"] in final_pointers:
+                    continue
+                position = positions[item["pointer"]]
+                insertion = next((
+                    index for index, current in enumerate(merged["cited"])
+                    if positions.get(current["pointer"], len(positions)) > position
+                ), len(merged["cited"]))
+                merged["cited"].insert(insertion, item)
+            merged["uncited"].extend(
+                item for item in usable["uncited"] if item["pointer"] not in final_pointers
+            )
+        self.retain(merged)
+
+    def text_chunk(self, index, text):
+        if not isinstance(text, str):
+            return
+        self.text_blocks[index] = self.text_blocks.get(index, "") + text
+        while "\n" in self.text_blocks[index]:
+            line, self.text_blocks[index] = self.text_blocks[index].split("\n", 1)
+            self.submit(line)
+
+    def stream_event(self, part):
+        if not isinstance(part, dict):
+            return
+        index = part.get("index")
+        if part.get("type") == "message_start":
+            self.text_blocks.clear()
+        if not isinstance(index, int):
+            return
+        if part.get("type") == "content_block_start":
+            block = part.get("content_block", {})
+            if not isinstance(block, dict):
+                return
+            self.note_tool(block)
+            if block.get("type") == "text":
+                self.streamed_text = True
+                self.text_blocks[index] = ""
+                self.text_chunk(index, block.get("text", ""))
+        elif part.get("type") == "content_block_delta" and index in self.text_blocks:
+            delta = part.get("delta", {})
+            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                self.text_chunk(index, delta.get("text", ""))
+        elif part.get("type") == "content_block_stop":
+            self.submit(self.text_blocks.pop(index, ""))
+
+    def note_tool(self, block):
+        if block.get("type") == "tool_use" and self.timeline["first_tool_call"] is None:
+            self.timeline["first_tool_call"] = self.timeline["last_activity"]
+
+    def observe(self, line):
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            return
+        if not isinstance(event, dict) or event.get("parent_tool_use_id"):
+            return
+        if event.get("type") == "result":
+            self.response = event
+            if not event.get("is_error"):
+                try:
+                    self.accept_final(event.get("structured_output"))
+                except (ValueError, TypeError) as error:
+                    self.final_error = str(error)
+        elif event.get("type") == "stream_event":
+            self.stream_event(event.get("event"))
+        elif event.get("type") == "assistant":
+            message = event.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+                return
+            for block in message["content"]:
+                if not isinstance(block, dict):
+                    continue
+                self.note_tool(block)
+                text = block.get("text")
+                if self.streamed_text or block.get("type") != "text" or not isinstance(text, str):
+                    continue
+                # Assistant messages mirror streamed text. Without deltas, a completed
+                # text block is itself a record boundary, even without a final newline.
+                for submission in text.splitlines():
+                    self.submit(submission)
+
+    def finish(self, failure):
+        if not failure:
+            if self.response is None:
+                failure = "witness session returned invalid JSON or no final result"
+            elif self.response.get("is_error"):
+                failure = "witness session returned an error result"
+            else:
+                failure = self.final_error
+        content = self.content or {}
+        if content.get("outcome") == "failed" and not failure:
+            failure = content["reason"]
+        if failure:
+            if content.get("brief"):
+                content = {**content, "outcome": "partial", "reason": "; ".join(
+                    part for part in (failure, content.get("reason")) if part
+                )}
+            else:
+                coverage = None if self.expected is None else (0, len(self.expected))
+                content = failed(failure, self.started, coverage=coverage)
+        duration = self.elapsed()
+        self.timeline["end"] = duration
+        document = {**content, "duration_seconds": duration, "timeline": self.timeline}
+        usage = self.response.get("usage") if isinstance(self.response, dict) else None
+        if isinstance(usage, dict):
+            document["usage"] = usage
+        return document
+
+
 def execute(
-    prompt, worktree, model, budget, timeout, session_environment, schema, render, started,
-    failure_coverage=None,
+    prompt, worktree, model, budget, timeout, session_environment, started, expected=None,
 ):
-    # The session is read-only by construction — a plan permission mode with one allowed Bash
-    # form, which reads the tracker — so there is no worktree change of its own to guard against.
-    # The worktree it reads is the escalating child's, live and still being worked in, and a
-    # comparison here would report that child's ordinary edit as this session's failure (#196).
-    result = None
-    failure = None
+    """Return the session's collected result within the configured execution budget."""
+    output = _SessionOutput(started, expected)
+    stderr = bytearray()
+    failure = ""
+    process = None
     try:
-        result = subprocess.run(
-            command(prompt, model, budget, schema),
-            cwd=worktree,
-            env=session_environment,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        prompt = f"Execution budget: {timeout:g} seconds and USD {budget:g}.\n\n{prompt}"
+        inherited = os.environ if session_environment is None else session_environment
+        process = subprocess.Popen(
+            command(prompt, model, budget, output.schema),
+            cwd=worktree, env={**inherited, ACTIVE_ENV: "1"}, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        failure = "witness session timed out"
+        deadline = time.monotonic() + timeout
+        pending = b""
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            selector.register(process.stderr, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = "witness session timed out"
+                    break
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    output.timeline["last_activity"] = output.elapsed()
+                    if key.fileobj is process.stderr:
+                        stderr.extend(chunk)
+                        continue
+                    pending += chunk
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        output.observe(line)
+            if not failure:
+                if pending:
+                    output.observe(pending)
+                try:
+                    process.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    failure = "witness session timed out"
+        if not failure and process.returncode:
+            failure = stderr.decode("utf-8", errors="replace").strip() or (
+                f"witness session exited {process.returncode}"
+            )
     except OSError as error:
-        failure = error
-    if failure is not None:
-        return failed(failure, started, coverage=failure_coverage)
-    if result.returncode:
-        detail = result.stderr.strip() or f"witness session exited {result.returncode}"
-        return failed(detail, started, coverage=failure_coverage)
-    try:
-        response = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        return failed(
-            f"witness session returned invalid JSON: {error}", started,
-            coverage=failure_coverage,
-        )
-    usage = response.get("usage") if isinstance(response, dict) else None
-    if not isinstance(response, dict) or response.get("is_error"):
-        return failed(
-            "witness session returned an error result", started, usage, failure_coverage
-        )
-    try:
-        content = render(response.get("structured_output"))
-    except (TypeError, ValueError) as error:
-        return failed(error, started, usage, failure_coverage)
-    if not isinstance(content, dict):
-        return failed(
-            "witness session returned an invalid result",
-            started,
-            usage,
-            failure_coverage,
-        )
-    if content.get("outcome") != "failed" and not str(content.get("brief", "")).strip():
-        return failed("witness session returned an empty brief", started, usage, failure_coverage)
-    document = dict(content)
-    document["duration_seconds"] = round(time.monotonic() - started, 3)
-    if isinstance(usage, dict):
-        document["usage"] = usage
-    return document
+        failure = str(error)
+    finally:
+        if process is not None:
+            if failure or process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
+    return output.finish(failure)
 
 
 def checked_context(worktree, model, budget, timeout):
@@ -506,6 +701,7 @@ def record(document, log, ticket, operation, model):
             duration_seconds=document["duration_seconds"],
             covered_count=document.get("covered_count", 0),
             uncovered_count=document.get("uncovered_count", 0),
+            timeline=document.get("timeline"),
             **(usage_counters(document) or {}),
         )
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -533,6 +729,7 @@ def recorded_document(event):
         "covered_count": event.get("covered_count"),
         "uncovered_count": event.get("uncovered_count"),
         "duration_seconds": event.get("duration_seconds"),
+        "timeline": dict(event["timeline"]) if event.get("timeline") is not None else None,
         "recorded": True,
     }
 
@@ -656,10 +853,8 @@ def check(args):
             budget,
             timeout,
             subject["session_environment"],
-            CHECK_SCHEMA,
-            lambda value: check_result(value, expected),
             started,
-            failure_coverage=(0, len(expected)),
+            expected=expected,
         )
     except (
         OSError, subprocess.CalledProcessError, accounts.AccountsError, run_plan.RunPlanError,
@@ -697,10 +892,6 @@ def ask(args):
             plan.run.witness_budget_usd,
             timeout,
             accounts.process_environment(ticket.binding),
-            ASK_SCHEMA,
-            lambda value: {
-                "brief": structured_ask_brief(value), "outcome": "checked", "reason": "",
-            },
             started,
         )
     except (
@@ -781,6 +972,12 @@ def check_form_problem(args):
 
 
 def main(argv=None):
+    if os.environ.get(ACTIVE_ENV):
+        print(json.dumps(failed(
+            "nested Witness invocation refused; return facts to the owning operation",
+            time.monotonic(), coverage=(0, 0),
+        )))
+        return 0
     args = parse_args(argv)
     if args.operation == "check":
         problem = check_form_problem(args)

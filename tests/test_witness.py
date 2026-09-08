@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -21,9 +22,10 @@ import witness as witness_module  # noqa: E402
 MODEL = "claude-sonnet-5"
 BUDGET_USD = "2"
 BRIEF = (
+    "pointers\n"
     "src/check.py:12 — held — the cited guard is present\n"
     "#130 — contradicted — the ticket says the session is fresh\n"
-    "ADR-0004 — missing — the ADR is absent from this fixture"
+    "ADR-0004 — missing — the ADR is absent from this fixture\nuncited"
 )
 CHECK_OUTPUT = {
     "cited": [
@@ -55,8 +57,9 @@ ASK_OUTPUT = {
 }
 ASK_BRIEF = "Issue 154 requires the tracker body and authoritative comments — #154"
 RUN_BRIEF = (
+    "pointers\n"
     "README.md:1 — held — the fixture line is there\n"
-    "#130 — contradicted — the ticket says otherwise"
+    "#130 — contradicted — the ticket says otherwise\nuncited"
 )
 STRUCTURED_FROM_BRIEF = object()
 
@@ -64,6 +67,8 @@ STRUCTURED_FROM_BRIEF = object()
 def check_output(brief):
     output = {"cited": [], "uncited": []}
     for line in brief.splitlines():
+        if line in ("pointers", "uncited"):
+            continue
         target = "uncited" if line.startswith("uncited ") else "cited"
         shaped = line.removeprefix("uncited ")
         pointer, status, reason = shaped.split(" — ", 2)
@@ -232,12 +237,17 @@ class WitnessTests(unittest.TestCase):
     def run_witness(
         self, behaviour="witness", *extra, stdin=None, brief=BRIEF, operation="check",
         structured_output=STRUCTURED_FROM_BRIEF, prose=None, issue=None, worktree=None,
+        events=None, nested_command=None,
     ):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
         environment["AGENTCREW_STUB_REPAIR"] = behaviour
         environment["AGENTCREW_STUB_WITNESS_BRIEF"] = brief
+        if events is not None:
+            environment["AGENTCREW_STUB_WITNESS_EVENTS"] = json.dumps(events)
+        if nested_command is not None:
+            environment["AGENTCREW_STUB_NESTED_COMMAND"] = json.dumps(nested_command)
         if structured_output is STRUCTURED_FROM_BRIEF:
             structured_output = check_output(brief)
         if structured_output is not None:
@@ -288,10 +298,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["brief"], BRIEF)
         argv = self.calls()[0]["argv"]
-        self.assertEqual(
-            argv[argv.index("--allowedTools") + 1],
-            "Bash(gh issue view:*)",
-        )
+        self.assertNotIn("--allowedTools", argv)
         schema = json.loads(argv[argv.index("--json-schema") + 1])
         self.assertEqual(schema["required"], ["cited", "uncited"])
         pointer_pattern = schema["$defs"]["finding"]["properties"]["pointer"]["pattern"]
@@ -351,7 +358,8 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "checked", document)
         self.assertEqual(
             document["brief"],
-            "#154 — held — Approved direction requires the tracker body and every comment.",
+            "pointers\n#154 — held — Approved direction requires the tracker body "
+            "and every comment.\nuncited",
         )
         self.assertNotIn("Outsider opinion", document["brief"])
         self.assertIn(
@@ -372,17 +380,22 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "failed")
         self.assertTrue(document["reason"])
         self.assertGreaterEqual(document["duration_seconds"], 0)
+        self.assertEqual(set(document["timeline"]), {
+            "start", "first_tool_call", "first_completed_finding", "last_activity", "end",
+        })
         return document
 
     def run_ask(
         self, question="What does this ticket require?", structured_output=ASK_OUTPUT,
-        run_dir=None,
+        run_dir=None, behaviour="witness", events=None, extra=(),
     ):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.bin_dir}{os.pathsep}{environment['PATH']}"
         environment["AGENTCREW_STUB_DIR"] = str(self.stub_dir)
-        environment["AGENTCREW_STUB_REPAIR"] = "witness"
+        environment["AGENTCREW_STUB_REPAIR"] = behaviour
         environment["AGENTCREW_STUB_WITNESS_BRIEF"] = BRIEF
+        if events is not None:
+            environment["AGENTCREW_STUB_WITNESS_EVENTS"] = json.dumps(events)
         if structured_output is not None:
             environment["AGENTCREW_STUB_WITNESS_OUTPUT"] = json.dumps(structured_output)
         return subprocess.run(
@@ -396,6 +409,7 @@ class WitnessTests(unittest.TestCase):
                 "154",
                 "--question",
                 question,
+                *extra,
             ],
             capture_output=True,
             text=True,
@@ -493,6 +507,281 @@ class WitnessTests(unittest.TestCase):
             },
         )
 
+    def test_timeout_preserves_a_completed_finding_and_observed_timeline(self):
+        result = self.run_witness("witness-progress-timeout", "--timeout-seconds", "1")
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial", document)
+        self.assertEqual(document["covered_count"], 1)
+        self.assertEqual(document["uncovered_count"], 2)
+        self.assertIn("src/check.py:12 — held", document["brief"])
+        self.assertIn("pointers\n", document["brief"])
+        self.assertIn("\nuncited", document["brief"])
+        self.assertIn("timed out", document["reason"])
+        self.assertIn("#130", document["reason"])
+        self.assertIn("ADR-0004", document["reason"])
+        timeline = document["timeline"]
+        self.assertEqual(timeline["start"], 0)
+        self.assertLessEqual(timeline["first_tool_call"], timeline["first_completed_finding"])
+        self.assertLessEqual(timeline["first_completed_finding"], timeline["last_activity"])
+        self.assertLessEqual(timeline["last_activity"], timeline["end"])
+
+    def test_timeout_timeline_survives_the_recorded_result_flow(self):
+        log = self.root / "log.jsonl"
+        result = self.run_witness(
+            "witness-progress-timeout", "--timeout-seconds", "1",
+            "--log", str(log), "--ticket", "154",
+        )
+        document = json.loads(result.stdout)
+        self.assertNotIn("record_error", document)
+        event, = self.events(log)
+        replay = witness_module.recorded_document(event)
+        self.assertEqual(replay["timeline"], document["timeline"])
+        self.assertEqual(replay["brief"], document["brief"])
+        self.assertEqual(replay["reason"], document["reason"])
+        self.assertEqual(replay["covered_count"], 1)
+
+    def test_a_complete_streamed_submission_survives_an_unfinished_message(self):
+        record = json.dumps({"witness_finding": {
+            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+        }}) + "\n"
+        events = [
+            {"type": "stream_event", "event": {"type": "message_start"}},
+            {"type": "stream_event", "event": {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }},
+            *[{"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": chunk},
+            }} for chunk in (record[:20], record[20:], '{"witness_finding":')],
+        ]
+        result = self.run_witness(
+            "witness-stream-timeout", "--timeout-seconds", "1", events=events,
+        )
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial", document)
+        self.assertEqual(document["covered_count"], 1)
+        self.assertIsNone(document["timeline"]["first_tool_call"])
+        self.assertIsNotNone(document["timeline"]["first_completed_finding"])
+
+    def test_timeout_retains_uncited_facts_without_claiming_cited_coverage(self):
+        log = self.root / "log.jsonl"
+        events = [{"type": "assistant", "message": {"content": [{
+            "type": "text", "text": json.dumps({"witness_finding": {
+                "section": "uncited", "finding": {
+                    "pointer": "docs/context.md:7", "status": "held",
+                    "reason": "the acceptance criteria also require updating this caller",
+                },
+            }}) + "\n",
+        }]}}]
+        result = self.run_witness(
+            "witness-stream-timeout", "--timeout-seconds", "1",
+            "--log", str(log), "--ticket", "154", events=events,
+        )
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial", document)
+        self.assertEqual(document["covered_count"], 0)
+        self.assertEqual(document["uncovered_count"], 3)
+        self.assertIn("docs/context.md:7", document["brief"])
+        for pointer in ("src/check.py:12", "#130", "ADR-0004"):
+            self.assertIn(pointer, document["reason"])
+        self.assertNotIn("record_error", document)
+        event, = self.events(log)
+        self.assertEqual(event["outcome"], "partial")
+
+    def test_timeout_after_a_valid_final_result_retains_its_findings(self):
+        result = self.run_witness(
+            "witness-stream-timeout", "--timeout-seconds", "1",
+            events=[{"type": "result", "structured_output": CHECK_OUTPUT}],
+        )
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial", document)
+        self.assertEqual(document["brief"], BRIEF)
+        self.assertEqual(document["covered_count"], 3)
+        self.assertEqual(document["uncovered_count"], 0)
+        self.assertIn("timed out", document["reason"])
+
+    def test_a_partial_final_result_does_not_replace_earlier_completed_findings(self):
+        result = self.run_witness("witness-stream", events=[
+            {"type": "assistant", "message": {"content": [{
+                "type": "text", "text": json.dumps({"witness_finding": {
+                    "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+                }}) + "\n",
+            }]}},
+            {"type": "result", "structured_output": {
+                "cited": [CHECK_OUTPUT["cited"][1]], "uncited": [],
+            }},
+        ])
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial", document)
+        self.assertEqual(document["covered_count"], 2)
+        self.assertEqual(document["uncovered_count"], 1)
+        self.assertIn("src/check.py:12 — held", document["brief"])
+        self.assertIn("#130 — contradicted", document["brief"])
+        self.assertEqual(document["reason"], "uncovered pointers: ADR-0004")
+
+    def test_a_final_rewording_updates_the_finding_for_that_pointer(self):
+        final = json.loads(json.dumps(CHECK_OUTPUT))
+        final["cited"][0]["reason"] += "."
+        result = self.run_witness("witness-stream", events=[
+            {"type": "assistant", "message": {"content": [{
+                "type": "text", "text": json.dumps({"witness_finding": {
+                    "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+                }}) + "\n",
+            }]}},
+            {"type": "result", "structured_output": final},
+        ])
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["covered_count"], 3)
+        self.assertEqual(document["reason"], "")
+        self.assertIn("src/check.py:12 — held — the cited guard is present.", document["brief"])
+
+    def test_a_final_claim_rewording_updates_the_answer_for_its_pointers(self):
+        final = json.loads(json.dumps(ASK_OUTPUT))
+        final["claims"][0]["claim"] += "."
+        result = self.run_ask(behaviour="witness-stream", events=[
+            {"type": "assistant", "message": {"content": [{
+                "type": "text", "text": json.dumps({"witness_finding": {
+                    "section": "claims", "finding": ASK_OUTPUT["claims"][0],
+                }}) + "\n",
+            }]}},
+            {"type": "result", "structured_output": final},
+        ])
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["reason"], "")
+        self.assertEqual(document["brief"],
+                         "Issue 154 requires the tracker body and authoritative comments. — #154")
+
+    def test_a_completed_text_block_commits_its_last_record_without_a_newline(self):
+        text = json.dumps({"witness_finding": {
+            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+        }})
+        cases = [
+            [{"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}],
+            [
+                {"type": "stream_event", "event": {
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }},
+                {"type": "stream_event", "event": {
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                }},
+                {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+            ],
+        ]
+        for events in cases:
+            with self.subTest(events=events):
+                result = self.run_witness(
+                    "witness-stream-timeout", "--timeout-seconds", "1", events=events,
+                )
+                document = json.loads(result.stdout)
+                self.assertEqual(document["outcome"], "partial", document)
+                self.assertEqual(document["covered_count"], 1)
+                self.assertIsNotNone(document["timeline"]["first_completed_finding"])
+
+    def test_a_complete_final_result_at_eof_needs_no_transport_newline(self):
+        result = self.run_witness("witness-stream-no-final-newline", events=[
+            {"type": "result", "structured_output": CHECK_OUTPUT},
+        ])
+        self.assertEqual(json.loads(result.stdout)["outcome"], "checked")
+
+    def test_activity_and_invalid_or_unfinished_submissions_are_not_findings(self):
+        valid = json.dumps({"witness_finding": {
+            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+        }})
+        invalid = json.dumps({"witness_finding": {"section": "cited", "finding": {
+            "pointer": "not-a-pointer", "status": "held", "reason": "not evidence",
+        }}})
+        result = self.run_witness(
+            "witness-stream-timeout", "--timeout-seconds", "1", events=[
+                {"type": "assistant", "message": {"content": [{
+                    "type": "tool_use", "name": "Read", "input": {},
+                }]}},
+                {"type": "user", "message": {"content": [{
+                    "type": "tool_result", "content": valid + "\n",
+                }]}},
+                {"type": "assistant", "parent_tool_use_id": "another-session",
+                 "message": {"content": [{"type": "text", "text": valid + "\n"}]}},
+                {"type": "assistant", "message": {"content": [{
+                    "type": "text", "text": "I checked everything.\n" + invalid + "\n" + valid[:-1],
+                }]}},
+            ],
+        )
+        document = self.assert_failed_result(result)
+        self.assertEqual(document["covered_count"], 0)
+        self.assertEqual(document["uncovered_count"], 3)
+        self.assertIsNotNone(document["timeline"]["first_tool_call"])
+        self.assertIsNotNone(document["timeline"]["last_activity"])
+        self.assertIsNone(document["timeline"]["first_completed_finding"])
+
+    def test_streamed_text_is_not_counted_again_from_the_completed_message(self):
+        submission = json.dumps({"witness_finding": {
+            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+        }}) + "\n"
+        events = [
+            {"type": "stream_event", "event": {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }},
+            {"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": submission},
+            }},
+            {"type": "assistant", "message": {"content": [{
+                "type": "text", "text": submission,
+            }]}},
+            {"type": "result", "structured_output": {"cited": "unfinished"}},
+        ]
+        result = self.run_witness("witness-stream", events=events)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial", document)
+        self.assertEqual(document["covered_count"], 1)
+        self.assertEqual(document["uncovered_count"], 2)
+        self.assertIn("invalid structured check output", document["reason"])
+
+    def test_interrupted_submissions_keep_existing_duplicate_and_order_validation(self):
+        for findings, covered, rejected in (
+            ([*CHECK_OUTPUT["cited"], CHECK_OUTPUT["cited"][0]], 2, "repeated"),
+            (list(reversed(CHECK_OUTPUT["cited"])), 1, "out of order"),
+        ):
+            with self.subTest(rejected=rejected):
+                events = [{"type": "assistant", "message": {"content": [{
+                    "type": "text", "text": json.dumps({"witness_finding": {
+                        "section": "cited", "finding": finding,
+                    }}) + "\n",
+                }]}} for finding in findings]
+                result = self.run_witness(
+                    "witness-stream-timeout", "--timeout-seconds", "1", events=events,
+                )
+                document = json.loads(result.stdout)
+                self.assertEqual(document["outcome"], "partial", document)
+                self.assertEqual(document["covered_count"], covered)
+                self.assertEqual(document["uncovered_count"], 3 - covered)
+                self.assertIn(f"structural rejection ({rejected})", document["reason"])
+                self.assertIn("timed out", document["reason"])
+
+    def test_ask_retains_completed_claims_and_records_its_timeout_timeline(self):
+        submission = json.dumps({"witness_finding": {
+            "section": "claims", "finding": ASK_OUTPUT["claims"][0],
+        }}) + "\n"
+        result = self.run_ask(
+            behaviour="witness-stream-timeout", extra=("--timeout-seconds", "1"),
+            events=[{"type": "assistant", "message": {"content": [{
+                "type": "text", "text": submission,
+            }]}}],
+        )
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "partial", document)
+        self.assertEqual(document["brief"], ASK_BRIEF)
+        self.assertIn("timed out", document["reason"])
+        self.assertNotIn("record_error", document)
+        event, = self.events(self.state_dir / "log.jsonl")
+        self.assertEqual(event["timeline"], document["timeline"])
+        self.assertEqual(event["covered_count"], 0)
+
     def test_check_renders_the_numbered_normalised_pointer_list_into_the_prompt(self):
         result = self.run_witness()
 
@@ -522,14 +811,14 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "partial")
         self.assertEqual(document["covered_count"], 10)
         self.assertEqual(document["uncovered_count"], 2)
-        self.assertEqual(document["brief"].splitlines(), [
+        self.assertEqual(document["brief"].splitlines(), ["pointers", *[
             f"{pointer} — held — fact {number}"
             for number, pointer in enumerate(expected[:10], 1)
-        ])
+        ], "uncited"])
         self.assertIn("src/check.py:11", document["reason"])
         self.assertIn("src/check.py:12", document["reason"])
 
-    def test_the_session_is_headless_budget_capped_read_only_and_in_the_worktree(self):
+    def test_the_session_inherits_permissions_and_keeps_its_model_budget_and_worktree(self):
         result = self.run_witness()
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -539,8 +828,31 @@ class WitnessTests(unittest.TestCase):
         self.assertIn("--print", argv)
         self.assertEqual(argv[argv.index("--model") + 1], MODEL)
         self.assertEqual(argv[argv.index("--max-budget-usd") + 1], BUDGET_USD)
-        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("--permission-mode", argv)
+        self.assertNotIn("--disallowedTools", argv)
+        self.assertNotIn("--tools", argv)
+        self.assertNotIn("--settings", argv)
         self.assertEqual(pathlib.Path(calls[0]["cwd"]).resolve(), self.worktree.resolve())
+
+    def test_a_carried_witness_command_cannot_launch_or_record_a_nested_session(self):
+        log = self.root / "log.jsonl"
+        nested = [
+            sys.executable, str(WITNESS), "check", "--escalation", str(self.escalation),
+            "--worktree", str(self.worktree), "--model", MODEL, "--budget-usd", BUDGET_USD,
+            "--log", str(log), "--ticket", "154",
+        ]
+        self.escalation.write_text(
+            self.escalation.read_text() + "\nWitness: " + shlex.join(nested) + "\n"
+        )
+        result = self.run_witness(
+            "witness-recursive", "--log", str(log), "--ticket", "154", nested_command=nested,
+        )
+        self.assertEqual(json.loads(result.stdout)["outcome"], "checked")
+        refusal = json.loads((self.stub_dir / "nested.json").read_text())
+        self.assertEqual(refusal["outcome"], "failed")
+        self.assertIn("nested", refusal["reason"])
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(len(self.events(log)), 1)
 
     def test_stdin_is_the_second_documented_escalation_source(self):
         escalation = "CREW ASK 132 stuck — ADR-0004 is the only pointer"
@@ -652,7 +964,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "partial")
         self.assertEqual(
             document["brief"],
-            "src/check.py:12 — held — the cited guard is present",
+            "pointers\nsrc/check.py:12 — held — the cited guard is present\nuncited",
         )
         self.assertEqual(document["covered_count"], 1)
         self.assertEqual(document["uncovered_count"], 2)
@@ -736,7 +1048,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "checked")
         self.assertEqual(
             document["brief"],
-            "uncited #200 — held — the follow-up ticket exists",
+            "pointers\nuncited\nuncited #200 — held — the follow-up ticket exists",
         )
         self.assertEqual(document["covered_count"], 0)
         self.assertEqual(document["uncovered_count"], 0)
@@ -753,7 +1065,7 @@ class WitnessTests(unittest.TestCase):
 
     def test_a_time_is_not_mistaken_for_a_path_and_line_pointer(self):
         escalation = "CREW ASK 132 stuck — at 09:30 check src/check.py:12"
-        brief = "src/check.py:12 — held — the cited guard is present"
+        brief = "pointers\nsrc/check.py:12 — held — the cited guard is present\nuncited"
 
         result = self.run_witness(stdin=escalation, brief=brief)
 
@@ -761,7 +1073,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["brief"], brief)
 
     def test_a_numeric_or_version_token_is_not_a_path_and_line_pointer(self):
-        brief = "src/check.py:12 — held — the cited guard is present"
+        brief = "pointers\nsrc/check.py:12 — held — the cited guard is present\nuncited"
         for token in ("2.0:1", "v1.2:34", "4-2:1"):
             with self.subTest(token=token):
                 escalation = f"CREW ASK 132 stuck — {token} check src/check.py:12"
@@ -780,7 +1092,7 @@ class WitnessTests(unittest.TestCase):
         ):
             with self.subTest(pointer=pointer):
                 escalation = f"CREW ASK 132 stuck — check {pointer}"
-                brief = f"{pointer} — held — the cited location is present"
+                brief = f"pointers\n{pointer} — held — the cited location is present\nuncited"
 
                 result = self.run_witness(stdin=escalation, brief=brief)
 
@@ -816,6 +1128,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(event["brief"], BRIEF)
         self.assertEqual(event["covered_count"], 3)
         self.assertEqual(event["uncovered_count"], 0)
+        self.assertEqual(event["timeline"], document["timeline"])
         self.assertGreaterEqual(event["duration_seconds"], 0)
         self.assertEqual(event["total_tokens"], sum(
             event[name] for name in

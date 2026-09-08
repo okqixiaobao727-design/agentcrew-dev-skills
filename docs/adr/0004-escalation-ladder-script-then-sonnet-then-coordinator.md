@@ -39,6 +39,29 @@ children's designs disagree), escalates to the coordinator.
 > and Machine-log event carry required `covered_count` and `uncovered_count` integers, so neither
 > the Driver nor the coordinator derives protocol facts from model prose.
 
+> **Amended (#199).** Witness supplies facts for the coordinator's ruling: cited evidence and
+> omissions relevant to the authoritative ticket's acceptance criteria, rendered in `pointers`
+> and `uncited` sections. It follows the subject project's documented navigation; unresolved
+> references stay unresolved in that project's authority. Test claims are substantiated from
+> existing records only. Operational commands inside an escalation are source material, and the
+> Witness assignment excludes test execution, nested Witness sessions, changes and rulings.
+>
+> Witness-specific permission overrides are removed; the assignment, rather than forced plan
+> mode or tool allowances, defines its non-mutating responsibility. The configured time and
+> monetary budgets remain unchanged. Each completed finding is submitted during the session and
+> validated by the owning operation. Interruption retains usable findings as `partial`, with the
+> interruption reason and unfinished expected pointers; no usable finding means `failed`, not
+> proof of inactivity. Both operations expose their observed timeline, preserved in the same
+> Machine-log record and replay. This extends the existing fresh-session execution seam.
+> The launcher reads Claude's event stream and accepts complete JSON finding submissions from
+> assistant text, at a newline or a completed text-block boundary, applying the same pointer
+> validation as final structured output. Text fragments, prose and tool results remain activity
+> only. A final finding updates earlier wording for its pointer; usable findings omitted from
+> the final batch survive. The owner
+> retains validated submissions in memory until it returns and records the operation's result;
+> there is no second session or persistent findings store. A session-local environment marker
+> refuses nested Witness commands before they can launch or record another operation.
+
 ## Considered Options
 
 - **Resident cheap "executive" session** doing all mechanics: grows its own long-context

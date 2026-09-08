@@ -31,6 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import datetime
 import json
+import math
 import os
 import pathlib
 import re
@@ -1711,6 +1712,30 @@ def witness_problem(fields):
         return "duration_seconds is never negative"
     if fields["covered_count"] < 0 or fields["uncovered_count"] < 0:
         return "witness coverage counts are never negative"
+    timeline = fields.get("timeline")
+    if timeline is not None:
+        milestones = {"start", "first_tool_call", "first_completed_finding", "last_activity", "end"}
+        if not isinstance(timeline, dict) or set(timeline) != milestones:
+            return (
+                "witness timeline carries start, first_tool_call, first_completed_finding, "
+                "last_activity and end"
+            )
+        if any(
+            value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0
+            ) for value in timeline.values()
+        ):
+            return "witness timeline milestones are non-negative finite seconds or null"
+        if timeline["start"] != 0 or timeline["end"] is None:
+            return "witness timeline starts at zero and carries its end"
+        if any(value is not None and value > timeline["end"] for value in timeline.values()):
+            return "witness timeline milestones precede its end"
+        for name in ("first_tool_call", "first_completed_finding"):
+            if timeline[name] is not None and (
+                timeline["last_activity"] is None or timeline[name] > timeline["last_activity"]
+            ):
+                return "witness first milestones precede its last observed activity"
     if outcome == "checked" and reason:
         return "a checked witness carries an empty reason"
     if outcome in ("partial", "failed") and not reason.strip():
@@ -1721,8 +1746,6 @@ def witness_problem(fields):
         return "a failed witness carries no brief"
     if outcome == "checked" and fields["uncovered_count"]:
         return "a checked witness leaves no pointers uncovered"
-    if outcome == "partial" and not fields["covered_count"]:
-        return "a partial witness has one or more covered pointers"
     if outcome == "failed" and fields["covered_count"]:
         return "a failed witness covers no pointers"
     counters = [fields[name] for name in COST_COUNTERS]
@@ -1741,7 +1764,7 @@ def witness_problem(fields):
 
 def witness_fields(
     ticket, operation, executor, model, outcome, reason, brief, duration_seconds,
-    covered_count, uncovered_count, counters=None,
+    covered_count, uncovered_count, counters=None, timeline=None,
 ):
     """The witness event's fields, in the order the record writes them."""
     counters = counters or {}
@@ -1759,13 +1782,15 @@ def witness_fields(
     }
     for name in COST_COUNTERS + (COST_TOTAL,):
         fields[name] = counters.get(name)
+    if timeline is not None:
+        fields["timeline"] = timeline
     return fields
 
 
 def record_witness(log, *, ticket, operation, executor, model, outcome, reason, brief,
                    duration_seconds, covered_count, uncovered_count,
                    input_tokens=None, output_tokens=None, cache_read_tokens=None,
-                   cache_creation_tokens=None, total_tokens=None):
+                   cache_creation_tokens=None, total_tokens=None, timeline=None):
     """Append one `witness`: one fact-check of an escalation; returns nothing.
 
     Raises ValueError for a result that contradicts itself and OSError for a log it could not
@@ -1775,6 +1800,7 @@ def record_witness(log, *, ticket, operation, executor, model, outcome, reason, 
     fields = witness_fields(
         ticket, operation, executor, model, outcome, reason, brief, duration_seconds,
         covered_count, uncovered_count,
+        timeline=timeline,
         counters={
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -1911,6 +1937,7 @@ def build_parser():
     witness.add_argument("--duration-seconds", required=True, type=float)
     witness.add_argument("--covered-count", required=True, type=int)
     witness.add_argument("--uncovered-count", required=True, type=int)
+    witness.add_argument("--timeline", type=json.loads, help="observed milestones as a JSON object")
     for tokens in ("input", "output", "cache-read", "cache-creation", "total"):
         witness.add_argument(f"--{tokens}-tokens", type=int, help=f"{tokens} tokens, as counted")
 

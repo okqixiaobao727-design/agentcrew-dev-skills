@@ -105,6 +105,7 @@ def main():
             target.append({"pointer": pointer, "status": status, "reason": reason})
         structured_output = os.environ.get("AGENTCREW_STUB_WITNESS_OUTPUT")
         print(json.dumps({
+            "type": "result",
             "is_error": False,
             "result": os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
             "structured_output": (

@@ -161,8 +161,8 @@ def render_witness_prompt(subject, templates=None, operation="check", check_poin
         f"{block(witness['prompt'])}\n\n{block(witness[operation])}",
         {
             "<ticket comment rule>": block(templates["ticket"]["comment_rule"]),
-            f"<{operation} subject>": str(subject).strip(),
             "<check pointers>": numbered_pointers,
+            f"<{operation} subject>": json.dumps(str(subject).strip(), ensure_ascii=False),
         },
     )
 

@@ -112,9 +112,37 @@ def main():
     if step == "witness-timeout":
         time.sleep(30)
         return 0
+    if step == "witness-progress-timeout":
+        finding = json.loads(os.environ["AGENTCREW_STUB_WITNESS_OUTPUT"])["cited"][0]
+        print(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "src/check.py"}},
+        ]}}), flush=True)
+        print(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": json.dumps({"witness_finding": {
+                "section": "cited", "finding": finding,
+            }}) + "\n"},
+        ]}}), flush=True)
+        time.sleep(30)
+        return 0
+    if step in ("witness-stream-timeout", "witness-stream", "witness-stream-no-final-newline"):
+        events = json.loads(os.environ["AGENTCREW_STUB_WITNESS_EVENTS"])
+        for index, event in enumerate(events):
+            final_line = step == "witness-stream-no-final-newline" and index == len(events) - 1
+            end = "" if final_line else "\n"
+            print(json.dumps(event), end=end, flush=True)
+        if step == "witness-stream-timeout":
+            time.sleep(30)
+        return 0
+    if step == "witness-recursive":
+        child_environment = {**os.environ, "AGENTCREW_STUB_REPAIR": "witness"}
+        nested = subprocess.run(
+            json.loads(os.environ["AGENTCREW_STUB_NESTED_COMMAND"]),
+            capture_output=True, text=True, env=child_environment, check=True,
+        )
+        (state_dir() / "nested.json").write_text(nested.stdout)
     if step in (
         "witness", "witness-write", "witness-rewrite", "witness-error",
-        "witness-partial-usage", "witness-no-usage", "witness-tracker",
+        "witness-partial-usage", "witness-no-usage", "witness-tracker", "witness-recursive",
     ):
         if step == "witness-write":
             (pathlib.Path(repo) / STRAY_FILE).write_text("work nobody asked for\n")

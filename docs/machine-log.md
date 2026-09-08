@@ -393,7 +393,8 @@ written; the event shape and the rule that the last line holds are unchanged.
 
 `ticket`, `operation` (`check` or `ask`), `executor`, `model`, `outcome` (`checked`, `partial`, or
 `failed`), `reason`, `brief`, `duration_seconds`, `covered_count`, `uncovered_count`,
-`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`.
+`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`,
+optional `timeline`.
 
 The Witness writes this line itself, on completion of every operation it offers, and no caller
 transcribes those fields: it is the one process that holds them, and the coordinator-initiated
@@ -410,9 +411,11 @@ so a later reader takes the finding from the log rather than paying for a second
 non-empty for `checked` and `partial` and empty for `failed`.
 
 Both coverage counts are required non-negative integers: `checked` leaves none uncovered (and can
-have no expected pointers when its brief consists of uncited findings), `partial` has covered
-pointers and may have zero uncovered pointers when its only structural rejection is an extra cited
-pointer, and `failed` covers none. An `ask` has no pointers to cover and records both as zero.
+have no expected pointers when its brief consists of uncited findings), `partial` retains usable
+findings and may cover zero cited pointers when only uncited evidence is complete. It may leave
+zero uncovered when interrupted after checking every citation, or when its only structural rejection
+is an extra cited pointer. `failed` covers none. An `ask` has no expected pointers and records both
+counts as zero, including when completed claims survive interruption as `partial`.
 
 The four token counters and `total_tokens` use the same meanings as `session-cost`, and total is
 their sum. They are absent together when the Witness returned no usage; the outcome, reason,
@@ -421,6 +424,14 @@ Claude and Codex children: the witness session runs in the escalating child's wo
 that ticket's named Claude account where it has one. A Witness invoked with no run to record
 against — the manual, driver-less flow — records nothing and returns its document as usual, and
 a log it could not write leaves the document standing with the failure named in it.
+
+`timeline` carries `start`, `first_tool_call`, `first_completed_finding`, `last_activity`, and `end`
+as elapsed seconds since this operation began (`start` is zero). An unobserved intermediate
+milestone is `null`; a pre-launch failure has all three intermediate milestones null. Activity
+means observed session output, including tool events and diagnostics, not validated evidence.
+The first completed finding is the first usable finding accepted by Witness's existing pointer
+validation. Recording and replay preserve the object verbatim. Older records omit it and replay
+reports `timeline: null`, rather than inventing historical observations.
 
 ### `base-gate` — whether a fresh run checked its integration base
 
