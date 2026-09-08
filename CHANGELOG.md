@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.21] - 2026-09-08
+
 ### Fixed
 - Witness retains validated findings completed before a timeout and returns them with the
   interruption reason and unfinished citations. Its observed timeline survives Machine-log
