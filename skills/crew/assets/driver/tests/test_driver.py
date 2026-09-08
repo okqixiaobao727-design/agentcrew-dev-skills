@@ -1205,9 +1205,9 @@ class WakeMonitorAccountTests(DriverTestCase):
         self.fixture.ticket("02", "second thing")
         self.fixture.commit_feature()
 
-    def launched(self, *tickets):
+    def launched(self, *tickets, env_overrides=None):
         """Start the run and wait until every one of those tickets has a child of its own."""
-        self.fixture.launch()
+        self.fixture.launch(env_overrides=env_overrides)
         for ticket in tickets:
             self.assertTrue(
                 self.fixture.wait_for(
@@ -1260,11 +1260,12 @@ class WakeMonitorAccountTests(DriverTestCase):
         )
         return list(reading)
 
-    def snapshot_homes(self):
-        """The configuration home every agents-list read of this run was made under."""
+    def snapshot_homes(self, **identity):
+        """The homes of this run's agents-list reads matching the supplied caller or gate."""
         return [
             call["configHome"] for call in self.fixture.claude_calls()
             if call["argv"][:2] == ["agents", "--json"]
+            and all(call.get(name) == value for name, value in identity.items())
         ]
 
     def worktrees(self, *tickets):
@@ -1327,20 +1328,43 @@ class WakeMonitorAccountTests(DriverTestCase):
         arming that spelled the row's directory into the environment would ask the old one.
         """
         self.single_account()
-        self.launched("01", "02")
         elsewhere = self.fixture.profile("operators-own-login")
-        first = self.fixture.running[0]
-        first.kill()
-        first.communicate()
-        before = len(self.snapshot_homes())
+        gate = self.fixture.root / "snapshot-gate"
+        # Hold an old poll across the restart: completing after the driver died does not
+        # make it a reading from the resumed driver, however late it reaches the call log.
+        with gate.open("w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            self.launched("01", "02", env_overrides={
+                "AGENTCREW_STUB_SNAPSHOT_GATE": str(gate),
+            })
+            gate.with_suffix(".armed").touch()
+            self.assertTrue(
+                self.fixture.wait_for(lambda: gate.with_suffix(".waiting").exists()),
+                "the old poll never reached the gate",
+            )
+            first = self.fixture.running[0]
+            first.kill()
+            first.communicate()
 
-        self.fixture.resume(env_overrides={"CLAUDE_CONFIG_DIR": str(elsewhere)})
+            self.fixture.resume(env_overrides={
+                "CLAUDE_CONFIG_DIR": str(elsewhere), "AGENTCREW_STUB_CALLER": "resumed-driver",
+            })
+
+        def resumed_homes():
+            return self.snapshot_homes(caller="resumed-driver")
 
         self.assertTrue(
-            self.fixture.wait_for(lambda: len(self.snapshot_homes()) > before),
+            self.fixture.wait_for(resumed_homes),
             "the resumed run never re-armed a monitor",
         )
-        self.assertEqual(set(self.snapshot_homes()[before:]), {str(elsewhere)})
+        self.assertEqual(set(resumed_homes()), {str(elsewhere)})
+        self.assertTrue(
+            self.fixture.wait_for(lambda: self.snapshot_homes(caller=None, gated=True)),
+            "the old poll never finished across the restart",
+        )
+        self.assertEqual(
+            self.snapshot_homes(caller=None, gated=True), [str(self.fixture.config_dir)],
+        )
         self.assertEqual(
             self.rows()["01"]["account"], str(self.fixture.config_dir),
             "the table still carries the home the run began on",

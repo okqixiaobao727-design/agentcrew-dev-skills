@@ -17,6 +17,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
   while the configured time and cost budgets remain unchanged (#199).
 - Final findings update earlier wording by pointer identity, and complete records at text-block
   boundaries or clean output EOF remain usable without a trailing newline (#199).
+- Release validation no longer mistakes an old poll completing after restart for the resumed
+  Driver's account. The regression holds an old poll across the restart and attributes snapshots
+  to their caller, removing the timing-dependent test failure that blocked this release (#199).
 
 ## [0.9.20] - 2026-09-06
 

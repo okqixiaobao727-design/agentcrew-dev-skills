@@ -17,6 +17,7 @@ surface post-launch verification reads.
 named, which is the silent-downgrade case the renderer has to catch.
 """
 
+import fcntl
 import json
 import os
 import pathlib
@@ -75,9 +76,24 @@ def write_transcript(session_id, cwd, model):
 
 def main():
     argv = sys.argv[1:]
+    gated = False
+    gate_path = os.environ.get("AGENTCREW_STUB_SNAPSHOT_GATE")
+    if gate_path and argv[:2] == ["agents", "--json"]:
+        gate = pathlib.Path(gate_path)
+        try:
+            gate.with_suffix(".armed").unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            gate.with_suffix(".waiting").touch()
+            with gate.open() as handle:
+                fcntl.flock(handle, fcntl.LOCK_SH)
+            gated = True
     with (state_dir() / "claude-calls.jsonl").open("a") as handle:
         handle.write(json.dumps({
             "argv": argv, "configHome": config_home(), "cwd": os.getcwd(),
+            "caller": os.environ.get("AGENTCREW_STUB_CALLER"),
+            "gated": gated,
         }) + "\n")
 
     if argv[:2] == ["agents", "--json"]:
