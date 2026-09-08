@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Witness retains validated findings completed before a timeout and returns them with the
+  interruption reason and unfinished citations. Its observed timeline survives Machine-log
+  recording and replay, so an empty failed brief no longer implies an inactive session (#199).
+- Witness follows the subject project's reference authority, checks relevant omitted evidence,
+  reads existing test records without running tests, and refuses nested Witness commands. Its
+  prompt defines the read-only assignment; Witness-specific permission overrides are removed
+  while the configured time and cost budgets remain unchanged (#199).
+- Final findings update earlier wording by pointer identity, and complete records at text-block
+  boundaries or clean output EOF remain usable without a trailing newline (#199).
+
 ## [0.9.20] - 2026-09-06
 
 ### Changed
