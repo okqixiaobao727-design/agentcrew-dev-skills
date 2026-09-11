@@ -459,6 +459,13 @@ this log is the only trail of what happened overnight; the run's `report.md` is 
 human gets at the end.
 _Avoid_: decision log (legacy), status report
 
+**Review report copy** — `<run-dir>/review-<NN>-<axis>.md`, the verbatim text of one Review lane
+axis's own report, kept at the Run directory's top level by the axis-end Lifecycle Hook. It is
+there so the Coordinator rules on the reviewer's own words rather than on the child's
+transcription of them; nothing parses it, counts from it, or writes a Machine-log field out of it.
+A re-review takes the next number — `-2`, `-3` — rather than the round before it.
+_Avoid_: review artefact, review log
+
 **Run projection** — The current facts about one run, derived solely from its ordered Machine log.
 It says what has happened and remains true; it contains neither the Wave table's plan nor the
 Driver's next action

@@ -7,6 +7,24 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- A review's own report reaches the run it belongs to. Review-Switch writes each axis's report
+  under a state directory of its own and names it to the axis-end Lifecycle Hook; this repository
+  configured that hook for the axis's cost alone and ignored the path, so nothing in a run's own
+  directory recorded what a review found. In the run that reported this, the coordinator ruled on
+  a declined finding from the child's transcription of a verdict whose text the run could not
+  reach. The hook now keeps that text verbatim at the run's top level as
+  `review-<NN>-<axis>.md` — the run directory the report is written to, not the machine-log
+  directory below it, because that is where the coordinator's file rule already lets it read
+  Markdown whole. Each axis of a ticket and each reviewed ticket lands a file of its own, and a
+  re-review takes the next number rather than the round before it. The copy is published by
+  renaming a temporary beside it, because a copy that died with bytes already on disk would
+  otherwise leave a truncated report the coordinator could not tell from a whole one. An axis that
+  produced no report copies nothing, and a copy that cannot be written changes neither the
+  review's result nor the axis's cost event: the copy happens before the cost write, which remains
+  the hook's own exit status. Nothing reads the copy — no counts, no verdict, no new machine-log
+  field — and a run dispatched without a machine log renders no such hook at all (#203).
+
 ### Fixed
 - The Witness answers on the release installed when it runs, not the one the run was launched on
   (ADR-0031). The line an escalation ends on is composed into the child's first turn at launch and
