@@ -107,6 +107,7 @@ MACHINE_LOG = pathlib.Path(__file__).resolve().parent.parent / "machine_log.py"
 # this renderer decides neither what "inherit" means nor how an account is spelled into a process.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import accounts  # noqa: E402
+import bounded_read  # noqa: E402
 import machine_log  # noqa: E402
 import run_plan  # noqa: E402
 
@@ -162,6 +163,10 @@ def render_witness_prompt(subject, templates=None, operation="check", check_poin
         {
             "<ticket comment rule>": block(templates["ticket"]["comment_rule"]),
             "<check pointers>": numbered_pointers,
+            # The quotation cap is the coordinator's own read boundary, filled from where that
+            # boundary already lives so the assignment and the hook can never name two numbers
+            # (ADR-0032).
+            "<witness quote lines>": bounded_read.MAX_LINES,
             f"<{operation} subject>": json.dumps(str(subject).strip(), ensure_ascii=False),
         },
     )

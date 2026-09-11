@@ -14,6 +14,7 @@ import sys
 import time
 
 import accounts
+import bounded_read
 import machine_log
 import run_plan
 
@@ -52,57 +53,40 @@ SCHEMA_POINTER_PATTERN = rf"^(?:{PATH_POINTER_BODY}|#\d+|ADR-\d{{4}})$"
 POINTER_SCHEMA = {
     "type": "string", "minLength": 1, "pattern": SCHEMA_POINTER_PATTERN,
 }
-CHECK_SCHEMA = {
+# One brief entry is a pointer and the source text that pointer names, and both operations return
+# the same list of them: the Witness carries evidence and the coordinator judges it (ADR-0032).
+# A pointer that resolved to nothing carries an empty `says`, which is the whole of what the old
+# `missing` status meant, so there is nowhere left in the shape for a verdict to be written.
+BRIEF_SECTION = "entries"
+BRIEF_SCHEMA = {
     "type": "object",
     "properties": {
-        "cited": {
+        BRIEF_SECTION: {
             "type": "array",
-            "items": {"$ref": "#/$defs/finding"},
-        },
-        "uncited": {
-            "type": "array",
-            "items": {"$ref": "#/$defs/finding"},
+            "items": {"$ref": "#/$defs/entry"},
         },
     },
-    "required": ["cited", "uncited"],
+    "required": [BRIEF_SECTION],
     "additionalProperties": False,
     "$defs": {
-        "finding": {
+        "entry": {
             "type": "object",
             "properties": {
                 "pointer": POINTER_SCHEMA,
-                "status": {"type": "string", "enum": ["held", "contradicted", "missing"]},
-                "reason": {"type": "string", "minLength": 1},
+                "says": {"type": "string"},
             },
-            "required": ["pointer", "status", "reason"],
+            "required": ["pointer", "says"],
             "additionalProperties": False,
         },
     },
 }
-ASK_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "claims": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "claim": {"type": "string", "minLength": 1},
-                    "pointers": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": POINTER_SCHEMA,
-                    },
-                },
-                "required": ["claim", "pointers"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["claims"],
-    "additionalProperties": False,
-}
+# What a quotation is cut to, read from the coordinator's own read boundary rather than written
+# down a second time: no single pointer hands the coordinator more than it could have fetched
+# itself (ADR-0032).
+QUOTE_MAX_LINES = bounded_read.MAX_LINES
+# The quotation is indented under its pointer rather than delimited, so a line at column zero is
+# always a pointer and a blank line inside source can never be read as the end of an entry.
+QUOTE_INDENT = "    "
 WAVE_TABLE = "wave-table.json"
 
 
@@ -391,19 +375,44 @@ def valid_pointer(pointer):
     )
 
 
-def finding_line(value, prefix=""):
-    if not isinstance(value, dict) or set(value) != {"pointer", "status", "reason"}:
-        raise ValueError("structured finding has an invalid shape")
+def capped_quotation(says):
+    """Return one quotation's lines, cut to the read the coordinator could have made itself.
+
+    Cutting *around the pointer* is the session's job and is instructed in the assignment, because
+    only the session that read the file knows where in a definition its pointer sits: an entry
+    carries a pointer and what it says and nothing else, and a field naming where the quotation
+    starts is the required-field growth ADR-0032 rejects. What this guarantees instead is the
+    ceiling — a brief's cost computable from its pointer count rather than discovered after a
+    1,399-line class has already landed in the coordinator's context.
+
+    No truncation marker is added: under a rule that quotes whole below the limit, a quotation of
+    exactly the limit is itself the sign that there is more, and the coordinator's own bounded
+    read at that pointer — now permitted as often as a ruling needs — is how it sees the rest.
+    """
+    lines = says.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return lines[:QUOTE_MAX_LINES]
+
+
+def entry_block(value):
+    """Return one brief entry as its pointer and the source text quoted beneath it.
+
+    A pointer that resolved to nothing stands alone, which is the whole of what the retired
+    `missing` status said and the only thing this shape can say about it.
+    """
+    if not isinstance(value, dict) or set(value) != {"pointer", "says"}:
+        raise ValueError("structured entry has an invalid shape")
     pointer = value["pointer"]
-    status = value["status"]
-    reason = value["reason"]
+    says = value["says"]
     if not valid_pointer(pointer):
-        raise ValueError(f"structured finding has an invalid pointer {pointer!r}")
-    if status not in ("held", "contradicted", "missing"):
-        raise ValueError(f"structured finding has an invalid status {status!r}")
-    if not isinstance(reason, str) or not reason.strip() or "\n" in reason or "\r" in reason:
-        raise ValueError("structured finding has an invalid reason")
-    return f"{prefix}{pointer} — {status} — {reason.strip()}"
+        raise ValueError(f"structured entry has an invalid pointer {pointer!r}")
+    if not isinstance(says, str):
+        raise ValueError("structured entry has invalid quoted text")
+    quoted = [f"{QUOTE_INDENT}{line}".rstrip() for line in capped_quotation(says)]
+    return "\n".join([pointer, *quoted])
 
 
 def _largest_ordered_subset(values):
@@ -426,47 +435,44 @@ def _largest_ordered_subset(values):
     return set(largest)
 
 
-def structured_check_findings(value, expected):
-    if not isinstance(value, dict) or set(value) != {"cited", "uncited"}:
-        raise ValueError("session returned invalid structured check output")
-    cited = value["cited"]
-    uncited = value["uncited"]
-    if not isinstance(cited, list) or not isinstance(uncited, list):
-        raise ValueError("session returned invalid structured check output")
+def structured_brief_entries(value, expected):
+    """Return one brief's rendered blocks, what it left uncovered, and what of it stays usable.
+
+    The expected pointers come back first and in their given order; everything else the session
+    reached in one hop follows, once each. There is no second section to place an entry in, so an
+    entry the escalation did not cite is simply a hop rather than a structural rejection.
+    """
+    if not isinstance(value, dict) or set(value) != {BRIEF_SECTION}:
+        raise ValueError("session returned invalid structured witness output")
+    entries = value[BRIEF_SECTION]
+    if not isinstance(entries, list):
+        raise ValueError("session returned invalid structured witness output")
     expected = [str(pointer) for pointer in expected]
     expected_indexes = {pointer: index for index, pointer in enumerate(expected)}
-    cited_findings = []
-    for item in cited:
-        line = finding_line(item)
-        cited_findings.append((item["pointer"], line, item))
-    uncited_findings = []
-    for item in uncited:
-        line = finding_line(item, "uncited ")
-        uncited_findings.append((item["pointer"], line, item))
+    rendered = []
+    for item in entries:
+        # Rendered before its pointer is read: `entry_block` is what validates the shape, and a
+        # submission is arbitrary JSON off a session's text stream until it has run.
+        block = entry_block(item)
+        rendered.append((item["pointer"], block, item))
     occurrences = {pointer: 0 for pointer in expected}
-    for pointer, _, _ in cited_findings + uncited_findings:
+    for pointer, _, _ in rendered:
         if pointer in occurrences:
             occurrences[pointer] += 1
 
     candidate_indexes = [
         expected_indexes[pointer]
-        for pointer, _, _ in cited_findings
+        for pointer, _, _ in rendered
         if pointer in expected_indexes and occurrences[pointer] == 1
     ]
     selected_indexes = _largest_ordered_subset(candidate_indexes)
-    cited_by_index = {
-        expected_indexes[pointer]: line
-        for pointer, line, _ in cited_findings
+    selected = {
+        expected_indexes[pointer]: (block, item)
+        for pointer, block, item in rendered
         if pointer in expected_indexes and expected_indexes[pointer] in selected_indexes
     }
-    lines = [cited_by_index[index] for index in sorted(selected_indexes)]
-    usable = {
-        "cited": [
-            item for pointer, _, item in cited_findings
-            if pointer in expected_indexes and expected_indexes[pointer] in selected_indexes
-        ],
-        "uncited": [],
-    }
+    blocks = [selected[index][0] for index in sorted(selected_indexes)]
+    usable = [selected[index][1] for index in sorted(selected_indexes)]
 
     missing = []
     structural_rejections = []
@@ -474,44 +480,32 @@ def structured_check_findings(value, expected):
         if occurrences[pointer] == 0:
             missing.append(pointer)
         elif occurrences[pointer] > 1:
-            structural_rejections.append(
-                f"structural rejection (repeated): {pointer}"
-            )
+            structural_rejections.append(f"structural rejection (repeated): {pointer}")
         elif index not in selected_indexes:
-            cited_once = any(item_pointer == pointer for item_pointer, _, _ in cited_findings)
-            shape = "out of order" if cited_once else "uncited"
-            structural_rejections.append(
-                f"structural rejection ({shape}): {pointer}"
-            )
+            structural_rejections.append(f"structural rejection (out of order): {pointer}")
 
-    extra_cited = set()
-    rendered_uncited = set()
-    for pointer, _, item in cited_findings:
-        if pointer in expected_indexes:
+    hopped = set()
+    for pointer, block, item in rendered:
+        if pointer in expected_indexes or pointer in hopped:
             continue
-        if pointer not in extra_cited:
-            structural_rejections.append(
-                f"structural rejection (extra cited): {pointer}"
-            )
-            extra_cited.add(pointer)
-        if pointer not in rendered_uncited:
-            lines.append(finding_line(item, "uncited "))
-            usable["uncited"].append(item)
-            rendered_uncited.add(pointer)
-    for pointer, line, item in uncited_findings:
-        if pointer not in expected_indexes and pointer not in rendered_uncited:
-            lines.append(line)
-            usable["uncited"].append(item)
-            rendered_uncited.add(pointer)
+        blocks.append(block)
+        usable.append(item)
+        hopped.add(pointer)
 
     uncovered = [
         pointer for index, pointer in enumerate(expected) if index not in selected_indexes
     ]
-    return lines, uncovered, missing, structural_rejections, usable
+    return blocks, uncovered, missing, structural_rejections, {BRIEF_SECTION: usable}
 
 
-def check_result(value, expected):
-    findings, uncovered, missing, structural_rejections, _ = structured_check_findings(
+def brief_result(value, expected):
+    """Return the document one operation's structured output renders to.
+
+    One renderer for `check` and for `ask`, because after ADR-0032 they return the same thing:
+    an `ask` is a brief whose selection of pointers is the answer, so it arrives here with no
+    expected pointers and every entry counted as a hop.
+    """
+    blocks, uncovered, missing, structural_rejections, _ = structured_brief_entries(
         value, expected
     )
     covered_count = len(expected) - len(uncovered)
@@ -524,17 +518,14 @@ def check_result(value, expected):
         reason_parts.append(f"uncovered pointers: {', '.join(missing)}")
     reason_parts.extend(structural_rejections)
     reason = "; ".join(reason_parts)
-    if not findings:
+    if not blocks:
         return {
             "brief": "",
             "outcome": "failed",
-            "reason": reason or "witness matched none of the expected or uncited pointers",
+            "reason": reason or "witness returned no entries",
             **coverage,
         }
-    brief = "\n".join([
-        "pointers", *(line for line in findings if not line.startswith("uncited ")),
-        "uncited", *(line for line in findings if line.startswith("uncited ")),
-    ])
+    brief = "\n\n".join(blocks)
     if uncovered or structural_rejections:
         return {
             "brief": brief,
@@ -543,32 +534,6 @@ def check_result(value, expected):
             **coverage,
         }
     return {"brief": brief, "outcome": "checked", "reason": "", **coverage}
-
-
-def structured_ask_brief(value):
-    if not isinstance(value, dict) or set(value) != {"claims"}:
-        raise ValueError("session returned invalid structured ask output")
-    claims = value["claims"]
-    if not isinstance(claims, list) or not claims:
-        raise ValueError("session returned an empty answer")
-    lines = []
-    seen_pointers = set()
-    for value in claims:
-        if not isinstance(value, dict) or set(value) != {"claim", "pointers"}:
-            raise ValueError("structured claim has an invalid shape")
-        claim = value["claim"]
-        claim_pointers = value["pointers"]
-        if not isinstance(claim, str) or not claim.strip() or "\n" in claim or "\r" in claim:
-            raise ValueError("structured claim is empty or multiline")
-        if not isinstance(claim_pointers, list) or not claim_pointers:
-            raise ValueError("structured claim has no pointer")
-        if any(not valid_pointer(pointer) for pointer in claim_pointers):
-            raise ValueError("structured claim has an invalid pointer")
-        if any(pointer in seen_pointers for pointer in claim_pointers):
-            raise ValueError("structured claim repeats a pointer")
-        seen_pointers.update(claim_pointers)
-        lines.append(f"{claim.strip()} — {', '.join(claim_pointers)}")
-    return "\n".join(lines)
 
 
 def command(prompt, model, budget, schema):
@@ -597,13 +562,13 @@ def environment(account):
 
 
 class _SessionOutput:
-    """The validated findings and observed milestones of one session's output."""
+    """The validated brief entries and observed milestones of one session's output."""
 
-    def __init__(self, started, expected):
+    def __init__(self, started, expected=()):
         self.started = started
-        self.expected = None if expected is None else tuple(map(str, expected))
-        self.schema = ASK_SCHEMA if expected is None else CHECK_SCHEMA
-        self.progress = {"claims": []} if expected is None else {"cited": [], "uncited": []}
+        self.expected = tuple(map(str, expected))
+        self.schema = BRIEF_SCHEMA
+        self.progress = {BRIEF_SECTION: []}
         self.timeline = execution_timeline()
         self.content = None
         self.response = None
@@ -615,9 +580,7 @@ class _SessionOutput:
         return round(time.monotonic() - self.started, 3)
 
     def render(self, value):
-        if self.expected is not None:
-            return check_result(value, self.expected)
-        return {"brief": structured_ask_brief(value), "outcome": "checked", "reason": ""}
+        return brief_result(value, self.expected)
 
     def retain(self, value):
         content = self.render(value)
@@ -633,11 +596,9 @@ class _SessionOutput:
             item = envelope["witness_finding"]
             if not isinstance(item, dict) or set(item) != {"section", "finding"}:
                 return
-            section = item["section"]
-            if not isinstance(section, str) or section not in self.progress:
+            if item["section"] != BRIEF_SECTION:
                 return
-            candidate = {name: list(items) for name, items in self.progress.items()}
-            candidate[section].append(item["finding"])
+            candidate = {BRIEF_SECTION: [*self.progress[BRIEF_SECTION], item["finding"]]}
             self.retain(candidate)
         except (ValueError, TypeError):
             return
@@ -646,29 +607,23 @@ class _SessionOutput:
         # Validate the final batch before it can replace earlier evidence. Its pointer
         # identities supersede earlier wording; omitted, usable evidence is retained.
         self.render(value)
-        merged = {name: list(items) for name, items in value.items()}
-        if self.expected is None:
-            final_pointers = {pointer for item in value["claims"] for pointer in item["pointers"]}
-            merged["claims"].extend(
-                item for item in self.progress["claims"]
-                if final_pointers.isdisjoint(item["pointers"])
-            )
-        else:
-            *_, usable = structured_check_findings(self.progress, self.expected)
-            final_pointers = {item["pointer"] for items in value.values() for item in items}
-            positions = {pointer: index for index, pointer in enumerate(self.expected)}
-            for item in usable["cited"]:
-                if item["pointer"] in final_pointers:
-                    continue
-                position = positions[item["pointer"]]
-                insertion = next((
-                    index for index, current in enumerate(merged["cited"])
-                    if positions.get(current["pointer"], len(positions)) > position
-                ), len(merged["cited"]))
-                merged["cited"].insert(insertion, item)
-            merged["uncited"].extend(
-                item for item in usable["uncited"] if item["pointer"] not in final_pointers
-            )
+        merged = {BRIEF_SECTION: list(value[BRIEF_SECTION])}
+        *_, usable = structured_brief_entries(self.progress, self.expected)
+        final_pointers = {item["pointer"] for item in value[BRIEF_SECTION]}
+        positions = {pointer: index for index, pointer in enumerate(self.expected)}
+        for item in usable[BRIEF_SECTION]:
+            if item["pointer"] in final_pointers:
+                continue
+            if item["pointer"] not in positions:
+                # A retained hop keeps no place of its own; the expected pointers hold the order.
+                merged[BRIEF_SECTION].append(item)
+                continue
+            position = positions[item["pointer"]]
+            insertion = next((
+                index for index, current in enumerate(merged[BRIEF_SECTION])
+                if positions.get(current["pointer"], len(positions)) > position
+            ), len(merged[BRIEF_SECTION]))
+            merged[BRIEF_SECTION].insert(insertion, item)
         self.retain(merged)
 
     def text_chunk(self, index, text):
@@ -756,8 +711,9 @@ class _SessionOutput:
                     part for part in (failure, content.get("reason")) if part
                 )}
             else:
-                coverage = None if self.expected is None else (0, len(self.expected))
-                content = failed(failure, self.started, coverage=coverage)
+                content = failed(
+                    failure, self.started, coverage=(0, len(self.expected))
+                )
         duration = self.elapsed()
         self.timeline["end"] = duration
         document = {**content, "duration_seconds": duration, "timeline": self.timeline}
@@ -768,7 +724,7 @@ class _SessionOutput:
 
 
 def execute(
-    prompt, worktree, model, budget, timeout, session_environment, started, expected=None,
+    prompt, worktree, model, budget, timeout, session_environment, started, expected=(),
 ):
     """Return the session's collected result within the configured execution budget."""
     output = _SessionOutput(started, expected)
@@ -1000,7 +956,7 @@ def record_run(document, identity, operation):
 
 
 def check(args):
-    """Return one escalation's fact-check, in the Run's terms or in the ones a command line names.
+    """Return one escalation's brief, in the Run's terms or in the ones a command line names.
 
     Two forms, one operation and one recorded event: the Run-named form reads the standing
     escalation, the worktree and the witness routing out of the Run itself, and the driver-less
@@ -1106,7 +1062,7 @@ def ask(args):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     operations = parser.add_subparsers(dest="operation", required=True)
-    check = operations.add_parser("check", help="fact-check one escalation")
+    check = operations.add_parser("check", help="gather the evidence one escalation cites")
     # The Run-named form, which is the one an escalation carries and a coordinator copies: it
     # names the Run and the ticket, and the Run holds the standing escalation, the worktree and
     # the witness routing. The driver-less form below names all of them because nothing holds

@@ -62,6 +62,20 @@ children's designs disagree), escalates to the coordinator.
 > there is no second session or persistent findings store. A session-local environment marker
 > refuses nested Witness commands before they can launch or record another operation.
 
+> **Amended (#205, 2026-09-12).** The rung stands; the job given to it does not. Checking a
+> pointer, hunting omissions and substantiating test claims are all judgments, and the session
+> making them is a fresh, budget-capped Sonnet with no ruling context — so `held`, `contradicted`
+> and `missing` are retired along with the `reason` prose and the `cited`/`uncited` split, and a
+> brief is now one ordered list of entries, each a pointer and the source text it names. A
+> pointer that resolves to nothing has an empty quotation, which is the whole of what `missing`
+> said. `check` and `ask` return the same shape against one schema. The Witness gathers the
+> child's pointers plus one hop and quotes the innermost enclosing definition, cut to the
+> coordinator's own 80-line read. Everything this amendment's predecessor settled about
+> execution — incremental submission, retention, `partial` on interruption, the timeline, the
+> budgets, reference resolution and the nesting refusal — is unchanged: the interface shrank, the
+> implementation did not
+> ([ADR-0032](0032-the-witness-carries-evidence-the-coordinator-judges.md)).
+
 ## Considered Options
 
 - **Resident cheap "executive" session** doing all mechanics: grows its own long-context

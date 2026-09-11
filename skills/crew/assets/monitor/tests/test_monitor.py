@@ -3939,7 +3939,7 @@ class CostTests(MonitorTestCase):
         self.fixture.append(
             LAUNCH_TS, "witness", ticket="06", operation="check", executor="claude",
             model="claude-sonnet-5", outcome="checked", reason="",
-            brief="README.md:1 — held — the fixture file exists",
+            brief="README.md:1\n    the fixture file exists",
             duration_seconds=1.25, input_tokens=11, output_tokens=22,
             cache_read_tokens=33, cache_creation_tokens=44, total_tokens=110,
         )

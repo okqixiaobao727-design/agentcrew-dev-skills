@@ -510,7 +510,7 @@ class RunProjectionTests(unittest.TestCase):
         }
         check = {
             "event": "witness", "ticket": "7", "operation": "check", "outcome": "checked",
-            "reason": "", "brief": "src/check.py:12 — held — the guard is present",
+            "reason": "", "brief": "src/check.py:12\n    the guard is present",
             "duration_seconds": 1,
         }
         ask = {
@@ -531,7 +531,7 @@ class RunProjectionTests(unittest.TestCase):
         }
         later = {
             "event": "witness", "ticket": "7", "operation": "brief", "outcome": "checked",
-            "reason": "", "brief": "src/check.py:12 — held — the guard is present",
+            "reason": "", "brief": "src/check.py:12\n    the guard is present",
             "duration_seconds": 1,
         }
 
@@ -1179,7 +1179,7 @@ class EventTests(MachineLogTestCase):
             "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5", "--plugin-version", "0.9.21",
             "--outcome", "checked", "--reason", "",
-            "--brief", "c.py:10 — held — the cited guard is present",
+            "--brief", "c.py:10\n    the cited guard is present",
             "--duration-seconds", "12.5",
             "--covered-count", "1", "--uncovered-count", "0", log=self.log,
         )
@@ -1192,7 +1192,7 @@ class EventTests(MachineLogTestCase):
             "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5", "--plugin-version", "",
             "--outcome", "checked", "--reason", "",
-            "--brief", "c.py:10 — held — the cited guard is present",
+            "--brief", "c.py:10\n    the cited guard is present",
             "--duration-seconds", "12.5",
             "--covered-count", "1", "--uncovered-count", "0", log=self.log,
         )
@@ -1205,7 +1205,7 @@ class EventTests(MachineLogTestCase):
             "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
             "--outcome", "checked", "--reason", "",
-            "--brief", "c.py:10 — held — the cited guard is present",
+            "--brief", "c.py:10\n    the cited guard is present",
             "--duration-seconds", "12.5",
             "--covered-count", "1", "--uncovered-count", "0", log=self.log,
         )
@@ -1218,7 +1218,7 @@ class EventTests(MachineLogTestCase):
             "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
             "--model", "claude-sonnet-5",
             "--outcome", "partial", "--reason", "uncovered pointers: c.py:11, c.py:12",
-            "--brief", "c.py:10 — held — the cited guard is present",
+            "--brief", "c.py:10\n    the cited guard is present",
             "--duration-seconds", "12.5",
             "--covered-count", "10", "--uncovered-count", "2", log=self.log,
         )
@@ -1235,7 +1235,7 @@ class EventTests(MachineLogTestCase):
             "--model", "claude-sonnet-5",
             "--outcome", "partial",
             "--reason", "structural rejection (extra cited): docs/context.md:7",
-            "--brief", "c.py:10 — held — the cited guard is present",
+            "--brief", "c.py:10\n    the cited guard is present",
             "--duration-seconds", "12.5",
             "--covered-count", "3", "--uncovered-count", "0", log=self.log,
         )
@@ -1824,13 +1824,13 @@ WRITTEN_LINES = (
         "a witness check with its cost",
         ("witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
          "--model", "claude-opus-4-6-20260401", "--outcome", "checked", "--reason", "",
-         "--brief", "all nine pointers held", "--duration-seconds", "12.5",
+         "--brief", "all nine pointers quoted", "--duration-seconds", "12.5",
          "--covered-count", "9", "--uncovered-count", "0",
          "--input-tokens", "1", "--output-tokens", "2", "--cache-read-tokens", "3",
          "--cache-creation-tokens", "4", "--total-tokens", "10"),
         '{"event": "witness", "ticket": "07", "operation": "check", "executor": "claude",'
         ' "model": "claude-opus-4-6-20260401", "outcome": "checked", "reason": "",'
-        ' "brief": "all nine pointers held", "duration_seconds": 12.5, "covered_count": 9,'
+        ' "brief": "all nine pointers quoted", "duration_seconds": 12.5, "covered_count": 9,'
         ' "uncovered_count": 0, "input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 3,'
         ' "cache_creation_tokens": 4, "total_tokens": 10}',
     ),

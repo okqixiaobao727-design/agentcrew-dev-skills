@@ -30,6 +30,9 @@ sys.path.insert(0, str(TESTS_DIR.parents[1]))
 # account's agents list lives in. Imported rather than restated, so they cannot drift apart.
 import stub_claude  # noqa: E402
 import run_plan  # noqa: E402
+# The brief renderer itself, so the fixture's rendered brief and the entries the stub answers with
+# are the same fact stated once (ADR-0032).
+import witness  # noqa: E402
 DRIVER = TESTS_DIR.parent / "driver.py"
 MACHINE_LOG = DRIVER.parent.parent / "machine_log.py"
 TRIAGE = DRIVER.parent.parent.parent / "references" / "triage.md"
@@ -88,7 +91,8 @@ WITNESS_MODEL = "claude-sonnet-5"
 # The shipped `[witness] timeout_seconds`, which a project inherits where it names none.
 WITNESS_TIMEOUT_SECONDS = 300
 WITNESS_BUDGET_USD = 2.0
-WITNESS_BRIEF = "README.md:1 — held — the fixture file exists"
+WITNESS_ENTRIES = {"entries": [{"pointer": "README.md:1", "says": "the fixture file exists"}]}
+WITNESS_BRIEF = witness.brief_result(WITNESS_ENTRIES, ())["brief"]
 # A file carrying a line that reads as an opening conflict marker: the merge driver will not
 # rewrite a conflict in it, so this is the shape that still climbs to the repair rung.
 UNREWRITABLE = "one\n<<<<<<< left over from an earlier merge\nthree\n"
@@ -611,7 +615,9 @@ class Fixture:
             ],
             check=True, capture_output=True, text=True,
             env=self.environment({
-                "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF, **(env_overrides or {}),
+                "AGENTCREW_STUB_WITNESS_BRIEF": WITNESS_BRIEF,
+                "AGENTCREW_STUB_WITNESS_OUTPUT": json.dumps(WITNESS_ENTRIES),
+                **(env_overrides or {}),
             }),
         )
 

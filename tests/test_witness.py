@@ -18,63 +18,76 @@ TESTS_DIR = pathlib.Path(__file__).resolve().parent
 ASSETS = PLUGIN_ROOT / "skills" / "crew" / "assets"
 WITNESS = ASSETS / "witness.py"
 sys.path.insert(0, str(ASSETS))
+import bounded_read  # noqa: E402
 import witness as witness_module  # noqa: E402
 
 MODEL = "claude-sonnet-5"
 BUDGET_USD = "2"
-BRIEF = (
-    "pointers\n"
-    "src/check.py:12 — held — the cited guard is present\n"
-    "#130 — contradicted — the ticket says the session is fresh\n"
-    "ADR-0004 — missing — the ADR is absent from this fixture\nuncited"
-)
+# One entry is a pointer and what that pointer says; a pointer that resolved to nothing says
+# nothing, which is the whole of what the retired `missing` status meant (ADR-0032).
 CHECK_OUTPUT = {
-    "cited": [
-        {
-            "pointer": "src/check.py:12",
-            "status": "held",
-            "reason": "the cited guard is present",
-        },
-        {
-            "pointer": "#130",
-            "status": "contradicted",
-            "reason": "the ticket says the session is fresh",
-        },
-        {
-            "pointer": "ADR-0004",
-            "status": "missing",
-            "reason": "the ADR is absent from this fixture",
-        },
+    "entries": [
+        {"pointer": "src/check.py:12", "says": "guard = True"},
+        {"pointer": "#130", "says": "The checking session is fresh for every escalation."},
+        {"pointer": "ADR-0004", "says": ""},
     ],
-    "uncited": [],
 }
+BRIEF = (
+    "src/check.py:12\n"
+    "    guard = True\n"
+    "\n"
+    "#130\n"
+    "    The checking session is fresh for every escalation.\n"
+    "\n"
+    "ADR-0004"
+)
 ASK_OUTPUT = {
-    "claims": [
+    "entries": [
         {
-            "claim": "Issue 154 requires the tracker body and authoritative comments",
-            "pointers": ["#154"],
+            "pointer": "#154",
+            "says": "Read the tracker body and every authoritative comment.",
         },
     ],
 }
-ASK_BRIEF = "Issue 154 requires the tracker body and authoritative comments — #154"
+ASK_BRIEF = "#154\n    Read the tracker body and every authoritative comment."
+RUN_OUTPUT = {
+    "entries": [
+        {"pointer": "README.md:1", "says": "ask fixture"},
+        {"pointer": "#130", "says": "The ticket says otherwise."},
+    ],
+}
 RUN_BRIEF = (
-    "pointers\n"
-    "README.md:1 — held — the fixture line is there\n"
-    "#130 — contradicted — the ticket says otherwise\nuncited"
+    "README.md:1\n"
+    "    ask fixture\n"
+    "\n"
+    "#130\n"
+    "    The ticket says otherwise."
 )
 STRUCTURED_FROM_BRIEF = object()
 
 
 def check_output(brief):
-    output = {"cited": [], "uncited": []}
-    for line in brief.splitlines():
-        if line in ("pointers", "uncited"):
+    """Read one rendered brief back into the structured output that produced it.
+
+    The rendering is unambiguous in this direction: a line at column zero is a pointer, and every
+    line beneath it is that pointer's quoted text. Fixture quotations carry no blank line, which
+    is the one thing the indent cannot tell apart from the separator between entries.
+    """
+    entries = []
+    for line in brief.split("\n"):
+        if not line:
             continue
-        target = "uncited" if line.startswith("uncited ") else "cited"
-        shaped = line.removeprefix("uncited ")
-        pointer, status, reason = shaped.split(" — ", 2)
-        output[target].append({"pointer": pointer, "status": status, "reason": reason})
-    return output
+        if line.startswith(witness_module.QUOTE_INDENT):
+            said = line[len(witness_module.QUOTE_INDENT):]
+            entries[-1]["says"] = f"{entries[-1]['says']}\n{said}" if entries[-1]["says"] else said
+            continue
+        entries.append({"pointer": line, "says": ""})
+    return {"entries": entries}
+
+
+def brief_of(output):
+    """Render one structured output the way the witness renders it, for a fixture to expect."""
+    return witness_module.brief_result(output, ())["brief"]
 
 
 def git(repo, *args):
@@ -301,8 +314,11 @@ class WitnessTests(unittest.TestCase):
         argv = self.calls()[0]["argv"]
         self.assertNotIn("--allowedTools", argv)
         schema = json.loads(argv[argv.index("--json-schema") + 1])
-        self.assertEqual(schema["required"], ["cited", "uncited"])
-        pointer_pattern = schema["$defs"]["finding"]["properties"]["pointer"]["pattern"]
+        self.assertEqual(schema["required"], ["entries"])
+        entry = schema["$defs"]["entry"]
+        self.assertEqual(sorted(entry["properties"]), ["pointer", "says"])
+        self.assertEqual(sorted(entry["required"]), ["pointer", "says"])
+        pointer_pattern = entry["properties"]["pointer"]["pattern"]
         self.assertIsNotNone(re.fullmatch(pointer_pattern, "docs/context.md:7"))
         self.assertIsNone(re.fullmatch(pointer_pattern, "docs/context.md:7-9"))
 
@@ -318,13 +334,13 @@ class WitnessTests(unittest.TestCase):
     def test_check_never_returns_a_checked_empty_brief(self):
         result = self.run_witness(
             stdin="CREW ASK 132 stuck — no source pointer",
-            structured_output={"cited": [], "uncited": []},
+            structured_output={"entries": []},
         )
 
         self.assert_failed_result(result)
 
     def test_matching_no_expected_pointer_returns_failed_with_zero_coverage(self):
-        result = self.run_witness(structured_output={"cited": [], "uncited": []})
+        result = self.run_witness(structured_output={"entries": []})
 
         document = self.assert_failed_result(result)
         self.assertEqual(document["covered_count"], 0)
@@ -359,14 +375,17 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "checked", document)
         self.assertEqual(
             document["brief"],
-            "pointers\n#154 — held — Approved direction requires the tracker body "
-            "and every comment.\nuncited",
+            "#154\n    Approved direction requires the tracker body and every comment.",
         )
         self.assertNotIn("Outsider opinion", document["brief"])
         self.assertIn(
             "issue view 154 --json body,comments",
             (self.stub_dir / "gh-calls").read_text(encoding="utf-8"),
         )
+
+    def schema_of(self, call):
+        argv = call["argv"]
+        return json.loads(argv[argv.index("--json-schema") + 1])
 
     def calls(self):
         path = self.stub_dir / "repairs.jsonl"
@@ -435,7 +454,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--model") + 1], MODEL)
         self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "3.5")
         schema = json.loads(argv[argv.index("--json-schema") + 1])
-        self.assertEqual(schema["required"], ["claims"])
+        self.assertEqual(schema["required"], ["entries"])
 
     def test_ask_keeps_accepting_the_state_directory_form(self):
         result = self.run_ask(run_dir=self.state_dir)
@@ -458,30 +477,51 @@ class WitnessTests(unittest.TestCase):
         )
         self.assertIn("<feature-dir>/.crew", document["reason"])
 
-    def test_ask_rejects_a_pointer_repeated_across_claims(self):
+    def test_one_schema_serves_both_operations(self):
+        # `check` and `ask` return the same shape, so the coordinator learns one thing rather
+        # than two and the code holds one schema rather than two (ADR-0032).
+        self.run_witness(structured_output=CHECK_OUTPUT)
+        check_schema = self.schema_of(self.calls()[-1])
+        self.run_ask()
+        ask_schema = self.schema_of(self.calls()[-1])
+
+        self.assertEqual(check_schema, ask_schema)
+        self.assertNotIn("held", json.dumps(check_schema))
+        self.assertNotIn("contradicted", json.dumps(check_schema))
+
+    def test_a_pointer_answered_twice_is_carried_once_rather_than_discarded(self):
+        # A repeat is the session quoting the same place twice, not a contradiction it could
+        # state: the brief keeps the first quotation and drops the duplicate, because throwing
+        # a whole answer away over a duplicate is what cost #175 a run of briefs (ADR-0032).
         result = self.run_ask(structured_output={
-            "claims": [
-                {"claim": "The issue is open", "pointers": ["#154"]},
-                {"claim": "The issue has an owner ruling", "pointers": ["#154"]},
+            "entries": [
+                {"pointer": "#154", "says": "The issue is open."},
+                {"pointer": "#154", "says": "The issue is open."},
             ],
         })
 
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
-        self.assertEqual(document["brief"], "")
-        self.assertEqual(document["outcome"], "failed")
-        self.assertIn("repeat", document["reason"])
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], "#154\n    The issue is open.")
 
-    def test_ask_rejects_empty_questions_answers_and_uncited_or_malformed_claims(self):
+    def test_a_pointer_that_resolved_to_nothing_answers_with_an_empty_quotation(self):
+        result = self.run_ask(structured_output={
+            "entries": [{"pointer": "ADR-0004", "says": ""}],
+        })
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], "ADR-0004")
+
+    def test_ask_rejects_empty_questions_answers_and_malformed_entries(self):
         cases = (
             ("", ASK_OUTPUT),
-            ("What changed?", {"claims": []}),
-            ("What changed?", {"claims": [{"claim": "", "pointers": ["#154"]}]}),
-            ("What changed?", {"claims": [{"claim": "A fact", "pointers": []}]}),
-            (
-                "What changed?",
-                {"claims": [{"claim": "A fact", "pointers": ["not-a-pointer"]}]},
-            ),
+            ("What changed?", {"entries": []}),
+            ("What changed?", {"entries": [{"pointer": "not-a-pointer", "says": "A fact"}]}),
+            ("What changed?", {"entries": [{"pointer": "#154"}]}),
+            ("What changed?", {"entries": [{"pointer": "#154", "says": 7}]}),
         )
         for question, structured_output in cases:
             with self.subTest(question=question, structured_output=structured_output):
@@ -514,9 +554,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "partial", document)
         self.assertEqual(document["covered_count"], 1)
         self.assertEqual(document["uncovered_count"], 2)
-        self.assertIn("src/check.py:12 — held", document["brief"])
-        self.assertIn("pointers\n", document["brief"])
-        self.assertIn("\nuncited", document["brief"])
+        self.assertEqual(document["brief"], "src/check.py:12\n    guard = True")
         self.assertIn("timed out", document["reason"])
         self.assertIn("#130", document["reason"])
         self.assertIn("ADR-0004", document["reason"])
@@ -544,7 +582,8 @@ class WitnessTests(unittest.TestCase):
 
     def test_a_replay_names_the_release_that_did_the_checking(self):
         recorded = {
-            "event": "witness", "ticket": "7", "outcome": "checked", "brief": "src/a.py:1 — held",
+            "event": "witness", "ticket": "7", "outcome": "checked",
+            "brief": "src/a.py:1\n    guard = True",
             "reason": "", "covered_count": 1, "uncovered_count": 0, "duration_seconds": 2.0,
             "plugin_version": "0.9.20",
         }
@@ -556,7 +595,8 @@ class WitnessTests(unittest.TestCase):
 
     def test_a_replay_of_a_check_from_before_the_field_names_no_release(self):
         recorded = {
-            "event": "witness", "ticket": "7", "outcome": "checked", "brief": "src/a.py:1 — held",
+            "event": "witness", "ticket": "7", "outcome": "checked",
+            "brief": "src/a.py:1\n    guard = True",
             "reason": "", "covered_count": 1, "uncovered_count": 0, "duration_seconds": 2.0,
         }
 
@@ -564,7 +604,7 @@ class WitnessTests(unittest.TestCase):
 
     def test_a_complete_streamed_submission_survives_an_unfinished_message(self):
         record = json.dumps({"witness_finding": {
-            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+            "section": "entries", "finding": CHECK_OUTPUT["entries"][0],
         }}) + "\n"
         events = [
             {"type": "stream_event", "event": {"type": "message_start"}},
@@ -586,13 +626,13 @@ class WitnessTests(unittest.TestCase):
         self.assertIsNone(document["timeline"]["first_tool_call"])
         self.assertIsNotNone(document["timeline"]["first_completed_finding"])
 
-    def test_timeout_retains_uncited_facts_without_claiming_cited_coverage(self):
+    def test_timeout_retains_a_one_hop_entry_without_claiming_cited_coverage(self):
         log = self.root / "log.jsonl"
         events = [{"type": "assistant", "message": {"content": [{
             "type": "text", "text": json.dumps({"witness_finding": {
-                "section": "uncited", "finding": {
-                    "pointer": "docs/context.md:7", "status": "held",
-                    "reason": "the acceptance criteria also require updating this caller",
+                "section": "entries", "finding": {
+                    "pointer": "docs/context.md:7",
+                    "says": "The Audience enum defines the term.",
                 },
             }}) + "\n",
         }]}}]
@@ -627,28 +667,28 @@ class WitnessTests(unittest.TestCase):
         result = self.run_witness("witness-stream", events=[
             {"type": "assistant", "message": {"content": [{
                 "type": "text", "text": json.dumps({"witness_finding": {
-                    "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+                    "section": "entries", "finding": CHECK_OUTPUT["entries"][0],
                 }}) + "\n",
             }]}},
             {"type": "result", "structured_output": {
-                "cited": [CHECK_OUTPUT["cited"][1]], "uncited": [],
+                "entries": [CHECK_OUTPUT["entries"][1]],
             }},
         ])
         document = json.loads(result.stdout)
         self.assertEqual(document["outcome"], "partial", document)
         self.assertEqual(document["covered_count"], 2)
         self.assertEqual(document["uncovered_count"], 1)
-        self.assertIn("src/check.py:12 — held", document["brief"])
-        self.assertIn("#130 — contradicted", document["brief"])
+        self.assertIn("src/check.py:12\n    guard = True", document["brief"])
+        self.assertIn("#130\n    The checking session is fresh", document["brief"])
         self.assertEqual(document["reason"], "uncovered pointers: ADR-0004")
 
-    def test_a_final_rewording_updates_the_finding_for_that_pointer(self):
+    def test_a_final_requotation_updates_the_entry_for_that_pointer(self):
         final = json.loads(json.dumps(CHECK_OUTPUT))
-        final["cited"][0]["reason"] += "."
+        final["entries"][0]["says"] = "guard = True  # the cited guard"
         result = self.run_witness("witness-stream", events=[
             {"type": "assistant", "message": {"content": [{
                 "type": "text", "text": json.dumps({"witness_finding": {
-                    "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+                    "section": "entries", "finding": CHECK_OUTPUT["entries"][0],
                 }}) + "\n",
             }]}},
             {"type": "result", "structured_output": final},
@@ -657,15 +697,15 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "checked", document)
         self.assertEqual(document["covered_count"], 3)
         self.assertEqual(document["reason"], "")
-        self.assertIn("src/check.py:12 — held — the cited guard is present.", document["brief"])
+        self.assertIn("src/check.py:12\n    guard = True  # the cited guard", document["brief"])
 
-    def test_a_final_claim_rewording_updates_the_answer_for_its_pointers(self):
+    def test_a_final_requotation_updates_the_answer_for_its_pointer(self):
         final = json.loads(json.dumps(ASK_OUTPUT))
-        final["claims"][0]["claim"] += "."
+        final["entries"][0]["says"] += " Every comment."
         result = self.run_ask(behaviour="witness-stream", events=[
             {"type": "assistant", "message": {"content": [{
                 "type": "text", "text": json.dumps({"witness_finding": {
-                    "section": "claims", "finding": ASK_OUTPUT["claims"][0],
+                    "section": "entries", "finding": ASK_OUTPUT["entries"][0],
                 }}) + "\n",
             }]}},
             {"type": "result", "structured_output": final},
@@ -673,12 +713,11 @@ class WitnessTests(unittest.TestCase):
         document = json.loads(result.stdout)
         self.assertEqual(document["outcome"], "checked", document)
         self.assertEqual(document["reason"], "")
-        self.assertEqual(document["brief"],
-                         "Issue 154 requires the tracker body and authoritative comments. — #154")
+        self.assertEqual(document["brief"], brief_of(final))
 
     def test_a_completed_text_block_commits_its_last_record_without_a_newline(self):
         text = json.dumps({"witness_finding": {
-            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+            "section": "entries", "finding": CHECK_OUTPUT["entries"][0],
         }})
         cases = [
             [{"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}],
@@ -712,10 +751,10 @@ class WitnessTests(unittest.TestCase):
 
     def test_activity_and_invalid_or_unfinished_submissions_are_not_findings(self):
         valid = json.dumps({"witness_finding": {
-            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+            "section": "entries", "finding": CHECK_OUTPUT["entries"][0],
         }})
-        invalid = json.dumps({"witness_finding": {"section": "cited", "finding": {
-            "pointer": "not-a-pointer", "status": "held", "reason": "not evidence",
+        invalid = json.dumps({"witness_finding": {"section": "entries", "finding": {
+            "pointer": "not-a-pointer", "says": "not evidence",
         }}})
         result = self.run_witness(
             "witness-stream-timeout", "--timeout-seconds", "1", events=[
@@ -741,7 +780,7 @@ class WitnessTests(unittest.TestCase):
 
     def test_streamed_text_is_not_counted_again_from_the_completed_message(self):
         submission = json.dumps({"witness_finding": {
-            "section": "cited", "finding": CHECK_OUTPUT["cited"][0],
+            "section": "entries", "finding": CHECK_OUTPUT["entries"][0],
         }}) + "\n"
         events = [
             {"type": "stream_event", "event": {
@@ -755,26 +794,26 @@ class WitnessTests(unittest.TestCase):
             {"type": "assistant", "message": {"content": [{
                 "type": "text", "text": submission,
             }]}},
-            {"type": "result", "structured_output": {"cited": "unfinished"}},
+            {"type": "result", "structured_output": {"entries": "unfinished"}},
         ]
         result = self.run_witness("witness-stream", events=events)
         document = json.loads(result.stdout)
         self.assertEqual(document["outcome"], "partial", document)
         self.assertEqual(document["covered_count"], 1)
         self.assertEqual(document["uncovered_count"], 2)
-        self.assertIn("invalid structured check output", document["reason"])
+        self.assertIn("invalid structured witness output", document["reason"])
 
     def test_interrupted_submissions_keep_existing_duplicate_and_order_validation(self):
-        for findings, covered, rejected in (
-            ([*CHECK_OUTPUT["cited"], CHECK_OUTPUT["cited"][0]], 2, "repeated"),
-            (list(reversed(CHECK_OUTPUT["cited"])), 1, "out of order"),
+        for entries, covered, rejected in (
+            ([*CHECK_OUTPUT["entries"], CHECK_OUTPUT["entries"][0]], 2, "repeated"),
+            (list(reversed(CHECK_OUTPUT["entries"])), 1, "out of order"),
         ):
             with self.subTest(rejected=rejected):
                 events = [{"type": "assistant", "message": {"content": [{
                     "type": "text", "text": json.dumps({"witness_finding": {
-                        "section": "cited", "finding": finding,
+                        "section": "entries", "finding": entry,
                     }}) + "\n",
-                }]}} for finding in findings]
+                }]}} for entry in entries]
                 result = self.run_witness(
                     "witness-stream-timeout", "--timeout-seconds", "1", events=events,
                 )
@@ -785,9 +824,9 @@ class WitnessTests(unittest.TestCase):
                 self.assertIn(f"structural rejection ({rejected})", document["reason"])
                 self.assertIn("timed out", document["reason"])
 
-    def test_ask_retains_completed_claims_and_records_its_timeout_timeline(self):
+    def test_ask_retains_completed_entries_and_records_its_timeout_timeline(self):
         submission = json.dumps({"witness_finding": {
-            "section": "claims", "finding": ASK_OUTPUT["claims"][0],
+            "section": "entries", "finding": ASK_OUTPUT["entries"][0],
         }}) + "\n"
         result = self.run_ask(
             behaviour="witness-stream-timeout", extra=("--timeout-seconds", "1"),
@@ -818,14 +857,14 @@ class WitnessTests(unittest.TestCase):
     def test_omitting_two_expected_pointers_returns_a_partial_brief_and_coverage(self):
         expected = [f"src/check.py:{line}" for line in range(1, 13)]
         escalation = "CREW ASK 132 design — " + "，".join(expected)
-        cited = [
-            {"pointer": pointer, "status": "held", "reason": f"fact {number}"}
+        entries = [
+            {"pointer": pointer, "says": f"fact {number}"}
             for number, pointer in enumerate(expected[:10], 1)
         ]
 
         result = self.run_witness(
             stdin=escalation,
-            structured_output={"cited": cited, "uncited": []},
+            structured_output={"entries": entries},
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -833,10 +872,10 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "partial")
         self.assertEqual(document["covered_count"], 10)
         self.assertEqual(document["uncovered_count"], 2)
-        self.assertEqual(document["brief"].splitlines(), ["pointers", *[
-            f"{pointer} — held — fact {number}"
+        self.assertEqual(document["brief"], "\n\n".join(
+            f"{pointer}\n    fact {number}"
             for number, pointer in enumerate(expected[:10], 1)
-        ], "uncited"])
+        ))
         self.assertIn("src/check.py:11", document["reason"])
         self.assertIn("src/check.py:12", document["reason"])
 
@@ -967,36 +1006,90 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "checked")
         self.assertEqual(document["brief"], BRIEF)
 
-    def test_an_uncited_pointer_uses_the_fixed_uncited_line_shape(self):
-        brief = BRIEF + "\nuncited docs/context.md:7 — held — this fact also needs context"
+    def test_a_one_hop_entry_is_rendered_by_the_same_rule_as_a_cited_one(self):
+        brief = BRIEF + "\n\ndocs/context.md:7\n    class Audience(Enum):"
 
         result = self.run_witness(brief=brief)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["brief"], brief)
 
-    def test_check_degrades_out_of_order_findings_to_the_largest_ordered_partial(self):
+    def test_a_quotation_is_indented_whole_under_its_pointer(self):
+        entries = {"entries": [{
+            "pointer": "src/check.py:12",
+            "says": "def guard(self):\n    \"\"\"The innermost definition.\"\"\"\n    return True",
+        }]}
+
+        result = self.run_witness(
+            stdin="CREW ASK 132 stuck — check src/check.py:12", structured_output=entries,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(document["brief"], (
+            "src/check.py:12\n"
+            "    def guard(self):\n"
+            "        \"\"\"The innermost definition.\"\"\"\n"
+            "        return True"
+        ))
+
+    def test_a_definition_past_the_limit_is_cut_to_the_coordinators_own_read(self):
+        # The limit is the coordinator's bounded read and is read from where that boundary
+        # already lives, so no single pointer hands it more than it could have fetched itself.
+        # No truncation marker: a quotation of exactly the limit is the sign there is more.
+        limit = witness_module.QUOTE_MAX_LINES
+        self.assertEqual(limit, bounded_read.MAX_LINES)
+        entries = {"entries": [{
+            "pointer": "src/check.py:12",
+            "says": "\n".join(f"line {number}" for number in range(limit * 3)),
+        }]}
+
+        result = self.run_witness(
+            stdin="CREW ASK 132 stuck — check src/check.py:12", structured_output=entries,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        quoted = document["brief"].splitlines()
+        self.assertEqual(quoted[0], "src/check.py:12")
+        self.assertEqual(len(quoted) - 1, limit)
+        self.assertNotIn("…", document["brief"])
+        self.assertNotIn("truncated", document["brief"])
+
+    def test_a_definition_below_the_limit_is_quoted_whole(self):
+        limit = witness_module.QUOTE_MAX_LINES
+        says = "\n".join(f"line {number}" for number in range(limit - 1))
+        entries = {"entries": [{"pointer": "src/check.py:12", "says": says}]}
+
+        result = self.run_witness(
+            stdin="CREW ASK 132 stuck — check src/check.py:12", structured_output=entries,
+        )
+
+        document = json.loads(result.stdout)
+        self.assertEqual(document["outcome"], "checked", document)
+        self.assertEqual(len(document["brief"].splitlines()) - 1, limit - 1)
+
+    def test_check_degrades_out_of_order_entries_to_the_largest_ordered_partial(self):
         out_of_order = json.loads(json.dumps(CHECK_OUTPUT))
-        out_of_order["cited"].reverse()
+        out_of_order["entries"].reverse()
 
         result = self.run_witness(structured_output=out_of_order)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
         self.assertEqual(document["outcome"], "partial")
-        self.assertEqual(
-            document["brief"],
-            "pointers\nsrc/check.py:12 — held — the cited guard is present\nuncited",
-        )
+        self.assertEqual(document["brief"], "src/check.py:12\n    guard = True")
         self.assertEqual(document["covered_count"], 1)
         self.assertEqual(document["uncovered_count"], 2)
         self.assertIn("structural rejection (out of order): #130", document["reason"])
         self.assertIn("structural rejection (out of order): ADR-0004", document["reason"])
         self.assertNotIn("uncovered pointers", document["reason"])
 
-    def test_a_duplicate_expected_finding_is_structurally_rejected_from_a_partial(self):
+    def test_a_duplicate_expected_entry_is_structurally_rejected_from_a_partial(self):
         duplicate = json.loads(json.dumps(CHECK_OUTPUT))
-        duplicate["cited"].append(dict(duplicate["cited"][-1]))
+        duplicate["entries"].append(dict(duplicate["entries"][-1]))
 
         result = self.run_witness(structured_output=duplicate)
 
@@ -1005,59 +1098,55 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "partial")
         self.assertEqual(document["covered_count"], 2)
         self.assertEqual(document["uncovered_count"], 1)
-        self.assertNotIn("ADR-0004 —", document["brief"])
+        self.assertNotIn("ADR-0004", document["brief"])
         self.assertIn("structural rejection (repeated): ADR-0004", document["reason"])
         self.assertNotIn("uncovered pointers", document["reason"])
 
-    def test_an_expected_pointer_repeated_as_uncited_is_rejected_from_a_partial(self):
-        repeated_uncited = json.loads(json.dumps(CHECK_OUTPUT))
-        repeated_uncited["uncited"] = [dict(repeated_uncited["cited"][0])]
+    def test_an_expected_pointer_repeated_after_a_hop_is_still_a_repeat(self):
+        # One list now, so a repeat is a repeat wherever it sits: there is no second section an
+        # expected pointer could be filed under to escape the check (ADR-0032).
+        repeated = json.loads(json.dumps(CHECK_OUTPUT))
+        repeated["entries"].append({"pointer": "docs/context.md:7", "says": "context"})
+        repeated["entries"].append(dict(repeated["entries"][0]))
 
-        result = self.run_witness(structured_output=repeated_uncited)
+        result = self.run_witness(structured_output=repeated)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
         self.assertEqual(document["outcome"], "partial")
         self.assertEqual(document["covered_count"], 2)
         self.assertEqual(document["uncovered_count"], 1)
-        self.assertNotIn("src/check.py:12 —", document["brief"])
+        self.assertNotIn("src/check.py:12", document["brief"])
         self.assertIn(
             "structural rejection (repeated): src/check.py:12",
             document["reason"],
         )
 
-    def test_an_extra_cited_pointer_becomes_uncited_in_a_structural_partial(self):
+    def test_a_pointer_beyond_the_expected_list_is_a_hop_and_not_a_rejection(self):
+        # The cited/uncited split is gone, so an entry the escalation did not cite is simply
+        # the one hop the assignment asks for, and a brief carrying one is still `checked`.
         extra = json.loads(json.dumps(CHECK_OUTPUT))
-        extra["cited"].append({
+        extra["entries"].append({
             "pointer": "docs/context.md:7",
-            "status": "held",
-            "reason": "the extra context exists",
+            "says": "class Audience(Enum):",
         })
 
         result = self.run_witness(structured_output=extra)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
-        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["outcome"], "checked", document)
         self.assertEqual(document["covered_count"], 3)
         self.assertEqual(document["uncovered_count"], 0)
+        self.assertEqual(document["reason"], "")
         self.assertEqual(
             document["brief"],
-            BRIEF + "\nuncited docs/context.md:7 — held — the extra context exists",
-        )
-        self.assertIn(
-            "structural rejection (extra cited): docs/context.md:7",
-            document["reason"],
+            BRIEF + "\n\ndocs/context.md:7\n    class Audience(Enum):",
         )
 
-    def test_pointer_free_escalation_keeps_an_uncited_finding_as_checked(self):
+    def test_pointer_free_escalation_keeps_a_one_hop_entry_as_checked(self):
         structured_output = {
-            "cited": [],
-            "uncited": [{
-                "pointer": "#200",
-                "status": "held",
-                "reason": "the follow-up ticket exists",
-            }],
+            "entries": [{"pointer": "#200", "says": "The follow-up ticket is open."}],
         }
 
         result = self.run_witness(
@@ -1068,17 +1157,24 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
         self.assertEqual(document["outcome"], "checked")
-        self.assertEqual(
-            document["brief"],
-            "pointers\nuncited\nuncited #200 — held — the follow-up ticket exists",
-        )
+        self.assertEqual(document["brief"], "#200\n    The follow-up ticket is open.")
         self.assertEqual(document["covered_count"], 0)
         self.assertEqual(document["uncovered_count"], 0)
 
-    def test_a_nonpointer_line_cannot_pose_as_an_uncited_pointer(self):
-        brief = BRIEF + "\ntotal garbage — held — anything"
+    def test_a_malformed_submission_is_refused_rather_than_crashing_the_operation(self):
+        # A submission is arbitrary JSON off the session's text stream: the schema bounds the
+        # final answer, not the lines streamed before it, so a half-shaped entry has to be
+        # refused by the renderer rather than reach a dictionary lookup.
+        for entry in ({"says": "no pointer"}, {"pointer": "#1"}, "a bare string", 7):
+            with self.subTest(entry=entry):
+                with self.assertRaises(ValueError):
+                    witness_module.brief_result({"entries": [entry]}, [])
 
-        result = self.run_witness(brief=brief)
+    def test_a_nonpointer_cannot_pose_as_a_brief_entry(self):
+        garbage = json.loads(json.dumps(CHECK_OUTPUT))
+        garbage["entries"].append({"pointer": "total garbage", "says": "anything"})
+
+        result = self.run_witness(structured_output=garbage)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
@@ -1087,7 +1183,7 @@ class WitnessTests(unittest.TestCase):
 
     def test_a_time_is_not_mistaken_for_a_path_and_line_pointer(self):
         escalation = "CREW ASK 132 stuck — at 09:30 check src/check.py:12"
-        brief = "pointers\nsrc/check.py:12 — held — the cited guard is present\nuncited"
+        brief = "src/check.py:12\n    guard = True"
 
         result = self.run_witness(stdin=escalation, brief=brief)
 
@@ -1095,7 +1191,7 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["brief"], brief)
 
     def test_a_numeric_or_version_token_is_not_a_path_and_line_pointer(self):
-        brief = "pointers\nsrc/check.py:12 — held — the cited guard is present\nuncited"
+        brief = "src/check.py:12\n    guard = True"
         for token in ("2.0:1", "v1.2:34", "4-2:1"):
             with self.subTest(token=token):
                 escalation = f"CREW ASK 132 stuck — {token} check src/check.py:12"
@@ -1114,7 +1210,7 @@ class WitnessTests(unittest.TestCase):
         ):
             with self.subTest(pointer=pointer):
                 escalation = f"CREW ASK 132 stuck — check {pointer}"
-                brief = f"pointers\n{pointer} — held — the cited location is present\nuncited"
+                brief = f"{pointer}\n    the cited location is present"
 
                 result = self.run_witness(stdin=escalation, brief=brief)
 
@@ -1774,6 +1870,59 @@ class WitnessReleaseTests(unittest.TestCase):
         self.assertIsNone(witness_module.plugin_root(loose))
         self.assertIsNone(witness_module.plugin_release(self.root / "loose"))
 
+
+class CoordinatorContractDocumentationTests(unittest.TestCase):
+    """What the coordinator is told about a brief, in the two documents it reads it from.
+
+    Pinned here because the assignment, the renderer and the Contract are one interface: a brief
+    that states no verdict is only half the change if the reference still tells the coordinator
+    to take one from it (ADR-0032).
+    """
+
+    TRIAGE = PLUGIN_ROOT / "skills" / "crew" / "references" / "triage.md"
+    SKILL = PLUGIN_ROOT / "skills" / "crew" / "SKILL.md"
+    GLOSSARY = PLUGIN_ROOT / "docs" / "glossary.md"
+
+    def joined(self, path):
+        return " ".join(path.read_text(encoding="utf-8").split())
+
+    def test_the_reference_states_the_reach_rather_than_a_read_count(self):
+        for document in (self.TRIAGE, self.SKILL):
+            with self.subTest(document=document.name):
+                text = self.joined(document)
+                self.assertIn("bounded by reach", text)
+                self.assertIn("already on the table", text)
+                self.assertIn("cited by the escalation", text)
+                self.assertIn("as often as the ruling needs", text)
+                self.assertIn("nothing off the table may be read", text)
+                self.assertIn("`Grep`, `Glob` and shell file reads", text)
+
+    def test_one_ask_stands_between_a_failed_check_and_a_ruling_without_a_brief(self):
+        triage = self.joined(self.TRIAGE)
+
+        self.assertIn("witness.py ask", triage)
+        self.assertIn("send one `ask` for the fact the ruling turns on", triage)
+        self.assertIn("rule without a brief only where that returns nothing either", triage)
+        # The permission this replaces: a failed check used to license ruling from the child's
+        # word, which is what #200 cost — nine checks, not one `ask` in the whole run.
+        self.assertNotIn("stops nothing: rule without a brief", triage)
+
+    def test_no_document_the_coordinator_reads_offers_it_a_verdict_to_inherit(self):
+        for document in (self.TRIAGE, self.SKILL, self.GLOSSARY):
+            with self.subTest(document=document.name):
+                text = self.joined(document)
+                # The bare words, not the backticked ones: `held` in its ordinary English sense
+                # reads as the retired status to anyone scanning for it, so these documents are
+                # written without it at all rather than relying on the reader's charity.
+                for retired in ("held", "contradicted"):
+                    self.assertIsNone(
+                        re.search(rf"\b{retired}\b", text),
+                        f"{document.name} still carries the retired word {retired!r}",
+                    )
+                # `uncited` is exempt in the glossary alone, which names the retired split in
+                # order to say it is gone.
+                if document is not self.GLOSSARY:
+                    self.assertNotIn("uncited", text)
 
 
 if __name__ == "__main__":

@@ -112,23 +112,13 @@ def main():
         }
         if os.environ.get("AGENTCREW_STUB_WITNESS_BEHAVIOUR") == "partial-usage":
             usage.pop("cache_creation_input_tokens")
-        cited = []
-        uncited = []
-        for line in os.environ["AGENTCREW_STUB_WITNESS_BRIEF"].splitlines():
-            target = uncited if line.startswith("uncited ") else cited
-            shaped = line.removeprefix("uncited ")
-            pointer, status, reason = shaped.split(" — ", 2)
-            target.append({"pointer": pointer, "status": status, "reason": reason})
-        structured_output = os.environ.get("AGENTCREW_STUB_WITNESS_OUTPUT")
+        # The entries the caller wants answered with, named rather than reconstructed from the
+        # rendered brief: the renderer is the fixture's, so only one side needs to hold it.
         print(json.dumps({
             "type": "result",
             "is_error": False,
             "result": os.environ["AGENTCREW_STUB_WITNESS_BRIEF"],
-            "structured_output": (
-                json.loads(structured_output)
-                if structured_output is not None
-                else {"cited": cited, "uncited": uncited}
-            ),
+            "structured_output": json.loads(os.environ["AGENTCREW_STUB_WITNESS_OUTPUT"]),
             "usage": usage,
         }))
         return 0

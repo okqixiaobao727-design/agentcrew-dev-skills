@@ -32,19 +32,23 @@ start, before the first ruling: staging generated it as this run's **Reference i
 maintainer-authored Markdown the coordinator may read whole. The hook compares physical locations.
 Code, tests and git remain facts for the witness brief. Every escalation carries the Witness line
 that checks its pointers; you run it yourself, before you rule, as
-[`references/triage.md`](references/triage.md) says. When a ruling needs an uncited fact, ask the
-same Witness directly:
+[`references/triage.md`](references/triage.md) says. When a ruling needs a fact the table lacks,
+ask the same Witness directly:
 
 ```bash
 python3 <crew-skill-dir>/assets/witness.py ask \
   --run <run-dir> --ticket <NN> --question '<one factual question>'
 ```
 
-Both operations return pointer-backed facts and no recommendation. Where the child and the brief
-state a fact differently, one bounded `Read` settles it: that pointer, an explicit offset, 80 lines
-at most. `Grep`, `Glob` and shell file reads are hunts and the hook refuses them; `gh issue view`
-stays open because the tracker is the ticket. A message lacking what a ruling needs is answered by
-asking its sender for exactly what it lacks.
+Both operations return quoted source and no verdict: the Witness carries evidence and you judge it
+([ADR-0032](../../docs/adr/0032-the-witness-carries-evidence-the-coordinator-judges.md)). You are
+bounded by reach, not by count — any pointer already on the table, carried by the brief or cited
+by the escalation, may be read with an explicit offset and at most 80 lines, as often as the ruling
+needs, and nothing off the table may be read at all. `Grep`, `Glob` and shell file reads are hunts
+and the hook refuses them; `gh issue view` stays open because the tracker is the ticket. Where a
+check comes back `failed` or `partial`, the table is empty: send one `ask` before you rule without
+a brief. A message lacking what a ruling needs is answered by asking its sender for exactly what
+it lacks.
 
 **A ruling is one decision and its action** — pick an option, redirect, or sketch pseudocode —
 and the child writes the edit: product code belongs to a child, merge-conflict resolution included.

@@ -113,13 +113,13 @@ def main():
         time.sleep(30)
         return 0
     if step == "witness-progress-timeout":
-        finding = json.loads(os.environ["AGENTCREW_STUB_WITNESS_OUTPUT"])["cited"][0]
+        finding = json.loads(os.environ["AGENTCREW_STUB_WITNESS_OUTPUT"])["entries"][0]
         print(json.dumps({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Read", "input": {"file_path": "src/check.py"}},
         ]}}), flush=True)
         print(json.dumps({"type": "assistant", "message": {"content": [
             {"type": "text", "text": json.dumps({"witness_finding": {
-                "section": "cited", "finding": finding,
+                "section": "entries", "finding": finding,
             }}) + "\n"},
         ]}}), flush=True)
         time.sleep(30)
@@ -161,12 +161,7 @@ def main():
                 if comment["authorAssociation"] in ("OWNER", "MEMBER", "COLLABORATOR")
             )
             tracker_output = {
-                "cited": [{
-                    "pointer": "#154",
-                    "status": "held",
-                    "reason": authoritative,
-                }],
-                "uncited": [],
+                "entries": [{"pointer": "#154", "says": authoritative}],
             }
         response = {
             "type": "result",

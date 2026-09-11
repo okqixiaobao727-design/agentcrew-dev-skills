@@ -77,8 +77,9 @@ prompt over the trusted channel, never be sent afterwards as a message.
 **One rule: answer everything, keep it moving. Nothing parks except the red line.**
 
 The coordinator reads maintainer-authored judgment Markdown whole. It rules source facts from the
-escalation and its witness brief, with at most one bounded read of a pointer the two state
-differently — it is serving the whole wave at once. Children escalate in a fixed compact format:
+escalation and the source its witness brief quotes, bounded by reach rather than by count: any
+pointer already on that table may be read, at most 80 lines at a time, and nothing off it — it is
+serving the whole wave at once. Children escalate in a fixed compact format:
 ticket number, one of five kinds, the question in one paragraph, two or three options with one
 recommended, every fact as a pointer.
 

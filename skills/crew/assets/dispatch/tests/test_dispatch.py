@@ -503,13 +503,26 @@ class WitnessPromptTests(unittest.TestCase):
         instructions = " ".join(prompt.split())
         for boundary in (
             "Never invoke another Witness.",
-            "Missing records mean the pass cannot be substantiated.",
             "Witness must not execute any test commands, test scripts, test suites, smoke probes "
             "or acceptance workflows.",
             "Resolve ADR identifiers in the subject project's authority.",
-            "including required scope the child did not mention.",
+            # The three instructions ADR-0032 retired, each a judgment a fresh, budget-capped
+            # Sonnet was being asked to make, and the one hop that replaced the first of them.
+            "That hop is the whole of what you gather.",
+            "do not look for what the source material left out",
+            "do not read or reason about test or review records",
+            "Return no status, no verdict, no reason",
+            # The quotation unit and its cap, which is where "around the pointer" is implemented:
+            # only the session reading the file knows where in a definition its pointer sits, so
+            # the assignment centres the cut and `witness.py` caps what arrives (ADR-0032).
+            "the innermost enclosing definition the pointer falls inside — the method, not the "
+            "class around it — quoted whole",
+            "quote 80 lines around the pointer and add no truncation marker",
+            "A pointer you cannot resolve comes back as an entry whose `says` is empty",
         ):
             self.assertIn(boundary, instructions)
+        for retired in ("held", "contradicted", "uncited", "substantiate"):
+            self.assertNotIn(retired, instructions.lower())
 
     def test_the_ruled_witness_prompt_renders_from_witness_dot_prompt(self):
         escalation = "CREW ASK 132 design — check src/check.py:12 and ADR-0004"

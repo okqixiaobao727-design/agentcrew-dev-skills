@@ -406,16 +406,21 @@ the run come from the run's `[witness]` configuration; `executor` and `model` ar
 witness route, while the hard budget remains in the Wave table.
 
 `reason` is empty for `checked` and non-empty for `partial` and `failed`. `brief` is what the
-operation found, verbatim — the fact-check's findings for a `check`, the answer for an `ask` —
-so a later reader takes the finding from the log rather than paying for a second session. It is
-non-empty for `checked` and `partial` and empty for `failed`.
+operation gathered, verbatim: one entry per pointer, the pointer on its own line and the source
+text it names quoted, indented, beneath it. Both operations carry the same shape — for a `check`
+the escalation's pointers and the hops out from them, for an `ask` the pointers that answer it
+(ADR-0032) — so a later reader takes the evidence from the log rather than paying for a second
+session. It is non-empty for `checked` and `partial` and empty for `failed`.
 
-Both coverage counts are required non-negative integers: `checked` leaves none uncovered (and can
-have no expected pointers when its brief consists of uncited findings), `partial` retains usable
-findings and may cover zero cited pointers when only uncited evidence is complete. It may leave
-zero uncovered when interrupted after checking every citation, or when its only structural rejection
-is an extra cited pointer. `failed` covers none. An `ask` has no expected pointers and records both
-counts as zero, including when completed claims survive interruption as `partial`.
+Both coverage counts are required non-negative integers, and they count the *expected* pointers
+only: how many of the escalation's cited pointers the brief carried an entry for, in the order
+they were given, and how many it did not. A pointer that resolved to nothing is covered — its
+entry is there with nothing quoted — so a count is not a claim about what was found. One-hop
+entries are counted by neither. `checked` leaves none uncovered (and can have no expected pointers
+at all, when the escalation cited none and the brief is entirely hops); `partial` retains usable
+entries and may cover zero of them when only hops are complete. `failed` covers none. An `ask` has
+no expected pointers and records both counts as zero, including when completed entries survive
+interruption as `partial`.
 
 The four token counters and `total_tokens` use the same meanings as `session-cost`, and total is
 their sum. They are absent together when the Witness returned no usage; the outcome, reason,

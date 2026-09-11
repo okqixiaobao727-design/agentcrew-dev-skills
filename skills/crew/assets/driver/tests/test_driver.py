@@ -5176,7 +5176,7 @@ class AnswerTests(DriverTestCase):
         environment = self.fixture.environment()
         environment["AGENTCREW_STUB_WITNESS_BRIEF"] = WITNESS_BRIEF
         environment["AGENTCREW_STUB_WITNESS_OUTPUT"] = json.dumps({
-            "claims": [{"claim": "Use the existing table", "pointers": ["#01"]}],
+            "entries": [{"pointer": "#01", "says": "Use the existing table."}],
         })
 
         result = subprocess.run(
@@ -5191,7 +5191,7 @@ class AnswerTests(DriverTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(result.stdout)
         self.assertEqual(document["outcome"], "checked", document)
-        self.assertEqual(document["brief"], "Use the existing table — #01")
+        self.assertEqual(document["brief"], "#01\n    Use the existing table.")
 
     def test_answer_reports_the_checked_path_and_accepted_forms_for_a_wrong_directory(self):
         run_dir = self.fixture.feature_dir / "missing-run"

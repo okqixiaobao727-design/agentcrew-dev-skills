@@ -173,6 +173,19 @@ operator. A clean run costs it one turn to launch, one per ASK, and one to point
 > behind it and the row annotation that drew its elapsed go with it, and `awaiting_ruling` starts
 > at a delivered escalation and, for an undelivered one, at the Driver's hand-over line.
 
+> **Amended (#205, 2026-09-12).** The read boundary stays a kind line, but the quantity on the
+> code side is replaced by a reach. "One pointer of at most 80 lines, to settle a fact the child
+> and the brief state differently" described a condition that can no longer arise: a brief now
+> quotes source and states no verdict, so there is nothing in it to differ with. Any pointer
+> already on the table — carried by the brief, or cited by the escalation — may be read with an
+> explicit offset and at most 80 lines, as often as the ruling needs, and nothing off the table
+> may be read at all. `Grep`, `Glob` and shell file reads remain hunts, so what bounds the
+> coordinator is the table and what bounds the table is the Witness's one hop. The other half:
+> "a fact-check that fails or times out prints no brief and is not an error, and the coordinator
+> rules without one" now has one `ask` in front of it — an empty table is laid again before it is
+> ruled around, on the same one-retry rhythm the run already uses for a bounced receipt
+> ([ADR-0032](0032-the-witness-carries-evidence-the-coordinator-judges.md)).
+
 ## Consequences
 
 - The crew skill document is the oracle's resident prefix, so it holds the reversibility contract,

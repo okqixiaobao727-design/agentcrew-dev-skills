@@ -13,7 +13,7 @@ the message, or from the snapshot's `detail`, `ticket`, `child` and `window`. A 
 
 An escalation ends on the Witness line that checks its pointers, already filled in with this run
 and this ticket. Copy it out of the message and run it, in the foreground, with a Bash tool
-timeout of `600000` ms — the tool's maximum, which is what any configured witness timeout is held
+timeout of `600000` ms — the tool's maximum, which is what any configured witness timeout stays
 below, so the session always ends before the tool gives up on it:
 
 ```bash
@@ -29,12 +29,33 @@ check, so an upgrade mid-run is picked up by the next check on its own. The rele
 ran under is on its `witness` record and in the run's report. Substituting a path by hand is
 never the fix (#204).
 
-It prints one JSON object, and `brief` is the fact-check: one line per pointer, each `held`,
-`contradicted` or `missing`. `outcome` says how much of the escalation it covered — `checked` is
-every cited pointer, `partial` is some of them with `reason` naming the rest, and `failed` is none
-of them, with an empty `brief` and `reason` saying why. A failed fact-check is not an error and
-stops nothing: rule without a brief. Run twice for one escalation, the second run prints the brief
-already recorded, marked `"recorded": true`, and buys no second opinion.
+It prints one JSON object, and `brief` is the evidence: one entry per pointer — the pointer on its
+own line, and beneath it, indented, what that pointer says, quoted from the source. A pointer that
+resolved to nothing stands alone with nothing beneath it. There is no verdict in a brief and
+nowhere to put one: the Witness carries evidence and you judge it
+([ADR-0032](../../../docs/adr/0032-the-witness-carries-evidence-the-coordinator-judges.md)), so
+read the quotations rather than taking a conclusion from them. `outcome` says how much of the
+escalation it covered — `checked` is every cited pointer, `partial` is some of them with `reason`
+naming the rest, and `failed` is none of them, with an empty `brief` and `reason` saying why.
+Run twice for one escalation, the second run prints the brief already recorded, marked
+`"recorded": true`, and buys no second opinion.
+
+A `failed` or `partial` check is an empty or thin table, not an error and not a licence to rule
+from the child's word alone: send one `ask` for the fact the ruling turns on, and rule without a
+brief only where that returns nothing either.
+
+```bash
+python3 <crew-skill-dir>/assets/witness.py ask \
+  --run <run-dir> --ticket <NN> --question '<one factual question>'
+```
+
+You are bounded by reach, not by count. Any pointer already on the table — carried by the
+brief, or cited by the escalation — may be read with an explicit offset and at most 80 lines,
+as often as the ruling needs, and nothing off the table may be read at all. `Grep`, `Glob` and
+shell file reads stay refused: what bounds you is the table, and what bounds the table is the
+Witness's one hop.
+Where the table lacks what the ruling turns on, the answer is another `ask`, never a private
+search.
 
 ## Decide
 

@@ -7,6 +7,46 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The Witness brief carries quoted source and nothing else, and the coordinator does the judging
+  (ADR-0032). A brief used to ask a fresh, budget-capped Sonnet to *check* cited facts, to hunt
+  for omissions the escalation left out, and to substantiate test claims from records the run does
+  not keep — then to report `held`, `contradicted` or `missing` per pointer with a reason. Every
+  one of those is a judgment, and it reached the coordinator wearing the same clothes as a quoted
+  line, because there was no field in which the difference could be written. In one run that cost
+  a wrong ruling on the largest ticket (#202), four findings that a record does not exist (#203),
+  and seven `failed` checks the coordinator ruled straight past (#200). A brief is now one ordered
+  list of entries, each a `pointer` and what that pointer `says` — the source text itself. A
+  pointer that resolves to nothing comes back with an empty `says`, which is the whole of what
+  `missing` meant. There is no status, no reason prose and no `cited`/`uncited` split, and one
+  schema now validates `check` and `ask` alike: after this change there is nowhere to put a
+  verdict. What a Witness gathers beyond the escalation's own citations is **one hop** — where a
+  cited symbol is defined, how a concept the ticket names is defined in the subject project's own
+  authority, and the rest of the definition a cited line sits in. It no longer surveys the
+  repository and no longer reads or reasons about test or review records. What it quotes per
+  pointer is the innermost enclosing definition — the method, not the class around it — quoted
+  whole, and cut to 80 lines around the pointer where it runs longer; 80 is the coordinator's own
+  bounded read, read from that one constant rather than written down a second time, so no single
+  pointer hands the coordinator more than it could have fetched itself. No truncation marker is
+  added: a quotation of exactly the limit is itself the sign that there is more (#205).
+- The coordinator is bounded by reach rather than by count. The old rule allowed one bounded read
+  per ruling, triggered by "what an escalation and its witness brief state differently" — a
+  condition that cannot arise once the brief states nothing to differ with. Any pointer already on
+  the table — carried by the brief, or cited by the escalation — may now be read with an offset
+  and at most 80 lines, as often as a ruling needs, and nothing off the table may be read at all.
+  `Grep`, `Glob` and shell file reads stay refused, so the coordinator still cannot hunt: what
+  bounds it is the table, and what bounds the table is the Witness's one hop. Where a `check`
+  returns `failed` or `partial` the table is empty, so one `ask` is dispatched before ruling;
+  ruling with no brief survives as the last resort behind that attempt rather than as the
+  permission in front of it (#205).
+- `covered_count` and `uncovered_count` keep their names and count the expected pointers only:
+  how many of the escalation's cited pointers the brief carried an entry for, in the given order,
+  and how many it did not. A pointer that resolved to nothing is *covered* — its entry is there
+  with nothing quoted — so neither count is a claim about what was found, and one-hop entries are
+  counted by neither. The `witness` event, its outcomes, the `[witness] timeout_seconds` budget,
+  incremental submission, timeline recording, reference-authority resolution and worktree-change
+  tolerance are all unchanged: the interface shrank, the implementation did not (#205).
+
 ### Fixed
 - The Witness answers on the release installed when it runs, not the one the run was launched on
   (ADR-0031). The line an escalation ends on is composed into the child's first turn at launch and

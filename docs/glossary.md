@@ -211,9 +211,10 @@ runs, and which tests the ticket names. Method belongs to the skill the opening 
 its whole job is judgment. It launches the driver, rules on what children escalate and on what the
 rule table has no row for, and points at the report. It writes no product code. It reads the
 judgment Markdown the Contract names whole; for code, tests and git facts it rules from the
-escalation and its witness brief, with at most one bounded read to settle a fact they state
-differently
-([ADR-0010](adr/0010-the-driver-runs-the-run-the-coordinator-rules.md)). It speaks to the human
+escalation and the source its witness brief quotes, reading any pointer already on that table as
+often as the ruling needs and nothing off it
+([ADR-0010](adr/0010-the-driver-runs-the-run-the-coordinator-rules.md),
+[ADR-0032](adr/0032-the-witness-carries-evidence-the-coordinator-judges.md)). It speaks to the human
 only for a decision that is theirs; the human asks when they want to know.
 _Avoid_: lead, orchestrator (legacy term from `/orchestrate`), advisor (the role's name in a
 manual run's prompt, never in these documents)
@@ -268,9 +269,9 @@ reset time in the pane. Both ends are the child's own Machine-log records — it
 writes `paused` when a turn ends on the limit, and its `Stop` hook writes `resumed` at the end of
 the next ordinary turn — so a ticket is paused exactly while its latest child-side record is a
 `paused` one, and nobody holds that fact anywhere else. The rule table's idle rung skips a paused
-ticket entirely, and the run's inactivity deadline is held while one is live: the lane reports a
-paused session as `idle`, so without the records the run reads the wait as the second silence and
-settles the ticket `failed` (#190).
+ticket entirely, and the run's inactivity deadline pauses with it while one is live: the lane
+reports a paused session as `idle`, so without the records the run reads the wait as the second
+silence and settles the ticket `failed` (#190).
 _Avoid_: idle, stuck, waiting (the words the lane's own status tempts)
 
 **Vanished** — A launched, unsettled child whose lane's live source was read successfully and

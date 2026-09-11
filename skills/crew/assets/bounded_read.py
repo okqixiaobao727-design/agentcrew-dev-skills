@@ -32,9 +32,10 @@ REFERENCE_FILES_BEFORE_ADRS = (
     pathlib.Path("docs/glossary.md"),
 )
 DENIAL_REASON = (
-    "Blocked: the coordinator may read judgment Markdown whole, but checks a source fact only "
-    "at the escalation's pointer against its witness brief. Use Read with an explicit offset "
-    "and a limit of at most 80 lines; searches and shell reads are hunts."
+    "Blocked: the coordinator may read judgment Markdown whole, but reads a source fact only at "
+    "a pointer already on the table — carried by the witness brief, or cited by the escalation. "
+    "Use Read with an explicit offset and a limit of at most 80 lines; searches and shell reads "
+    "are hunts."
 )
 UNPARSEABLE_DETAIL = "The command could not be parsed."
 Invocation = collections.namedtuple(
