@@ -1174,6 +1174,45 @@ class EventTests(MachineLogTestCase):
         self.assertEqual(entry["total_tokens"], 110)
         self.assertEqual(entry["timeline"], timeline)
 
+    def test_a_witness_records_the_plugin_release_it_ran_under(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
+            "--model", "claude-sonnet-5", "--plugin-version", "0.9.21",
+            "--outcome", "checked", "--reason", "",
+            "--brief", "c.py:10 — held — the cited guard is present",
+            "--duration-seconds", "12.5",
+            "--covered-count", "1", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.only_line()["plugin_version"], "0.9.21")
+
+    def test_a_witness_given_an_empty_release_leaves_the_field_off_its_line(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
+            "--model", "claude-sonnet-5", "--plugin-version", "",
+            "--outcome", "checked", "--reason", "",
+            "--brief", "c.py:10 — held — the cited guard is present",
+            "--duration-seconds", "12.5",
+            "--covered-count", "1", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("plugin_version", self.only_line())
+
+    def test_a_witness_naming_no_release_leaves_the_field_off_its_line(self):
+        result = run_cli(
+            "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",
+            "--model", "claude-sonnet-5",
+            "--outcome", "checked", "--reason", "",
+            "--brief", "c.py:10 — held — the cited guard is present",
+            "--duration-seconds", "12.5",
+            "--covered-count", "1", "--uncovered-count", "0", log=self.log,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("plugin_version", self.only_line())
+
     def test_a_partial_witness_records_its_required_coverage_counts(self):
         result = run_cli(
             "witness", "--ticket", "07", "--operation", "check", "--executor", "claude",

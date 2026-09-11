@@ -394,7 +394,7 @@ written; the event shape and the rule that the last line holds are unchanged.
 `ticket`, `operation` (`check` or `ask`), `executor`, `model`, `outcome` (`checked`, `partial`, or
 `failed`), `reason`, `brief`, `duration_seconds`, `covered_count`, `uncovered_count`,
 `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`,
-optional `timeline`.
+optional `timeline`, optional `plugin_version`.
 
 The Witness writes this line itself, on completion of every operation it offers, and no caller
 transcribes those fields: it is the one process that holds them, and the coordinator-initiated
@@ -432,6 +432,14 @@ means observed session output, including tool events and diagnostics, not valida
 The first completed finding is the first usable finding accepted by Witness's existing pointer
 validation. Recording and replay preserve the object verbatim. Older records omit it and replay
 reports `timeline: null`, rather than inventing historical observations.
+
+`plugin_version` is the release of this plugin the operation ran under, read by the Witness after
+any superseding release has taken over, so it names the code that did the checking rather than the
+code the run was launched on (ADR-0031). A run can carry two of them: the line a child pastes names
+the release the Driver started on, and a release installed since supersedes it at the moment the
+line is run. The field is absent where there is no release to name — a run driven from a source
+checkout — and absent on records written before it existed; replay reports `plugin_version: null`
+for both, and the run report counts such checks as `not recorded` rather than dropping them.
 
 ### `base-gate` — whether a fresh run checked its integration base
 
@@ -580,6 +588,7 @@ machine_log.py --log <path> witness --ticket NN --operation check|ask --model ID
                                     --executor claude|codex \
                                     --reason TEXT --brief TEXT --duration-seconds N \
                                     --covered-count N --uncovered-count N \
+                                    [--plugin-version VERSION] \
                                     [--input-tokens N] [--output-tokens N] \
                                     [--cache-read-tokens N] [--cache-creation-tokens N] \
                                     [--total-tokens N]

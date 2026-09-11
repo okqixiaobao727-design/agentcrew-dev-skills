@@ -248,6 +248,38 @@ class QueuedAnchorTests(unittest.TestCase):
 class ReportSelectionTests(unittest.TestCase):
     """Report chronology remains distinct from the projection's non-empty settling fact."""
 
+    def test_a_run_whose_fact_checks_spanned_two_releases_says_so(self):
+        records = (
+            {"event": "witness", "ticket": "7", "plugin_version": "0.9.20"},
+            {"event": "witness", "ticket": "8", "plugin_version": "0.9.21"},
+            {"event": "witness", "ticket": "9", "plugin_version": "0.9.20"},
+        )
+
+        self.assertEqual(driver_module.report_witness_releases(records), "0.9.20, 0.9.21")
+
+    def test_one_release_is_named_once(self):
+        records = (
+            {"event": "witness", "ticket": "7", "plugin_version": "0.9.21"},
+            {"event": "witness", "ticket": "8", "plugin_version": "0.9.21"},
+        )
+
+        self.assertEqual(driver_module.report_witness_releases(records), "0.9.21")
+
+    def test_a_check_from_before_the_field_is_counted_rather_than_dropped(self):
+        records = (
+            {"event": "witness", "ticket": "7"},
+            {"event": "witness", "ticket": "8", "plugin_version": "0.9.21"},
+        )
+
+        self.assertEqual(
+            driver_module.report_witness_releases(records), "not recorded, 0.9.21"
+        )
+
+    def test_a_run_that_fact_checked_nothing_names_no_release(self):
+        records = ({"event": "receipt", "ticket": "7"},)
+
+        self.assertEqual(driver_module.report_witness_releases(records), "")
+
     def test_received_is_the_last_receipt_or_outcome_even_when_its_value_is_empty(self):
         records = (
             {"event": "outcome", "ticket": "7", "outcome": "completed", "ts": "01"},

@@ -23,6 +23,12 @@ python3 <crew-skill-dir>/assets/witness.py check --run <run-dir> --ticket <NN>
 A Codex escalation carries no such line, because the child never sent a message to carry it. Spell
 the same command out from the snapshot's `ticket` and this run's directory.
 
+Run the line as it stands, whatever plugin version it names. It was filled in when the child was
+launched, and the release installed at the moment you run it supersedes that one and does the
+check, so an upgrade mid-run is picked up by the next check on its own. The release each check
+ran under is on its `witness` record and in the run's report. Substituting a path by hand is
+never the fix (#204).
+
 It prints one JSON object, and `brief` is the fact-check: one line per pointer, each `held`,
 `contradicted` or `missing`. `outcome` says how much of the escalation it covered — `checked` is
 every cited pointer, `partial` is some of them with `reason` naming the rest, and `failed` is none

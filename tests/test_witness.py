@@ -6,6 +6,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -539,6 +540,27 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(replay["brief"], document["brief"])
         self.assertEqual(replay["reason"], document["reason"])
         self.assertEqual(replay["covered_count"], 1)
+        self.assertEqual(replay["plugin_version"], event["plugin_version"])
+
+    def test_a_replay_names_the_release_that_did_the_checking(self):
+        recorded = {
+            "event": "witness", "ticket": "7", "outcome": "checked", "brief": "src/a.py:1 — held",
+            "reason": "", "covered_count": 1, "uncovered_count": 0, "duration_seconds": 2.0,
+            "plugin_version": "0.9.20",
+        }
+
+        replay = witness_module.recorded_document(recorded)
+
+        self.assertEqual(replay["plugin_version"], "0.9.20")
+        self.assertTrue(replay["recorded"])
+
+    def test_a_replay_of_a_check_from_before_the_field_names_no_release(self):
+        recorded = {
+            "event": "witness", "ticket": "7", "outcome": "checked", "brief": "src/a.py:1 — held",
+            "reason": "", "covered_count": 1, "uncovered_count": 0, "duration_seconds": 2.0,
+        }
+
+        self.assertIsNone(witness_module.recorded_document(recorded)["plugin_version"])
 
     def test_a_complete_streamed_submission_survives_an_unfinished_message(self):
         record = json.dumps({"witness_finding": {
@@ -1106,6 +1128,22 @@ class WitnessTests(unittest.TestCase):
             return []
         return [json.loads(line) for line in pathlib.Path(log).read_text().splitlines()]
 
+    def test_a_witness_event_names_the_release_the_check_ran_under(self):
+        log = self.root / "log.jsonl"
+        release = witness_module.plugin_release(witness_module.plugin_root(WITNESS))
+        self.assertIsNotNone(release, "this checkout carries a plugin manifest")
+
+        self.run_witness("witness", "--log", str(log), "--ticket", "154")
+
+        self.assertEqual(self.events(log)[0]["plugin_version"], release)
+
+    def test_a_tree_with_no_manifest_names_no_release_to_record(self):
+        loose = self.root / "loose"
+        loose.mkdir()
+
+        self.assertIsNone(witness_module.plugin_root(loose / "witness.py"))
+        self.assertIsNone(witness_module.plugin_release(None))
+
     def test_a_check_records_one_witness_event_carrying_its_brief(self):
         log = self.root / "log.jsonl"
 
@@ -1444,6 +1482,298 @@ class WitnessTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["outcome"], "checked")
+
+
+class WitnessReleaseTests(unittest.TestCase):
+    """Which release of the plugin a carried Witness line runs, and what it is recorded as.
+
+    The line a child pastes into its ASK is filled in at launch and re-pasted unchanged for the
+    rest of the run, so the release it names is the one the Driver started on. These exercise the
+    succession that keeps it current, and the refusals that keep a source checkout and an
+    unreadable registry running the witness that was actually invoked (#204).
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = pathlib.Path(self.temporary.name)
+        self.family = self.root / "cache" / "agentcrew-dev-skills" / "agentcrew-dev-skills"
+        self.family.mkdir(parents=True)
+        self.config_home = self.root / "config"
+        (self.config_home / "plugins").mkdir(parents=True)
+        self.registry = self.config_home / "plugins" / "installed_plugins.json"
+        self.marker = self.root / "handed-over.json"
+
+    def install(self, version):
+        """A copy of this plugin at one version of the cache family; returns its witness."""
+        release = self.family / version
+        shutil.copytree(
+            PLUGIN_ROOT / "skills", release / "skills",
+            ignore=shutil.ignore_patterns("tests", "__pycache__"),
+        )
+        self.manifest(release, version)
+        return release / "skills" / "crew" / "assets" / "witness.py"
+
+    def manifest(self, release, version):
+        directory = release / ".claude-plugin"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "plugin.json").write_text(
+            json.dumps({"name": "agentcrew-dev-skills", "version": version}), encoding="utf-8"
+        )
+
+    def stub_release(self, version):
+        """A release whose witness only records how it was called; returns its witness."""
+        release = self.family / version
+        assets = release / "skills" / "crew" / "assets"
+        assets.mkdir(parents=True)
+        self.manifest(release, version)
+        witness = assets / "witness.py"
+        witness.write_text(
+            "#!{interpreter}\n"
+            "import json, os, sys\n"
+            "record = {{\n"
+            "    'argv': sys.argv[1:],\n"
+            "    'script': sys.argv[0],\n"
+            "    'superseded_by': os.environ.get('AGENTCREW_WITNESS_RELEASE'),\n"
+            "    'stdin': sys.stdin.read(),\n"
+            "}}\n"
+            "open({marker!r}, 'w').write(json.dumps(record))\n"
+            "print(json.dumps({{'outcome': 'checked', 'release': {version!r}}}))\n".format(
+                interpreter=sys.executable, marker=str(self.marker), version=version,
+            ),
+            encoding="utf-8",
+        )
+        return witness
+
+    def record(self, *releases, scope="user"):
+        """Write the plugin registry naming these release directories."""
+        self.registry.write_text(
+            json.dumps({
+                "plugins": {
+                    "agentcrew-dev-skills@agentcrew-dev-skills": [
+                        {
+                            "scope": scope,
+                            "installPath": str(release),
+                            "version": pathlib.Path(release).name,
+                        }
+                        for release in releases
+                    ],
+                },
+            }),
+            encoding="utf-8",
+        )
+
+    def run_release(self, witness, *arguments, stdin=""):
+        environment = dict(os.environ)
+        environment["CLAUDE_CONFIG_DIR"] = str(self.config_home)
+        environment.pop("AGENTCREW_WITNESS_RELEASE", None)
+        return subprocess.run(
+            [sys.executable, str(witness), *arguments],
+            input=stdin, capture_output=True, text=True, env=environment,
+        )
+
+    def superseded(self):
+        return json.loads(self.marker.read_text(encoding="utf-8"))
+
+    def test_a_witness_from_a_superseded_release_runs_the_one_installed_now(self):
+        launched = self.install("0.9.20")
+        current = self.stub_release("0.9.21")
+        self.record(current.parents[3])
+
+        result = self.run_release(
+            launched, "check", "--run", str(self.root / "run"), "--ticket", "305"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["release"], "0.9.21")
+        ran = self.superseded()
+        self.assertEqual(ran["script"], str(current))
+        self.assertEqual(
+            ran["argv"], ["check", "--run", str(self.root / "run"), "--ticket", "305"]
+        )
+
+    def test_the_superseding_release_is_told_so_and_does_not_look_again(self):
+        launched = self.install("0.9.20")
+        current = self.stub_release("0.9.21")
+        self.record(current.parents[3])
+
+        self.run_release(launched, "check", "--run", str(self.root / "run"), "--ticket", "305")
+
+        self.assertEqual(self.superseded()["superseded_by"], str(current.parents[3]))
+
+    def test_the_escalation_on_stdin_survives_the_succession(self):
+        launched = self.install("0.9.20")
+        current = self.stub_release("0.9.21")
+        self.record(current.parents[3])
+
+        self.run_release(
+            launched, "check", "--escalation", "-", "--worktree", str(self.root),
+            "--model", MODEL, "--budget-usd", BUDGET_USD, stdin="CREW ASK 305 design",
+        )
+
+        self.assertEqual(self.superseded()["stdin"], "CREW ASK 305 design")
+
+    def test_the_release_the_registry_still_names_runs_itself(self):
+        launched = self.install("0.9.20")
+        self.stub_release("0.9.21")
+        self.record(launched.parents[3])
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        # Its own argument checking answered, which is the running witness and not the stub.
+        self.assertIn("--ticket", result.stderr)
+
+    def test_a_source_checkout_runs_itself_though_the_registry_names_a_release(self):
+        current = self.stub_release("0.9.21")
+        self.record(current.parents[3])
+
+        result = self.run_release(WITNESS, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_a_registry_that_cannot_be_read_leaves_the_invoked_witness_running(self):
+        launched = self.install("0.9.20")
+        self.stub_release("0.9.21")
+        for content in ("", "{", json.dumps({"plugins": {}}), json.dumps([])):
+            with self.subTest(registry=content or "empty"):
+                self.marker.unlink(missing_ok=True)
+                self.registry.write_text(content, encoding="utf-8")
+
+                result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+                self.assertFalse(self.marker.exists())
+                self.assertIn("--ticket", result.stderr)
+
+    def test_an_absent_registry_leaves_the_invoked_witness_running(self):
+        launched = self.install("0.9.20")
+        self.stub_release("0.9.21")
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_two_releases_named_at_once_are_not_chosen_between(self):
+        launched = self.install("0.9.20")
+        current = self.stub_release("0.9.21")
+        other = self.stub_release("0.9.22")
+        self.record(current.parents[3], other.parents[3])
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_one_release_named_twice_is_not_a_disagreement(self):
+        launched = self.install("0.9.20")
+        current = self.stub_release("0.9.21")
+        self.record(current.parents[3], current.parents[3])
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertEqual(json.loads(result.stdout)["release"], "0.9.21")
+
+    def test_a_named_release_that_is_not_on_disk_does_not_supersede(self):
+        launched = self.install("0.9.20")
+        self.record(self.family / "0.9.99")
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_a_release_outside_this_plugins_family_does_not_supersede(self):
+        launched = self.install("0.9.20")
+        stranger = self.root / "other-plugin" / "1.0.0"
+        (stranger / "skills" / "crew" / "assets").mkdir(parents=True)
+        (stranger / "skills" / "crew" / "assets" / "witness.py").write_text("", encoding="utf-8")
+        self.record(stranger)
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_a_release_whose_witness_cannot_be_read_does_not_supersede(self):
+        launched = self.install("0.9.20")
+        current = self.stub_release("0.9.21")
+        self.record(current.parents[3])
+        # Present, so it would be chosen, and unreadable, so starting it would fail in the new
+        # process — where the coordinator is expecting a brief rather than a read error.
+        current.chmod(0o000)
+        self.addCleanup(current.chmod, 0o644)
+        if os.access(current, os.R_OK):
+            self.skipTest("this user reads a mode-000 file, so the refusal cannot be staged")
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertNotIn("Traceback", result.stderr)
+        # The check this process can still do, which answers with its own argument refusal.
+        self.assertIn("--ticket", result.stderr)
+
+    def test_a_sibling_naming_another_plugin_does_not_supersede(self):
+        launched = self.install("0.9.20")
+        impostor = self.stub_release("0.9.21")
+        # Same family directory, same layout, different plugin: position without identity.
+        self.manifest(impostor.parents[3], "0.9.21")
+        (impostor.parents[3] / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "another-plugin", "version": "0.9.21"}), encoding="utf-8"
+        )
+        self.record(impostor.parents[3])
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_a_sibling_with_no_manifest_does_not_supersede(self):
+        launched = self.install("0.9.20")
+        nameless = self.stub_release("0.9.21")
+        (nameless.parents[3] / ".claude-plugin" / "plugin.json").unlink()
+        self.record(nameless.parents[3])
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_this_release_named_beside_another_is_not_chosen_between(self):
+        launched = self.install("0.9.20")
+        current = self.stub_release("0.9.21")
+        # The running release and one other, which is the two-scope case: no answer to read out.
+        self.record(launched.parents[3], current.parents[3])
+
+        result = self.run_release(launched, "check", "--run", str(self.root / "run"))
+
+        self.assertFalse(self.marker.exists())
+        self.assertIn("--ticket", result.stderr)
+
+    def test_this_release_named_alone_leaves_nothing_to_do(self):
+        launched = self.install("0.9.20")
+        self.stub_release("0.9.21")
+        self.record(launched.parents[3])
+
+        self.assertIsNone(witness_module.superseding_release(launched))
+
+    def test_the_plugin_root_is_found_by_its_manifest_and_its_release_read_from_it(self):
+        launched = self.install("0.9.20")
+
+        root = witness_module.plugin_root(launched)
+
+        self.assertEqual(root, self.family / "0.9.20")
+        self.assertEqual(witness_module.plugin_release(root), "0.9.20")
+
+    def test_a_tree_with_no_manifest_has_no_plugin_root_and_no_release(self):
+        loose = self.root / "loose" / "witness.py"
+        loose.parent.mkdir(parents=True)
+        loose.write_text("", encoding="utf-8")
+
+        self.assertIsNone(witness_module.plugin_root(loose))
+        self.assertIsNone(witness_module.plugin_release(self.root / "loose"))
+
 
 
 if __name__ == "__main__":

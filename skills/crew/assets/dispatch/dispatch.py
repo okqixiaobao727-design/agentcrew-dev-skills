@@ -270,6 +270,13 @@ def witness_command(ticket, log):
     child's turn carries no such instruction at all. The driver-less flow keeps the other half of
     the arrangement instead, where the developer runs the manual line itself and pastes the brief
     under the message before it sends.
+
+    The script it names is this release's, because that is the module rendering the line, and the
+    line is filled in once at launch and re-pasted unchanged for the rest of the run. Which
+    release actually answers it is the Witness's own decision at the moment it is run: a release
+    installed since supersedes it and runs in its place, so an upgrade mid-run is picked up here
+    without this line or the child's message changing (ADR-0031, #204). Both spellings below
+    are served by that one decision, so neither carries a version-independent path of its own.
     """
     if log is None:
         return None

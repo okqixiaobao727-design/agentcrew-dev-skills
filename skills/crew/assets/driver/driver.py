@@ -2483,6 +2483,25 @@ def report_base_gate(records):
     raise DriverError("the machine log carries a contradictory base-gate record")
 
 
+def report_witness_releases(records):
+    """Return the plugin releases this run's fact-checks ran under, or "" where it ran none.
+
+    A Witness line is filled into a child's first turn at launch and re-pasted unchanged, but a
+    release installed since supersedes the one it names and runs the check in its place, so an
+    upgrade mid-run is picked up and a run can span two releases (ADR-0031). Rendered in the
+    order they first appear, with the checks of a release too old to record one counted as
+    `not recorded` rather than dropped (#204).
+    """
+    seen = []
+    for record in records:
+        if record.get("event") != "witness":
+            continue
+        release = record.get("plugin_version") or "not recorded"
+        if release not in seen:
+            seen.append(release)
+    return ", ".join(seen)
+
+
 def render_report(run, tickets, records, cost_output):
     """Render the complete human report from the table, machine log and cost-pass output."""
     ticket_ids = sorted(tickets, key=report_ticket_sort_key)
@@ -2507,6 +2526,10 @@ def render_report(run, tickets, records, cost_output):
         )
 
     lines += ["", "## Base gate", "", f"- Base gate: {report_base_gate(records)}"]
+
+    releases = report_witness_releases(records)
+    if releases:
+        lines += ["", "## Fact-check releases", "", f"- Witness ran under: {releases}"]
 
     lines += ["", "## Parked checklists", ""]
     parked = [ticket for ticket in ticket_ids if outcomes[ticket] == PARKED]

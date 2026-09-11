@@ -7,6 +7,35 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- The Witness answers on the release installed when it runs, not the one the run was launched on
+  (ADR-0031). The line an escalation ends on is composed into the child's first turn at launch and
+  re-pasted unchanged for the rest of the run, so it names a script inside one version directory of
+  the plugin tree; an operator who upgraded mid-run and ran `/reload-plugins` went on getting the
+  old release's fact-check, and `references/triage.md` — "copy it out of the message and run it"
+  — is what kept it that way. In the run that reported this, the coordinator substituted the path
+  by hand for seven checks after the operator said so in chat. The Witness now finds its own
+  plugin tree by the manifest that names it, reads the harness's registry of installed plugins
+  under this process's configuration home, and runs the release named there in its own place
+  before it parses its arguments, so the release that changed them is the release that reads them.
+  A candidate is a release of this plugin: a version directory among the running tree's siblings
+  whose own manifest names the same plugin. A source checkout is in no such family, which is why
+  this repository's own runs and suites keep running the code that was actually invoked. Every
+  other case leaves the invoked Witness running rather than failing: an absent, unreadable or
+  unexpected registry, a named release that is not on disk or cannot be read, and a registry
+  naming two releases of this plugin at once, which are not chosen between. Both spellings of the
+  line, the one a child carries and the driver-less one a developer runs, are served by that one
+  decision. This takes effect for runs launched on a release carrying it: the line a run launched
+  on an older release names that release's Witness, which has no such decision to make (#204).
+- Every `witness` event records `plugin_version`, the release the fact-check ran under, read after
+  any succession so it names the code that did the checking; a replayed brief names the release
+  that produced it rather than the one reading it back. The run report gains a **Fact-check
+  releases** line naming the releases a run's checks ran under, so a run that spanned two of them
+  says so; checks recorded before this field existed are counted as `not recorded` rather than
+  dropped. The field is absent rather than empty where there is no release to name, and the
+  Machine log's command-line adapter takes `--plugin-version` so both writers can express it
+  (ADR-0030, #204).
+
 ## [0.9.21] - 2026-09-08
 
 ### Fixed

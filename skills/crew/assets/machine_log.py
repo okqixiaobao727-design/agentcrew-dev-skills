@@ -1764,15 +1764,23 @@ def witness_problem(fields):
 
 def witness_fields(
     ticket, operation, executor, model, outcome, reason, brief, duration_seconds,
-    covered_count, uncovered_count, counters=None, timeline=None,
+    covered_count, uncovered_count, counters=None, timeline=None, plugin_version=None,
 ):
-    """The witness event's fields, in the order the record writes them."""
+    """The witness event's fields, in the order the record writes them.
+
+    `plugin_version` is the release of this plugin the fact-check ran under. It is optional
+    because a run driven from a source checkout has no release to name, and absent rather than
+    empty because a reader must be able to tell "not recorded" from "recorded as nothing" — a run
+    from before the field existed says nothing here either. An empty one is therefore the same
+    answer as none, and is written the same way: left off (#204).
+    """
     counters = counters or {}
     fields = {
         "ticket": ticket,
         "operation": operation,
         "executor": executor,
         "model": model,
+        "plugin_version": plugin_version or None,
         "outcome": outcome,
         "reason": reason,
         "brief": brief,
@@ -1788,7 +1796,7 @@ def witness_fields(
 
 
 def record_witness(log, *, ticket, operation, executor, model, outcome, reason, brief,
-                   duration_seconds, covered_count, uncovered_count,
+                   duration_seconds, covered_count, uncovered_count, plugin_version=None,
                    input_tokens=None, output_tokens=None, cache_read_tokens=None,
                    cache_creation_tokens=None, total_tokens=None, timeline=None):
     """Append one `witness`: one fact-check of an escalation; returns nothing.
@@ -1801,6 +1809,7 @@ def record_witness(log, *, ticket, operation, executor, model, outcome, reason, 
         ticket, operation, executor, model, outcome, reason, brief, duration_seconds,
         covered_count, uncovered_count,
         timeline=timeline,
+        plugin_version=plugin_version,
         counters={
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -1931,6 +1940,9 @@ def build_parser():
     witness.add_argument("--operation", required=True, choices=WITNESS_OPERATIONS)
     witness.add_argument("--executor", required=True, choices=EXECUTORS)
     witness.add_argument("--model", required=True, help="the full model ID, never an alias")
+    witness.add_argument(
+        "--plugin-version", help="the release of this plugin the fact-check ran under"
+    )
     witness.add_argument("--outcome", required=True, choices=WITNESS_OUTCOMES)
     witness.add_argument("--reason", required=True)
     witness.add_argument("--brief", required=True, help="what the operation found, as recorded")

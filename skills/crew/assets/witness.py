@@ -2,6 +2,7 @@
 """Run one fresh, budget-capped Witness operation with a non-mutating assignment."""
 
 import argparse
+import collections
 import json
 import os
 import pathlib
@@ -24,6 +25,13 @@ CLAUDE = "claude"
 HEADLESS_FLAG = "--print"
 BUDGET_FLAG = "--max-budget-usd"
 ACTIVE_ENV = "AGENTCREW_WITNESS_ACTIVE"
+# The superseding release this process was replaced by, set as it is run so it happens once (#204).
+RELEASE_ENV = "AGENTCREW_WITNESS_RELEASE"
+# A plugin tree names itself here, which is what makes one findable from a file inside it.
+PLUGIN_MANIFEST = (".claude-plugin", "plugin.json")
+# Where the harness records which release of each plugin is installed now, under the
+# configuration home this process belongs to. Machine-level, so `CLAUDE_CONFIG_DIR` moves it.
+PLUGIN_REGISTRY = ("plugins", "installed_plugins.json")
 # A path part starts with a letter, underscore, dot, tilde, or slash; contains at
 # least one ASCII letter; and is not a bare version/number token matching
 # v?[0-9]+([.-][0-9]+)*. ASCII boundary classes deliberately let a pointer touch CJK prose.
@@ -96,6 +104,189 @@ ASK_SCHEMA = {
     "additionalProperties": False,
 }
 WAVE_TABLE = "wave-table.json"
+
+
+# --- which release answers the line -----------------------------------------------------------
+
+# Both halves are carried because they answer different questions: the release is what a check
+# records itself as having run under, and the Witness is what this process runs in its own place.
+Superseding = collections.namedtuple("Superseding", ("release", "witness"))
+
+
+def plugin_root(path):
+    """Return the plugin tree holding `path`, found by the manifest that names it, or None.
+
+    Walked up to rather than counted down from, so the answer does not depend on where inside a
+    tree the caller sits, and a file outside any plugin honestly has no root.
+    """
+    for directory in pathlib.Path(path).resolve().parents:
+        if directory.joinpath(*PLUGIN_MANIFEST).is_file():
+            return directory
+    return None
+
+
+def plugin_manifest(root):
+    """Return the manifest the plugin tree at `root` names itself in, or None where there is none.
+
+    None covers every way of not having one — no tree, no file, or a file this cannot parse —
+    because each leaves the caller with the same nothing to identify a tree by.
+    """
+    if root is None:
+        return None
+    try:
+        manifest = json.loads(
+            pathlib.Path(root).joinpath(*PLUGIN_MANIFEST).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def declared(manifest, key):
+    """Return the non-empty string `manifest` declares under `key`, or None where it has none."""
+    value = (manifest or {}).get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def plugin_release(root):
+    """Return the version the manifest at `root` declares, or None where it declares none.
+
+    None is a fact about the record, not a failure: a tree with no manifest — a checkout under
+    test, a copy made by hand — has no release to attribute its fact-check to, and an absent
+    field says so where an invented one would not.
+    """
+    return declared(plugin_manifest(root), "version")
+
+
+def plugin_name(root):
+    """Return the plugin the manifest at `root` names, or None where it names none.
+
+    This is the identity a superseding release must share. A directory is not identity: it says
+    where a tree was put, and this says what was put there.
+    """
+    return declared(plugin_manifest(root), "name")
+
+
+def plugin_registry():
+    """Return where the harness records the release of each plugin installed now.
+
+    Under the configuration home this process belongs to, because a plugin is installed into one
+    home and `CLAUDE_CONFIG_DIR` is what moves a process between them.
+    """
+    home = os.environ.get(accounts.CONFIG_HOME_VARIABLE)
+    base = pathlib.Path(home) if home else pathlib.Path.home() / accounts.CONFIG_HOME
+    return base.joinpath(*PLUGIN_REGISTRY)
+
+
+def installed_releases(registry):
+    """Return every install path the registry records, in the order it records them.
+
+    Every plugin's, because the registry is one file for all of them and the entry shape carries
+    no identity this can filter on that the tree itself does not state better. Which of them are
+    this plugin's is settled where a candidate is judged, against the manifest each one carries.
+
+    A registry that is absent, unreadable or not the shape this reads returns nothing, which the
+    caller treats as "nothing supersedes what is running" rather than as an error. The fact-check
+    is the thing being protected here: it runs on a slightly old release far more usefully than
+    it fails on a file this process does not own.
+    """
+    try:
+        document = json.loads(pathlib.Path(registry).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    plugins = document.get("plugins") if isinstance(document, dict) else None
+    if not isinstance(plugins, dict):
+        return []
+    return [
+        entry["installPath"]
+        for entries in plugins.values() if isinstance(entries, list)
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("installPath"), str)
+        and entry["installPath"]
+    ]
+
+
+def superseding_release(script):
+    """Return the release installed in place of the one running `script`, or None where none is.
+
+    The line a child pastes into its ASK is filled in at launch and re-pasted unchanged for the
+    rest of the run, so it names the release the Driver started on. An operator who upgrades the
+    plugin mid-run and reloads it expects the next fact-check to be the upgraded one; before this,
+    every later check went on running the release the run began with, and nothing recorded that
+    it had (#204).
+
+    A candidate is a release of *this* plugin: a version directory among this tree's siblings
+    whose own manifest names the plugin this tree's manifest names. The directory alone would be
+    close enough in practice and is still not identity — it says where a tree was put — so both
+    are required, and a source checkout, which is in no family, matches nothing either way. That
+    is what keeps this repository's own runs and suites on the code that was actually invoked.
+
+    A candidate must also carry a Witness this process can read, because what replaces this one is
+    the interpreter and not the script: an unreadable Witness would be chosen, started, and fail
+    in the new process with a read error where the coordinator expects a brief. Tested for here,
+    it is simply not chosen, and this process does the check.
+
+    The release running is a candidate like any other, which is what makes "one candidate" the
+    whole rule. A registry naming only this release leaves it as the single candidate and nothing
+    to do; a registry naming a second — the same plugin installed at two scopes — is one this
+    cannot read an answer out of, and nothing is chosen between them. Excluding this release
+    first would have turned that second case into a silent move onto whichever other release was
+    listed, which is the one thing an operator has not asked for.
+    """
+    script = pathlib.Path(script).resolve()
+    root = plugin_root(script)
+    name = plugin_name(root)
+    if root is None or name is None:
+        return None
+    relative = script.relative_to(root)
+    candidates = {
+        release for path in installed_releases(plugin_registry())
+        for release in [pathlib.Path(path).resolve()]
+        if release.parent == root.parent
+        and plugin_name(release) == name
+        and release.joinpath(relative).is_file()
+        and os.access(release.joinpath(relative), os.R_OK)
+    }
+    if len(candidates) != 1:
+        return None
+    release = candidates.pop()
+    if release == root:
+        return None
+    return Superseding(release, release.joinpath(relative))
+
+
+def run_superseding_release(argv):
+    """Run the installed release's Witness in this process's place, or return to run this one.
+
+    Not the coordinator's hand-over of a run and not the Driver's hand-over of an escalation:
+    this process is replaced by the same operation on newer code, and nothing about the run
+    changes hands. It is the first thing the command does, before its arguments are read, so a
+    release that changed them is the release that parses them. It happens once — the release run
+    is named in the environment, and a process that finds it there is already the answer.
+
+    A replacement the operating system refuses to start leaves this process running, with one line
+    on stderr. Every other refusal here is silent because nothing went wrong; this one did, and the
+    operator reading a brief from an older release than they installed is owed the reason. What it
+    is not is fatal: the coordinator is waiting on a fact-check, and the check this process can
+    still do serves the ruling better than a traceback where its JSON should be. The reachable
+    shape of "cannot be started" — a Witness this process cannot read — is settled earlier,
+    where the release is chosen.
+    """
+    if os.environ.get(RELEASE_ENV):
+        return
+    superseding = superseding_release(__file__)
+    if superseding is None:
+        return
+    os.environ[RELEASE_ENV] = str(superseding.release)
+    try:
+        os.execv(sys.executable, [sys.executable, str(superseding.witness), *argv])
+    except OSError as error:
+        del os.environ[RELEASE_ENV]
+        print(
+            f"witness: {superseding.release} is installed but could not be started"
+            f" ({error}); this check runs on {plugin_root(__file__)}",
+            file=sys.stderr,
+        )
 
 
 class Pointer(str):
@@ -685,6 +876,10 @@ def record(document, log, ticket, operation, model):
     normally. A log that could not be written is a failure of the record and not of the operation:
     the document stands, and carries `record_error` so the failure is visible to a caller reading
     the document, whether that is the Driver or the coordinator itself.
+
+    The release is this process's own, read after any superseding one has taken over, so it names
+    the code that did the checking rather than the code the run was launched on. A run may now
+    span two releases, and this is what makes that visible afterwards (#204).
     """
     if log is None or not ticket or not model:
         return document
@@ -695,6 +890,7 @@ def record(document, log, ticket, operation, model):
             operation=operation,
             executor=run_plan.WITNESS_EXECUTOR,
             model=model,
+            plugin_version=plugin_release(plugin_root(__file__)),
             outcome=document["outcome"],
             reason=document.get("reason", ""),
             brief=document.get("brief", ""),
@@ -721,6 +917,10 @@ def recorded_document(event):
     The token counters are deliberately left out. They were counted when the session ran and are
     already in the run's cost rollup; printing them again beside a replay is an invitation to add
     them twice.
+
+    The release is the one that did the checking, not the one replaying it. A replay after an
+    upgrade is read by a newer release than the brief was written by, and the fact worth having is
+    which code produced the brief (#204).
     """
     return {
         "brief": event.get("brief") or "",
@@ -729,6 +929,7 @@ def recorded_document(event):
         "covered_count": event.get("covered_count"),
         "uncovered_count": event.get("uncovered_count"),
         "duration_seconds": event.get("duration_seconds"),
+        "plugin_version": event.get("plugin_version"),
         "timeline": dict(event["timeline"]) if event.get("timeline") is not None else None,
         "recorded": True,
     }
@@ -978,6 +1179,9 @@ def main(argv=None):
             time.monotonic(), coverage=(0, 0),
         )))
         return 0
+    # After the nesting refusal, which is this process's own answer and needs no other release,
+    # and before the arguments are read.
+    run_superseding_release(sys.argv[1:] if argv is None else list(argv))
     args = parse_args(argv)
     if args.operation == "check":
         problem = check_form_problem(args)
