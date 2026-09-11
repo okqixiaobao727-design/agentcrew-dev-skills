@@ -43,6 +43,16 @@ REVIEW_LANE_MATRIX = (
     ("codex", "claude"),
     ("codex", "codex"),
 )
+REVIEW_AXIS_COUNTERS = (
+    "REVIEW_INPUT_TOKENS", "REVIEW_OUTPUT_TOKENS",
+    "REVIEW_CACHE_READ_TOKENS", "REVIEW_CACHE_CREATION_TOKENS",
+)
+# Every fact Review-Switch sets at the axis-end point, which is what a test fires a hook with and
+# therefore what it scrubs first.
+REVIEW_AXIS_END_VARS = (
+    "REVIEW_AXIS", "REVIEW_STATUS", "REVIEW_SESSION", "REVIEW_REPORT_FILE", "REVIEW_MODEL",
+    "REVIEW_COST_DETAIL", *REVIEW_AXIS_COUNTERS,
+)
 WITNESS_MODEL = "claude-sonnet-5"
 WITNESS_BUDGET_USD = 2.5
 WITNESS_TIMEOUT_SECONDS = 420
@@ -84,6 +94,29 @@ def review_command_argv(prompt):
         if not continued:
             break
     return shlex.split(" ".join(command))
+
+
+def install_run_log_writer(log):
+    """The run's own copy of the machine-log writer, put beside the log its hooks name it by."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    return shutil.copy2(DISPATCH.parents[1] / "machine_log.py", log.parent / "machine_log.py")
+
+
+def fire_hook(command, **facts):
+    """The finished `sh -c` run of one rendered Lifecycle Hook, given this axis's facts.
+
+    One way for every test that runs a hook, so the two kinds — what the hook logs, and what it
+    leaves in the run directory — cannot drift into disagreeing about how Review-Switch runs one.
+    Every fact a point sets is scrubbed before the caller's own go in: an axis is described by
+    what it is handed and never by what the environment this suite runs in happens to carry.
+    """
+    environment = dict(os.environ)
+    for name in REVIEW_AXIS_END_VARS:
+        environment.pop(name, None)
+    environment.update(facts)
+    return subprocess.run(
+        ["sh", "-c", command], capture_output=True, text=True, env=environment
+    )
 
 
 def run_git(repo, *args):
@@ -993,25 +1026,12 @@ class ReviewEventRenderTests(DispatchTestCase):
         ]
 
     def run_axis_end_hook(self, **facts):
-        """Run the rendered hook and return the one session-cost event it appends."""
-        self.machine_log.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(
-            DISPATCH.parents[1] / "machine_log.py",
-            self.machine_log.parent / "machine_log.py",
-        )
+        """Return the one session-cost event the rendered axis-end hook appends."""
+        install_run_log_writer(self.machine_log)
         command = self.hook_command(
             self.prompt_for("--log", str(self.machine_log)), "--on-axis-end"
         )
-        environment = dict(os.environ)
-        for name in (
-            "REVIEW_COST_DETAIL", "REVIEW_INPUT_TOKENS", "REVIEW_OUTPUT_TOKENS",
-            "REVIEW_CACHE_READ_TOKENS", "REVIEW_CACHE_CREATION_TOKENS",
-        ):
-            environment.pop(name, None)
-        environment.update(facts)
-        result = subprocess.run(
-            ["sh", "-c", command], capture_output=True, text=True, env=environment
-        )
+        result = fire_hook(command, **facts)
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = self.machine_log.read_text().splitlines()
         self.assertEqual(len(lines), 1, lines)
@@ -1112,6 +1132,200 @@ class ReviewEventRenderTests(DispatchTestCase):
 
         for flag in ("--on-review-start", "--on-axis-end", "--on-review-end"):
             self.assertNotIn(flag, argv)
+
+
+class ReviewReportCopyTests(DispatchTestCase):
+    """A review's own report reaches the Run it belongs to, where the Coordinator reads it.
+
+    Review-Switch keeps each axis's report under a machine-global state directory of its own and
+    hands the axis-end hook the path. Nothing in the Run recorded what a review found, so a
+    Coordinator ruling on a finding the child declined had only the child's transcription of the
+    verdict to rule from (#203). The hook now keeps the report's own text at the Run's top level,
+    which is where the Coordinator's file rule already lets it read Markdown whole. Nothing here
+    reads that text: the Machine log carries exactly the event it carried before.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A dispatched run's own shape: the log inside the state directory, whose parent is the
+        # Run's top level — the directory the Driver writes `report.md` to and the one the
+        # Coordinator's bounded-read rule admits Markdown from.
+        self.run_dir = self.fixture.feature_dir
+        self.machine_log = self.run_dir / ".crew" / "log.jsonl"
+        install_run_log_writer(self.machine_log)
+
+    def axis_end_hook_for(self, ticket_id):
+        """The rendered axis-end hook command of one reviewed ticket on this run."""
+        table = self.fixture.table([self.fixture.ticket(ticket_id, "reviewed")])
+        result = self.fixture.run_dispatch(
+            "render", table, extra=("--log", str(self.machine_log))
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = review_command_argv(self.fixture.turn(ticket_id))
+        return argv[argv.index("--on-axis-end") + 1]
+
+    def write_source_report(self, name, text):
+        """The path of one axis's own report, written where Review-Switch keeps it.
+
+        Outside the run entirely, which is the whole reason the run needs a copy of its own.
+        """
+        path = self.fixture.root / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def end_axis(self, command, axis, report, **facts):
+        """The finished run of one axis-end hook, ending the named axis on the named report."""
+        return fire_hook(
+            command,
+            **{name: "1" for name in REVIEW_AXIS_COUNTERS},
+            REVIEW_AXIS=axis,
+            REVIEW_REPORT_FILE=str(report),
+            REVIEW_MODEL=CODEX_MODEL,
+            REVIEW_SESSION="",
+            **facts,
+        )
+
+    def path_with_failing_copy(self):
+        """A PATH whose `cp` writes part of the report and then fails, as a full disk would.
+
+        The real `cp` opens its source before it creates anything, so an unreadable report never
+        reaches the case worth testing: a copy that failed with the destination already on disk.
+        """
+        directory = self.fixture.root / "failing-cp"
+        directory.mkdir()
+        stub = directory / "cp"
+        stub.write_text('#!/bin/sh\nprintf "half a rep" > "$2"\nexit 1\n')
+        stub.chmod(0o755)
+        return f"{directory}{os.pathsep}{os.environ['PATH']}"
+
+    def copied_report_names(self):
+        """The name of every report copy now at the Run's top level, in sorted order."""
+        return sorted(path.name for path in self.run_dir.glob("review-*.md"))
+
+    def run_directory_names(self):
+        """The name of everything at the Run's top level, copies and residue alike."""
+        return sorted(path.name for path in self.run_dir.iterdir())
+
+    def machine_log_events(self):
+        """Every event the Machine log holds, in the order it was appended."""
+        return [json.loads(line) for line in self.machine_log.read_text().splitlines()]
+
+    def test_the_axis_end_hook_keeps_the_reports_text_at_the_runs_top_level(self):
+        text = "# Spec axis\n\n0 findings. Next: commit.\n"
+        report = self.write_source_report("axis-report.md", text)
+
+        result = self.end_axis(self.axis_end_hook_for("06"), "spec", report)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copy = self.run_dir / "review-06-spec.md"
+        self.assertEqual(copy.read_text(encoding="utf-8"), text)
+
+    def test_the_copy_is_the_reports_own_bytes_and_not_a_rendering_of_them(self):
+        text = "Standards axis — 1 finding, « fix and stop », and no trailing newline"
+        report = self.write_source_report("axis-report.md", text)
+
+        self.end_axis(self.axis_end_hook_for("06"), "standards", report)
+
+        self.assertEqual(
+            (self.run_dir / "review-06-standards.md").read_bytes(), text.encode("utf-8")
+        )
+
+    def test_each_axis_and_each_ticket_lands_a_file_of_its_own(self):
+        spec = self.write_source_report("spec-report.md", "spec axis\n")
+        standards = self.write_source_report("standards-report.md", "standards axis\n")
+        six = self.axis_end_hook_for("06")
+
+        self.end_axis(six, "spec", spec)
+        self.end_axis(six, "standards", standards)
+        self.end_axis(self.axis_end_hook_for("07"), "spec", spec)
+
+        self.assertEqual(
+            self.copied_report_names(),
+            ["review-06-spec.md", "review-06-standards.md", "review-07-spec.md"],
+        )
+
+    def test_a_re_review_of_one_axis_keeps_the_round_before_it(self):
+        command = self.axis_end_hook_for("06")
+        rounds = ("round one\n", "round two\n", "round three\n")
+
+        for number, text in enumerate(rounds, 1):
+            self.end_axis(command, "spec", self.write_source_report(f"round-{number}.md", text))
+
+        self.assertEqual(
+            self.copied_report_names(),
+            ["review-06-spec-2.md", "review-06-spec-3.md", "review-06-spec.md"],
+        )
+        for name, text in zip(
+            ("review-06-spec.md", "review-06-spec-2.md", "review-06-spec-3.md"),
+            rounds,
+            strict=True,
+        ):
+            self.assertEqual((self.run_dir / name).read_text(encoding="utf-8"), text)
+
+    def test_an_axis_that_produced_no_report_copies_nothing_and_succeeds(self):
+        result = self.end_axis(self.axis_end_hook_for("06"), "spec", "")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.copied_report_names(), [])
+        self.assertEqual([event["event"] for event in self.machine_log_events()], ["session-cost"])
+
+    def test_a_report_named_but_not_on_disk_is_the_same_as_no_report(self):
+        result = self.end_axis(self.axis_end_hook_for("06"), "spec", self.fixture.root / "gone.md")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.copied_report_names(), [])
+        self.assertEqual([event["event"] for event in self.machine_log_events()], ["session-cost"])
+
+    def test_a_copy_that_fails_half_written_publishes_nothing_and_leaves_no_residue(self):
+        """A half-written report is one the coordinator cannot tell from a whole one.
+
+        The copy goes to a temporary beside the name it will take and is published by renaming it,
+        so a copy that died with bytes already on disk — a full disk, an I/O error, a killed
+        process — leaves the run's top level exactly as it found it rather than a truncated report
+        the coordinator would rule from.
+        """
+        report = self.write_source_report("axis-report.md", "spec axis: 2 findings\n")
+        command = self.axis_end_hook_for("06")
+        before = self.run_directory_names()
+
+        result = self.end_axis(
+            command, "spec", report, PATH=self.path_with_failing_copy()
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_directory_names(), before)
+        self.assertEqual(
+            [event["event"] for event in self.machine_log_events()], ["session-cost"]
+        )
+
+    def test_a_copy_that_cannot_be_written_leaves_the_cost_event_and_status_alone(self):
+        report = self.write_source_report("axis-report.md", "spec axis\n")
+        command = self.axis_end_hook_for("06")
+        mode = self.run_dir.stat().st_mode
+        self.run_dir.chmod(0o500)
+        self.addCleanup(self.run_dir.chmod, mode)
+
+        result = self.end_axis(command, "spec", report)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.copied_report_names(), [])
+        self.assertEqual([event["event"] for event in self.machine_log_events()], ["session-cost"])
+
+    def test_a_report_adds_no_field_to_the_axis_cost_event(self):
+        command = self.axis_end_hook_for("06")
+        report = self.write_source_report("axis-report.md", "spec axis: 2 findings\n")
+
+        self.end_axis(command, "spec", "")
+        self.end_axis(command, "spec", report)
+
+        without, carried = self.machine_log_events()
+        self.assertEqual(sorted(carried), sorted(without))
+
+    def test_the_rendered_hook_names_the_runs_top_level_and_the_axis_it_is_handed(self):
+        command = self.axis_end_hook_for("06")
+
+        self.assertIn(f'{self.run_dir}/review-06-"$REVIEW_AXIS"', command)
+        self.assertNotIn("<", command)
 
 
 class ReviewAccountTests(ReviewEventRenderTests):

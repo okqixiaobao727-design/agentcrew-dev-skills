@@ -350,7 +350,29 @@ python3 <machine log script>
   --log <machine log path> review
   --ticket <NN> --lane <review lane> --state running
 '''
+# Review-Switch fires one command per lifecycle point, so this one both keeps the axis's own
+# report and records what the axis spent. The report comes first. Review-Switch writes each report
+# under a state directory of its own and names it here, so without this copy a coordinator ruling
+# on a declined finding has only the child's transcription of the verdict (#203). The copy is
+# published by renaming a temporary file beside it, because a half-written `.md` at the run's top
+# level is a report the coordinator cannot tell from a whole one; the temporary carries this
+# shell's pid and no `.md`, so nothing reads it while it is being written and nothing survives a
+# copy that failed. A round landing on a name already taken takes the next number rather than the
+# round before it. The cost write stays last, so the hook's exit status is the one it has always
+# been and a report that cannot be copied changes nothing.
 on-axis-end = '''
+if [ -n "$REVIEW_REPORT_FILE" ]; then
+  report_stem=<run directory>/review-<NN>-"$REVIEW_AXIS";
+  report_copy="$report_stem.md";
+  report_round=2;
+  while [ -e "$report_copy" ]; do
+    report_copy="$report_stem-$report_round.md";
+    report_round=$((report_round + 1));
+  done;
+  report_part="$report_stem.$$.part";
+  cp "$REVIEW_REPORT_FILE" "$report_part" && mv "$report_part" "$report_copy";
+  rm -f "$report_part";
+fi;
 set -- python3 <machine log script>
   --log <machine log path> session-cost
   --ticket <NN> --executor <review vendor> --model "$REVIEW_MODEL"

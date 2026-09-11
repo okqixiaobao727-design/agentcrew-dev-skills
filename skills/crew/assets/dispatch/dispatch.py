@@ -389,6 +389,17 @@ def run_log_script(log):
     return str(pathlib.Path(log).parent / MACHINE_LOG.name)
 
 
+def run_top_level(log):
+    """The run's top level: the directory the state directory holding this log sits in.
+
+    Where a hook leaves something for the coordinator to read. The coordinator's file rule admits
+    Markdown at the run's top level and says nothing about the state directory below it, and the
+    driver writes the run's own report there for that same reason. Read off the log, which is the
+    one path a rendered hook is given and the path the Witness line beside it names its run by.
+    """
+    return str(pathlib.Path(log).parent.parent)
+
+
 def review_hook_flags(templates, ticket, log):
     """Return this run's lifecycle-hook arguments for Review-Switch.
 
@@ -402,6 +413,7 @@ def review_hook_flags(templates, ticket, log):
     values = {
         "<machine log script>": shlex.quote(run_log_script(log)),
         "<machine log path>": shlex.quote(str(log)),
+        "<run directory>": shlex.quote(run_top_level(log)),
         "<NN>": shlex.quote(ticket.id),
         "<review vendor>": shlex.quote(review.vendor),
         "<review lane>": shlex.quote(f"{review.vendor} {review.model}"),
