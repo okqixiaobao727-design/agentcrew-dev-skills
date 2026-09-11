@@ -303,27 +303,40 @@ public interface that the child cannot make alone, most often before its first e
 phase's decision points travel as one `design` escalation, the child's own pick marked on each.
 
 **Witness brief** — A pointer-backed, fact-only result from one fresh, budget-capped Witness
-session with a read-only assignment. An escalation `check` receives the normalised cited-pointer
-list as exact, numbered input and marks each covered pointer held, contradicted or missing in
-`pointers`; `uncited`
-holds important evidence omitted from the escalation but relevant to the authoritative ticket's
-acceptance criteria and current ruling. `checked` carries all findings and no reason; `partial`
-carries usable completed findings plus a reason naming each unfinished or structurally rejected
-expected pointer, including the timeout reason when interrupted. Repeated and out-of-order expected
-pointers stay out of the brief, while extra cited pointers become uncited findings. `failed` carries
-no brief and is not an error: the coordinator rules without one. The coordinator launches `check`
-once, before it rules, on the fixed command line the escalation carries (#194); in a run without a
-driver the checking session is launched by hand with the escalation on its stdin. An `ask` is
-coordinator-initiated and returns
-independently stated factual claims, each with at least one pointer. Both operations carry no
-recommendation or ruling, and both record their own Machine-log `witness` event with the brief in
-it, so a later reader takes the finding from the log rather than paying for a second session. The
-session is bounded by the run's `[witness] timeout_seconds`. It retains completed findings during
-execution and records its observed timeline, so failure with no usable findings does not imply
-inactivity. Witness follows the subject project's authority for references, reads existing test
-records without executing tests, and treats carried commands as source material. A change made to
-the worktree it reads — by the child still working in it — is never that session's failure.
-_Avoid_: research, verification
+session with a read-only assignment. It is one list of entries, each a pointer and what that
+pointer `says`: the source text itself, quoted rather than characterised. A pointer that resolves
+to nothing has an empty `says`. There is no verdict field, no reason prose and no cited/uncited
+split — the Witness carries evidence and the coordinator judges it
+([ADR-0031](adr/0031-the-witness-carries-evidence-the-coordinator-judges.md)). `check` receives the
+normalised cited-pointer list as exact, numbered input and returns one entry per pointer in that
+order, followed by its one-hop entries; an `ask` is coordinator-initiated and answers in the same
+shape, by returning the pointers that answer it — which pointers come back *is* the answer. Both
+operations carry no recommendation or ruling.
+
+**One hop** is the whole of what a brief gathers beyond the citations: where a cited symbol is
+defined, how a concept the ticket names is defined in the subject project's own authority, and the
+rest of the definition a cited line sits in. No survey of the repository, and no search for what
+the escalation should have mentioned. **The quotation** is the innermost enclosing definition — the
+method, not the class around it — quoted whole, and cut to 80 lines around the pointer where it
+runs longer. That is the same 80 the Bounded read allows, so no single pointer hands the
+coordinator more than it could have fetched itself, and a quotation of exactly 80 lines is itself
+the sign that there is more.
+
+`checked` carries all entries and no reason; `partial` carries usable completed entries plus a
+reason naming each unfinished or structurally rejected expected pointer, including the timeout
+reason when interrupted. Repeated and out-of-order expected pointers stay out of the brief.
+`failed` carries no brief and is not an error, but it is an empty table: the coordinator sends one
+`ask` before it rules, and rules without a brief only where that returns nothing either. The
+coordinator launches `check` once, before it rules, on the fixed command line the escalation
+carries (#194); in a run without a driver the checking session is launched by hand with the
+escalation on its stdin. Both operations record their own Machine-log `witness` event with the
+brief in it, so a later reader takes it from the log rather than paying for a second session. The
+session is bounded by the run's `[witness] timeout_seconds`. It retains completed entries during
+execution and records its observed timeline, so failure with no usable entries does not imply
+inactivity. Witness follows the subject project's authority for references, executes no tests, and
+treats carried commands as source material. A change made to the worktree it reads — by the child
+still working in it — is never that session's failure.
+_Avoid_: research, verification, fact-check (it checks nothing; it fetches)
 
 **Wrap-up** — The `wrap-up` escalation a child sends when its ticket is complete and leftovers
 remain: one line per leftover — what it is and its pointer, at the cause where the child knows it
@@ -369,9 +382,12 @@ _Avoid_: follow-up ticket, re-run, second run
 Markdown is read whole: top-level Markdown in the current staged run; repository ADRs, the
 glossary, `CONTEXT.md`, `references/trackers.md` and `docs/agents/*.md`; and the Crew `SKILL.md`
 and its Markdown references. Physical locations decide membership (ADR-0007). Code, tests and git
-are facts: one source pointer may be read with an explicit offset and at most 80 lines to settle
-what an escalation and its witness brief state differently, or to see a pointer the brief marks
-missing. `Grep`, `Glob` and shell file reads are a **hunt**, and the hook refuses them.
+are facts: any pointer already on the table — carried by the witness brief, or cited by the
+escalation — may be read with an explicit offset and at most 80 lines, as often as the ruling
+needs, and nothing off the table may be read at all. What bounds the coordinator is reach rather
+than count, and what bounds the table is the Witness's one hop
+([ADR-0031](adr/0031-the-witness-carries-evidence-the-coordinator-judges.md)). `Grep`, `Glob` and
+shell file reads are a **hunt**, and the hook refuses them.
 
 **Ruling** — A judgment the coordinator issues in reply to an escalation: design direction, a
 conflict verdict, or a scope decision.
