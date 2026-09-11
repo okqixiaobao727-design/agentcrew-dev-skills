@@ -307,7 +307,7 @@ session with a read-only assignment. It is one list of entries, each a pointer a
 pointer `says`: the source text itself, quoted rather than characterised. A pointer that resolves
 to nothing has an empty `says`. There is no verdict field, no reason prose and no cited/uncited
 split — the Witness carries evidence and the coordinator judges it
-([ADR-0031](adr/0031-the-witness-carries-evidence-the-coordinator-judges.md)). `check` receives the
+([ADR-0032](adr/0032-the-witness-carries-evidence-the-coordinator-judges.md)). `check` receives the
 normalised cited-pointer list as exact, numbered input and returns one entry per pointer in that
 order, followed by its one-hop entries; an `ask` is coordinator-initiated and answers in the same
 shape, by returning the pointers that answer it — which pointers come back *is* the answer. Both
@@ -386,7 +386,7 @@ are facts: any pointer already on the table — carried by the witness brief, or
 escalation — may be read with an explicit offset and at most 80 lines, as often as the ruling
 needs, and nothing off the table may be read at all. What bounds the coordinator is reach rather
 than count, and what bounds the table is the Witness's one hop
-([ADR-0031](adr/0031-the-witness-carries-evidence-the-coordinator-judges.md)). `Grep`, `Glob` and
+([ADR-0032](adr/0032-the-witness-carries-evidence-the-coordinator-judges.md)). `Grep`, `Glob` and
 shell file reads are a **hunt**, and the hook refuses them.
 
 **Ruling** — A judgment the coordinator issues in reply to an escalation: design direction, a
