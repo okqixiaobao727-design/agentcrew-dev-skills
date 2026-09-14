@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.22] - 2026-09-15
+
 ### Added
 - A review's own report reaches the run it belongs to. Review-Switch writes each axis's report
   under a state directory of its own and names it to the axis-end Lifecycle Hook; this repository
